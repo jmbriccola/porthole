@@ -126,6 +126,9 @@ impl FirewallBackend for Firewalld<'_> {
                 zone,
                 rich_rule: (*one).clone(),
             }),
+            // Reachable because firewall-cmd downgrades ALREADY_ENABLED to exit 0
+            // for a single-item invocation, so the add above succeeds and simply
+            // adds no new line. Verified in firewall/command.py, __cmd_sequence.
             [] => Err(Error::AlreadyOpen {
                 port: req.port,
                 protocol: req.protocol,
@@ -310,9 +313,18 @@ mod tests {
 
     #[test]
     fn open_stores_the_string_firewalld_normalised_not_the_one_we_sent() {
-        // firewalld may reorder or reformat what it was given. --remove-rich-rule
-        // needs firewalld's own spelling, so that is what goes in the handle.
-        let normalised = r#"rule family="ipv4" source address="10.10.10.0/24" port port="5173" protocol="tcp" accept"#;
+        // firewalld may spell a rule differently from the way porthole builds it,
+        // and --remove-rich-rule needs firewalld's spelling. This fixture is
+        // deliberately NOT the string `rich_rule` constructs: if it were, the
+        // assertion would hold even when `open` wrongly returned its own string,
+        // and the test would prove nothing about the behaviour it is named for.
+        let normalised = r#"rule family="ipv4" source address="10.10.10.0/24" port protocol="tcp" port="5173" accept"#;
+        assert_ne!(
+            normalised,
+            Firewalld::rich_rule(&subnet_request()),
+            "this fixture must differ from the constructed rule, or the test is vacuous"
+        );
+
         let runner = RecordingRunner::with_responses(open_script("", normalised));
         let handle = Firewalld::new(&runner).open(&subnet_request()).unwrap();
 
@@ -391,6 +403,26 @@ mod tests {
             status: 13,
             stdout: String::new(),
             stderr: "Error: NOT_ENABLED: rule family=\"ipv4\" ...".into(),
+        }]);
+        let handle = RuleHandle::Firewalld {
+            zone: ZONE.to_string(),
+            rich_rule: SUBNET_RULE.to_string(),
+        };
+        assert!(Firewalld::new(&runner).close(&handle).is_ok());
+    }
+
+    #[test]
+    fn close_accepts_firewalld_s_real_already_absent_response() {
+        // firewall-cmd downgrades ALREADY_ENABLED and NOT_ENABLED to exit 0 for a
+        // single-item invocation (firewall/command.py, __cmd_sequence), so the
+        // response porthole will actually meet is a zero exit with a warning on
+        // stderr. The status-13 case above stays as defence: the firewalld D-Bus
+        // API, which a later milestone may use instead of the CLI, raises the
+        // error rather than downgrading it.
+        let runner = RecordingRunner::with_responses(vec![Output {
+            status: 0,
+            stdout: String::new(),
+            stderr: "Warning: NOT_ENABLED: rule family=\"ipv4\" ...".into(),
         }]);
         let handle = RuleHandle::Firewalld {
             zone: ZONE.to_string(),
