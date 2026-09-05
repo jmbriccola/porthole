@@ -1,0 +1,21 @@
+[package]
+name = "porthole-helper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Privileged D-Bus service for porthole."
+
+[[bin]]
+name = "porthole-helper"
+path = "src/main.rs"
+
+[dependencies]
+porthole-core = { path = "../porthole-core" }
+zbus.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
