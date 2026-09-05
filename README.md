@@ -14,16 +14,21 @@ porthole does one thing: it opens a single port towards the network you are on
 right now, for a bounded amount of time, and closes it again.
 
 ```console
-$ porthole open 5173 --for 30m
+$ sudo porthole open 5173 --for 30m
 Opened 5173/tcp towards 10.10.10.0/24 · closes 30m 0s
 
 $ porthole list
-PORT      TOWARDS         BACKEND    CLOSES IN
-5173/tcp  10.10.10.0/24   firewalld  29m 41s
+PORT      TOWARDS        BACKEND    CLOSES IN
+5173/tcp  10.10.10.0/24  firewalld  29m 41s
 
-$ porthole close 5173
+$ sudo porthole close 5173
 Closed 5173/tcp towards 10.10.10.0/24
 ```
+
+Opening and closing need root in this release; `porthole list`, `porthole
+status` and anything with `--dry-run` do not. The unprivileged helper that
+removes the `sudo` — a system D-Bus service authorised by polkit — is the next
+release's work.
 
 ## What it is not
 

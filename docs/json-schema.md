@@ -1,6 +1,6 @@
 # `--json` output
 
-Every reading command accepts `--json`. The shape is versioned by the top-level
+Every command accepts `--json`. The shape is versioned by the top-level
 `schema` field, currently `1`. Fields are added, never renamed or removed.
 
 All timestamps are **seconds since the Unix epoch**, as integers. Convert with
