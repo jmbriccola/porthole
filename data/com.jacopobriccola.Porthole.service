@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=com.jacopobriccola.Porthole
+Exec=/usr/libexec/porthole-helper
+User=root
+SystemdService=porthole-helper.service

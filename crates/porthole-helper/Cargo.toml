@@ -1,24 +1,29 @@
 [package]
-name = "porthole-cli"
+name = "porthole-helper"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Command-line interface for porthole."
+description = "Privileged D-Bus service for porthole."
+
+[lib]
+name = "porthole_helper"
+path = "src/lib.rs"
 
 [[bin]]
-name = "porthole"
+name = "porthole-helper"
 path = "src/main.rs"
 
 [dependencies]
+async-trait.workspace = true
 porthole-core = { path = "../porthole-core" }
-clap.workspace = true
-libc.workspace = true
-serde_json.workspace = true
-tokio.workspace = true
 zbus.workspace = true
+zbus_polkit.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
+libc.workspace = true
 tempfile.workspace = true
+tokio.workspace = true

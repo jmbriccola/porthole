@@ -84,6 +84,34 @@ failure appears in `errors` with the same `{code, kind, message}` shape used
 below. The output is always a single object — the exit code carries the first
 failure's code.
 
+## `porthole doctor --json`
+
+```json
+{
+  "schema": 1,
+  "checks": [
+    {
+      "name": "Firewall",
+      "ok": true,
+      "detail": "firewalld 2.4.4 is running",
+      "remedy": ""
+    },
+    {
+      "name": "Helper",
+      "ok": false,
+      "detail": "not answering on the bus",
+      "remedy": "Either /usr/libexec/porthole-helper is not installed, or its dbus activation file is missing…"
+    }
+  ]
+}
+```
+
+One object per check, always in the same order — the order a failure cascades
+in: `Firewall`, `Helper`, `Expiry timer`, `polkit`, `State`, `Network`, `Docker`,
+`IPv6`. `remedy` is `""` when there is nothing to do. The process exits `1` if
+any check's `ok` is `false`, `0` if every check passed — a script can gate on
+the exit code without parsing the JSON at all.
+
 ## Errors
 
 On failure, the JSON goes to **stdout** and the process exits with `code`.
@@ -96,3 +124,14 @@ On failure, the JSON goes to **stdout** and the process exits with `code`.
 ```
 
 `kind` is a stable slug; `message` is human text and may change wording.
+
+This shape is identical whether `open` or `close` did the work locally
+(`--dry-run`) or asked the privileged helper over D-Bus to do it: the helper
+sends back the same `code` and the same `kind` slug milestone 1 defined, and
+the CLI reports them verbatim rather than re-deriving them. A script reading
+`--json` output cannot tell, and does not need to, whether the work happened
+in-process or across the bus — with two exceptions: `command_spawn_failed`
+and `io_error` are distinct kinds locally, but both collapse into the same
+`unexpected` kind once they cross the bus, since the helper's own error type
+has no request-specific meaning worth distinguishing on the wire for either
+one.

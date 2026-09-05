@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>porthole</vendor>
+  <vendor_url>https://github.com/jmbriccola/porthole</vendor_url>
+
+  <action id="com.jacopobriccola.Porthole.open-subnet">
+    <description>Open a port towards the current network</description>
+    <message>Authentication is required to open $(protocol) port $(port) towards $(target), the network you are on.</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.jacopobriccola.Porthole.open-any">
+    <description>Open a port towards everyone</description>
+    <message>Authentication is required to open $(protocol) port $(port) towards $(target) — every network this machine can reach.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.jacopobriccola.Porthole.close">
+    <description>Close a port porthole opened</description>
+    <message>Closing a port porthole opened.</message>
+    <defaults>
+      <allow_any>yes</allow_any>
+      <allow_inactive>yes</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.jacopobriccola.Porthole.list">
+    <description>List the ports porthole has open</description>
+    <message>Listing the ports porthole has open.</message>
+    <defaults>
+      <allow_any>yes</allow_any>
+      <allow_inactive>yes</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

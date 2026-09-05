@@ -40,6 +40,13 @@ pub enum Error {
     #[error("{0}")]
     BackendUnavailable(String),
 
+    /// The README's exit-code table says exit 4 means "Polkit refused the
+    /// request. Never `sudo`." That sentence is true only because this
+    /// variant has exactly one production construction site today —
+    /// `polkit.rs`'s `denied()`. Nothing in the type system enforces that; if
+    /// a second call site is ever added, either keep the sentence true or go
+    /// update the README, because nothing else will notice the two have
+    /// drifted apart.
     #[error("not authorized: {0}")]
     NotAuthorized(String),
 
@@ -81,6 +88,20 @@ pub enum Error {
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    /// An error the privileged helper already rendered.
+    ///
+    /// Carries its own kind slug and exit code so the CLI reports exactly what
+    /// the helper said, once. Rebuilding a local variant from a rendered
+    /// message doubles every prefixing template — and for `AlreadyOpen`, whose
+    /// template names the port, it made the CLI announce a port nobody asked
+    /// about.
+    #[error("{message}")]
+    Remote {
+        message: String,
+        kind: &'static str,
+        code: ExitCode,
+    },
 }
 
 impl Error {
@@ -93,6 +114,7 @@ impl Error {
             Error::DeviceUnreachable(_) => ExitCode::DeviceUnreachable,
             Error::RuleNotFound(_) => ExitCode::RuleNotFound,
             Error::NoNetwork(_) => ExitCode::NoNetwork,
+            Error::Remote { code, .. } => *code,
             Error::CommandFailed { .. }
             | Error::CommandSpawn { .. }
             | Error::State { .. }
@@ -111,6 +133,7 @@ impl Error {
             Error::DeviceUnreachable(_) => "device_unreachable",
             Error::RuleNotFound(_) => "rule_not_found",
             Error::NoNetwork(_) => "no_network",
+            Error::Remote { kind, .. } => kind,
             Error::CommandFailed { .. } => "command_failed",
             Error::CommandSpawn { .. } => "command_spawn_failed",
             Error::State { .. } => "state_error",
@@ -169,5 +192,24 @@ mod tests {
             "invalid_argument"
         );
         assert_eq!(Error::NoNetwork("x".into()).kind(), "no_network");
+    }
+
+    #[test]
+    fn a_remote_error_reports_the_helpers_words_once() {
+        // The helper sends its message already rendered. Re-wrapping it in a
+        // local variant's template doubles the prefix; for AlreadyOpen it also
+        // invents a port.
+        let e = Error::Remote {
+            message: "5173/tcp is already open (open towards 10.10.10.0/24)".to_string(),
+            kind: "already_open",
+            code: ExitCode::AlreadyOpen,
+        };
+        assert_eq!(
+            e.to_string(),
+            "5173/tcp is already open (open towards 10.10.10.0/24)"
+        );
+        assert_eq!(e.kind(), "already_open");
+        assert_eq!(e.exit_code(), ExitCode::AlreadyOpen);
+        assert!(!e.to_string().contains("0/tcp"), "no invented port");
     }
 }

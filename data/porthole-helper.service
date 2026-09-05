@@ -1,0 +1,33 @@
+[Unit]
+Description=porthole privileged helper
+Documentation=man:porthole(1)
+
+[Service]
+Type=dbus
+BusName=com.jacopobriccola.Porthole
+ExecStart=/usr/libexec/porthole-helper
+# The state lives here and nowhere else. systemd creates it with these
+# permissions so an unprivileged `porthole list` can read it and only the
+# helper can change it.
+RuntimeDirectory=porthole
+RuntimeDirectoryMode=0755
+# Without this, systemd's default (`no`) removes /run/porthole -- and
+# state.json with it -- on every stop, restart, package try-restart, or
+# crash, while every rich rule porthole added stays live in firewalld
+# regardless. The next `porthole list` would show nothing, `close --all`
+# would close nothing, and a close already scheduled on a transient timer
+# would fire into RuleNotFound: the port stays open until reboot with
+# nothing left anywhere able to close it. Removing this line reopens that.
+RuntimeDirectoryPreserve=yes
+# It talks to firewalld and systemd and writes one file. Nothing else.
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+# No Restart=: this unit has no WantedBy=, so nothing depends on it staying
+# up between calls -- D-Bus activation already starts it again the next time
+# `open`, `close` or `list` addresses the bus name, which is the same
+# self-healing path a crash takes as a clean stop. Restart=on-failure would
+# race that mechanism with a second one, and would turn a startup failure
+# (no safe CLI binary found, a corrupt state file) into a tight crash loop
+# against systemd's start-limit instead of a helper that just waits to be
+# asked again.

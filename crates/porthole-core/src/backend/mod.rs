@@ -90,11 +90,11 @@ pub fn detect<'a>(runner: &'a dyn CommandRunner) -> Result<Box<dyn FirewallBacke
     if firewalld.health()?.available {
         return Ok(Box::new(firewalld));
     }
-    Err(Error::BackendUnavailable(
-        "firewalld is not installed. porthole 0.1 manages firewalld only; \
+    Err(Error::BackendUnavailable(format!(
+        "firewalld is not installed. porthole {} manages firewalld only; \
          support for ufw and nftables is planned. If you use one of those, \
          porthole cannot see your rules and cannot tell you whether this port \
-         is reachable."
-            .to_string(),
-    ))
+         is reachable.",
+        env!("CARGO_PKG_VERSION")
+    )))
 }

@@ -1,4 +1,6 @@
 mod cli;
+mod client;
+mod doctor;
 mod output;
 mod run;
 

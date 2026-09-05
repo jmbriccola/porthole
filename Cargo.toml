@@ -1,17 +1,18 @@
 [workspace]
 resolver = "2"
-members = ["crates/porthole-core", "crates/porthole-cli"]
+members = ["crates/porthole-core", "crates/porthole-cli", "crates/porthole-helper"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.87"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/jmbriccola/porthole"
 authors = ["Jacopo Maria Briccola <jmbriccola@gmail.com>"]
 description = "Open a port to your local network, temporarily and on purpose."
 
 [workspace.dependencies]
+async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 ipnet = { version = "2", features = ["serde"] }
 libc = "0.2"
@@ -19,4 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 uuid = { version = "1", features = ["v4"] }
+zbus = "5"
+zbus_polkit = "5"

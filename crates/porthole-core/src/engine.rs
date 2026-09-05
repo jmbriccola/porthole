@@ -22,6 +22,55 @@ use crate::validate;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+/// Turn what the caller asked for into the network a backend can use.
+///
+/// A free function because the privileged helper needs to resolve a scope —
+/// and decide which polkit action applies — *before* it takes the state lock.
+/// A polkit check can block for as long as a human takes to type a password,
+/// and holding an advisory lock across that would stall every other writer.
+pub fn resolve_scope(runner: &dyn CommandRunner, spec: &ScopeSpec) -> Result<Target> {
+    Ok(match spec {
+        ScopeSpec::CurrentSubnet => Target::Network {
+            cidr: net::current_network(runner)?.cidr,
+        },
+        ScopeSpec::Anywhere => Target::Anywhere,
+        ScopeSpec::Network(cidr) => {
+            // A /0 is everyone, however it was spelled.
+            if cidr.prefix_len() == 0 {
+                Target::Anywhere
+            } else {
+                Target::Network { cidr: *cidr }
+            }
+        }
+        ScopeSpec::Host(addr) => Target::Network {
+            cidr: validate::host_to_network(*addr),
+        },
+    })
+}
+
+/// Whether `target` amounts to the same exposure as `Target::Anywhere`.
+///
+/// `Target::Anywhere` always does. A `Target::Network` does too unless it
+/// sits entirely inside the machine's own local subnet: a `/32` for a device
+/// on that subnet stays the weaker case, but a network broader than the local
+/// subnet, or one the machine is not even on, is not "the network you are on"
+/// no matter how it was spelled — `--to 0.0.0.0/1` plus `--to 128.0.0.0/1`
+/// between them cover the entire address space while neither is literally
+/// `/0`, and both must still be treated as maximum exposure.
+///
+/// `local` is `None` when the local network could not be resolved. That is
+/// the safe direction: nothing can be verified to be contained in a network
+/// that is not known, so a resolution failure must not buy the weaker check.
+pub fn is_open_any(target: &Target, local: Option<&LocalNetwork>) -> bool {
+    match target {
+        Target::Anywhere => true,
+        Target::Network { cidr } => match local {
+            None => true,
+            Some(local) => !local.cidr.contains(cidr),
+        },
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Status {
     pub backend: BackendId,
@@ -65,26 +114,7 @@ impl<'a> Engine<'a> {
 
     /// Turn what the user asked for into the network a backend can use.
     pub fn resolve(&self, spec: &ScopeSpec) -> Result<Target> {
-        Ok(match spec {
-            ScopeSpec::CurrentSubnet => Target::Network {
-                cidr: net::current_network(self.runner)?.cidr,
-            },
-            ScopeSpec::Anywhere => Target::Anywhere,
-            ScopeSpec::Network(cidr) => {
-                // A /0 is everyone, however it was spelled. Classify it as such:
-                // milestone 2 gives "open to anywhere" a stronger polkit action
-                // than "open to a subnet", and `--to 0.0.0.0/0` must not take
-                // the weaker path.
-                if cidr.prefix_len() == 0 {
-                    Target::Anywhere
-                } else {
-                    Target::Network { cidr: *cidr }
-                }
-            }
-            ScopeSpec::Host(addr) => Target::Network {
-                cidr: validate::host_to_network(*addr),
-            },
-        })
+        resolve_scope(self.runner, spec)
     }
 
     pub fn open(
@@ -867,6 +897,76 @@ mod tests {
             Target::Network {
                 cidr: "10.10.10.0/24".parse().unwrap()
             }
+        );
+    }
+
+    fn local_net() -> LocalNetwork {
+        LocalNetwork {
+            interface: "wlo1".to_string(),
+            address: "10.10.10.119".parse().unwrap(),
+            cidr: "10.10.10.0/24".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn anywhere_is_always_open_any() {
+        assert!(is_open_any(&Target::Anywhere, Some(&local_net())));
+        assert!(is_open_any(&Target::Anywhere, None));
+    }
+
+    #[test]
+    fn a_slash_32_inside_the_local_subnet_stays_open_subnet() {
+        let target = Target::Network {
+            cidr: "10.10.10.42/32".parse().unwrap(),
+        };
+        assert!(
+            !is_open_any(&target, Some(&local_net())),
+            "a single device on the local subnet must keep the weaker action"
+        );
+    }
+
+    #[test]
+    fn a_network_that_is_not_the_local_subnet_is_open_any() {
+        // Same prefix length as the local subnet, but a different network —
+        // "the network you are on" this is not.
+        let target = Target::Network {
+            cidr: "192.168.1.0/24".parse().unwrap(),
+        };
+        assert!(is_open_any(&target, Some(&local_net())));
+    }
+
+    #[test]
+    fn a_slash_zero_is_open_any() {
+        let target = Target::Network {
+            cidr: "0.0.0.0/0".parse().unwrap(),
+        };
+        assert!(is_open_any(&target, Some(&local_net())));
+    }
+
+    #[test]
+    fn splitting_the_whole_address_space_in_half_does_not_hide_it_from_open_any() {
+        // 0.0.0.0/1 and 128.0.0.0/1 together are total exposure, and neither
+        // one is literally 0.0.0.0/0. A classifier that only caught prefix
+        // length zero would let this through at the weaker action.
+        for cidr in ["0.0.0.0/1", "128.0.0.0/1"] {
+            let target = Target::Network {
+                cidr: cidr.parse().unwrap(),
+            };
+            assert!(
+                is_open_any(&target, Some(&local_net())),
+                "{cidr} must be classified open-any"
+            );
+        }
+    }
+
+    #[test]
+    fn no_local_network_is_the_safe_direction_open_any() {
+        let target = Target::Network {
+            cidr: "10.10.10.42/32".parse().unwrap(),
+        };
+        assert!(
+            is_open_any(&target, None),
+            "an unresolved local network must not buy the weaker check"
         );
     }
 
