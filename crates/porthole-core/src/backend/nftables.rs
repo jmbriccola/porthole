@@ -66,6 +66,12 @@ struct ChainJson {
     name: String,
     #[serde(default)]
     hook: Option<String>,
+    /// `hook == "input"` alone is not enough: nat has its own `input` hook
+    /// (used for locally-destined DNAT/REDIRECT), and a `type nat hook input`
+    /// chain is a real base chain there that filters nothing. Only a `filter`
+    /// chain at that hook decides whether the packet is delivered at all.
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
     #[serde(default)]
     policy: Option<String>,
 }
@@ -97,7 +103,7 @@ fn parse_input_chains(json: &str) -> Result<Vec<InputChain>> {
                 "could not parse a chain in `nft -j list chains` output: {e}"
             ))
         })?;
-        if chain.hook.as_deref() == Some("input") {
+        if chain.hook.as_deref() == Some("input") && chain.kind.as_deref() == Some("filter") {
             chains.push(InputChain {
                 family: chain.family,
                 table: chain.table,
@@ -133,11 +139,69 @@ fn parse_rules(json: &str) -> Result<Vec<RuleJson>> {
 /// The kernel-assigned handle of the rule carrying `marker` as its comment, if
 /// any. Never cached: handles are reassigned after a ruleset flush, so one
 /// read now can name a different rule later.
+///
+/// Matches against the *unquoted* comment string `nft -j` reports. The
+/// literal quotes `open_impl` puts in the argv element are syntax for nft's
+/// own command-line grammar, not part of the comment itself, and `nft`
+/// strips them before this value ever reaches JSON.
 fn find_rule_handle(json: &str, marker: &str) -> Result<Option<u64>> {
     Ok(parse_rules(json)?
         .into_iter()
         .find(|rule| rule.comment.as_deref() == Some(marker))
         .map(|rule| rule.handle))
+}
+
+/// Whether a rule's expression list is exactly the shape `open_impl` writes:
+/// a single tcp/udp `dport` match, an optional `ip saddr` match, and a
+/// terminal `accept` -- nothing else.
+///
+/// Mirrors `Ufw::parse_status`'s `is_porthole_shape`: a `porthole:`-commented
+/// rule of any other shape is a hand-edited rule or a marker collision, not
+/// something reconciliation may remove. Without this, `owned_rules` claims a
+/// rule on the comment alone, and that list is what task 5's orphan sweep
+/// deletes from — the one place where getting ownership wrong deletes the
+/// user's firewall.
+fn rule_matches_porthole_shape(rule: &RuleJson) -> bool {
+    let mut has_dport = false;
+    let mut has_saddr = false;
+    let mut has_accept = false;
+
+    for stmt in &rule.expr {
+        if let Some(m) = stmt.get("match") {
+            let payload = m.get("left").and_then(|l| l.get("payload"));
+            let protocol = payload
+                .and_then(|p| p.get("protocol"))
+                .and_then(|v| v.as_str());
+            let field = payload
+                .and_then(|p| p.get("field"))
+                .and_then(|v| v.as_str());
+            // A plain scalar right-hand side, not a range or a set -- those
+            // are matches porthole never writes, so they disqualify the rule
+            // from this shape rather than being treated as some other kind
+            // of dport/saddr match.
+            let scalar_right = m
+                .get("right")
+                .is_some_and(|r| r.is_string() || r.is_number());
+
+            match (protocol, field) {
+                (Some("tcp") | Some("udp"), Some("dport")) if !has_dport && scalar_right => {
+                    has_dport = true;
+                }
+                (Some("ip"), Some("saddr")) if !has_saddr && scalar_right => {
+                    has_saddr = true;
+                }
+                _ => return false,
+            }
+        } else if stmt.get("accept").is_some() && !has_accept {
+            has_accept = true;
+        } else {
+            // Any other statement -- a second accept, a counter, a log, a
+            // different verdict -- is not a shape `open_impl` produces.
+            return false;
+        }
+    }
+
+    has_dport && has_accept
 }
 
 /// Discover every base chain registered at the input hook.
@@ -194,9 +258,12 @@ impl<'a> Nftables<'a> {
     }
 
     /// Every rule in every chain registered at the input hook, paired with
-    /// the chain it came from. Diagnostic: unlike `open`, a chain count other
-    /// than one is not refused here, because listing what exists must not
-    /// itself require the same proof that mutating it does.
+    /// the chain it came from.
+    ///
+    /// For `list_rules` only, which is diagnostic and documented as such:
+    /// unlike `open` and `owned_rules`, a chain count other than one is not
+    /// refused here, because merely listing what exists must not require the
+    /// same proof that mutating -- or claiming ownership of -- it does.
     fn all_rules(&self) -> Result<Vec<(InputChain, RuleJson)>> {
         let chains = self.list_chains()?;
         let mut all = Vec::new();
@@ -220,7 +287,16 @@ impl<'a> Nftables<'a> {
         Ok(all)
     }
 
-    fn chain_has_a_drop_or_reject(&self, chain: &InputChain) -> Result<bool> {
+    /// Whether any rule *in this chain itself* drops or rejects.
+    ///
+    /// Deliberately does not follow `jump`/`goto`: a chain with `policy
+    /// accept` that jumps to a chain which does the actual dropping is
+    /// exactly how firewalld and ufw lay out their rulesets, and walking
+    /// jump targets to see through that is real work this round does not do.
+    /// Callers must phrase what they say about the result accordingly -- "no
+    /// drop found in this chain", never "nothing here drops", since the
+    /// latter is false on a very common ruleset shape.
+    fn chain_itself_has_a_drop_or_reject(&self, chain: &InputChain) -> Result<bool> {
         let cmd = Command::read(
             "nft",
             [
@@ -261,7 +337,16 @@ impl<'a> Nftables<'a> {
         }
         args.push("accept".to_string());
         args.push("comment".to_string());
-        args.push(marker.to_string());
+        // The quotes here are literal characters in the argv element, not
+        // shell quoting: `RealRunner` spawns via `StdCommand::args`, with no
+        // shell in between to add or strip anything. `nft` re-lexes argv
+        // with its own grammar, in which an unquoted token cannot contain a
+        // colon -- and the marker is always `porthole:<uuid>`. Confirmed
+        // against the real binary, unprivileged, in check mode: `nft -c ...
+        // comment porthole:abc` is a syntax error ("unexpected colon");
+        // `nft -c ... comment '"porthole:abc"'` reaches netlink, i.e. it
+        // parsed. Do not "clean up" these quotes -- they are load-bearing.
+        args.push(format!("\"{marker}\""));
 
         // `insert`, not `add`: `add` appends after the user's drop, where the
         // rule is never reached. This is the entire point of this backend.
@@ -335,6 +420,16 @@ impl FirewallBackend for Nftables<'_> {
         Ok(self
             .all_rules()?
             .into_iter()
+            // An uncommented rule becomes a handle with `marker: ""`, which
+            // names no rule `close` could ever find (it would read back
+            // `RuleNotFound`, never someone else's rule). That's acceptable
+            // here specifically because this list is diagnostic, never
+            // consumed to decide what to delete: the trait's own contract
+            // for `list_rules` is "every rule visible in the place porthole
+            // writes to", the user's un-marked rules included, so skipping
+            // them would violate that contract for no safety gain. Contrast
+            // `owned_rules`, which requires a real `porthole:` marker before
+            // a rule is ever named as something reconciliation may remove.
             .map(|(chain, rule)| RuleHandle::Nftables {
                 family: chain.family,
                 table: chain.table,
@@ -344,19 +439,50 @@ impl FirewallBackend for Nftables<'_> {
             .collect())
     }
 
+    /// The rules porthole can prove it created: a `porthole:`-commented rule,
+    /// of exactly the shape `open_impl` writes, in the one chain `open` would
+    /// insert into.
+    ///
+    /// This deliberately uses the same single-chain discovery `open` uses,
+    /// and returns the same refusal when it is ambiguous -- rather than
+    /// `all_rules`'s "walk every input-hook chain", which `list_rules` uses.
+    /// This list is what reconciliation's orphan sweep (task 5) deletes from;
+    /// on a two-chain ruleset, `open` refuses to touch either chain because
+    /// it cannot prove which one decides a packet's fate, and a rule marked
+    /// `porthole:` sitting in one of them is equally unprovable -- it could
+    /// be a leftover from before the ruleset grew a second chain, or a marker
+    /// collision. Claiming it anyway, the way `all_rules` does for the
+    /// diagnostic `list_rules`, would hand the orphan sweep a rule to delete
+    /// on exactly the same guess `open` already declined to make.
     fn owned_rules(&self) -> Result<Option<Vec<RuleHandle>>> {
+        let chain = self.discover_single_input_chain()?;
+        let cmd = Command::read(
+            "nft",
+            [
+                "-j",
+                "list",
+                "chain",
+                &chain.family,
+                &chain.table,
+                &chain.name,
+            ],
+        );
+        let out = self.runner.run(&cmd)?.into_ok(&cmd)?;
+        let rules = parse_rules(&out.stdout)?;
+
         Ok(Some(
-            self.all_rules()?
+            rules
                 .into_iter()
-                .filter(|(_, rule)| {
+                .filter(|rule| {
                     rule.comment
                         .as_deref()
                         .is_some_and(|c| c.starts_with("porthole:"))
+                        && rule_matches_porthole_shape(rule)
                 })
-                .map(|(chain, rule)| RuleHandle::Nftables {
-                    family: chain.family,
-                    table: chain.table,
-                    chain: chain.name,
+                .map(|rule| RuleHandle::Nftables {
+                    family: chain.family.clone(),
+                    table: chain.table.clone(),
+                    chain: chain.name.clone(),
                     marker: rule.comment.unwrap_or_default(),
                 })
                 .collect(),
@@ -419,16 +545,21 @@ impl FirewallBackend for Nftables<'_> {
         };
 
         // The direction that misleads: a chain whose policy is accept and
-        // holds no drop or reject is not enforcing anything, so closing a
-        // port there does not make it unreachable. Say that out loud rather
-        // than let a user infer the opposite from `active: true`.
+        // holds no drop or reject *of its own* might still not be enforcing
+        // anything -- but it might also jump to a chain that does the actual
+        // dropping (exactly how firewalld and ufw lay out their rulesets),
+        // which this backend does not check. Say only what was actually
+        // inspected, with the hedge spelled out, rather than let a user read
+        // a confident guarantee into `active: true` that the chain alone
+        // cannot support.
         if let [chain] = chains.as_slice() {
             if chain.policy.as_deref() == Some("accept")
-                && !self.chain_has_a_drop_or_reject(chain)?
+                && !self.chain_itself_has_a_drop_or_reject(chain)?
             {
                 detail.push_str(
-                    "; its policy is accept and it holds no drop or reject rule, so closing a \
-                     port here does not make it unreachable",
+                    "; its policy is accept and no rule in this chain drops or rejects (a \
+                     chain it jumps to might still), so closing a port here is not on its own \
+                     evidence that it becomes unreachable",
                 );
             }
         }
@@ -511,11 +642,48 @@ mod tests {
     }
 
     #[test]
-    fn chains_at_other_hooks_are_not_candidates() {
-        // The nat prerouting chain in the fixture is a base chain, but nothing
-        // arriving for a local port is filtered by it.
-        let found = parse_input_chains(CHAINS_ONE_INPUT).unwrap();
-        assert!(found.iter().all(|c| c.name != "prerouting"));
+    fn a_same_named_chain_at_a_different_hook_is_not_a_candidate() {
+        // Both chains here are named "input" -- one really is registered at
+        // the input hook, the other is a nat chain at prerouting that merely
+        // shares the name. A version of this test that only checked `len()`
+        // and the surviving chain's `name` (as an earlier draft of this test
+        // did, against a fixture where the *other* chain was named
+        // "prerouting") would pass even if the parser mistakenly kept both
+        // chains under whichever name collided, or admitted the prerouting
+        // chain under a different field. Pinning `table` as well as the
+        // count is what actually proves discovery keyed on `hook`, not name.
+        const CHAINS_ONE_INPUT_SAME_NAMED_OTHER_HOOK: &str = r#"{"nftables":[
+          {"metainfo":{"version":"1.1.3","json_schema_version":1}},
+          {"chain":{"family":"inet","table":"filter","name":"input","handle":1,
+                    "type":"filter","hook":"input","prio":0,"policy":"drop"}},
+          {"chain":{"family":"ip","table":"nat","name":"input","handle":1,
+                    "type":"nat","hook":"prerouting","prio":-100,"policy":"accept"}}
+        ]}"#;
+        let found = parse_input_chains(CHAINS_ONE_INPUT_SAME_NAMED_OTHER_HOOK).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].table, "filter",
+            "the same-named prerouting chain must not be counted"
+        );
+    }
+
+    #[test]
+    fn a_base_chain_at_the_input_hook_that_is_not_type_filter_is_not_a_candidate() {
+        // nat has its own "input" hook -- used for locally-destined
+        // DNAT/REDIRECT -- so `type nat hook input` is a real base chain
+        // there, not a malformed fixture. It has nothing to do with whether
+        // the packet is filtered. Keying on `hook` alone would count it as a
+        // candidate and turn an openable system into a refusal.
+        const CHAINS_NAT_AT_INPUT_HOOK: &str = r#"{"nftables":[
+          {"metainfo":{"version":"1.1.3","json_schema_version":1}},
+          {"chain":{"family":"ip","table":"nat","name":"redirect","handle":1,
+                    "type":"nat","hook":"input","prio":100,"policy":"accept"}}
+        ]}"#;
+        let found = parse_input_chains(CHAINS_NAT_AT_INPUT_HOOK).unwrap();
+        assert!(
+            found.is_empty(),
+            "a nat chain at the input hook filters nothing: {found:?}"
+        );
     }
 
     #[test]
@@ -538,15 +706,21 @@ mod tests {
             .map(|c| c.display())
             .collect();
         assert_eq!(mutating.len(), 1);
+        // The exact string, table and all, is the whole assertion: it pins
+        // both "no table of porthole's own" (there is nothing here but
+        // `insert rule` into the discovered chain) and "insert, not add" at
+        // once, so a separate `!contains("add table")` check on top of it
+        // would test nothing this equality doesn't already cover.
+        //
+        // The marker is wrapped in literal `"` characters -- see the comment
+        // at the `args.push(format!("\"{marker}\""))` call site for why: an
+        // unquoted `:` is a syntax error in nft's own argv grammar, and
+        // `Command::display()`'s shell-quoting then wraps that whole token
+        // in single quotes because it treats `"` as unsafe.
         assert_eq!(
             mutating[0],
             "nft insert rule inet filter input tcp dport 5173 \
-             ip saddr 10.10.10.0/24 accept comment porthole:abc"
-        );
-        assert!(
-            !mutating[0].contains("add table"),
-            "porthole must not create a table of its own: an accept there \
-             does not override the user's drop"
+             ip saddr 10.10.10.0/24 accept comment '\"porthole:abc\"'"
         );
         assert_eq!(
             handle,
@@ -554,6 +728,89 @@ mod tests {
                 family: "inet".to_string(),
                 table: "filter".to_string(),
                 chain: "input".to_string(),
+                marker: "porthole:abc".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn the_marker_argv_element_carries_literal_quote_characters() {
+        // `RealRunner` spawns via `StdCommand::args`, with no shell in
+        // between to add or strip quoting. `nft` re-lexes argv with its own
+        // grammar, in which an unquoted token cannot contain a colon, and
+        // the marker is always `porthole:<uuid>`. Verified against the real
+        // binary, unprivileged, in check mode (nothing was modified):
+        //
+        //   $ nft -c insert rule inet filter input tcp dport 5173 accept \
+        //         comment porthole:abc
+        //   Error: syntax error, unexpected colon, ...
+        //
+        //   $ nft -c insert rule inet filter input tcp dport 5173 accept \
+        //         comment '"porthole:abc"'
+        //   netlink: Error: cache initialization failed: Operation not permitted
+        //
+        // The second one reaches netlink -- it parsed. A future reader must
+        // not see the quotes in the argv element below as redundant noise
+        // left over from `display()`'s shell-quoting and remove them: they
+        // are literal characters this backend puts there on purpose.
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(CHAINS_ONE_INPUT),
+            Output::empty(),
+        ]);
+        Nftables::new(&runner)
+            .open(&request(5173, subnet()), "porthole:abc")
+            .unwrap();
+        let mutate = runner
+            .recorded()
+            .into_iter()
+            .find(|c| c.effect == Effect::Mutate)
+            .expect("open issues exactly one mutating command");
+        assert_eq!(
+            mutate.args.last(),
+            Some(&"\"porthole:abc\"".to_string()),
+            "the argv element itself must carry literal quote characters, \
+             not just its shell-quoted display"
+        );
+    }
+
+    #[test]
+    fn open_targets_whatever_chain_discovery_found_not_a_hardcoded_name() {
+        // Every fixture above happens to have its only base chain named
+        // `inet filter input` -- exactly the string a hardcoding regression
+        // would write, and the exact-string assertions above would not catch
+        // it. A real iptables-nft system's chain is `ip filter INPUT`; if
+        // `open_impl` ever stopped using what `discover_single_input_chain`
+        // returned and hardcoded the common case instead, this is the
+        // fixture that catches it.
+        const CHAINS_IPTABLES_NFT_STYLE: &str = r#"{"nftables":[
+          {"metainfo":{"version":"1.1.3","json_schema_version":1}},
+          {"chain":{"family":"ip","table":"filter","name":"INPUT","handle":1,
+                    "type":"filter","hook":"input","prio":0,"policy":"drop"}}
+        ]}"#;
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(CHAINS_IPTABLES_NFT_STYLE),
+            Output::empty(),
+        ]);
+        let handle = Nftables::new(&runner)
+            .open(&request(5173, subnet()), "porthole:abc")
+            .unwrap();
+
+        let mutate = runner
+            .recorded()
+            .into_iter()
+            .find(|c| c.effect == Effect::Mutate)
+            .expect("open issues exactly one mutating command");
+        assert_eq!(
+            mutate.display(),
+            "nft insert rule ip filter INPUT tcp dport 5173 \
+             ip saddr 10.10.10.0/24 accept comment '\"porthole:abc\"'"
+        );
+        assert_eq!(
+            handle,
+            RuleHandle::Nftables {
+                family: "ip".to_string(),
+                table: "filter".to_string(),
+                chain: "INPUT".to_string(),
                 marker: "porthole:abc".to_string(),
             }
         );
@@ -645,6 +902,42 @@ mod tests {
     }
 
     #[test]
+    fn close_targets_whatever_chain_the_handle_names_not_a_hardcoded_one() {
+        // Same concern as `open_targets_whatever_chain_discovery_found...`,
+        // for the other direction: `close` has no discovery step of its own
+        // -- it must act on exactly the family/table/chain the `RuleHandle`
+        // carries. Every other close test happens to use `inet filter
+        // input`; this one uses the differently-named, differently-cased
+        // `ip filter INPUT` a real iptables-nft system would have, so a
+        // hardcoded "inet"/"filter"/"input" anywhere in `close_impl` would
+        // read and delete from the wrong place and this test would catch it.
+        const CHAIN_WITH_RULES_IPTABLES_NFT_STYLE: &str = r#"{"nftables":[
+          {"metainfo":{"version":"1.1.3","json_schema_version":1}},
+          {"rule":{"family":"ip","table":"filter","chain":"INPUT","handle":7,
+                   "comment":"porthole:abc","expr":[]}}
+        ]}"#;
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(CHAIN_WITH_RULES_IPTABLES_NFT_STYLE),
+            Output::empty(),
+        ]);
+        Nftables::new(&runner)
+            .close(&RuleHandle::Nftables {
+                family: "ip".to_string(),
+                table: "filter".to_string(),
+                chain: "INPUT".to_string(),
+                marker: "porthole:abc".to_string(),
+            })
+            .unwrap();
+        let mutating: Vec<_> = runner
+            .recorded()
+            .iter()
+            .filter(|c| c.effect == Effect::Mutate)
+            .map(|c| c.display())
+            .collect();
+        assert_eq!(mutating, vec!["nft delete rule ip filter INPUT handle 7"]);
+    }
+
+    #[test]
     fn closing_a_rule_whose_marker_is_gone_is_rule_not_found() {
         const CHAIN_EMPTY: &str = r#"{"nftables":[
           {"metainfo":{"version":"1.1.3","json_schema_version":1}}
@@ -680,5 +973,85 @@ mod tests {
             assert!(!shown.contains(" -f "), "{shown}");
             assert!(!shown.contains('>'), "{shown}");
         }
+    }
+
+    #[test]
+    fn owned_rules_requires_the_exact_shape_not_just_the_comment() {
+        // Mirrors `Ufw::parse_status`'s own requirement: a `porthole:`
+        // comment on a rule of any other shape is a hand-edited rule or a
+        // marker collision, not something reconciliation may remove. This
+        // rule matches the right port but also carries a `log` statement
+        // `open_impl` never writes.
+        const CHAIN_WITH_A_MARKED_BUT_WRONGLY_SHAPED_RULE: &str = r#"{"nftables":[
+          {"metainfo":{"version":"1.1.3","json_schema_version":1}},
+          {"rule":{"family":"inet","table":"filter","chain":"input","handle":9,
+                   "comment":"porthole:evil",
+                   "expr":[
+                     {"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":5173}},
+                     {"log":null},
+                     {"accept":null}
+                   ]}}
+        ]}"#;
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(CHAINS_ONE_INPUT),
+            Output::stdout(CHAIN_WITH_A_MARKED_BUT_WRONGLY_SHAPED_RULE),
+        ]);
+        let owned = Nftables::new(&runner).owned_rules().unwrap().unwrap();
+        assert!(
+            owned.is_empty(),
+            "a `porthole:`-commented rule of the wrong shape must not be claimed: {owned:?}"
+        );
+    }
+
+    #[test]
+    fn owned_rules_refuses_the_same_ambiguity_open_refuses() {
+        // `all_rules` (which backs the diagnostic `list_rules`) walks every
+        // input-hook chain regardless of count. `owned_rules` must not: its
+        // output is what task 5's orphan sweep deletes from, and `open`
+        // already decided that a two-chain ruleset is not provably safe to
+        // touch. A rule marked `porthole:` sitting in one of those chains is
+        // equally unprovable -- it could be a leftover from before the
+        // ruleset grew a second chain -- so `owned_rules` must refuse
+        // exactly as `open` does, not guess which chain matters.
+        let runner = RecordingRunner::with_responses(vec![Output::stdout(CHAINS_TWO_INPUTS)]);
+        let err = Nftables::new(&runner).owned_rules().unwrap_err();
+        assert_eq!(err.exit_code(), ExitCode::BackendUnavailable);
+    }
+
+    #[test]
+    fn health_scopes_the_no_drop_claim_to_this_chain_only() {
+        // A chain with `policy accept` and no rules of its own is exactly
+        // how firewalld and ufw commonly implement enforcement: the actual
+        // dropping happens in a chain this one jumps to, which this backend
+        // does not follow. The message must say what was actually inspected
+        // ("in this chain"), never a blanket "closing a port here does not
+        // make it unreachable" -- that sentence is false on this very common
+        // layout.
+        const CHAINS_ACCEPT_POLICY_SINGLE_INPUT: &str = r#"{"nftables":[
+          {"metainfo":{"version":"1.1.3","json_schema_version":1}},
+          {"chain":{"family":"inet","table":"filter","name":"input","handle":1,
+                    "type":"filter","hook":"input","prio":0,"policy":"accept"}}
+        ]}"#;
+        const CHAIN_ACCEPT_POLICY_NO_RULES: &str = r#"{"nftables":[
+          {"metainfo":{"version":"1.1.3","json_schema_version":1}}
+        ]}"#;
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout("nftables v1.1.3 (Commodore Bullmoose)"),
+            Output::stdout(CHAINS_ACCEPT_POLICY_SINGLE_INPUT),
+            Output::stdout(CHAIN_ACCEPT_POLICY_NO_RULES),
+        ]);
+        let health = Nftables::new(&runner).health().unwrap();
+        assert!(health.active);
+        assert!(
+            health.detail.contains("in this chain"),
+            "must scope the claim to what was actually inspected: {}",
+            health.detail
+        );
+        assert!(
+            !health.detail.contains("does not make it unreachable"),
+            "must not promise unreachability outright -- a jump target may \
+             still drop, and this backend does not follow jump/goto: {}",
+            health.detail
+        );
     }
 }
