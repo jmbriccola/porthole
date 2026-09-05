@@ -167,6 +167,9 @@ fn dry_run_needs_no_privileges_and_changes_nothing() {
     assert!(text.contains("Nothing was changed"), "got: {text}");
 
     assert!(!path.exists(), "dry-run must not write the state file");
+
+    // The audit trail must not claim an opening that never happened.
+    assert!(!stderr(&out).contains("opened"), "got: {}", stderr(&out));
 }
 
 #[test]

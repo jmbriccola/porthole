@@ -104,16 +104,21 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<()> {
     // The audit trail. Under the expiry timer this goes to the journal; run
     // interactively it goes to the terminal. Milestone 2 moves it into the
     // helper, where the journal gets it in every case.
-    eprintln!(
-        "porthole: uid={} opened {}/{} towards {} until {}",
-        rule.uid,
-        rule.port,
-        rule.protocol,
-        rule.target,
-        rule.expires_at
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "reboot".to_string())
-    );
+    //
+    // Never under --dry-run: nothing was opened, and an audit trail that
+    // records openings which did not happen is worse than none at all.
+    if !cli.dry_run {
+        eprintln!(
+            "porthole: uid={} opened {}/{} towards {} until {}",
+            rule.uid,
+            rule.port,
+            rule.protocol,
+            rule.target,
+            rule.expires_at
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "reboot".to_string())
+        );
+    }
 
     if cli.json {
         println!(
