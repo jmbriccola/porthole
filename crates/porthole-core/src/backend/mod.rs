@@ -12,6 +12,7 @@
 
 pub mod fake;
 pub mod firewalld;
+pub mod nftables;
 pub mod ufw;
 
 use crate::command::CommandRunner;
@@ -169,6 +170,7 @@ pub fn detect<'a>(runner: &'a dyn CommandRunner) -> Result<Box<dyn FirewallBacke
 mod tests {
     use super::firewalld;
     use super::firewalld::tests::{ROUTE_JSON, SUBNET_RULE, ZONE};
+    use super::nftables;
     use super::ufw;
     use super::{FirewallBackend, Ownership};
     use crate::command::{Output, RecordingRunner};
@@ -257,10 +259,21 @@ mod tests {
                 super::BackendId::Ufw => {
                     check(&ufw::Ufw::new(&RecordingRunner::new()));
                 }
-                // Task 3 adds this backend; fill in a construction and a
-                // `check(&...)` call here when it lands, rather than leaving
-                // the arm empty.
-                super::BackendId::Nftables => {}
+                super::BackendId::Nftables => {
+                    // A bare `RecordingRunner::new()` answers every read with
+                    // empty stdout, and empty stdout is not valid `nft -j`
+                    // output -- unlike ufw's and firewalld's parsers, this one
+                    // would then error rather than report zero rules. So this
+                    // scripts the smallest *valid* answer instead: an envelope
+                    // with no chain at the input hook, which is a legitimate
+                    // (if unenforced) nftables state, not a parse failure.
+                    const NO_INPUT_CHAIN: &str = r#"{"nftables":[
+                        {"metainfo":{"version":"1.1.3","json_schema_version":1}}
+                    ]}"#;
+                    check(&nftables::Nftables::new(&RecordingRunner::with_responses(
+                        vec![Output::stdout(NO_INPUT_CHAIN)],
+                    )));
+                }
             }
         }
     }
