@@ -14,7 +14,19 @@ use std::net::Ipv4Addr;
 
 /// Interface name prefixes that are never "the network I am on".
 const VIRTUAL_PREFIXES: &[&str] = &[
-    "lo", "docker", "br-", "virbr", "tun", "tap", "veth", "cni", "podman", "vboxnet", "wg", "zt",
+    "lo",
+    "docker",
+    "br-",
+    "virbr",
+    "tun",
+    "tap",
+    "veth",
+    "cni",
+    "podman",
+    "vboxnet",
+    "wg",
+    "zt",
+    "tailscale",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +71,12 @@ fn parse_default_route(json: &str) -> Result<String> {
     routes
         .into_iter()
         .filter(|r| r.dst == "default")
-        .filter_map(|r| r.dev.map(|dev| (dev, r.metric.unwrap_or(u32::MAX))))
+        // An absent `metric` means zero, not unknown: the kernel only emits
+        // RTA_PRIORITY when fib_priority is non-zero, so a statically
+        // configured default route (`ip route add default via ...`) arrives
+        // with no metric key at all. Treating that as u32::MAX would rank the
+        // most-preferred route last and hand back the wrong subnet.
+        .filter_map(|r| r.dev.map(|dev| (dev, r.metric.unwrap_or(0))))
         .filter(|(dev, _)| !is_virtual_interface(dev))
         // Lowest metric wins, exactly as the kernel decides.
         .min_by_key(|(_, metric)| *metric)
@@ -153,6 +170,7 @@ mod tests {
             "cni-podman0",
             "wg0",
             "vboxnet0",
+            "tailscale0",
             "lo",
         ] {
             assert!(is_virtual_interface(name), "{name} should be virtual");
@@ -185,6 +203,20 @@ mod tests {
           {"dst":"default","dev":"wlo1","metric":600}
         ]"#;
         assert_eq!(parse_default_route(json).unwrap(), "wlo1");
+    }
+
+    #[test]
+    fn a_route_with_no_metric_key_outranks_one_with_a_metric() {
+        // The kernel omits RTA_PRIORITY when the metric is zero, so an absent
+        // "metric" is the most-preferred route, not the least. A statically
+        // configured wired default route looks exactly like this, and it must
+        // beat NetworkManager's metric-600 wifi route — otherwise porthole
+        // opens the port towards the wrong network without saying a word.
+        let json = r#"[
+          {"dst":"default","dev":"wlo1","metric":600},
+          {"dst":"default","dev":"enp0s31f6"}
+        ]"#;
+        assert_eq!(parse_default_route(json).unwrap(), "enp0s31f6");
     }
 
     #[test]
