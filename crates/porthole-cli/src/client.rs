@@ -4,7 +4,7 @@
 //! and the helper acts. Reads — `list`, `status` — and `--dry-run` stay local
 //! and never touch the bus, so they keep working when the helper is absent.
 
-use porthole_core::error::{Error, Result};
+use porthole_core::error::{Error, ExitCode, Result};
 use porthole_core::ipc::{PortholeProxy, WireRule};
 use porthole_core::state::ManagedRule;
 
@@ -36,40 +36,52 @@ async fn proxy(session: bool) -> Result<PortholeProxy<'static>> {
         .map_err(|e| Error::Unexpected(format!("could not bind the helper's interface: {e}")))
 }
 
-/// Turn a D-Bus error name back into the error the CLI would have produced
-/// locally, so `porthole open` exits 5 for "already open" whether it did the
-/// work itself or asked the helper to.
+/// Turn a D-Bus error name back into an error carrying the helper's own text,
+/// its `--json` kind slug, and the exit code milestone 1 documented.
+///
+/// It does **not** rebuild the local variant. The helper sends its error
+/// already rendered, and every variant whose `Display` has a prefix would
+/// double it — `not authorized: not authorized: …`. `AlreadyOpen` is worse
+/// still: its template names the port, so rebuilding it with a placeholder
+/// made the CLI announce a port the user never asked about. `Error::Remote`
+/// exists so the helper's message is reported once, verbatim.
 fn from_dbus(e: zbus::Error) -> Error {
     if let zbus::Error::MethodError(name, detail, _) = &e {
-        let text = detail.clone().unwrap_or_else(|| name.to_string());
+        let message = detail.clone().unwrap_or_else(|| name.to_string());
         let short = name.as_str().rsplit('.').next().unwrap_or("");
-        return match short {
-            "InvalidArgument" => Error::InvalidArgument(text),
-            "BackendUnavailable" => Error::BackendUnavailable(text),
-            "NotAuthorized" => Error::NotAuthorized(text),
-            "AlreadyOpen" => Error::AlreadyOpen {
-                port: 0,
-                protocol: porthole_core::model::Protocol::Tcp,
-                detail: text,
-            },
-            "DeviceUnreachable" => Error::DeviceUnreachable(text),
-            "RuleNotFound" => Error::RuleNotFound(text),
-            "NoNetwork" => Error::NoNetwork(text),
-            // The bus itself answered, but nothing owns `com.jacopobriccola.Porthole`
-            // and nothing can be activated to. That is a live system bus with no
-            // helper installed — the ordinary "not installed yet" case, and
-            // exactly as unprivileged an outcome as failing to reach the bus at
-            // all. A real dbus-daemon on an ordinary desktop reports this as
+
+        // These slugs are the ones `--json` publishes, and they must stay
+        // identical to `Error::kind()`'s — a script cannot tell whether the
+        // work happened locally or over the bus, and must not have to.
+        let (kind, code) = match short {
+            "InvalidArgument" => ("invalid_argument", ExitCode::InvalidArguments),
+            "BackendUnavailable" => ("backend_unavailable", ExitCode::BackendUnavailable),
+            "NotAuthorized" => ("not_authorized", ExitCode::NotAuthorized),
+            "AlreadyOpen" => ("already_open", ExitCode::AlreadyOpen),
+            "DeviceUnreachable" => ("device_unreachable", ExitCode::DeviceUnreachable),
+            "RuleNotFound" => ("rule_not_found", ExitCode::RuleNotFound),
+            "NoNetwork" => ("no_network", ExitCode::NoNetwork),
+            // Not the helper: the bus itself answered, but nothing owns
+            // `com.jacopobriccola.Porthole` and nothing can be activated to.
+            // That is a live system bus with no helper installed — the
+            // ordinary "not installed yet" case, and exactly as unprivileged
+            // an outcome as failing to reach the bus at all. A real
+            // dbus-daemon on an ordinary desktop reports this as
             // `org.freedesktop.DBus.Error.ServiceUnknown` ("The name is not
-            // activatable") rather than a connection failure, which is why this
-            // cannot simply fall through to `Unexpected`.
+            // activatable") rather than a connection failure, which is why
+            // this cannot simply fall through to the catch-all below.
             "ServiceUnknown" | "NameHasNoOwner" | "ServiceNotFound" => {
-                Error::BackendUnavailable(format!(
-                    "the porthole helper is not registered on the bus ({name}: {text}). \
+                return Error::BackendUnavailable(format!(
+                    "the porthole helper is not registered on the bus ({name}: {message}). \
                      Is porthole installed? `porthole doctor` says what is missing."
                 ))
             }
-            _ => Error::Unexpected(text),
+            _ => ("unexpected", ExitCode::Failure),
+        };
+        return Error::Remote {
+            message,
+            kind,
+            code,
         };
     }
     Error::Unexpected(format!("the helper could not be reached: {e}"))
@@ -161,7 +173,6 @@ pub fn close_all(session: bool) -> Result<(Vec<ManagedRule>, Vec<Error>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use porthole_core::error::ExitCode;
 
     fn method_error(name: &str, detail: &str) -> zbus::Error {
         zbus::Error::MethodError(
@@ -236,5 +247,96 @@ mod tests {
             from_dbus(method_error("org.freedesktop.DBus.Error.Failed", "boom")).exit_code(),
             ExitCode::Failure
         );
+    }
+
+    #[test]
+    fn remote_errors_report_the_helpers_words_once_not_doubled() {
+        // The helper sends its message already rendered. Rebuilding a local
+        // variant from it ran that variant's own prefixing template a second
+        // time over text that had already been through it — and for
+        // `AlreadyOpen`, whose template also names the port, it invented a
+        // port (0) that nobody asked about, since the wire's `MethodError`
+        // carries no structured port field to refill it with. Covers the two
+        // names the reviewer's reproduction did not happen to exercise
+        // (`NotAuthorized`, `RuleNotFound`) plus every other previously-broken
+        // variant, so none of the five can regress unnoticed.
+        let cases = [
+            (
+                "com.jacopobriccola.Porthole.InvalidArgument",
+                "invalid argument: bad port",
+            ),
+            (
+                "com.jacopobriccola.Porthole.NotAuthorized",
+                "not authorized: denied by policy",
+            ),
+            (
+                "com.jacopobriccola.Porthole.DeviceUnreachable",
+                "device not reachable: laptop",
+            ),
+            (
+                "com.jacopobriccola.Porthole.RuleNotFound",
+                "no rule matches 5173/tcp",
+            ),
+            (
+                "com.jacopobriccola.Porthole.AlreadyOpen",
+                "5173/tcp is already open (open towards 10.10.10.0/24)",
+            ),
+        ];
+        for (name, message) in cases {
+            let reported = from_dbus(method_error(name, message)).to_string();
+            assert_eq!(reported, message, "doubled or altered for {name}");
+            assert!(!reported.contains("0/tcp"), "no invented port for {name}");
+        }
+    }
+
+    #[test]
+    fn every_kind_slug_matches_the_local_variants_own_kind() {
+        // `--json` publishes `kind`. A script must not be able to tell whether
+        // an error came from the CLI acting locally or from the helper over
+        // the bus, so these slugs must be byte-identical to `Error::kind()`'s
+        // own — checked here against the real local variants, not retyped.
+        use porthole_core::model::Protocol;
+
+        let cases: &[(&str, Error)] = &[
+            (
+                "com.jacopobriccola.Porthole.InvalidArgument",
+                Error::InvalidArgument(String::new()),
+            ),
+            (
+                "com.jacopobriccola.Porthole.BackendUnavailable",
+                Error::BackendUnavailable(String::new()),
+            ),
+            (
+                "com.jacopobriccola.Porthole.NotAuthorized",
+                Error::NotAuthorized(String::new()),
+            ),
+            (
+                "com.jacopobriccola.Porthole.AlreadyOpen",
+                Error::AlreadyOpen {
+                    port: 0,
+                    protocol: Protocol::Tcp,
+                    detail: String::new(),
+                },
+            ),
+            (
+                "com.jacopobriccola.Porthole.DeviceUnreachable",
+                Error::DeviceUnreachable(String::new()),
+            ),
+            (
+                "com.jacopobriccola.Porthole.RuleNotFound",
+                Error::RuleNotFound(String::new()),
+            ),
+            (
+                "com.jacopobriccola.Porthole.NoNetwork",
+                Error::NoNetwork(String::new()),
+            ),
+        ];
+        for (name, local) in cases {
+            assert_eq!(
+                from_dbus(method_error(name, "x")).kind(),
+                local.kind(),
+                "kind slug drifted for {name}"
+            );
+        }
     }
 }
