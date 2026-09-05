@@ -14,21 +14,30 @@ porthole does one thing: it opens a single port towards the network you are on
 right now, for a bounded amount of time, and closes it again.
 
 ```console
-$ sudo porthole open 5173 --for 30m
+$ porthole open 5173 --for 30m
 Opened 5173/tcp towards 10.10.10.0/24 · closes 30m 0s
 
 $ porthole list
 PORT      TOWARDS        BACKEND    CLOSES IN
 5173/tcp  10.10.10.0/24  firewalld  29m 41s
 
-$ sudo porthole close 5173
+$ porthole close 5173
 Closed 5173/tcp towards 10.10.10.0/24
 ```
 
-Opening and closing need root in this release; `porthole list`, `porthole
-status` and anything with `--dry-run` do not. The unprivileged helper that
-removes the `sudo` — a system D-Bus service authorised by polkit — is the next
-release's work.
+Opening and closing no longer need root: a privileged helper does the work — a
+system D-Bus service authorised by polkit, rather than the CLI holding
+privilege itself. Installing it does need root, **once**: a helper binary, a
+polkit policy, a D-Bus configuration and a systemd unit. See
+[docs/installing.md](docs/installing.md) for where each one goes; until a
+distribution packages porthole, you place them by hand.
+
+`porthole list`, `porthole status` and anything with `--dry-run` need none of
+that installed at all — they never touch the bus. Once it is, opening towards
+your own subnet asks polkit to authenticate the first time and not again that
+session; opening towards everyone (`--to any`) asks every time, because it is
+the more dangerous request; closing never asks, because closing only ever
+reduces what is exposed.
 
 ## What it is not
 
@@ -61,6 +70,10 @@ cargo build --release
 sudo install -m 0755 target/release/porthole /usr/local/bin/porthole
 ```
 
+That gives you `porthole list`, `porthole status`, `porthole doctor` and
+`--dry-run`. `open` and `close` also need the privileged helper installed —
+see [docs/installing.md](docs/installing.md).
+
 ## Usage
 
 ```
@@ -69,6 +82,7 @@ porthole open <PORT> [--proto tcp|udp] [--for 30m | --until-reboot]
 porthole close <PORT> | --id <ID> | --all
 porthole list
 porthole status
+porthole doctor
 ```
 
 Global flags:
@@ -88,7 +102,7 @@ Defaults: `--proto tcp`, `--for 1h`, `--to subnet`.
 | 1 | Unexpected failure |
 | 2 | Invalid arguments |
 | 3 | An operation needed a usable firewall and there was none. `porthole status` does not use this code: it reports the situation in its own output and exits 0. |
-| 4 | Not authorized |
+| 4 | Polkit refused the request. Never `sudo`: the CLI holds no privilege of its own to grant. |
 | 5 | That port is already open |
 | 6 | The named device is not reachable on this network |
 | 7 | No porthole-managed rule matches |
