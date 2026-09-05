@@ -38,7 +38,9 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
 
             let status = match backend::detect(runner.as_ref()) {
                 Ok(backend) => {
-                    let engine = make_engine(backend.as_ref(), runner.as_ref())?;
+                    // Never for_write: status only ever reads, regardless of
+                    // --dry-run.
+                    let engine = make_engine(backend.as_ref(), runner.as_ref(), false)?;
                     engine.status()?
                 }
                 Err(Error::BackendUnavailable(detail)) => Status {
@@ -93,7 +95,7 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
 
     let runner = make_runner(cli);
     let backend = backend::detect(runner.as_ref())?;
-    let mut engine = make_engine(backend.as_ref(), runner.as_ref())?;
+    let mut engine = make_engine(backend.as_ref(), runner.as_ref(), !cli.dry_run)?;
 
     let rule = engine.open(port, protocol, &scope, lifetime, requesting_uid())?;
     // Render against the rule's own opening instant rather than reading the clock
@@ -158,7 +160,7 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
 
     let runner = make_runner(cli);
     let backend = backend::detect(runner.as_ref())?;
-    let mut engine = make_engine(backend.as_ref(), runner.as_ref())?;
+    let mut engine = make_engine(backend.as_ref(), runner.as_ref(), !cli.dry_run)?;
 
     let mut failures: Vec<Error> = Vec::new();
     let closed = if args.all {
@@ -234,11 +236,22 @@ fn make_runner(cli: &Cli) -> Box<dyn CommandRunner> {
     }
 }
 
+/// `for_write` is `true` only for the call sites that can actually save: `open`
+/// and `close`, and only when they are not `--dry-run`. `status` never saves —
+/// no matter what `--dry-run` says — so it always passes `false`: taking the
+/// lock would call `ensure_dir` on `/run/porthole`, which an unprivileged user
+/// cannot create, and `porthole status` is documented to need no privileges.
 fn make_engine<'a>(
     backend: &'a dyn FirewallBackend,
     runner: &'a dyn CommandRunner,
+    for_write: bool,
 ) -> Result<Engine<'a>> {
-    let state = StateStore::open_exclusive(StateStore::default_path())?;
+    let path = StateStore::default_path();
+    let state = if for_write {
+        StateStore::open_exclusive(path)?
+    } else {
+        StateStore::open(path)?
+    };
     let executable = std::env::current_exe()
         .map_err(|e| Error::Unexpected(format!("could not determine porthole's own path: {e}")))?;
     Ok(Engine::new(

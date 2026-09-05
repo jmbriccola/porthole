@@ -284,6 +284,64 @@ fn close_all_json_on_an_empty_state_is_an_empty_array() {
 }
 
 #[test]
+fn a_dry_run_works_without_a_writable_state_directory() {
+    // Every other test points PORTHOLE_STATE_FILE at a temp path, so none of
+    // them touches the real /run/porthole — which does not exist until
+    // something privileged creates it. A dry run must still work there,
+    // because --dry-run needs no privileges. Taking the state lock would try
+    // to create that directory and fail.
+    if is_root() {
+        eprintln!("skipped: running as root");
+        return;
+    }
+    if !have("firewall-cmd") || !have("ip") {
+        eprintln!("skipped: needs firewall-cmd and ip");
+        return;
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_porthole"))
+        .args(["open", "5173", "--dry-run", "--json"])
+        .env_remove("PORTHOLE_STATE_FILE")
+        .output()
+        .expect("porthole binary runs");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn status_works_without_a_writable_state_directory() {
+    // The same directory-creation problem that broke a dry-run `open` above
+    // also broke `status`: it went through the same `make_engine`, and the
+    // README promises `porthole status` needs no privileges, with no
+    // `--dry-run` exception — it is a query, not an operation. This is a
+    // second, independent regression that a single `for_write` gate on
+    // `--dry-run` alone would not have caught, since `status` never writes
+    // regardless of that flag.
+    if is_root() {
+        eprintln!("skipped: running as root");
+        return;
+    }
+    if !have("firewall-cmd") || !have("ip") {
+        eprintln!("skipped: needs firewall-cmd and ip");
+        return;
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_porthole"))
+        .args(["status", "--json"])
+        .env_remove("PORTHOLE_STATE_FILE")
+        .output()
+        .expect("porthole binary runs");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn the_default_scope_is_declared_as_subnet_in_the_help() {
     // The dry-run test that proves the default resolves to a real CIDR skips
     // itself where there is no firewall. This one cannot: it reads --help and
