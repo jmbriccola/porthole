@@ -69,6 +69,10 @@ pub struct WireStatus {
     pub location: String,
     /// Empty when not on a usable network.
     pub interface: String,
+    /// This machine's own address on that interface. `docs/json-schema.md`
+    /// already publishes it in the local `--json` status, so a D-Bus-backed
+    /// view has to be able to show the same thing.
+    pub address: String,
     pub cidr: String,
     pub rules: Vec<WireRule>,
 }
@@ -85,6 +89,11 @@ impl WireStatus {
                 .network
                 .as_ref()
                 .map(|n| n.interface.clone())
+                .unwrap_or_default(),
+            address: status
+                .network
+                .as_ref()
+                .map(|n| n.address.to_string())
                 .unwrap_or_default(),
             cidr: status
                 .network
@@ -133,8 +142,9 @@ pub trait Porthole {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackendId, RuleHandle};
+    use crate::backend::{BackendHealth, BackendId, RuleHandle};
     use crate::model::{Protocol, Target};
+    use crate::net::LocalNetwork;
     use crate::state::ManagedRule;
 
     fn rule(expires_at: Option<u64>) -> ManagedRule {
@@ -199,5 +209,33 @@ mod tests {
         let wire = WireRule::from_rule(&r);
         assert_eq!(wire.scope, "anywhere");
         assert_eq!(wire.target, "anywhere");
+    }
+
+    #[test]
+    fn status_carries_the_network_a_client_needs_to_show() {
+        // interface, address and cidr all come from the same LocalNetwork,
+        // so a regression that drops one silently is easy to miss unless all
+        // three are checked together.
+        let status = Status {
+            backend: BackendId::Firewalld,
+            health: BackendHealth {
+                available: true,
+                active: true,
+                version: Some("1.3.2".to_string()),
+                detail: "running".to_string(),
+            },
+            network: Some(LocalNetwork {
+                interface: "wlo1".to_string(),
+                address: "10.10.10.119".parse().unwrap(),
+                cidr: "10.10.10.0/24".parse().unwrap(),
+            }),
+            location: Some("FedoraWorkstation".to_string()),
+            rules: vec![],
+        };
+
+        let wire = WireStatus::from_status(&status);
+        assert_eq!(wire.interface, "wlo1");
+        assert_eq!(wire.address, "10.10.10.119");
+        assert_eq!(wire.cidr, "10.10.10.0/24");
     }
 }
