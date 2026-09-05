@@ -133,7 +133,15 @@ impl<'a> Engine<'a> {
 
         if !self.runner.is_dry_run() {
             self.state.insert(rule.clone());
-            self.state.save()?;
+            if let Err(e) = self.state.save() {
+                // The backend already has the rule. If recording it failed,
+                // nothing would ever close it — no state entry to find it by,
+                // and the scheduling below is never reached. Undo the opening
+                // rather than return leaving a hole in the firewall that
+                // porthole has no memory of.
+                self.roll_back(&rule);
+                return Err(e);
+            }
         }
 
         if let Lifetime::For(duration) = lifetime {
@@ -200,15 +208,24 @@ impl<'a> Engine<'a> {
     fn close_rule(&mut self, rule: ManagedRule, from_timer: bool) -> Result<ManagedRule> {
         self.backend.close(&rule.handle)?;
 
-        // A close invoked *by* the expiry timer must not try to stop that timer.
-        if !from_timer && rule.expires_at.is_some() {
-            expiry::cancel_close(self.runner, &rule.id)?;
-        }
-
+        // The rule is gone from the firewall, so the state must stop claiming it
+        // is open — and it must do so before anything else that could fail. A
+        // state file that disagrees with the firewall is worse than a stray
+        // timer: it points at a handle that no longer removes anything.
         if !self.runner.is_dry_run() {
             self.state.remove(&rule.id);
             self.state.save()?;
         }
+
+        // Cancelling is secondary and deliberately cannot fail the close. A
+        // close invoked *by* the expiry timer must not stop that timer, and a
+        // rule that never had one has nothing to cancel. If the cancel itself
+        // fails, the timer simply fires later, finds no such rule and exits —
+        // harmless, and not a reason to report a successful close as an error.
+        if !from_timer && rule.expires_at.is_some() {
+            let _ = expiry::cancel_close(self.runner, &rule.id);
+        }
+
         Ok(rule)
     }
 
@@ -228,6 +245,7 @@ impl<'a> Engine<'a> {
 mod tests {
     use super::*;
     use crate::backend::fake::FakeBackend;
+    use crate::backend::RuleHandle;
     use crate::clock::FixedClock;
     use crate::command::{DryRunRunner, Output, RecordingRunner};
     use crate::model::Protocol;
@@ -494,6 +512,8 @@ mod tests {
         assert_eq!(closed.port, 5173);
         assert!(backend.handles().is_empty());
         assert!(engine.rules().is_empty());
+        // On disk too, not just in memory.
+        assert!(StateStore::open(&harness.path).unwrap().rules().is_empty());
 
         let last = runner.recorded().pop().unwrap();
         assert_eq!(last.program, "systemctl");
@@ -583,6 +603,63 @@ mod tests {
         assert!(errors.is_empty());
         assert!(engine.rules().is_empty());
         assert!(backend.handles().is_empty());
+    }
+
+    #[test]
+    fn close_all_keeps_going_when_one_rule_will_not_close() {
+        // This is the entire reason close_all returns two lists instead of a
+        // Result: one rule that refuses to close must not leave the others open.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ADDR_JSON),
+        ]);
+        let clock = FixedClock(NOW);
+
+        // A rule the backend has never issued a handle for: closing it fails.
+        // It is inserted first, so close_all meets the failure before the
+        // healthy rule and has to keep going to reach it.
+        let mut store = harness.store();
+        store.insert(ManagedRule {
+            id: "stale".to_string(),
+            port: 9999,
+            protocol: Protocol::Tcp,
+            target: Target::Anywhere,
+            backend: BackendId::Firewalld,
+            opened_at: NOW,
+            expires_at: None,
+            uid: 1000,
+            handle: RuleHandle::Firewalld {
+                zone: "TestZone".to_string(),
+                rich_rule: "a rule the fake backend never issued".to_string(),
+            },
+        });
+
+        let mut engine = make_engine(&backend, &runner, &clock, store);
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        let (closed, errors) = engine.close_all(false);
+
+        assert_eq!(errors.len(), 1, "the stale rule must fail to close");
+        assert_eq!(closed.len(), 1, "the healthy rule must close regardless");
+        assert_eq!(closed[0].port, 5173);
+        assert!(
+            backend.handles().is_empty(),
+            "the healthy rule must be gone from the firewall"
+        );
+        // The stale rule stays recorded: porthole could not close it, so it must
+        // not pretend it did.
+        assert_eq!(engine.rules().len(), 1);
+        assert_eq!(engine.rules()[0].id, "stale");
     }
 
     #[test]
