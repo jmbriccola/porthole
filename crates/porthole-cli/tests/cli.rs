@@ -131,15 +131,14 @@ fn an_empty_list_is_an_empty_array() {
 }
 
 #[test]
-fn opening_without_privileges_exits_not_authorized() {
-    if is_root() {
-        eprintln!("skipped: running as root");
-        return;
-    }
+fn opening_without_a_helper_says_the_helper_is_missing() {
+    // Milestone 2 removed the root requirement: the CLI holds no privilege at
+    // all now. Without a helper on the bus there is nothing to ask, which is
+    // "no usable backend" (3), not "not authorized" (4).
     let dir = TempDir::new().unwrap();
     let out = porthole(&["open", "5173"], &state_path(&dir));
-    assert_eq!(code(&out), 4);
-    assert!(stderr(&out).contains("--dry-run"), "got: {}", stderr(&out));
+    assert_eq!(code(&out), 3, "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("doctor"), "got: {}", stderr(&out));
 }
 
 #[test]
@@ -230,14 +229,14 @@ fn close_rejects_conflicting_targets() {
 }
 
 #[test]
-fn closing_without_privileges_exits_not_authorized() {
-    if is_root() {
-        eprintln!("skipped: running as root");
-        return;
-    }
+fn closing_without_a_helper_says_the_helper_is_missing() {
+    // Same change as `open`, and for the same reason: without a helper on the
+    // bus there is no one to authorize or deny the request, so this is
+    // "no usable backend" (3), not "not authorized" (4).
     let dir = TempDir::new().unwrap();
     let out = porthole(&["close", "5173"], &state_path(&dir));
-    assert_eq!(code(&out), 4);
+    assert_eq!(code(&out), 3, "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("doctor"), "got: {}", stderr(&out));
 }
 
 #[test]

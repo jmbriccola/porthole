@@ -1,6 +1,7 @@
 //! Wiring: build a runner, a backend and an engine, then dispatch.
 
 use crate::cli::{Cli, Commands};
+use crate::client;
 use crate::output;
 use porthole_core::backend::{self, BackendHealth, BackendId, FirewallBackend};
 use porthole_core::clock::{Clock, SystemClock};
@@ -73,7 +74,9 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
 }
 
 fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
-    // Validate everything before asking for a password or touching the firewall.
+    // Validate everything before asking for a password or touching the bus: a
+    // bad port or an over-long duration must cost no round trip, and — now
+    // that opening means a polkit prompt — no authentication prompt either.
     let port = validate::parse_port(&args.port)?;
     let protocol = validate::parse_protocol(&args.proto)?;
     let scope = validate::parse_scope(&args.to)?;
@@ -89,46 +92,28 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
         }
     };
 
-    if !cli.dry_run {
-        require_root()?;
-    }
+    if cli.dry_run {
+        // Unchanged: local, unprivileged, no helper needed. Seeing what
+        // porthole would do is what earns a user's trust, and asking for a
+        // password — or reaching for a helper that may not even be installed
+        // — first would defeat that.
+        let runner = make_runner(cli);
+        let backend = backend::detect(runner.as_ref())?;
+        let mut engine = make_engine(backend.as_ref(), runner.as_ref(), false)?;
 
-    let runner = make_runner(cli);
-    let backend = backend::detect(runner.as_ref())?;
-    let mut engine = make_engine(backend.as_ref(), runner.as_ref(), !cli.dry_run)?;
+        let rule = engine.open(port, protocol, &scope, lifetime, requesting_uid())?;
+        // Render against the rule's own opening instant rather than reading the
+        // clock a second time: a tick between the two would report 3599 seconds
+        // for a one-hour rule, and the end-to-end assertion would fail for a
+        // real reason.
+        let now = rule.opened_at;
 
-    let rule = engine.open(port, protocol, &scope, lifetime, requesting_uid())?;
-    // Render against the rule's own opening instant rather than reading the clock
-    // a second time: a tick between the two would report 3599 seconds for a
-    // one-hour rule, and the end-to-end assertion would fail for a real reason.
-    let now = rule.opened_at;
-
-    // The audit trail. Under the expiry timer this goes to the journal; run
-    // interactively it goes to the terminal. Milestone 2 moves it into the
-    // helper, where the journal gets it in every case.
-    //
-    // Never under --dry-run: nothing was opened, and an audit trail that
-    // records openings which did not happen is worse than none at all.
-    if !cli.dry_run {
-        eprintln!(
-            "porthole: uid={} opened {}/{} towards {} until {}",
-            rule.uid,
-            rule.port,
-            rule.protocol,
-            rule.target,
-            rule.expires_at
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| "reboot".to_string())
-        );
-    }
-
-    if cli.json {
-        println!(
-            "{}",
-            output::json_opened(&rule, now, cli.dry_run, &runner.recorded())
-        );
-    } else {
-        if cli.dry_run {
+        if cli.json {
+            println!(
+                "{}",
+                output::json_opened(&rule, now, true, &runner.recorded())
+            );
+        } else {
             println!(
                 "Would open {}/{} towards {} for {}",
                 rule.port,
@@ -137,11 +122,26 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
                 output::format_remaining(rule.expires_in(now))
             );
             output::print_dry_run(&runner.recorded());
+        }
+        Ok(ExitCode::Success)
+    } else {
+        let seconds = match lifetime {
+            Lifetime::UntilReboot => 0,
+            Lifetime::For(d) => d.as_secs() as u32,
+        };
+        // No engine, no runner, no local audit line: the helper does the work
+        // and, being a system service, its own journal entry is the audit
+        // trail now — in every case, not just under the expiry timer.
+        let rule = client::open(cli.session, port, &args.proto, &args.to, seconds)?;
+        let now = rule.opened_at;
+
+        if cli.json {
+            println!("{}", output::json_opened(&rule, now, false, &[]));
         } else {
             output::print_opened(&rule, now);
         }
+        Ok(ExitCode::Success)
     }
-    Ok(ExitCode::Success)
 }
 
 fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
@@ -154,77 +154,95 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
         ));
     }
 
-    if !cli.dry_run {
-        require_root()?;
-    }
+    if cli.dry_run {
+        // Unchanged: local, unprivileged, no helper needed.
+        let runner = make_runner(cli);
+        let backend = backend::detect(runner.as_ref())?;
+        let mut engine = make_engine(backend.as_ref(), runner.as_ref(), false)?;
 
-    let runner = make_runner(cli);
-    let backend = backend::detect(runner.as_ref())?;
-    let mut engine = make_engine(backend.as_ref(), runner.as_ref(), !cli.dry_run)?;
+        let mut failures: Vec<Error> = Vec::new();
+        let closed = if args.all {
+            let (closed, errors) = engine.close_all(args.from_timer);
+            failures = errors;
+            closed
+        } else if let Some(id) = &args.id {
+            vec![engine.close_by_id(id, args.from_timer)?]
+        } else {
+            vec![engine.close_by_port(
+                port.expect("a port, an id or --all was required above"),
+                protocol,
+                args.from_timer,
+            )?]
+        };
 
-    let mut failures: Vec<Error> = Vec::new();
-    let closed = if args.all {
-        let (closed, errors) = engine.close_all(args.from_timer);
-        failures = errors;
-        closed
-    } else if let Some(id) = &args.id {
-        vec![engine.close_by_id(id, args.from_timer)?]
-    } else {
-        vec![engine.close_by_port(
-            port.expect("a port, an id or --all was required above"),
-            protocol,
-            args.from_timer,
-        )?]
-    };
-
-    // Same rule as `open`: a dry run records nothing, because nothing happened.
-    for rule in closed.iter().filter(|_| !cli.dry_run) {
-        // The rule's own uid, not the caller's. When the expiry timer fires,
-        // this runs as root under systemd with no SUDO_UID, so `requesting_uid()`
-        // would report 0 and the audit line would lose the person who actually
-        // asked for the opening — and that timer-fired close is precisely the
-        // one that reaches the journal in this milestone.
-        eprintln!(
-            "porthole: closed {}/{} towards {} (opened by uid={}{})",
-            rule.port,
-            rule.protocol,
-            rule.target,
-            rule.uid,
-            if args.from_timer { ", expired" } else { "" }
-        );
-    }
-
-    let now = SystemClock.now();
-    if cli.json {
-        println!(
-            "{}",
-            output::json_closed(&closed, &failures, now, cli.dry_run, &runner.recorded())
-        );
-    } else {
-        // "Nothing to close." would be a lie when there WAS something and every
-        // attempt failed: the ports are still open. Say nothing on stdout in
-        // that case and let the errors below speak.
-        if !closed.is_empty() || failures.is_empty() {
-            output::print_closed(&closed, cli.dry_run);
-        }
-        for error in &failures {
-            eprintln!("porthole: {error}");
-        }
-        if cli.dry_run {
+        let now = SystemClock.now();
+        if cli.json {
+            println!(
+                "{}",
+                output::json_closed(&closed, &failures, now, true, &runner.recorded())
+            );
+        } else {
+            // "Nothing to close." would be a lie when there WAS something and
+            // every attempt failed: the ports are still open. Say nothing on
+            // stdout in that case and let the errors below speak.
+            if !closed.is_empty() || failures.is_empty() {
+                output::print_closed(&closed, true);
+            }
+            for error in &failures {
+                eprintln!("porthole: {error}");
+            }
             output::print_dry_run(&runner.recorded());
         }
-    }
 
-    // Report what did close, then exit on what did not. Silently succeeding
-    // after a failed close would tell the user a port is shut when it is open.
-    //
-    // The failures were rendered above — inside the single JSON object, or on
-    // stderr — so this returns a code rather than an `Err`. Returning `Err`
-    // would make `main` print a second top-level JSON object, which no JSON
-    // reader can parse.
-    match failures.first() {
-        Some(error) => Ok(error.exit_code()),
-        None => Ok(ExitCode::Success),
+        match failures.first() {
+            Some(error) => Ok(error.exit_code()),
+            None => Ok(ExitCode::Success),
+        }
+    } else {
+        // No engine, no runner, no local audit line: the helper closes the
+        // rule and logs it to the journal itself, exactly as `open` does.
+        let mut failures: Vec<Error> = Vec::new();
+        let closed = if args.all {
+            let (closed, errors) = client::close_all(cli.session)?;
+            failures = errors;
+            closed
+        } else if let Some(id) = &args.id {
+            vec![client::close_by_id(cli.session, id)?]
+        } else {
+            vec![client::close(
+                cli.session,
+                port.expect("a port, an id or --all was required above"),
+                &args.proto,
+            )?]
+        };
+
+        if cli.json {
+            let now = SystemClock.now();
+            println!(
+                "{}",
+                output::json_closed(&closed, &failures, now, false, &[])
+            );
+        } else {
+            if !closed.is_empty() || failures.is_empty() {
+                output::print_closed(&closed, false);
+            }
+            for error in &failures {
+                eprintln!("porthole: {error}");
+            }
+        }
+
+        // Report what did close, then exit on what did not. Silently succeeding
+        // after a failed close would tell the user a port is shut when it is
+        // open.
+        //
+        // The failures were rendered above — inside the single JSON object, or
+        // on stderr — so this returns a code rather than an `Err`. Returning
+        // `Err` would make `main` print a second top-level JSON object, which
+        // no JSON reader can parse.
+        match failures.first() {
+            Some(error) => Ok(error.exit_code()),
+            None => Ok(ExitCode::Success),
+        }
     }
 }
 
@@ -264,23 +282,6 @@ fn make_engine<'a>(
 }
 
 static SYSTEM_CLOCK: SystemClock = SystemClock;
-
-/// Real firewall changes need root in this milestone. `--dry-run` does not:
-/// seeing what porthole would do is what earns a user's trust, and asking for
-/// a password first defeats that.
-pub fn require_root() -> Result<()> {
-    // SAFETY: geteuid takes no arguments, touches no memory and cannot fail.
-    let euid = unsafe { libc::geteuid() };
-    if euid != 0 {
-        return Err(Error::NotAuthorized(
-            "changing firewall rules needs root in this version — run `sudo porthole …`, \
-             or add --dry-run to see what would happen. The unprivileged helper arrives \
-             in the next release."
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
 
 /// The uid that asked for this, seen through sudo where possible, so the audit
 /// trail names a person rather than root.

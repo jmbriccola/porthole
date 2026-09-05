@@ -582,6 +582,8 @@ dependencies = [
  "porthole-core",
  "serde_json",
  "tempfile",
+ "tokio",
+ "zbus",
 ]
 
 [[package]]

@@ -26,6 +26,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub dry_run: bool,
 
+    /// Talk to a helper on the session bus instead of the system bus.
+    /// For tests: the real helper serves the system bus.
+    #[arg(long, global = true, hide = true)]
+    pub session: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
