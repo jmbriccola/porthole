@@ -1,0 +1,18 @@
+[Unit]
+Description=porthole privileged helper
+Documentation=man:porthole(1)
+
+[Service]
+Type=dbus
+BusName=com.jacopobriccola.Porthole
+ExecStart=/usr/libexec/porthole-helper
+# The state lives here and nowhere else. systemd creates it with these
+# permissions so an unprivileged `porthole list` can read it and only the
+# helper can change it.
+RuntimeDirectory=porthole
+RuntimeDirectoryMode=0755
+# It talks to firewalld and systemd and writes one file. Nothing else.
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+# Exits when idle; D-Bus activation starts it again on the next call.
