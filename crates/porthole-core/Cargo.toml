@@ -10,6 +10,7 @@ description = "Core library for porthole: models, firewall backends, state and v
 
 [dependencies]
 ipnet.workspace = true
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

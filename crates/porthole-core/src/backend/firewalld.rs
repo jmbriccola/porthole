@@ -119,7 +119,17 @@ impl FirewallBackend for Firewalld<'_> {
         }
 
         let after = self.list_rich_rules(&zone)?;
-        let added: Vec<&String> = after.iter().filter(|r| !before.contains(r)).collect();
+        // Only a line mentioning this port and protocol can be the rule we just
+        // asked for. Without this, a rule another process added in the same
+        // window would be adopted — and porthole would then schedule a timer to
+        // delete a rule it did not create.
+        let port_clause = format!(r#"port="{}""#, req.port);
+        let proto_clause = format!(r#"protocol="{}""#, req.protocol);
+        let added: Vec<&String> = after
+            .iter()
+            .filter(|r| !before.contains(r))
+            .filter(|r| r.contains(&port_clause) && r.contains(&proto_clause))
+            .collect();
 
         match added.as_slice() {
             [one] => Ok(RuleHandle::Firewalld {
@@ -348,6 +358,28 @@ mod tests {
                 cmd.display()
             );
         }
+    }
+
+    #[test]
+    fn open_ignores_an_unrelated_rule_added_by_someone_else_in_the_same_window() {
+        // If another process adds an unrelated rich rule in the window between
+        // porthole's own add and its read-back, an unfiltered before/after diff
+        // would see two new lines and either error out or — worse, when
+        // porthole's own add is a no-op because its rule already exists —
+        // adopt the stranger's rule as if it were porthole's own, then
+        // schedule a timer to delete a rule porthole never created.
+        let other_rule = r#"rule family="ipv4" port port="9999" protocol="tcp" accept"#;
+        let after = format!("{SUBNET_RULE}\n{other_rule}");
+        let runner = RecordingRunner::with_responses(open_script("", &after));
+        let handle = Firewalld::new(&runner).open(&subnet_request()).unwrap();
+
+        assert_eq!(
+            handle,
+            RuleHandle::Firewalld {
+                zone: ZONE.to_string(),
+                rich_rule: SUBNET_RULE.to_string(),
+            }
+        );
     }
 
     #[test]

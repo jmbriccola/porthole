@@ -12,7 +12,9 @@ use crate::error::{Error, Result};
 use crate::model::{Protocol, Target};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::fs::File;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 pub const STATE_DIR: &str = "/run/porthole";
@@ -70,6 +72,10 @@ impl Default for State {
 pub struct StateStore {
     path: PathBuf,
     state: State,
+    /// Held from before the read until this store is dropped, so the whole
+    /// read-modify-write is atomic against other porthole processes. `None`
+    /// for a read-only view.
+    _lock: Option<File>,
 }
 
 impl StateStore {
@@ -82,7 +88,38 @@ impl StateStore {
     /// Load the state, or start empty if the file does not exist yet.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let state = match fs::read_to_string(&path) {
+        let state = Self::read(&path)?;
+        Ok(StateStore {
+            path,
+            state,
+            _lock: None,
+        })
+    }
+
+    /// A view for anything that will write.
+    ///
+    /// Takes an advisory lock *before* reading and holds it until the store is
+    /// dropped, so a read-modify-write cannot interleave with another
+    /// porthole process. This is not theoretical: the expiry timer is a
+    /// separate process by design, and without the lock a timer firing during
+    /// an `open` silently discards one of the two rules — leaving a port open
+    /// in the firewall with nothing recorded that could ever close it.
+    pub fn open_exclusive(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        if let Some(parent) = path.parent() {
+            ensure_dir(parent)?;
+        }
+        let lock = lock_exclusive(&path)?;
+        let state = Self::read(&path)?;
+        Ok(StateStore {
+            path,
+            state,
+            _lock: Some(lock),
+        })
+    }
+
+    fn read(path: &Path) -> Result<State> {
+        match fs::read_to_string(path) {
             Ok(text) => {
                 let parsed: State = serde_json::from_str(&text).map_err(|e| Error::State {
                     path: path.display().to_string(),
@@ -97,17 +134,14 @@ impl StateStore {
                         ),
                     });
                 }
-                parsed
+                Ok(parsed)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
-            Err(e) => {
-                return Err(Error::State {
-                    path: path.display().to_string(),
-                    detail: e.to_string(),
-                })
-            }
-        };
-        Ok(StateStore { path, state })
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
+            Err(e) => Err(Error::State {
+                path: path.display().to_string(),
+                detail: e.to_string(),
+            }),
+        }
     }
 
     pub fn state(&self) -> &State {
@@ -187,6 +221,33 @@ fn ensure_dir(dir: &Path) -> Result<()> {
         detail: e.to_string(),
     })?;
     Ok(())
+}
+
+/// Take an exclusive advisory lock on a sidecar file next to the state.
+///
+/// A sidecar rather than the state file itself, because `save` replaces the
+/// state file by rename — a lock held on the old inode would protect nothing.
+fn lock_exclusive(path: &Path) -> Result<File> {
+    let lock_path = path.with_extension("lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| Error::State {
+            path: lock_path.display().to_string(),
+            detail: e.to_string(),
+        })?;
+    // SAFETY: flock takes a valid file descriptor and a flag constant. It
+    // cannot touch memory, and the descriptor is owned by `file` above.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(Error::State {
+            path: lock_path.display().to_string(),
+            detail: std::io::Error::last_os_error().to_string(),
+        });
+    }
+    Ok(file)
 }
 
 /// The state path implied by a given `PORTHOLE_STATE_FILE` value.
@@ -396,5 +457,37 @@ mod tests {
         assert_eq!(r["uid"], 1000);
         assert_eq!(r["handle"]["backend"], "firewalld");
         assert_eq!(r["handle"]["zone"], "FedoraWorkstation");
+    }
+
+    #[test]
+    fn two_writers_do_not_discard_each_others_rules() {
+        // The expiry timer is a separate process by design, so two porthole
+        // processes writing at once is not hypothetical. Before the lock, the
+        // later save silently dropped the earlier one's rule, leaving a port
+        // open in the firewall with nothing recorded that could close it.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.json");
+
+        let first_path = path.clone();
+        let holder = std::thread::spawn(move || {
+            let mut first = StateStore::open_exclusive(&first_path).unwrap();
+            first.insert(rule("first", 5173));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            first.save().unwrap();
+            // The lock is released when `first` is dropped here.
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut second = StateStore::open_exclusive(&path).unwrap();
+        second.insert(rule("second", 5432));
+        second.save().unwrap();
+        holder.join().unwrap();
+
+        let reloaded = StateStore::open(&path).unwrap();
+        assert_eq!(
+            reloaded.rules().len(),
+            2,
+            "neither writer may lose the other's rule"
+        );
     }
 }

@@ -91,9 +91,10 @@ pub fn detect<'a>(runner: &'a dyn CommandRunner) -> Result<Box<dyn FirewallBacke
         return Ok(Box::new(firewalld));
     }
     Err(Error::BackendUnavailable(
-        "no supported firewall found. porthole manages firewalld, ufw and nftables; \
-         none of them is installed. Without a firewall your ports are already \
-         reachable from the network — porthole will not install one for you."
+        "firewalld is not installed. porthole 0.1 manages firewalld only; \
+         support for ufw and nftables is planned. If you use one of those, \
+         porthole cannot see your rules and cannot tell you whether this port \
+         is reachable."
             .to_string(),
     ))
 }

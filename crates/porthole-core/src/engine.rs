@@ -70,7 +70,17 @@ impl<'a> Engine<'a> {
                 cidr: net::current_network(self.runner)?.cidr,
             },
             ScopeSpec::Anywhere => Target::Anywhere,
-            ScopeSpec::Network(cidr) => Target::Network { cidr: *cidr },
+            ScopeSpec::Network(cidr) => {
+                // A /0 is everyone, however it was spelled. Classify it as such:
+                // milestone 2 gives "open to anywhere" a stronger polkit action
+                // than "open to a subnet", and `--to 0.0.0.0/0` must not take
+                // the weaker path.
+                if cidr.prefix_len() == 0 {
+                    Target::Anywhere
+                } else {
+                    Target::Network { cidr: *cidr }
+                }
+            }
             ScopeSpec::Host(addr) => Target::Network {
                 cidr: validate::host_to_network(*addr),
             },
@@ -100,8 +110,8 @@ impl<'a> Engine<'a> {
                 port,
                 protocol,
                 detail: format!(
-                    "open towards {} since {}; close it first if you want a different scope",
-                    existing.target, existing.opened_at
+                    "open towards {}; close it first if you want a different scope",
+                    existing.target
                 ),
             });
         }
@@ -156,12 +166,15 @@ impl<'a> Engine<'a> {
         Ok(rule)
     }
 
-    /// Undo an opening that could not be completed. Best effort on every step:
-    /// the caller is already returning an error, and leaving the port open is
-    /// worse than any secondary failure here.
+    /// Undo an opening that could not be completed.
+    ///
+    /// Best effort, but not blind: if the compensating close fails, the rule is
+    /// still in the firewall, so the state entry must survive. A stale entry is
+    /// recoverable — `porthole list` shows it and `close --all` retries it — and
+    /// an open port with no record is not.
     fn roll_back(&mut self, rule: &ManagedRule) {
-        let _ = self.backend.close(&rule.handle);
-        if !self.runner.is_dry_run() {
+        let closed = self.backend.close(&rule.handle);
+        if closed.is_ok() && !self.runner.is_dry_run() {
             self.state.remove(&rule.id);
             let _ = self.state.save();
         }
@@ -827,6 +840,33 @@ mod tests {
         assert_eq!(
             engine.resolve(&ScopeSpec::Anywhere).unwrap(),
             Target::Anywhere
+        );
+    }
+
+    #[test]
+    fn a_slash_zero_network_resolves_to_anywhere() {
+        // 0.0.0.0/0 is everyone, however it was spelled, and milestone 2 gives
+        // "anywhere" a stronger polkit action than a subnet. A /0 must not take
+        // the weaker path by being classified as an ordinary network.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+        let engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        assert_eq!(
+            engine
+                .resolve(&ScopeSpec::Network("0.0.0.0/0".parse().unwrap()))
+                .unwrap(),
+            Target::Anywhere
+        );
+        assert_eq!(
+            engine
+                .resolve(&ScopeSpec::Network("10.10.10.0/24".parse().unwrap()))
+                .unwrap(),
+            Target::Network {
+                cidr: "10.10.10.0/24".parse().unwrap()
+            }
         );
     }
 

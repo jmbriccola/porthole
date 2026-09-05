@@ -203,7 +203,7 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
         // attempt failed: the ports are still open. Say nothing on stdout in
         // that case and let the errors below speak.
         if !closed.is_empty() || failures.is_empty() {
-            output::print_closed(&closed);
+            output::print_closed(&closed, cli.dry_run);
         }
         for error in &failures {
             eprintln!("porthole: {error}");
@@ -238,7 +238,7 @@ fn make_engine<'a>(
     backend: &'a dyn FirewallBackend,
     runner: &'a dyn CommandRunner,
 ) -> Result<Engine<'a>> {
-    let state = StateStore::open(StateStore::default_path())?;
+    let state = StateStore::open_exclusive(StateStore::default_path())?;
     let executable = std::env::current_exe()
         .map_err(|e| Error::Unexpected(format!("could not determine porthole's own path: {e}")))?;
     Ok(Engine::new(

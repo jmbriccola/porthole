@@ -257,6 +257,7 @@ name = "porthole-core"
 version = "0.1.0"
 dependencies = [
  "ipnet",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

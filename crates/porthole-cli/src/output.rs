@@ -190,14 +190,15 @@ pub fn json_closed(
     })
 }
 
-pub fn print_closed(rules: &[ManagedRule]) {
+pub fn print_closed(rules: &[ManagedRule], dry_run: bool) {
     if rules.is_empty() {
         println!("Nothing to close.");
         return;
     }
+    let verb = if dry_run { "Would close" } else { "Closed" };
     for rule in rules {
         println!(
-            "Closed {}/{} towards {}",
+            "{verb} {}/{} towards {}",
             rule.port, rule.protocol, rule.target
         );
     }
@@ -225,11 +226,14 @@ pub fn print_status(status: &Status, now: u64) {
     }
     println!();
 
-    if !status.health.active {
+    if status.health.available && !status.health.active {
         println!("{}", status.health.detail);
         println!(
             "While the firewall is not running, nothing porthole does changes what is reachable."
         );
+        println!();
+    } else if !status.health.available {
+        println!("{}", status.health.detail);
         println!();
     }
 

@@ -284,6 +284,22 @@ fn close_all_json_on_an_empty_state_is_an_empty_array() {
 }
 
 #[test]
+fn the_default_scope_is_declared_as_subnet_in_the_help() {
+    // The dry-run test that proves the default resolves to a real CIDR skips
+    // itself where there is no firewall. This one cannot: it reads --help and
+    // nothing else, so the guard on `--to`'s default survives on a bare CI
+    // container.
+    let dir = TempDir::new().unwrap();
+    let out = porthole(&["open", "--help"], &state_path(&dir));
+    assert_eq!(code(&out), 0);
+    assert!(
+        stdout(&out).contains("[default: subnet]"),
+        "got: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
 fn from_timer_is_hidden_from_the_help() {
     let dir = TempDir::new().unwrap();
     let out = porthole(&["close", "--help"], &state_path(&dir));
