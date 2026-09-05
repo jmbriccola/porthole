@@ -11,10 +11,5 @@
 //! 2. Every external command goes through [`command::CommandRunner`], which is
 //!    what makes dry-run and unit testing possible.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn workspace_builds() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub mod error;
+pub mod model;
