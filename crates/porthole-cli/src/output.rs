@@ -71,14 +71,18 @@ pub fn json_status(status: &Status, now: u64) -> Value {
     })
 }
 
+fn error_json(error: &Error) -> Value {
+    json!({
+        "code": error.exit_code() as i32,
+        "kind": error.kind(),
+        "message": error.to_string(),
+    })
+}
+
 pub fn json_error(error: &Error) -> Value {
     json!({
         "schema": JSON_SCHEMA,
-        "error": {
-            "code": error.exit_code() as i32,
-            "kind": error.kind(),
-            "message": error.to_string(),
-        }
+        "error": error_json(error),
     })
 }
 
@@ -167,11 +171,21 @@ pub fn print_dry_run(commands: &[Command]) {
     println!("Nothing was changed.");
 }
 
-pub fn json_closed(rules: &[ManagedRule], now: u64, dry_run: bool, commands: &[Command]) -> Value {
+/// `--all` can partly succeed, so failures belong inside this object rather
+/// than in a second one printed afterwards: two top-level objects on stdout
+/// are unparseable by any JSON reader.
+pub fn json_closed(
+    rules: &[ManagedRule],
+    errors: &[Error],
+    now: u64,
+    dry_run: bool,
+    commands: &[Command],
+) -> Value {
     json!({
         "schema": JSON_SCHEMA,
         "dry_run": dry_run,
         "closed": rules.iter().map(|r| rule_json(r, now)).collect::<Vec<_>>(),
+        "errors": errors.iter().map(error_json).collect::<Vec<_>>(),
         "commands": commands.iter().map(Command::display).collect::<Vec<_>>(),
     })
 }
@@ -334,5 +348,26 @@ mod tests {
     fn the_empty_list_is_an_empty_array_not_a_missing_key() {
         let json = json_rules(&[], 1_757_000_000);
         assert_eq!(json["rules"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn json_closed_puts_failures_in_the_same_object() {
+        // `--all` can partly fail. The output has to stay ONE object: a second
+        // top-level object on stdout is unparseable by any JSON reader, and a
+        // script asking what closed would see only the first one.
+        use porthole_core::error::Error;
+
+        let json = json_closed(
+            &[],
+            &[Error::RuleNotFound("9999/tcp".to_string())],
+            1_757_000_000,
+            false,
+            &[],
+        );
+        assert_eq!(json["schema"], 1);
+        assert_eq!(json["closed"].as_array().unwrap().len(), 0);
+        assert_eq!(json["errors"].as_array().unwrap().len(), 1);
+        assert_eq!(json["errors"][0]["kind"], "rule_not_found");
+        assert_eq!(json["errors"][0]["code"], 7);
     }
 }

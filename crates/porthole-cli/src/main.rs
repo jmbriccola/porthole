@@ -6,12 +6,15 @@ use clap::Parser;
 
 fn main() {
     let cli = cli::Cli::parse();
-    if let Err(error) = run::run(&cli) {
-        if cli.json {
-            println!("{}", output::json_error(&error));
-        } else {
-            eprintln!("porthole: {error}");
+    match run::run(&cli) {
+        Ok(code) => std::process::exit(code as i32),
+        Err(error) => {
+            if cli.json {
+                println!("{}", output::json_error(&error));
+            } else {
+                eprintln!("porthole: {error}");
+            }
+            std::process::exit(error.exit_code() as i32);
         }
-        std::process::exit(error.exit_code() as i32);
     }
 }

@@ -6,13 +6,13 @@ use porthole_core::backend::{self, BackendHealth, BackendId, FirewallBackend};
 use porthole_core::clock::{Clock, SystemClock};
 use porthole_core::command::{CommandRunner, DryRunRunner, RealRunner};
 use porthole_core::engine::{Engine, Status};
-use porthole_core::error::{Error, Result};
+use porthole_core::error::{Error, ExitCode, Result};
 use porthole_core::model::{Lifetime, DEFAULT_DURATION};
 use porthole_core::net;
 use porthole_core::state::StateStore;
 use porthole_core::validate;
 
-pub fn run(cli: &Cli) -> Result<()> {
+pub fn run(cli: &Cli) -> Result<ExitCode> {
     match &cli.command {
         // `list` deliberately touches nothing but the state file: it must work
         // even on a machine whose firewall was just uninstalled.
@@ -24,7 +24,7 @@ pub fn run(cli: &Cli) -> Result<()> {
             } else {
                 output::print_rules(state.rules(), now);
             }
-            Ok(())
+            Ok(ExitCode::Success)
         }
         // `status` is a question, not an operation. It answers in its own
         // shape whatever the answer is — including "there is no firewall" —
@@ -63,14 +63,14 @@ pub fn run(cli: &Cli) -> Result<()> {
             } else {
                 output::print_status(&status, now);
             }
-            Ok(())
+            Ok(ExitCode::Success)
         }
         Commands::Open(args) => open(cli, args),
         Commands::Close(args) => close(cli, args),
     }
 }
 
-fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<()> {
+fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
     // Validate everything before asking for a password or touching the firewall.
     let port = validate::parse_port(&args.port)?;
     let protocol = validate::parse_protocol(&args.proto)?;
@@ -139,10 +139,10 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<()> {
             output::print_opened(&rule, now);
         }
     }
-    Ok(())
+    Ok(ExitCode::Success)
 }
 
-fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<()> {
+fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
     let protocol = validate::parse_protocol(&args.proto)?;
     let port = args.port.as_deref().map(validate::parse_port).transpose()?;
 
@@ -196,20 +196,28 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<()> {
     if cli.json {
         println!(
             "{}",
-            output::json_closed(&closed, now, cli.dry_run, &runner.recorded())
+            output::json_closed(&closed, &failures, now, cli.dry_run, &runner.recorded())
         );
     } else {
         output::print_closed(&closed);
+        for error in &failures {
+            eprintln!("porthole: {error}");
+        }
         if cli.dry_run {
             output::print_dry_run(&runner.recorded());
         }
     }
 
-    // Report what did close, then fail on what did not. Silently succeeding
+    // Report what did close, then exit on what did not. Silently succeeding
     // after a failed close would tell the user a port is shut when it is open.
-    match failures.into_iter().next() {
-        Some(error) => Err(error),
-        None => Ok(()),
+    //
+    // The failures were rendered above — inside the single JSON object, or on
+    // stderr — so this returns a code rather than an `Err`. Returning `Err`
+    // would make `main` print a second top-level JSON object, which no JSON
+    // reader can parse.
+    match failures.first() {
+        Some(error) => Ok(error.exit_code()),
+        None => Ok(ExitCode::Success),
     }
 }
 
