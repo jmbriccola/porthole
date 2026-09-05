@@ -247,7 +247,7 @@ mod tests {
     use crate::backend::fake::FakeBackend;
     use crate::backend::RuleHandle;
     use crate::clock::FixedClock;
-    use crate::command::{DryRunRunner, Output, RecordingRunner};
+    use crate::command::{Command, DryRunRunner, Output, RecordingRunner};
     use crate::model::Protocol;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -603,6 +603,112 @@ mod tests {
         assert!(errors.is_empty());
         assert!(engine.rules().is_empty());
         assert!(backend.handles().is_empty());
+    }
+
+    /// Answers `ip` normally but makes every `systemctl` invocation fail to
+    /// spawn, so a close meets a cancellation failure on a real code path.
+    struct SystemctlMissing {
+        inner: RecordingRunner,
+    }
+
+    impl CommandRunner for SystemctlMissing {
+        fn run(&self, cmd: &Command) -> Result<Output> {
+            if cmd.program == "systemctl" {
+                return Err(Error::CommandSpawn {
+                    command: cmd.display(),
+                    source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+                });
+            }
+            self.inner.run(cmd)
+        }
+
+        fn recorded(&self) -> Vec<Command> {
+            self.inner.recorded()
+        }
+    }
+
+    #[test]
+    fn open_rolls_back_when_the_state_cannot_be_written() {
+        // A hole in the firewall that nothing has recorded is worse than no
+        // hole: no state entry means no way to find the rule again, and the
+        // scheduling branch is never reached, so nothing would ever close it.
+        //
+        // The seam: `save` writes `<path>.json.tmp` before renaming it into
+        // place. Pre-creating that path as a *directory* makes the write fail
+        // while `open` still sees an ordinary missing state file.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::create_dir(dir.path().join("state.json.tmp")).unwrap();
+        let store = StateStore::open(&path).unwrap();
+
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ADDR_JSON),
+        ]);
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, store);
+
+        let err = engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::For(Duration::from_secs(3600)),
+                1000,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("state.json"), "got: {err}");
+
+        assert!(
+            backend.handles().is_empty(),
+            "a rule that could not be recorded must be closed again"
+        );
+        assert!(
+            !runner.recorded().iter().any(|c| c.program == "systemd-run"),
+            "a rolled-back rule must not leave a timer behind"
+        );
+    }
+
+    #[test]
+    fn a_close_succeeds_even_when_its_timer_cannot_be_cancelled() {
+        // By the time cancellation runs, the rule is already gone from the
+        // firewall. Failing here would report an open port that is in fact
+        // closed, and would leave the state file claiming so too. A stray timer
+        // that later fires and finds nothing is the harmless outcome.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = SystemctlMissing {
+            inner: RecordingRunner::with_responses(vec![
+                Output::stdout(ROUTE_JSON),
+                Output::stdout(ADDR_JSON),
+                Output::stdout("Running timer as unit: porthole-close-x.timer"),
+            ]),
+        };
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::For(Duration::from_secs(3600)),
+                1000,
+            )
+            .unwrap();
+
+        let closed = engine
+            .close_by_port(5173, Protocol::Tcp, false)
+            .expect("the port is closed, so the close must not report failure");
+
+        assert_eq!(closed.port, 5173);
+        assert!(backend.handles().is_empty());
+        assert!(engine.rules().is_empty());
+        assert!(
+            StateStore::open(&harness.path).unwrap().rules().is_empty(),
+            "the state file must not outlive a close that really happened"
+        );
     }
 
     #[test]
