@@ -58,6 +58,27 @@ impl WireRule {
     }
 }
 
+/// One failure from `close_all`, carried structurally rather than as a bare
+/// rendered string.
+///
+/// A single failed `close`, `close_by_id` or `open` reports itself as a typed
+/// D-Bus error name, which the client maps back to the exact `kind` slug and
+/// exit code the CLI would have produced locally. `close_all` cannot use that
+/// mechanism for its *per-rule* failures — the call as a whole still
+/// succeeds — so without this shape those failures had nothing but a
+/// `.to_string()`, and a client reporting `--json` had no `kind` or `code` to
+/// put in each error, only `"unexpected"`. This carries the same three things
+/// a single failure would have sent as a typed error, so `close --all --json`
+/// cannot tell a bus-backed failure apart from a local one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct WireError {
+    pub message: String,
+    /// The same stable slug `Error::kind()` produces locally.
+    pub kind: String,
+    /// The same `ExitCode` a local failure of this kind would carry, as i32.
+    pub code: i32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct WireStatus {
     pub backend: String,
@@ -128,11 +149,15 @@ pub trait Porthole {
 
     async fn close(&self, port: u16, protocol: &str) -> zbus::Result<WireRule>;
 
-    async fn close_by_id(&self, id: &str) -> zbus::Result<WireRule>;
+    /// `from_timer` is the expiry timer's own claim about itself, forwarded
+    /// from `--from-timer` — see `porthole_helper::service::Porthole::close_by_id`
+    /// for why the helper accepts it from the client rather than verifying it
+    /// independently.
+    async fn close_by_id(&self, id: &str, from_timer: bool) -> zbus::Result<WireRule>;
 
     /// Returns what closed and, separately, the failures — so one stuck rule
     /// cannot hide the others, exactly as `close --all` behaves locally.
-    async fn close_all(&self) -> zbus::Result<(Vec<WireRule>, Vec<String>)>;
+    async fn close_all(&self) -> zbus::Result<(Vec<WireRule>, Vec<WireError>)>;
 
     async fn list(&self) -> zbus::Result<Vec<WireRule>>;
 
@@ -237,5 +262,22 @@ mod tests {
         assert_eq!(wire.interface, "wlo1");
         assert_eq!(wire.address, "10.10.10.119");
         assert_eq!(wire.cidr, "10.10.10.0/24");
+    }
+
+    #[test]
+    fn wire_error_carries_the_same_three_things_a_typed_dbus_error_would() {
+        // close_all cannot report a per-rule failure as a typed D-Bus error
+        // name -- the call as a whole still succeeds -- so this is what lets
+        // its failures carry the same kind slug and exit code a single failed
+        // close would have sent, instead of a bare rendered string.
+        let error = WireError {
+            message: "command `firewall-cmd ...` exited with status 1: boom".to_string(),
+            kind: "command_failed".to_string(),
+            code: crate::error::ExitCode::Failure as i32,
+        };
+        let json = serde_json::to_value(&error).unwrap();
+        assert_eq!(json["kind"], "command_failed");
+        assert_eq!(json["code"], 1);
+        assert!(json["message"].as_str().unwrap().contains("firewall-cmd"));
     }
 }

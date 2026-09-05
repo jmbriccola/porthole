@@ -580,6 +580,7 @@ dependencies = [
  "clap",
  "libc",
  "porthole-core",
+ "porthole-helper",
  "serde_json",
  "tempfile",
  "tokio",

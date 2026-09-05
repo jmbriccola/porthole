@@ -7,7 +7,16 @@
 
 use async_trait::async_trait;
 use porthole_core::error::{Error, Result};
+use std::collections::HashMap;
 use std::sync::Mutex;
+
+/// The `$(key)` substitutions available to a polkit `<message>`.
+///
+/// Only the `open-*` actions have anything request-specific to say: `close`
+/// and `list` pass an empty map. Keys are the static names the installed
+/// policy file's messages reference (`port`, `protocol`, `target`) — see
+/// [`crate::polkit::open_details`].
+pub type Details = HashMap<&'static str, String>;
 
 /// The polkit actions this helper distinguishes.
 ///
@@ -44,7 +53,16 @@ pub trait Authorizer: Send + Sync {
     /// of who sent this exact message; there is nothing else here a client
     /// could claim to be, which is the point of taking the header rather
     /// than a bus name the caller merely asserts.
-    async fn check(&self, action: Action, header: &zbus::message::Header<'_>) -> Result<()>;
+    ///
+    /// `details` is what a polkit `<message>` may interpolate via `$(key)` —
+    /// the port, protocol and resolved target for an open, empty for
+    /// everything else.
+    async fn check(
+        &self,
+        action: Action,
+        details: &Details,
+        header: &zbus::message::Header<'_>,
+    ) -> Result<()>;
 }
 
 /// Allows everything and remembers what it was asked. Tests only.
@@ -62,7 +80,12 @@ impl AlwaysAllow {
 
 #[async_trait]
 impl Authorizer for AlwaysAllow {
-    async fn check(&self, action: Action, header: &zbus::message::Header<'_>) -> Result<()> {
+    async fn check(
+        &self,
+        action: Action,
+        _details: &Details,
+        header: &zbus::message::Header<'_>,
+    ) -> Result<()> {
         let sender = header.sender().map(|s| s.to_string()).unwrap_or_default();
         self.asked
             .lock()

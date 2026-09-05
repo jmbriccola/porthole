@@ -25,11 +25,27 @@
 //! [`Authorizer::check`](crate::authz::Authorizer::check) takes the header
 //! rather than a sender string a caller could otherwise have supplied.
 
-use crate::authz::{Action, Authorizer};
+use crate::authz::{Action, Authorizer, Details};
 use async_trait::async_trait;
 use porthole_core::error::{Error, Result};
+use porthole_core::model::{Protocol, Target};
 use std::collections::HashMap;
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
+
+/// The `$(key)` substitutions for the two `open-*` policy messages: the port,
+/// the protocol and the target porthole actually resolved.
+///
+/// Without these a person sees only the static sentence in the `.policy`
+/// file and cannot tell an expected prompt from an unexpected one, or notice
+/// that the resolved target is not what they typed. `close` and `list` need
+/// nothing here — their messages name nothing request-specific.
+pub fn open_details(port: u16, protocol: Protocol, target: &Target) -> Details {
+    let mut details = Details::new();
+    details.insert("port", port.to_string());
+    details.insert("protocol", protocol.to_string());
+    details.insert("target", target.to_string());
+    details
+}
 
 /// The refusal a caller sees. Separate function so the message is identical
 /// whether polkit said no or the subject could not be built.
@@ -56,18 +72,30 @@ impl PolkitAuthorizer {
 
 #[async_trait]
 impl Authorizer for PolkitAuthorizer {
-    async fn check(&self, action: Action, header: &zbus::message::Header<'_>) -> Result<()> {
+    async fn check(
+        &self,
+        action: Action,
+        details: &Details,
+        header: &zbus::message::Header<'_>,
+    ) -> Result<()> {
         // The subject is the caller's *system bus name*, taken from the
         // header the bus daemon stamped. polkit resolves it to a process
         // itself, so nothing the client says about who it is matters.
         let subject = Subject::new_for_message_header(header).map_err(|_| denied(action))?;
+
+        // polkit substitutes `$(key)` in the action's `<message>` from
+        // exactly this map — the same mechanism udisks uses to name the
+        // drive in its own prompts. `check_authorization` wants borrowed
+        // strings; `details` owns them so callers can build them from
+        // formatted values.
+        let raw: HashMap<&str, &str> = details.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
         let result = self
             .authority
             .check_authorization(
                 &subject,
                 action.id(),
-                &HashMap::new(),
+                &raw,
                 // The user may be asked. That is the point: the whole design
                 // is one authentication instead of a sudo per gesture.
                 CheckAuthorizationFlags::AllowUserInteraction.into(),

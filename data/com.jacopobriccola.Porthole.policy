@@ -8,7 +8,7 @@
 
   <action id="com.jacopobriccola.Porthole.open-subnet">
     <description>Open a port towards the current network</description>
-    <message>Authentication is required to open a port towards the network you are on.</message>
+    <message>Authentication is required to open $(protocol) port $(port) towards $(target), the network you are on.</message>
     <defaults>
       <allow_any>auth_admin_keep</allow_any>
       <allow_inactive>auth_admin_keep</allow_inactive>
@@ -18,7 +18,7 @@
 
   <action id="com.jacopobriccola.Porthole.open-any">
     <description>Open a port towards everyone</description>
-    <message>Authentication is required to open a port towards any network this machine can reach.</message>
+    <message>Authentication is required to open $(protocol) port $(port) towards $(target) — every network this machine can reach.</message>
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>

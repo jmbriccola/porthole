@@ -15,15 +15,16 @@
 //! 5. **Log to the journal with the requesting uid**, which comes from the bus
 //!    daemon rather than from the client.
 
-use crate::authz::{caller_uid, Action, Authorizer};
+use crate::authz::{caller_uid, Action, Authorizer, Details};
 use crate::error::HelperError;
 use porthole_core::backend;
 use porthole_core::clock::SystemClock;
 use porthole_core::command::RealRunner;
-use porthole_core::engine::{resolve_scope, Engine};
+use porthole_core::engine::{is_open_any, resolve_scope, Engine};
 use porthole_core::error::Error;
-use porthole_core::ipc::{WireRule, WireStatus};
-use porthole_core::model::{Lifetime, Target};
+use porthole_core::ipc::{WireError, WireRule, WireStatus};
+use porthole_core::model::Lifetime;
+use porthole_core::net;
 use porthole_core::state::StateStore;
 use porthole_core::validate;
 use std::path::PathBuf;
@@ -87,14 +88,28 @@ impl Porthole {
         // 2. Resolve before choosing the action, and before taking any lock.
         let runner = RealRunner;
         let target = resolve_scope(&runner, &spec).map_err(HelperError::from)?;
-        let action = match target {
-            Target::Anywhere => Action::OpenAny,
-            Target::Network { .. } => Action::OpenSubnet,
+        // Whether this amounts to the same exposure as "everyone" depends on
+        // the local network, not just on how the target was spelled: a
+        // network broader than the local subnet, or one this machine is not
+        // even on, is not "the network you are on" no matter what the client
+        // called it. `Ok()` on failure, not `?`: not being on a network is a
+        // fact `is_open_any` already treats as the safe (stronger) direction,
+        // not a reason to fail the whole request before authorization.
+        let local = net::current_network(&runner).ok();
+        let action = if is_open_any(&target, local.as_ref()) {
+            Action::OpenAny
+        } else {
+            Action::OpenSubnet
         };
+        // What the polkit dialog's `$(key)` substitutions can show: the port,
+        // protocol and resolved target, so a person can tell an expected
+        // prompt from an unexpected one rather than reading a static
+        // sentence that could belong to any request.
+        let details = crate::polkit::open_details(port, protocol, &target);
 
         // 3. Authorize.
         self.authorizer
-            .check(action, &header)
+            .check(action, &details, &header)
             .await
             .map_err(HelperError::from)?;
 
@@ -139,7 +154,16 @@ impl Porthole {
     ) -> Result<WireRule, HelperError> {
         let protocol = validate::parse_protocol(protocol).map_err(HelperError::from)?;
         self.authorizer
-            .check(Action::Close, &header)
+            .check(Action::Close, &Details::new(), &header)
+            .await
+            .map_err(HelperError::from)?;
+
+        // The audit trail names who asked for *this* close, which is not
+        // necessarily who opened the rule: `close` is `yes` in the polkit
+        // policy, reachable by any local user with no prompt at all, which is
+        // exactly why it is the one operation where recording the requester
+        // matters most.
+        let closed_by = caller_uid(&self.bus, &header)
             .await
             .map_err(HelperError::from)?;
 
@@ -156,17 +180,32 @@ impl Porthole {
         let rule = engine
             .close_by_port(port, protocol, false)
             .map_err(HelperError::from)?;
-        Self::log_close(&rule);
+        Self::log_close(&rule, closed_by, false);
         Ok(WireRule::from_rule(&rule))
     }
 
+    /// `from_timer` is a claim the client makes about itself, accepted rather
+    /// than independently verified. It is safe to accept: the only thing it
+    /// changes is (a) whether this close also tries to stop the very timer
+    /// unit that is calling it, and (b) the `, expired` marker in the journal
+    /// line below. A client that lies and says `true` when it is not the
+    /// timer merely skips cancelling a timer that either does not exist or
+    /// was going to fire and find nothing anyway; a client that lies and says
+    /// `false` merely leaves a stray timer behind, which fires later, finds
+    /// no such rule, and exits. Neither lie reaches the firewall, the state
+    /// file, or authorization above.
     async fn close_by_id(
         &self,
         id: &str,
+        from_timer: bool,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<WireRule, HelperError> {
         self.authorizer
-            .check(Action::Close, &header)
+            .check(Action::Close, &Details::new(), &header)
+            .await
+            .map_err(HelperError::from)?;
+
+        let closed_by = caller_uid(&self.bus, &header)
             .await
             .map_err(HelperError::from)?;
 
@@ -180,8 +219,10 @@ impl Porthole {
             state,
             self.executable.clone(),
         );
-        let rule = engine.close_by_id(id, false).map_err(HelperError::from)?;
-        Self::log_close(&rule);
+        let rule = engine
+            .close_by_id(id, from_timer)
+            .map_err(HelperError::from)?;
+        Self::log_close(&rule, closed_by, from_timer);
         Ok(WireRule::from_rule(&rule))
     }
 
@@ -190,9 +231,13 @@ impl Porthole {
     async fn close_all(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-    ) -> Result<(Vec<WireRule>, Vec<String>), HelperError> {
+    ) -> Result<(Vec<WireRule>, Vec<WireError>), HelperError> {
         self.authorizer
-            .check(Action::Close, &header)
+            .check(Action::Close, &Details::new(), &header)
+            .await
+            .map_err(HelperError::from)?;
+
+        let closed_by = caller_uid(&self.bus, &header)
             .await
             .map_err(HelperError::from)?;
 
@@ -206,13 +251,27 @@ impl Porthole {
             state,
             self.executable.clone(),
         );
+        // `close --all` is never what the expiry timer invokes -- it always
+        // closes a single rule by id -- so there is no `from_timer` to thread
+        // through here.
         let (closed, errors) = engine.close_all(false);
         for rule in &closed {
-            Self::log_close(rule);
+            Self::log_close(rule, closed_by, false);
         }
         Ok((
             closed.iter().map(WireRule::from_rule).collect(),
-            errors.iter().map(|e| e.to_string()).collect(),
+            // Structured, not `.to_string()`'d away: a script must not be
+            // able to tell a `close --all` failure over the bus apart from
+            // the same failure reported locally, and a bare string discards
+            // exactly the `kind` and exit code that comparison needs.
+            errors
+                .iter()
+                .map(|e| WireError {
+                    message: e.to_string(),
+                    kind: e.kind().to_string(),
+                    code: e.exit_code() as i32,
+                })
+                .collect(),
         ))
     }
 
@@ -221,7 +280,7 @@ impl Porthole {
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<Vec<WireRule>, HelperError> {
         self.authorizer
-            .check(Action::List, &header)
+            .check(Action::List, &Details::new(), &header)
             .await
             .map_err(HelperError::from)?;
         // Read-only: the plain constructor, so a reader never blocks behind a
@@ -235,7 +294,7 @@ impl Porthole {
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<WireStatus, HelperError> {
         self.authorizer
-            .check(Action::List, &header)
+            .check(Action::List, &Details::new(), &header)
             .await
             .map_err(HelperError::from)?;
 
@@ -255,19 +314,99 @@ impl Porthole {
 }
 
 impl Porthole {
-    fn log_close(rule: &porthole_core::state::ManagedRule) {
-        eprintln!(
-            "porthole: closed {}/{} towards {} (opened by uid={})",
-            rule.port, rule.protocol, rule.target, rule.uid
-        );
+    /// `closed_by` is the uid that asked for *this* close — not necessarily
+    /// `rule.uid`, since any local user may close any rule. `from_timer`
+    /// controls only the trailing `, expired` marker: milestone 1 added it so
+    /// a timer-triggered close reads differently in the journal from one a
+    /// person asked for, and it must survive the request now crossing the bus
+    /// rather than being handled in-process.
+    fn log_close(rule: &porthole_core::state::ManagedRule, closed_by: u32, from_timer: bool) {
+        eprintln!("{}", format_close_log(rule, closed_by, from_timer));
     }
+}
+
+/// Split out from [`Porthole::log_close`] so the line itself is testable
+/// without capturing stderr from a live process.
+fn format_close_log(
+    rule: &porthole_core::state::ManagedRule,
+    closed_by: u32,
+    from_timer: bool,
+) -> String {
+    format!(
+        "porthole: closed {}/{} towards {} (opened by uid={}, closed by uid={}){}",
+        rule.port,
+        rule.protocol,
+        rule.target,
+        rule.uid,
+        closed_by,
+        if from_timer { ", expired" } else { "" }
+    )
 }
 
 // `Box<dyn Authorizer>` from an Arc, so tests can keep a handle on what the
 // authorizer was asked while the service owns it.
 #[async_trait::async_trait]
 impl Authorizer for std::sync::Arc<crate::authz::AlwaysAllow> {
-    async fn check(&self, action: Action, header: &zbus::message::Header<'_>) -> Result<(), Error> {
-        (**self).check(action, header).await
+    async fn check(
+        &self,
+        action: Action,
+        details: &crate::authz::Details,
+        header: &zbus::message::Header<'_>,
+    ) -> Result<(), Error> {
+        (**self).check(action, details, header).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use porthole_core::backend::{BackendId, RuleHandle};
+    use porthole_core::model::{Protocol, Target};
+    use porthole_core::state::ManagedRule;
+
+    fn rule(opener_uid: u32) -> ManagedRule {
+        ManagedRule {
+            id: "abc".to_string(),
+            port: 5173,
+            protocol: Protocol::Tcp,
+            target: Target::Network {
+                cidr: "10.10.10.0/24".parse().unwrap(),
+            },
+            backend: BackendId::Firewalld,
+            opened_at: 1_757_000_000,
+            expires_at: None,
+            uid: opener_uid,
+            handle: RuleHandle::Firewalld {
+                zone: "FedoraWorkstation".to_string(),
+                rich_rule: "rule ...".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn the_close_line_names_both_uids_when_they_differ() {
+        // I1: `close`, `close_by_id` and `close_all` must all log who *asked*
+        // for the close, separately from who *opened* the rule — a test
+        // where the two happen to be the same value would pass even if the
+        // closer's uid were never wired in at all.
+        let line = format_close_log(&rule(1000), 1001, false);
+        assert!(line.contains("opened by uid=1000"), "got: {line}");
+        assert!(line.contains("closed by uid=1001"), "got: {line}");
+    }
+
+    #[test]
+    fn a_timer_triggered_close_carries_the_expired_marker() {
+        // Milestone 1 added `, expired` so a close the timer fired reads
+        // differently in the journal from one a person asked for. I2 wires
+        // `from_timer` back across the bus so this survives the move to the
+        // helper.
+        let line = format_close_log(&rule(1000), 1000, true);
+        assert!(line.ends_with(", expired"), "got: {line}");
+    }
+
+    #[test]
+    fn a_human_initiated_close_carries_no_expired_marker() {
+        let line = format_close_log(&rule(1000), 1000, false);
+        assert!(!line.contains("expired"), "got: {line}");
     }
 }

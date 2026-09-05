@@ -5,7 +5,7 @@
 //! and never touch the bus, so they keep working when the helper is absent.
 
 use porthole_core::error::{Error, ExitCode, Result};
-use porthole_core::ipc::{PortholeProxy, WireRule};
+use porthole_core::ipc::{PortholeProxy, WireError, WireRule};
 use porthole_core::state::ManagedRule;
 
 /// One small runtime per invocation. The CLI is a short-lived process that
@@ -61,6 +61,8 @@ fn from_dbus(e: zbus::Error) -> Error {
             "DeviceUnreachable" => ("device_unreachable", ExitCode::DeviceUnreachable),
             "RuleNotFound" => ("rule_not_found", ExitCode::RuleNotFound),
             "NoNetwork" => ("no_network", ExitCode::NoNetwork),
+            "CommandFailed" => ("command_failed", ExitCode::Failure),
+            "State" => ("state_error", ExitCode::Failure),
             // Not the helper: the bus itself answered, but nothing owns
             // `com.jacopobriccola.Porthole` and nothing can be activated to.
             // That is a live system bus with no helper installed — the
@@ -153,12 +155,60 @@ pub fn close(session: bool, port: u16, protocol: &str) -> Result<ManagedRule> {
     })
 }
 
-pub fn close_by_id(session: bool, id: &str) -> Result<ManagedRule> {
+pub fn close_by_id(session: bool, id: &str, from_timer: bool) -> Result<ManagedRule> {
     block_on(async {
         let p = proxy(session).await?;
-        let wire = p.close_by_id(id).await.map_err(from_dbus)?;
+        let wire = p.close_by_id(id, from_timer).await.map_err(from_dbus)?;
         to_local(&wire)
     })
+}
+
+/// The kind slugs a `HelperError` variant can name on the wire, mapped back to
+/// the `&'static str` `Error::Remote` needs. Anything this client does not
+/// recognise — a slug a newer helper introduced — falls back to
+/// `"unexpected"` rather than failing to parse the response at all.
+fn static_kind(kind: &str) -> &'static str {
+    match kind {
+        "invalid_argument" => "invalid_argument",
+        "backend_unavailable" => "backend_unavailable",
+        "not_authorized" => "not_authorized",
+        "already_open" => "already_open",
+        "device_unreachable" => "device_unreachable",
+        "rule_not_found" => "rule_not_found",
+        "no_network" => "no_network",
+        "command_failed" => "command_failed",
+        "state_error" => "state_error",
+        _ => "unexpected",
+    }
+}
+
+/// The reverse of `ExitCode as i32`. `ExitCode`'s own doc comment says never
+/// to renumber an existing value, so this small, closed mapping is safe to
+/// hardcode rather than round-trip through a derive.
+fn exit_code_from_i32(code: i32) -> ExitCode {
+    match code {
+        2 => ExitCode::InvalidArguments,
+        3 => ExitCode::BackendUnavailable,
+        4 => ExitCode::NotAuthorized,
+        5 => ExitCode::AlreadyOpen,
+        6 => ExitCode::DeviceUnreachable,
+        7 => ExitCode::RuleNotFound,
+        8 => ExitCode::NoNetwork,
+        _ => ExitCode::Failure,
+    }
+}
+
+/// A `close_all` per-rule failure, as the local `Error` type.
+///
+/// `Error::Remote`, not a reconstructed local variant: the helper already
+/// rendered `message`, and rebuilding a variant from it would double every
+/// prefixing template exactly as `from_dbus` above is careful not to.
+fn wire_error_to_local(e: WireError) -> Error {
+    Error::Remote {
+        message: e.message,
+        kind: static_kind(&e.kind),
+        code: exit_code_from_i32(e.code),
+    }
 }
 
 pub fn close_all(session: bool) -> Result<(Vec<ManagedRule>, Vec<Error>)> {
@@ -166,7 +216,10 @@ pub fn close_all(session: bool) -> Result<(Vec<ManagedRule>, Vec<Error>)> {
         let p = proxy(session).await?;
         let (closed, errors) = p.close_all().await.map_err(from_dbus)?;
         let rules = closed.iter().map(to_local).collect::<Result<Vec<_>>>()?;
-        Ok((rules, errors.into_iter().map(Error::Unexpected).collect()))
+        Ok((
+            rules,
+            errors.into_iter().map(wire_error_to_local).collect(),
+        ))
     })
 }
 
@@ -295,6 +348,12 @@ mod tests {
         // an error came from the CLI acting locally or from the helper over
         // the bus, so these slugs must be byte-identical to `Error::kind()`'s
         // own — checked here against the real local variants, not retyped.
+        //
+        // Every `HelperError` variant is covered, not just the ones that
+        // happened to round-trip before: `CommandFailed` and `State` used to
+        // collapse into the `Failed` catch-all and report `"unexpected"`,
+        // which is exactly the drift `docs/json-schema.md`'s slug-equivalence
+        // promise cannot afford.
         use porthole_core::model::Protocol;
 
         let cases: &[(&str, Error)] = &[
@@ -330,13 +389,61 @@ mod tests {
                 "com.jacopobriccola.Porthole.NoNetwork",
                 Error::NoNetwork(String::new()),
             ),
+            (
+                "com.jacopobriccola.Porthole.CommandFailed",
+                Error::CommandFailed {
+                    command: String::new(),
+                    status: 1,
+                    stderr: String::new(),
+                },
+            ),
+            (
+                "com.jacopobriccola.Porthole.State",
+                Error::State {
+                    path: String::new(),
+                    detail: String::new(),
+                },
+            ),
         ];
         for (name, local) in cases {
+            let reported = from_dbus(method_error(name, "x"));
+            assert_eq!(reported.kind(), local.kind(), "kind slug drifted for {name}");
             assert_eq!(
-                from_dbus(method_error(name, "x")).kind(),
-                local.kind(),
-                "kind slug drifted for {name}"
+                reported.exit_code(),
+                local.exit_code(),
+                "exit code drifted for {name}"
             );
         }
+    }
+
+    #[test]
+    fn close_all_failures_keep_their_structured_kind_over_the_bus() {
+        // I3: close_all's per-rule failures used to be `.to_string()`'d away
+        // into `Error::Unexpected`, so `close --all --json` reported
+        // `"kind":"unexpected"` for a failure that would have been
+        // `"command_failed"` locally. `wire_error_to_local` is what
+        // `close_all` maps every `WireError` through before handing failures
+        // back to `run.rs`.
+        let wire = WireError {
+            message: "command `firewall-cmd ...` exited with status 1: boom".to_string(),
+            kind: "command_failed".to_string(),
+            code: ExitCode::Failure as i32,
+        };
+        let local = wire_error_to_local(wire);
+        assert_eq!(local.kind(), "command_failed");
+        assert_eq!(local.exit_code(), ExitCode::Failure);
+        assert_eq!(local.to_string(), "command `firewall-cmd ...` exited with status 1: boom");
+    }
+
+    #[test]
+    fn an_unrecognised_wire_kind_falls_back_to_unexpected_rather_than_panicking() {
+        // Forward compatibility: an older client meeting a newer helper's new
+        // kind slug must degrade gracefully, not crash.
+        let wire = WireError {
+            message: "something new".to_string(),
+            kind: "brand_new_kind_this_client_has_never_heard_of".to_string(),
+            code: 1,
+        };
+        assert_eq!(wire_error_to_local(wire).kind(), "unexpected");
     }
 }

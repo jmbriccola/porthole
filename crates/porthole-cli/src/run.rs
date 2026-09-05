@@ -221,7 +221,13 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
             failures = errors;
             closed
         } else if let Some(id) = &args.id {
-            vec![client::close_by_id(cli.session, id)?]
+            // `args.from_timer` matters here specifically: this is the only
+            // branch the expiry timer's own `close --id <id> --from-timer`
+            // ever reaches. It must cross the bus rather than being dropped
+            // at the client, or the helper cannot tell a timer-triggered
+            // close from an ordinary one — see
+            // `porthole_helper::service::Porthole::close_by_id`.
+            vec![client::close_by_id(cli.session, id, args.from_timer)?]
         } else {
             vec![client::close(
                 cli.session,

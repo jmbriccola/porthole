@@ -37,14 +37,14 @@ struct Probe {
 impl Probe {
     async fn check_open_any(&self, #[zbus(header)] header: zbus::message::Header<'_>) {
         self.authorizer
-            .check(Action::OpenAny, &header)
+            .check(Action::OpenAny, &Default::default(), &header)
             .await
             .expect("AlwaysAllow never refuses");
     }
 
     async fn check_close(&self, #[zbus(header)] header: zbus::message::Header<'_>) {
         self.authorizer
-            .check(Action::Close, &header)
+            .check(Action::Close, &Default::default(), &header)
             .await
             .expect("AlwaysAllow never refuses");
     }

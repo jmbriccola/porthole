@@ -4,6 +4,7 @@
 
 use porthole_core::ipc::{PortholeProxy, PATH};
 use porthole_helper::authz::{Action, AlwaysAllow};
+use porthole_helper::cli_path::CLI_CANDIDATES;
 use porthole_helper::service::Porthole;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -24,7 +25,11 @@ async fn serve(
         Box::new(Arc::clone(&authorizer)),
         bus,
         state.to_path_buf(),
-        std::path::PathBuf::from("/usr/bin/porthole"),
+        // Not a second hardcoded literal: this must track however
+        // `cli_path::resolve_cli` actually picks a candidate, or the two can
+        // silently drift apart the way the CLI's install path and the timer's
+        // once did.
+        std::path::PathBuf::from(CLI_CANDIDATES[0]),
     );
     let name = probe_name(suffix);
     let conn = zbus::connection::Builder::session()
@@ -55,8 +60,23 @@ async fn list_is_empty_before_anything_is_opened() {
     assert!(proxy.list().await.unwrap().is_empty());
 }
 
+/// This test drives the *real* engine against the *real* `firewall-cmd`,
+/// relying on firewalld's own polkit refusing an unprivileged caller so
+/// nothing is actually added. Under root that assumption is false: the open
+/// would genuinely succeed, and the temp state directory vanishing at the end
+/// of the test would leave a real rule in the firewall with nothing able to
+/// close it. `cli.rs` already guards its own real-firewall tests the same way.
+fn is_root() -> bool {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
 #[tokio::test]
 async fn opening_towards_everyone_asks_for_the_stronger_action() {
+    if is_root() {
+        eprintln!("skipped: running as root, where firewalld would not refuse this open");
+        return;
+    }
     // `--to any` and `--to 0.0.0.0/0` produce identical exposure, so both must
     // reach open-any. A client must not get the weaker authorization by
     // spelling "everyone" as a CIDR.

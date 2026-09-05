@@ -11,6 +11,7 @@ use porthole_core::backend;
 use porthole_core::command::RealRunner;
 use porthole_core::ipc::PortholeProxy;
 use porthole_core::net;
+use porthole_helper::cli_path;
 use serde_json::{json, Value};
 
 pub struct Check {
@@ -62,15 +63,18 @@ pub fn run(session: bool) -> Vec<Check> {
                  `journalctl -u firewalld -n 50` for why it is not.",
             ),
         },
-        Err(e) => Check::bad(
-            "Firewall",
-            e.to_string(),
-            "porthole 0.2 manages firewalld. Install it, or wait for the ufw and \
-             nftables backends. porthole will not install one for you.",
-        ),
+        Err(e) => {
+            let remedy = format!(
+                "porthole {} manages firewalld. Install it, or wait for the ufw \
+                 and nftables backends. porthole will not install one for you.",
+                env!("CARGO_PKG_VERSION")
+            );
+            Check::bad("Firewall", e.to_string(), &remedy)
+        }
     });
 
     checks.push(check_helper(session));
+    checks.push(check_expiry_timer(session));
 
     checks.push(if std::path::Path::new(POLICY_PATH).exists() {
         Check::good("polkit", format!("{POLICY_PATH} is installed"))
@@ -201,6 +205,45 @@ fn check_helper(session: bool) -> Check {
     helper_check(ask_helper(session))
 }
 
+/// Which CLI binary the expiry timer will invoke, and whether one resolves at
+/// all.
+///
+/// A missing timer target is invisible at open time — the open itself
+/// succeeds — and surfaces only much later as a port that never closed,
+/// which is exactly the kind of silent failure `doctor` exists to catch.
+/// This calls `porthole_helper::cli_path::resolve_cli_for` rather than
+/// re-deriving the answer, so it can never disagree with what the real
+/// helper will decide — the failure mode a second, hand-rolled opinion would
+/// invite.
+fn check_expiry_timer(session: bool) -> Check {
+    // The production helper always runs as root: systemd starts it with no
+    // `User=` override, so its own `resolve_cli` always sees euid 0.
+    // `--session` is the unprivileged helper this same suite spawns for
+    // tests, which is the only case where looking past the two system paths
+    // to the CLI built alongside it applies at all — so this simulates that
+    // same euid rather than always assuming privileged.
+    let euid: u32 = if session {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        unsafe { libc::geteuid() }
+    } else {
+        0
+    };
+    match cli_path::resolve_cli_for(euid) {
+        Ok(path) => Check::good(
+            "Expiry timer",
+            format!("will run {} when a timed opening expires", path.display()),
+        ),
+        Err(detail) => Check::bad(
+            "Expiry timer",
+            detail,
+            "Without a usable CLI binary the expiry timer cannot be scheduled: \
+             a timed opening would have nothing able to close it automatically \
+             and would stay open until reboot. Install porthole to /usr/bin or \
+             /usr/local/bin.",
+        ),
+    }
+}
+
 fn check_docker() -> Check {
     if !std::path::Path::new("/sys/class/net/docker0").exists() {
         return Check::good("Docker", "not present".to_string());
@@ -249,6 +292,13 @@ fn check_ipv6(runner: &RealRunner) -> Check {
 /// Counts characters, not bytes: this output contains `·` and `—`, and a
 /// byte-counting wrap would break early on any line holding them.
 fn wrap(text: &str, width: usize) -> Vec<String> {
+    // A literal 0 would force-break at index 0 forever: `split_at` at 0 pushes
+    // an empty line and hands the whole remaining string right back to the
+    // `while` loop below, unchanged. Both call sites pass a fixed width today,
+    // but a width computed from a terminal size can legitimately be zero — a
+    // pipe, a detached process — so this is guarded here rather than trusted
+    // to every future caller.
+    let width = width.max(1);
     let mut lines = Vec::new();
     let mut current = String::new();
     for word in text.split_whitespace() {
@@ -350,6 +400,23 @@ mod tests {
     }
 
     #[test]
+    fn the_expiry_timer_check_reports_the_same_candidates_resolve_cli_would() {
+        // This is deliberately not a check on doctor's own logic in isolation:
+        // the whole point of reusing `cli_path::resolve_cli_for` is that
+        // doctor cannot silently drift from what the real helper decides. On
+        // a machine with no `porthole` installed at either system path (true
+        // of this test environment), a *privileged* resolution (euid 0, what
+        // the real systemd-started helper always is) must fail exactly the
+        // way `resolve_cli_for(0)` fails on its own.
+        let check = check_expiry_timer(false);
+        let expected_ok = cli_path::resolve_cli_for(0).is_ok();
+        assert_eq!(check.ok, expected_ok, "doctor disagreed with resolve_cli_for");
+        if !check.ok {
+            assert!(!check.remedy.is_empty(), "a failing check must say what to do");
+        }
+    }
+
+    #[test]
     fn refused_is_a_failure_that_names_the_policy_and_does_not_say_install() {
         // A refusal is proof the helper is running: the fix is polkit, not
         // reinstalling a package that is already there. Getting this backwards
@@ -362,6 +429,20 @@ mod tests {
             .remedy
             .to_lowercase()
             .contains("install the porthole package"));
+    }
+
+    #[test]
+    fn a_zero_width_returns_rather_than_looping_forever() {
+        // Before the `width.max(1)` guard, `wrap("hi", 0)` never returned:
+        // splitting at index 0 pushes an empty line and hands the whole
+        // string right back, forever. Asserting on the result (not merely
+        // that the call returns at all) is what would have caught a
+        // regression that made the guard a no-op.
+        let lines = wrap("hi", 0);
+        assert!(!lines.is_empty());
+        for line in &lines {
+            assert!(line.chars().count() <= 1, "got: {line:?}");
+        }
     }
 
     #[test]

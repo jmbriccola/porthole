@@ -40,6 +40,13 @@ pub enum Error {
     #[error("{0}")]
     BackendUnavailable(String),
 
+    /// The README's exit-code table says exit 4 means "Polkit refused the
+    /// request. Never `sudo`." That sentence is true only because this
+    /// variant has exactly one production construction site today —
+    /// `polkit.rs`'s `denied()`. Nothing in the type system enforces that; if
+    /// a second call site is ever added, either keep the sentence true or go
+    /// update the README, because nothing else will notice the two have
+    /// drifted apart.
     #[error("not authorized: {0}")]
     NotAuthorized(String),
 
