@@ -3,6 +3,12 @@
 //! Shared between the helper binary itself and `porthole doctor`, so doctor's
 //! report of what the timer will run can never be a second opinion that
 //! disagrees with what the helper actually decides — it calls exactly this.
+//!
+//! It lives in `porthole-core` rather than in the helper because both sides
+//! need it, and the alternative — the unprivileged CLI depending on the
+//! privileged helper's crate — would make `porthole` link the helper's polkit
+//! and authorization code to answer one diagnostic question. `expiry`, the
+//! other consumer of this path, is already here.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};

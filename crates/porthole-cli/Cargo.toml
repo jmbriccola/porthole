@@ -14,7 +14,6 @@ path = "src/main.rs"
 
 [dependencies]
 porthole-core = { path = "../porthole-core" }
-porthole-helper = { path = "../porthole-helper" }
 clap.workspace = true
 libc.workspace = true
 serde_json.workspace = true

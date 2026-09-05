@@ -12,6 +12,7 @@
 //!    what makes dry-run and unit testing possible.
 
 pub mod backend;
+pub mod cli_path;
 pub mod clock;
 pub mod command;
 pub mod engine;

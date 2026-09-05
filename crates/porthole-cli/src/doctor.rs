@@ -11,7 +11,7 @@ use porthole_core::backend;
 use porthole_core::command::RealRunner;
 use porthole_core::ipc::PortholeProxy;
 use porthole_core::net;
-use porthole_helper::cli_path;
+use porthole_core::cli_path;
 use serde_json::{json, Value};
 
 pub struct Check {
@@ -211,7 +211,7 @@ fn check_helper(session: bool) -> Check {
 /// A missing timer target is invisible at open time — the open itself
 /// succeeds — and surfaces only much later as a port that never closed,
 /// which is exactly the kind of silent failure `doctor` exists to catch.
-/// This calls `porthole_helper::cli_path::resolve_cli_for` rather than
+/// This calls `porthole_core::cli_path::resolve_cli_for` rather than
 /// re-deriving the answer, so it can never disagree with what the real
 /// helper will decide — the failure mode a second, hand-rolled opinion would
 /// invite.

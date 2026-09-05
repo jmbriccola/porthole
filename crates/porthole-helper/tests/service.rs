@@ -4,7 +4,7 @@
 
 use porthole_core::ipc::{PortholeProxy, PATH};
 use porthole_helper::authz::{Action, AlwaysAllow};
-use porthole_helper::cli_path::CLI_CANDIDATES;
+use porthole_core::cli_path::CLI_CANDIDATES;
 use porthole_helper::service::Porthole;
 use std::sync::Arc;
 use tempfile::TempDir;
