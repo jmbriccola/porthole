@@ -5,7 +5,7 @@ members = ["crates/porthole-core", "crates/porthole-cli", "crates/porthole-helpe
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.87"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/jmbriccola/porthole"
 authors = ["Jacopo Maria Briccola <jmbriccola@gmail.com>"]

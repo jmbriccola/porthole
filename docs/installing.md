@@ -7,19 +7,20 @@ privileged helper to act, and that helper has to be installed once, as root,
 before they work. This is that installation.
 
 There is no installer yet — porthole is not packaged for any distribution.
-Until it is, do the five steps below by hand.
+Until it is, do the steps below by hand.
 
-## The five pieces
+## The pieces
 
-Building the workspace (`cargo build --release`) produces the helper binary.
-The other four are checked into `data/` and are not installed by anything
-automatically — you copy them into place yourself.
+Building the workspace (`cargo build --release`) produces the helper binary
+and the CLI. Four more pieces are checked into `data/` and are not installed
+by anything automatically — you copy them into place yourself.
 
 | Piece | Goes to | What it does |
 |---|---|---|
+| `target/release/porthole` (built, not in `data/` — install it per the top-level README, not by the commands below) | `/usr/local/bin/porthole` (a packaged install may instead use `/usr/bin/porthole`) | The CLI. Listed here, not just in the README, because its path is no longer only a `$PATH` convenience: `porthole open --for` schedules its own close with a transient systemd timer whose `ExecStart` is this exact absolute path, run **as root**. The helper looks for it at `/usr/bin/porthole` first, then `/usr/local/bin/porthole`, and refuses to start at all if neither is a regular file owned by root and unwritable by anyone else — so install it at one of those two paths, not somewhere else. |
 | `target/release/porthole-helper` (built, not in `data/`) | `/usr/libexec/porthole-helper` | The privileged binary itself. It is never setuid and never run directly — only D-Bus activation or systemd starts it, always as root. |
 | `data/com.jacopobriccola.Porthole.service` | `/usr/share/dbus-1/system-services/` | Tells the system bus daemon how to start the helper the first time something addresses `com.jacopobriccola.Porthole`: which binary to run, and — via `SystemdService=` — which systemd unit actually owns the process. |
-| `data/porthole-helper.service` | `/usr/lib/systemd/system/` | The systemd unit the activation file names. `Type=dbus` plus `BusName=` makes systemd wait until the name is actually claimed before treating the service as started; `RuntimeDirectory=porthole` creates `/run/porthole` mode `0755` so an unprivileged `porthole list` can read the state file that only the helper writes; the unit has no `WantedBy=`, so it is never running except while something needs it — D-Bus activation restarts it on the next call after it exits idle. |
+| `data/porthole-helper.service` | `/usr/lib/systemd/system/` | The systemd unit the activation file names. `Type=dbus` plus `BusName=` makes systemd wait until the name is actually claimed before treating the service as started; `RuntimeDirectory=porthole` creates `/run/porthole` mode `0755` so an unprivileged `porthole list` can read the state file that only the helper writes, and `RuntimeDirectoryPreserve=yes` keeps `state.json` there across a restart or a crash instead of systemd deleting it with the directory; the unit has no `WantedBy=`, so nothing starts it at boot — D-Bus activation starts it the first time something addresses the bus name. It does not exit on its own once running: it stops only when something stops it. |
 | `data/com.jacopobriccola.Porthole.conf` | `/usr/share/dbus-1/system.d/` | The bus's own policy: only `root` may own the name — a bus-level guard against anything else posing as the helper — and any user may address it, because deciding *who may do what* is the next file's job, not the bus's. |
 | `data/com.jacopobriccola.Porthole.policy` | `/usr/share/polkit-1/actions/` | The polkit actions and their severities: opening towards your own subnet asks once per session, opening towards everyone (`--to any`) asks every time, and closing or listing never ask. Without this file, polkit falls back to its own default for an unrecognised action and every one of those severity choices disappears — `porthole doctor` is what notices and says so. |
 

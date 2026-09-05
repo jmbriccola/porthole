@@ -61,7 +61,10 @@ opened. That is the whole design, not a limitation.
 ## Install
 
 Distribution packages are not published yet. To build from source you need Rust
-1.85 or newer:
+1.87 or newer — the privileged helper depends on `zbus`, and every `zbus 5.19`
+component declares `rust-version = "1.87"`. **Debian 13 ships rustc 1.85**, so
+packaging porthole for it means bringing a newer toolchain along, not just
+running `cargo build` with the system one.
 
 ```bash
 git clone https://github.com/jmbriccola/porthole

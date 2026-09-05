@@ -13,7 +13,50 @@ use porthole_core::state::StateStore;
 use porthole_helper::authz::{AlwaysAllow, Authorizer};
 use porthole_helper::polkit::PolkitAuthorizer;
 use porthole_helper::service::Porthole;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+
+/// Where the helper will look for the CLI it hands to the expiry timer.
+///
+/// Ordered: a packaged install first, a hand-built one second.
+const CLI_CANDIDATES: [&str; 2] = ["/usr/bin/porthole", "/usr/local/bin/porthole"];
+
+/// Pick the CLI binary the expiry timer will run.
+///
+/// `systemd-run` runs this **as root**, so the path is a root-execution
+/// target, not a configuration detail. A candidate that is writable by anyone
+/// other than root would turn a missed timer into root code execution through
+/// a mechanism the user never sees — so each candidate must be a regular file,
+/// owned by uid 0, and not group- or world-writable. A candidate that fails
+/// any of those is skipped rather than used, and if none passes the helper
+/// says so instead of scheduling a close that cannot run.
+fn resolve_cli() -> Result<PathBuf, String> {
+    for candidate in CLI_CANDIDATES {
+        let path = PathBuf::from(candidate);
+        // fs::metadata, not symlink_metadata: a symlink whose target passes
+        // every check below is fine to run, so it is the target we check.
+        let metadata = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        if metadata.uid() != 0 {
+            continue;
+        }
+        // Group- or world-writable (022) bits: writable by anyone but root.
+        if metadata.mode() & 0o022 != 0 {
+            continue;
+        }
+        return Ok(path);
+    }
+    Err(format!(
+        "no usable CLI binary found among {CLI_CANDIDATES:?} — each must exist, \
+         be a regular file, be owned by root, and not be group- or \
+         world-writable. Timed closes cannot run without one."
+    ))
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,6 +72,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         std::process::exit(2);
     }
+
+    // Fail loudly here, before ever claiming the bus name: a helper that
+    // starts, accepts openings, and only discovers it cannot schedule their
+    // close once the first timer is due is worse than one that refuses to
+    // start.
+    let cli = match resolve_cli() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("porthole-helper: refusing to start: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let (bus, serving) = if session {
         eprintln!("porthole-helper: session bus, authorization disabled — tests only");
@@ -51,12 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(PolkitAuthorizer::new(&bus).await?)
     };
 
-    let service = Porthole::new(
-        authorizer,
-        bus,
-        StateStore::default_path(),
-        PathBuf::from("/usr/bin/porthole"),
-    );
+    let service = Porthole::new(authorizer, bus, StateStore::default_path(), cli);
 
     let _conn = serving
         .name(SERVICE)?

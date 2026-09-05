@@ -113,6 +113,77 @@ fn activation_and_the_unit_agree_on_where_the_binary_lives() {
 }
 
 #[test]
+fn the_unit_preserves_state_across_restarts_and_crashes() {
+    // RuntimeDirectoryPreserve defaults to `no`, which makes systemd delete
+    // /run/porthole -- and state.json with it -- on every stop, restart, or
+    // crash, while every rich rule porthole added stays live in firewalld
+    // regardless: `list` shows nothing, `close --all` closes nothing, and a
+    // close already scheduled on a transient timer fires into RuleNotFound.
+    // A port left open until reboot with nothing able to close it is exactly
+    // what this project exists to prevent, so this pins the fix rather than
+    // trusting a comment in the unit file to survive the next edit.
+    let unit = data("porthole-helper.service");
+    assert!(unit.contains("RuntimeDirectory=porthole"), "got: {unit}");
+    assert!(unit.contains("RuntimeDirectoryMode=0755"), "got: {unit}");
+
+    let preserve = unit
+        .split("RuntimeDirectoryPreserve=")
+        .nth(1)
+        .expect("RuntimeDirectoryPreserve is set")
+        .split_whitespace()
+        .next()
+        .expect("a value follows the key");
+    assert_ne!(
+        preserve, "no",
+        "RuntimeDirectoryPreserve=no (systemd's own default) deletes \
+         /run/porthole -- and state.json with it -- on every stop, restart, \
+         or crash, while the firewall rules stay live in firewalld: a port \
+         left open with nothing able to close it. got: {unit}"
+    );
+}
+
+#[test]
+fn the_activation_files_systemd_service_names_a_real_unit_file() {
+    // A typo here would let D-Bus activation and the systemd unit silently
+    // stop agreeing on which unit owns the process -- the same class of
+    // drift C3 hit with the CLI path, just one file over.
+    let service = data("com.jacopobriccola.Porthole.service");
+    let unit_file = service
+        .lines()
+        .find_map(|l| l.strip_prefix("SystemdService="))
+        .expect("SystemdService= is set")
+        .trim();
+    let data_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data");
+    assert!(
+        std::path::Path::new(data_dir).join(unit_file).is_file(),
+        "SystemdService={unit_file} names a file that does not exist in data/"
+    );
+}
+
+#[test]
+fn the_cli_path_the_helper_resolves_is_documented() {
+    // Coupling code to documentation is an unusual thing for a test to do,
+    // but this exact drift -- the expiry timer pointed at a path the install
+    // docs never named at all, while the README installed somewhere else --
+    // is what C3 was. These two literals must stay in lockstep with
+    // CLI_CANDIDATES in crates/porthole-helper/src/main.rs; a change to one
+    // without the other silently reopens the exact bug this test exists to
+    // catch.
+    let installing = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/installing.md"
+    ))
+    .unwrap_or_else(|e| panic!("docs/installing.md: {e}"));
+    for candidate in ["/usr/bin/porthole", "/usr/local/bin/porthole"] {
+        assert!(
+            installing.contains(candidate),
+            "docs/installing.md must document {candidate} as a path the \
+             expiry timer's CLI resolution checks — got no match"
+        );
+    }
+}
+
+#[test]
 fn the_policy_is_well_formed_xml() {
     // A malformed policy is ignored by polkit without complaint, which would
     // silently disable every severity distinction in the project.
