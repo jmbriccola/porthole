@@ -1,8 +1,8 @@
 //! Rendering. Two audiences: a person reading a terminal, and a script reading
 //! `--json`.
 //!
-//! The JSON shape is a public interface and is documented in the README. Add
-//! fields; do not rename or remove them.
+//! The JSON shape is a public interface and is documented in
+//! `docs/json-schema.md`. Add fields; do not rename or remove them.
 
 use porthole_core::engine::Status;
 use porthole_core::error::Error;
@@ -134,11 +134,16 @@ pub fn print_rules(rules: &[ManagedRule], now: u64) {
 }
 
 pub fn print_status(status: &Status, now: u64) {
-    let firewall = match (&status.health.version, status.health.active) {
-        (Some(v), true) => format!("{} {} (running)", status.backend, v),
-        (Some(v), false) => format!("{} {} (NOT running)", status.backend, v),
-        (None, true) => format!("{} (running)", status.backend),
-        (None, false) => format!("{} (NOT running)", status.backend),
+    let firewall = if !status.health.available {
+        // Not "firewalld (NOT running)" — there is no firewalld to run.
+        "none installed".to_string()
+    } else {
+        match (&status.health.version, status.health.active) {
+            (Some(v), true) => format!("{} {} (running)", status.backend, v),
+            (Some(v), false) => format!("{} {} (NOT running)", status.backend, v),
+            (None, true) => format!("{} (running)", status.backend),
+            (None, false) => format!("{} (NOT running)", status.backend),
+        }
     };
     println!("Firewall  {firewall}");
     if let Some(location) = &status.location {
@@ -238,6 +243,35 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("5173/tcp"));
+    }
+
+    #[test]
+    fn json_status_can_report_that_there_is_no_firewall() {
+        // This field was unreachable until `status` learned to answer in its
+        // own shape rather than failing: `detect` errors exactly when the
+        // firewall is absent, so nothing could ever emit `available: false`.
+        use porthole_core::backend::{BackendHealth, BackendId};
+        use porthole_core::engine::Status;
+
+        let status = Status {
+            backend: BackendId::Firewalld,
+            health: BackendHealth {
+                available: false,
+                active: false,
+                version: None,
+                detail: "no supported firewall found".to_string(),
+            },
+            network: None,
+            location: None,
+            rules: Vec::new(),
+        };
+
+        let json = json_status(&status, 1_757_000_000);
+        assert_eq!(json["firewall_available"], false);
+        assert_eq!(json["firewall_active"], false);
+        assert!(json["firewall_version"].is_null());
+        assert!(json["network"].is_null());
+        assert!(json["location"].is_null());
     }
 
     #[test]
