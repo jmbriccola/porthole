@@ -3,7 +3,7 @@
 //! It impersonates firewalld, so `RuleHandle` and `BackendId` — both of which
 //! are serialised into the state file — need no test-only variants.
 
-use super::{BackendHealth, BackendId, FirewallBackend, RuleHandle};
+use super::{BackendHealth, BackendId, FirewallBackend, Ownership, RuleHandle};
 use crate::error::{Error, Result};
 use crate::model::OpenRequest;
 use std::sync::Mutex;
@@ -14,6 +14,7 @@ pub struct FakeBackend {
     health: BackendHealth,
     opened: Mutex<Vec<OpenRequest>>,
     handles: Mutex<Vec<RuleHandle>>,
+    markers: Mutex<Vec<String>>,
 }
 
 impl FakeBackend {
@@ -52,6 +53,7 @@ impl FakeBackend {
             health,
             opened: Mutex::new(Vec::new()),
             handles: Mutex::new(Vec::new()),
+            markers: Mutex::new(Vec::new()),
         }
     }
 
@@ -63,6 +65,12 @@ impl FakeBackend {
     /// Handles that are currently open.
     pub fn handles(&self) -> Vec<RuleHandle> {
         self.handles.lock().expect("not poisoned").clone()
+    }
+
+    /// Every marker passed to `open`, in order. Lets later tasks' tests assert
+    /// the `porthole:<uuid>` marker actually reached the backend.
+    pub fn markers(&self) -> Vec<String> {
+        self.markers.lock().expect("not poisoned").clone()
     }
 }
 
@@ -77,7 +85,7 @@ impl FirewallBackend for FakeBackend {
         BackendId::Firewalld
     }
 
-    fn open(&self, req: &OpenRequest) -> Result<RuleHandle> {
+    fn open(&self, req: &OpenRequest, marker: &str) -> Result<RuleHandle> {
         let handle = RuleHandle::Firewalld {
             zone: FAKE_ZONE.to_string(),
             rich_rule: format!(
@@ -90,6 +98,10 @@ impl FirewallBackend for FakeBackend {
             .lock()
             .expect("not poisoned")
             .push(handle.clone());
+        self.markers
+            .lock()
+            .expect("not poisoned")
+            .push(marker.to_string());
         Ok(handle)
     }
 
@@ -106,8 +118,16 @@ impl FirewallBackend for FakeBackend {
         }
     }
 
-    fn list_managed(&self) -> Result<Vec<RuleHandle>> {
+    fn list_rules(&self) -> Result<Vec<RuleHandle>> {
         Ok(self.handles())
+    }
+
+    fn owned_rules(&self) -> Result<Option<Vec<RuleHandle>>> {
+        Ok(Some(self.handles()))
+    }
+
+    fn ownership(&self) -> Ownership {
+        Ownership::Marked
     }
 
     fn health(&self) -> Result<BackendHealth> {
@@ -139,16 +159,23 @@ mod tests {
     #[test]
     fn open_records_the_request_and_returns_a_handle() {
         let backend = FakeBackend::new();
-        let handle = backend.open(&request(5173)).unwrap();
+        let handle = backend.open(&request(5173), "porthole:test").unwrap();
 
         assert_eq!(backend.opened(), vec![request(5173)]);
         assert_eq!(backend.handles(), vec![handle]);
     }
 
     #[test]
+    fn open_stores_the_marker_it_was_given() {
+        let backend = FakeBackend::new();
+        backend.open(&request(5173), "porthole:abc-123").unwrap();
+        assert_eq!(backend.markers(), vec!["porthole:abc-123".to_string()]);
+    }
+
+    #[test]
     fn close_removes_the_handle() {
         let backend = FakeBackend::new();
-        let handle = backend.open(&request(5173)).unwrap();
+        let handle = backend.open(&request(5173), "porthole:test").unwrap();
         backend.close(&handle).unwrap();
         assert!(backend.handles().is_empty());
     }
@@ -164,11 +191,26 @@ mod tests {
     }
 
     #[test]
-    fn list_managed_returns_open_handles() {
+    fn list_rules_returns_open_handles() {
         let backend = FakeBackend::new();
-        backend.open(&request(5173)).unwrap();
-        backend.open(&request(5174)).unwrap();
-        assert_eq!(backend.list_managed().unwrap().len(), 2);
+        backend.open(&request(5173), "porthole:test").unwrap();
+        backend.open(&request(5174), "porthole:test").unwrap();
+        assert_eq!(backend.list_rules().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn owned_rules_returns_the_same_handles_as_list_rules() {
+        let backend = FakeBackend::new();
+        backend.open(&request(5173), "porthole:test").unwrap();
+        assert_eq!(
+            backend.owned_rules().unwrap().unwrap(),
+            backend.list_rules().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_backend_that_can_prove_ownership_says_so() {
+        assert_eq!(FakeBackend::new().ownership(), Ownership::Marked);
     }
 
     #[test]

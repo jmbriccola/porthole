@@ -153,11 +153,15 @@ impl<'a> Engine<'a> {
             target,
             lifetime,
         };
-        let handle = self.backend.open(&request)?;
+        // Minted before the backend call, not after: the marker written into
+        // the firewall and the id written into the state file must be the
+        // same identity, or reconciliation has nothing to match them by.
+        let id = Uuid::new_v4().to_string();
+        let handle = self.backend.open(&request, &format!("porthole:{id}"))?;
 
         let now = self.clock.now();
         let rule = ManagedRule {
-            id: Uuid::new_v4().to_string(),
+            id,
             port,
             protocol,
             target,

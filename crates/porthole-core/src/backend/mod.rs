@@ -48,7 +48,45 @@ impl std::fmt::Display for BackendId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "backend", rename_all = "snake_case")]
 pub enum RuleHandle {
-    Firewalld { zone: String, rich_rule: String },
+    Firewalld {
+        zone: String,
+        rich_rule: String,
+    },
+    /// ufw deletes by re-stating the rule, not by number: numbers shift
+    /// whenever any other rule is removed, so a stored number is a
+    /// use-after-free waiting to happen. `spec` is the argument list after
+    /// `allow`, e.g. `from 10.10.10.0/24 to any port 5173 proto tcp`.
+    Ufw {
+        spec: String,
+        marker: String,
+    },
+    /// nftables rules live in the user's own enforcing chain — see
+    /// `nftables.rs` for why a table of porthole's own does not work. The
+    /// kernel-assigned handle is deliberately **not** stored: handles are not
+    /// stable across a ruleset flush, so it is re-read from the marker at
+    /// close time.
+    Nftables {
+        family: String,
+        table: String,
+        chain: String,
+        marker: String,
+    },
+}
+
+/// Whether a backend can prove which rules porthole created.
+///
+/// This is not a detail. Reconciliation removes rules the firewall has and
+/// porthole's state does not. On a backend that cannot tell its own rules from
+/// the user's, that sweep deletes the user's firewall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ownership {
+    /// Every rule carries `porthole:<uuid>`. A rule either is porthole's or it
+    /// plainly is not.
+    Marked,
+    /// The backend has nowhere to put a marker. firewalld's rich language has
+    /// no comment element, so a rule porthole wrote is textually identical to
+    /// one the user wrote by hand.
+    Unprovable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,11 +102,38 @@ pub struct BackendHealth {
 
 pub trait FirewallBackend {
     fn id(&self) -> BackendId;
-    fn open(&self, req: &OpenRequest) -> Result<RuleHandle>;
+
+    /// Create the rule.
+    ///
+    /// `marker` is `porthole:<uuid>`, built from the `ManagedRule::id` the
+    /// engine mints before calling in, so a backend never invents identity and
+    /// the marker in the firewall always matches the one in the state file.
+    /// firewalld ignores it — its rich language has nowhere to put it — and
+    /// that asymmetry is exactly what `Ownership` records.
+    fn open(&self, req: &OpenRequest, marker: &str) -> Result<RuleHandle>;
     fn close(&self, handle: &RuleHandle) -> Result<()>;
-    /// Rules this backend can see that porthole may have created. Used by the
-    /// reconciliation pass (milestone 3).
-    fn list_managed(&self) -> Result<Vec<RuleHandle>>;
+
+    /// Every rule visible in the place porthole writes to.
+    ///
+    /// **This is diagnostic information, not evidence of ownership.** On
+    /// firewalld it is every rich rule in the zone, the user's included. Use
+    /// [`FirewallBackend::owned_rules`] when the answer must be "porthole's
+    /// rules".
+    fn list_rules(&self) -> Result<Vec<RuleHandle>>;
+
+    /// The rules porthole can *prove* it created, or `None` when this backend
+    /// cannot prove it.
+    ///
+    /// Returns `None` if and only if [`FirewallBackend::ownership`] is
+    /// [`Ownership::Unprovable`]. Reconciliation's orphan sweep consumes this,
+    /// so on such a backend there is no way to obtain a list to sweep — the
+    /// mistake is unavailable rather than merely discouraged.
+    fn owned_rules(&self) -> Result<Option<Vec<RuleHandle>>>;
+
+    /// The static answer to "can this backend identify its own rules?", for
+    /// messaging that should not pay for a firewall call.
+    fn ownership(&self) -> Ownership;
+
     fn health(&self) -> Result<BackendHealth>;
 
     /// Where this backend keeps porthole's rules — the firewalld zone, the ufw
@@ -97,4 +162,56 @@ pub fn detect<'a>(runner: &'a dyn CommandRunner) -> Result<Box<dyn FirewallBacke
          is reachable.",
         env!("CARGO_PKG_VERSION")
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::firewalld;
+    use super::firewalld::tests::{ROUTE_JSON, SUBNET_RULE, ZONE};
+    use super::{FirewallBackend, Ownership};
+    use crate::command::{Output, RecordingRunner};
+
+    #[test]
+    fn firewalld_cannot_prove_ownership_and_says_so() {
+        // The rich language has no comment element. If this ever changes, the
+        // reconciliation sweep in reconcile.rs becomes available on firewalld —
+        // and that is a deliberate decision, not something to discover by
+        // accident, so it must break a test first.
+        let runner = RecordingRunner::new();
+        assert_eq!(
+            firewalld::Firewalld::new(&runner).ownership(),
+            Ownership::Unprovable
+        );
+    }
+
+    #[test]
+    fn a_backend_that_cannot_prove_ownership_returns_no_owned_rules() {
+        // The two must agree, always. `ownership()` is the cheap static answer
+        // used for messaging; `owned_rules()` is what reconciliation consumes.
+        // If they could drift, a caller could get Some(rules) from a backend that
+        // does not actually know which rules are porthole's — which is precisely
+        // the bug this seam exists to prevent.
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ZONE),
+            Output::stdout(SUBNET_RULE),
+        ]);
+        let backend = firewalld::Firewalld::new(&runner);
+        assert_eq!(backend.ownership(), Ownership::Unprovable);
+        assert!(backend.owned_rules().unwrap().is_none());
+    }
+
+    #[test]
+    fn list_rules_on_firewalld_returns_the_users_rules_too() {
+        // Documents the hazard in an executable place: this list is diagnostic,
+        // not evidence. A user rule porthole never created appears here.
+        const USER_RULE: &str = r#"rule family="ipv4" source address="192.168.0.0/16" port port="22" protocol="tcp" accept"#;
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ZONE),
+            Output::stdout(&format!("{SUBNET_RULE}\n{USER_RULE}")),
+        ]);
+        let rules = firewalld::Firewalld::new(&runner).list_rules().unwrap();
+        assert_eq!(rules.len(), 2, "the user's own rule is in this list");
+    }
 }

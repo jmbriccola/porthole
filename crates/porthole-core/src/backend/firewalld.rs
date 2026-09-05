@@ -19,7 +19,7 @@
 //! would race: firewalld would drop the rule and the later `close` would fail.
 //! Expiry stays uniform across backends, in `crate::expiry`.
 
-use super::{BackendHealth, BackendId, FirewallBackend, RuleHandle};
+use super::{BackendHealth, BackendId, FirewallBackend, Ownership, RuleHandle};
 use crate::command::{Command, CommandRunner, Output};
 use crate::error::{Error, Result};
 use crate::model::{OpenRequest, Target};
@@ -97,7 +97,9 @@ impl FirewallBackend for Firewalld<'_> {
         BackendId::Firewalld
     }
 
-    fn open(&self, req: &OpenRequest) -> Result<RuleHandle> {
+    fn open(&self, req: &OpenRequest, _marker: &str) -> Result<RuleHandle> {
+        // Rich rules have no comment element, so there is nowhere to put the
+        // marker; this is exactly why `ownership()` reports `Unprovable`.
         let zone = self.managed_zone()?;
         let rule = Self::rich_rule(req);
 
@@ -153,8 +155,6 @@ impl FirewallBackend for Firewalld<'_> {
     }
 
     fn close(&self, handle: &RuleHandle) -> Result<()> {
-        // One arm today. Milestones 3 adds Ufw and Nftables, and the compiler
-        // will point here when they do.
         match handle {
             RuleHandle::Firewalld { zone, rich_rule } => {
                 let cmd = Command::mutate(
@@ -175,6 +175,11 @@ impl FirewallBackend for Firewalld<'_> {
                     })
                 }
             }
+            // A caller bug, not a firewall state: the engine only ever hands a
+            // backend the handle it itself produced.
+            other => Err(Error::Unexpected(format!(
+                "firewalld cannot close a handle from another backend: {other:?}"
+            ))),
         }
     }
 
@@ -183,7 +188,7 @@ impl FirewallBackend for Firewalld<'_> {
     /// firewalld gives porthole no way to tell its own rules apart from a
     /// user's, so this returns all of them and the caller intersects with the
     /// state file. See the module docs.
-    fn list_managed(&self) -> Result<Vec<RuleHandle>> {
+    fn list_rules(&self) -> Result<Vec<RuleHandle>> {
         let zone = self.managed_zone()?;
         Ok(self
             .list_rich_rules(&zone)?
@@ -193,6 +198,15 @@ impl FirewallBackend for Firewalld<'_> {
                 rich_rule,
             })
             .collect())
+    }
+
+    fn owned_rules(&self) -> Result<Option<Vec<RuleHandle>>> {
+        // firewalld rich rules carry no marker; see `Ownership::Unprovable`.
+        Ok(None)
+    }
+
+    fn ownership(&self) -> Ownership {
+        Ownership::Unprovable
     }
 
     fn health(&self) -> Result<BackendHealth> {
@@ -246,17 +260,20 @@ fn is_already_absent(out: &Output) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::command::{Effect, Output, RecordingRunner};
     use crate::error::Error;
     use crate::model::{Lifetime, Protocol, Target};
     use std::time::Duration;
 
-    const ROUTE_JSON: &str = r#"[{"dst":"default","dev":"wlo1","metric":600}]"#;
-    const ZONE: &str = "FedoraWorkstation";
+    // Reused by `backend::tests` — the ownership seam's tests need a backend
+    // that has actually gone through a real firewalld exchange, and retyping
+    // these fixtures would risk them drifting apart.
+    pub(crate) const ROUTE_JSON: &str = r#"[{"dst":"default","dev":"wlo1","metric":600}]"#;
+    pub(crate) const ZONE: &str = "FedoraWorkstation";
 
-    const SUBNET_RULE: &str = r#"rule family="ipv4" source address="10.10.10.0/24" port port="5173" protocol="tcp" accept"#;
+    pub(crate) const SUBNET_RULE: &str = r#"rule family="ipv4" source address="10.10.10.0/24" port port="5173" protocol="tcp" accept"#;
     const ANY_RULE: &str = r#"rule family="ipv4" port port="5173" protocol="tcp" accept"#;
 
     fn subnet_request() -> OpenRequest {
@@ -302,7 +319,9 @@ mod tests {
     #[test]
     fn open_adds_the_rule_to_the_zone_of_the_default_route_interface() {
         let runner = RecordingRunner::with_responses(open_script("", SUBNET_RULE));
-        let handle = Firewalld::new(&runner).open(&subnet_request()).unwrap();
+        let handle = Firewalld::new(&runner)
+            .open(&subnet_request(), "porthole:test")
+            .unwrap();
 
         assert_eq!(
             handle,
@@ -340,17 +359,22 @@ mod tests {
         );
 
         let runner = RecordingRunner::with_responses(open_script("", normalised));
-        let handle = Firewalld::new(&runner).open(&subnet_request()).unwrap();
+        let handle = Firewalld::new(&runner)
+            .open(&subnet_request(), "porthole:test")
+            .unwrap();
 
-        match handle {
-            RuleHandle::Firewalld { rich_rule, .. } => assert_eq!(rich_rule, normalised),
-        }
+        let RuleHandle::Firewalld { rich_rule, .. } = handle else {
+            panic!("firewalld always returns a Firewalld handle: {handle:?}");
+        };
+        assert_eq!(rich_rule, normalised);
     }
 
     #[test]
     fn open_never_writes_a_permanent_rule() {
         let runner = RecordingRunner::with_responses(open_script("", SUBNET_RULE));
-        Firewalld::new(&runner).open(&subnet_request()).unwrap();
+        Firewalld::new(&runner)
+            .open(&subnet_request(), "porthole:test")
+            .unwrap();
         for cmd in runner.recorded() {
             assert!(
                 !cmd.args.iter().any(|a| a.contains("--permanent")),
@@ -371,7 +395,9 @@ mod tests {
         let other_rule = r#"rule family="ipv4" port port="9999" protocol="tcp" accept"#;
         let after = format!("{SUBNET_RULE}\n{other_rule}");
         let runner = RecordingRunner::with_responses(open_script("", &after));
-        let handle = Firewalld::new(&runner).open(&subnet_request()).unwrap();
+        let handle = Firewalld::new(&runner)
+            .open(&subnet_request(), "porthole:test")
+            .unwrap();
 
         assert_eq!(
             handle,
@@ -385,7 +411,9 @@ mod tests {
     #[test]
     fn open_reports_already_open_when_no_new_rule_appeared() {
         let runner = RecordingRunner::with_responses(open_script(SUBNET_RULE, SUBNET_RULE));
-        let err = Firewalld::new(&runner).open(&subnet_request()).unwrap_err();
+        let err = Firewalld::new(&runner)
+            .open(&subnet_request(), "porthole:test")
+            .unwrap_err();
         assert!(
             matches!(err, Error::AlreadyOpen { port: 5173, .. }),
             "got: {err}"
@@ -403,7 +431,9 @@ mod tests {
             Output::stdout(""),
         ]);
         let runner = DryRunRunner::new(Box::new(inner));
-        let handle = Firewalld::new(&runner).open(&subnet_request()).unwrap();
+        let handle = Firewalld::new(&runner)
+            .open(&subnet_request(), "porthole:test")
+            .unwrap();
         assert_eq!(
             handle,
             RuleHandle::Firewalld {
@@ -482,13 +512,13 @@ mod tests {
     }
 
     #[test]
-    fn list_managed_returns_every_rich_rule_in_the_zone() {
+    fn list_rules_returns_every_rich_rule_in_the_zone() {
         let runner = RecordingRunner::with_responses(vec![
             Output::stdout(ROUTE_JSON),
             Output::stdout(ZONE),
             Output::stdout(&format!("{SUBNET_RULE}\n{ANY_RULE}")),
         ]);
-        let handles = Firewalld::new(&runner).list_managed().unwrap();
+        let handles = Firewalld::new(&runner).list_rules().unwrap();
         assert_eq!(handles.len(), 2);
         assert_eq!(
             handles[0],
