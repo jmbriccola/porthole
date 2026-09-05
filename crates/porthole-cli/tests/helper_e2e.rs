@@ -333,7 +333,7 @@ fn an_open_reaches_the_firewall_and_changes_nothing_when_refused() {
 }
 
 #[test]
-fn closing_a_seeded_rule_reaches_the_real_backend_and_never_falsely_reports_success() {
+fn closing_a_seeded_phantom_rule_is_pruned_by_reconciliation_not_falsely_reported_open() {
     // I6: the previous version of this test claimed to prove the audit trail
     // names the requesting uid, but called `close 5173` (which fails
     // `RuleNotFound` before `log_close` is ever reached) and `list` (which
@@ -348,64 +348,41 @@ fn closing_a_seeded_rule_reaches_the_real_backend_and_never_falsely_reports_succ
     // this machine's own default zone but a rich rule that was never actually
     // added.
     //
-    // What I investigated and could not get past: `Porthole::close_by_id`
-    // only calls `log_close` *after* `backend.close` returns `Ok`, and on
-    // this machine (and, per the module doc comment above, deliberately on
-    // every machine this suite runs on) an unauthenticated `firewall-cmd
-    // --remove-rich-rule` never returns `Ok` — with no polkit agent
-    // registered to answer firewalld's own internal authorization check for a
-    // config-changing method call, the D-Bus call does not fail fast: it
-    // hangs for firewalld's own ~25s reply timeout and then fails with a
-    // generic "Did not receive a reply", regardless of whether the rule
-    // being removed exists, and regardless of the zone named. So this test
-    // cannot reach `log_close` for real, and does not claim to. What is
-    // proven instead, quickly and without touching any firewall, is the
-    // *format* of the audit line:
+    // Before reconciliation (milestone 3, task 5) existed, that made
+    // `close --id` reach a real, unauthorized `firewall-cmd
+    // --remove-rich-rule` call, which -- with no polkit agent registered to
+    // answer firewalld's own internal authorization check -- hung for
+    // firewalld's own ~25s reply timeout before failing. This test used to
+    // assert exactly that slow failure, and skip itself entirely when run as
+    // root (where the removal would have gone through for real instead).
+    //
+    // Reconciliation changes the outcome, and makes it strictly better:
+    // `Engine::close_by_id` now reconciles state against the firewall first
+    // (see `porthole_core::reconcile`), which lists this machine's real rich
+    // rules -- a read, needing no authorization at all -- and finds that the
+    // seeded rule's rich rule genuinely is not among them. It is dropped
+    // from state as stale *before* `close_by_id`'s own lookup ever runs, so
+    // the close fails fast with "no rule matches" instead of hanging for 25
+    // seconds attempting a removal that could only ever fail. There is no
+    // longer a privileged-vs-unprivileged split to guard against either: the
+    // removal this test used to worry about as root never happens for this
+    // rule now, on any account, because reconciliation prunes it first.
+    //
+    // What this test proves end to end: reconciliation reaches the real
+    // backend (a real `firewall-cmd --list-rich-rules` against this
+    // machine's own zone, not a fake one), correctly decides the seeded rule
+    // is not there, and prunes it -- quickly, and without ever attempting
+    // the doomed removal the old version of this test had to wait out.
+    //
+    // `log_close`'s audit-line format is proven separately and directly:
     // `porthole_helper::service::tests::the_close_line_names_both_uids_when_they_differ`
-    // calls `format_close_log` directly and checks both uids appear in it.
-    //
-    // That is not proof that `log_close` is ever called. `log_close`
-    // (`service.rs:323-325`) is a different function -- it just wraps
-    // `format_close_log`'s output in an `eprintln!` -- and nothing in this
-    // suite calls it. Deleting `log_close` and its three call sites
-    // (`service.rs:183,225,259`) would leave every test green; the only
-    // tripwire is indirect, `format_close_log` becoming dead code and
-    // failing the build under `-D warnings`, not a test asserting the call
-    // happens.
-    //
-    // No test closes that gap because `Porthole::close_by_id`,
-    // `Porthole::close_all` and `Porthole::status` all construct `RealRunner`
-    // and call `backend::detect` internally, with no seam through which a
-    // fake backend could be injected to make a close succeed
-    // deterministically and observe `log_close` actually firing. Adding that
-    // seam is a bigger change than this one.
-    //
-    // What this test does prove end to end: a close that reaches a real,
-    // unauthorized backend fails as a real failure — not a silent or false
-    // success — and the rule stays recorded as open rather than being
-    // dropped from state on a close that never really happened. Since the
-    // underlying D-Bus call is the ~25s timeout described above, this test is
-    // slow by the same amount `an_open_reaches_the_firewall_and_changes_nothing_when_refused`
-    // above already is, for the same underlying reason.
-    //
-    // That reasoning holds only when this test itself is unprivileged: as
-    // root, firewalld would not require an interactive polkit answer for a
-    // local root caller, so the close's `Some(0)` branch below would run for
-    // real — a real `firewall-cmd --remove-rich-rule` against this machine's
-    // default zone. Harmless here since the seeded rule (TEST-NET-3, port
-    // 25198) was never actually added, but it is the same class of test
-    // `an_open_reaches_the_firewall_and_changes_nothing_when_refused` already
-    // guards against, and the inconsistency is what would get copied next
-    // time. `cli.rs` guards its own real-firewall tests the same way.
-    if is_root() {
-        eprintln!("skipped: running as root, where firewalld would not refuse this close");
-        return;
-    }
+    // calls `format_close_log` and checks both uids appear in it. This test
+    // does not reach `log_close` -- reconciliation prunes the rule before
+    // `close_by_id` gets far enough to call it -- and does not claim to.
     let _guard = lock_helper();
     let dir = TempDir::new().unwrap();
     let state = dir.path().join("state.json");
 
-    const OPENER_UID: u32 = 999_999;
     const RULE_ID: &str = "i6-seeded-rule";
     const PORT: u16 = 25198;
     const CIDR: &str = "203.0.113.0/24"; // TEST-NET-3: never a real subnet.
@@ -423,7 +400,7 @@ fn closing_a_seeded_rule_reaches_the_real_backend_and_never_falsely_reports_succ
             "backend": "firewalld",
             "opened_at": 1_757_000_000_u64,
             "expires_at": null,
-            "uid": OPENER_UID,
+            "uid": 999_999,
             "handle": {"backend": "firewalld", "zone": zone, "rich_rule": rich_rule},
         }]
     });
@@ -431,45 +408,32 @@ fn closing_a_seeded_rule_reaches_the_real_backend_and_never_falsely_reports_succ
         .expect("seed the state file");
 
     let mut helper = start_or_skip!(&state);
-
+    let started = std::time::Instant::now();
     let out = cli(&state, &["close", "--id", RULE_ID]);
+    let elapsed = started.elapsed();
 
-    // Stop the helper so its stderr closes, then read what it wrote.
     let _ = helper.0.kill();
     let _ = helper.0.wait();
-    let mut text = String::new();
-    if let Some(mut err) = helper.0.stderr.take() {
-        use std::io::Read;
-        let _ = err.read_to_string(&mut text);
-    }
 
-    if out.status.code() == Some(0) {
-        // Not what this environment does (see above), but if some other
-        // environment's polkit configuration auto-grants this instead of
-        // hanging, the close really did succeed and really did reach
-        // `log_close` — so hold it to the full claim in that case.
-        let closer_uid = unsafe { libc::getuid() };
-        assert!(
-            text.contains(&format!("opened by uid={OPENER_UID}")),
-            "the opener's uid is missing from the close audit line, got: {text}"
-        );
-        assert!(
-            text.contains(&format!("closed by uid={closer_uid}")),
-            "the closer's uid is missing from the close audit line, got: {text}"
-        );
-    } else {
-        // The expected outcome here: a real failure, reported as one.
-        assert_ne!(
-            out.status.code(),
-            Some(7),
-            "the rule was seeded and must be found, not reported as missing; stderr: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let state_text = std::fs::read_to_string(&state).expect("the state file still exists");
-        assert!(
-            state_text.contains(RULE_ID),
-            "a close that failed at the backend must not drop the rule from \
-             state -- that would claim a port is shut when it is not: {state_text}"
-        );
-    }
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "reconciliation must prune the phantom rule before close_by_id's own \
+         lookup runs, so this must report RuleNotFound, not any other \
+         outcome; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "reconciliation only reads the real rich rules, which needs no \
+         authorization; taking anywhere near the old ~25s polkit timeout \
+         would mean it did not prune the rule first, got {elapsed:?}"
+    );
+
+    let state_text = std::fs::read_to_string(&state).expect("the state file still exists");
+    assert!(
+        !state_text.contains(RULE_ID),
+        "the phantom rule must be pruned from state, not left behind claiming \
+         a port is open that never really was: {state_text}"
+    );
 }

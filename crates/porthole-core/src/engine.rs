@@ -17,6 +17,7 @@ use crate::error::{Error, Result};
 use crate::expiry;
 use crate::model::{Lifetime, OpenRequest, Protocol, ScopeSpec, Target};
 use crate::net::{self, LocalNetwork};
+use crate::reconcile;
 use crate::state::{ManagedRule, StateStore};
 use crate::validate;
 use std::path::PathBuf;
@@ -108,13 +109,31 @@ impl<'a> Engine<'a> {
         }
     }
 
-    pub fn rules(&self) -> &[ManagedRule] {
+    /// Reconciles state against the firewall, then returns the (now
+    /// reconciled) rules.
+    pub fn rules(&mut self) -> &[ManagedRule] {
+        self.reconcile();
         self.state.rules()
     }
 
     /// Turn what the user asked for into the network a backend can use.
     pub fn resolve(&self, spec: &ScopeSpec) -> Result<Target> {
         resolve_scope(self.runner, spec)
+    }
+
+    /// Bring the firewall and the state file back into agreement before
+    /// doing anything else.
+    ///
+    /// Runs before every operation, not only once at helper start-up: see
+    /// `reconcile`'s module docs for why. A sweep failure is logged and
+    /// otherwise ignored -- the caller asked to open a port, close one, or
+    /// read the truth about what is open, not to tidy up, and refusing that
+    /// because an unrelated stale rule would not delete is a worse outcome
+    /// than a rule left behind.
+    fn reconcile(&mut self) {
+        if let Err(e) = reconcile::sweep(self.backend, &mut self.state) {
+            eprintln!("porthole: reconciliation failed, continuing anyway: {e}");
+        }
     }
 
     pub fn open(
@@ -125,6 +144,8 @@ impl<'a> Engine<'a> {
         lifetime: Lifetime,
         uid: u32,
     ) -> Result<ManagedRule> {
+        self.reconcile();
+
         let health = self.backend.health()?;
         if !health.active {
             return Err(Error::BackendUnavailable(format!(
@@ -215,6 +236,15 @@ impl<'a> Engine<'a> {
     }
 
     pub fn close_by_id(&mut self, id: &str, from_timer: bool) -> Result<ManagedRule> {
+        self.reconcile();
+        self.close_by_id_unreconciled(id, from_timer)
+    }
+
+    /// [`Engine::close_by_id`] without its own reconciliation pass. Used by
+    /// [`Engine::close_all`], which already reconciled once for the whole
+    /// batch: reconciling again per rule would run the same listing command
+    /// once per rule instead of once per operation.
+    fn close_by_id_unreconciled(&mut self, id: &str, from_timer: bool) -> Result<ManagedRule> {
         let rule = self
             .state
             .find_by_id(id)
@@ -229,6 +259,7 @@ impl<'a> Engine<'a> {
         protocol: Protocol,
         from_timer: bool,
     ) -> Result<ManagedRule> {
+        self.reconcile();
         let rule = self
             .state
             .find_by_port(port, protocol)
@@ -240,11 +271,12 @@ impl<'a> Engine<'a> {
     /// Close everything. Keeps going after a failure: one rule that will not
     /// close must not leave the others open.
     pub fn close_all(&mut self, from_timer: bool) -> (Vec<ManagedRule>, Vec<Error>) {
+        self.reconcile();
         let ids: Vec<String> = self.state.rules().iter().map(|r| r.id.clone()).collect();
         let mut closed = Vec::new();
         let mut errors = Vec::new();
         for id in ids {
-            match self.close_by_id(&id, from_timer) {
+            match self.close_by_id_unreconciled(&id, from_timer) {
                 Ok(rule) => closed.push(rule),
                 Err(e) => errors.push(e),
             }
@@ -276,7 +308,8 @@ impl<'a> Engine<'a> {
         Ok(rule)
     }
 
-    pub fn status(&self) -> Result<Status> {
+    pub fn status(&mut self) -> Result<Status> {
+        self.reconcile();
         Ok(Status {
             backend: self.backend.id(),
             health: self.backend.health()?,
@@ -566,6 +599,55 @@ mod tests {
     }
 
     #[test]
+    fn open_reconciles_before_deciding_the_port_is_already_open() {
+        // What a `firewall-cmd --reload` between two porthole commands looks
+        // like: state still claims 5173 is open, but the firewall dropped it.
+        // Without reconciliation this would wrongly refuse an open that
+        // should succeed.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::with_responses(subnet_open_script());
+        let clock = FixedClock(NOW);
+
+        let mut store = harness.store();
+        store.insert(ManagedRule {
+            id: "ghost".to_string(),
+            port: 5173,
+            protocol: Protocol::Tcp,
+            target: Target::Network {
+                cidr: "10.10.10.0/24".parse().unwrap(),
+            },
+            backend: BackendId::Firewalld,
+            opened_at: NOW,
+            expires_at: None,
+            uid: 1000,
+            handle: RuleHandle::Firewalld {
+                zone: "TestZone".to_string(),
+                rich_rule: "a rule the reload already dropped".to_string(),
+            },
+        });
+
+        let mut engine = make_engine(&backend, &runner, &clock, store);
+        let rule = engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::For(Duration::from_secs(3600)),
+                1000,
+            )
+            .unwrap();
+
+        assert_eq!(rule.port, 5173);
+        assert_eq!(
+            engine.rules().len(),
+            1,
+            "the ghost entry is gone, replaced by the real one"
+        );
+        assert_eq!(engine.rules()[0].id, rule.id);
+    }
+
+    #[test]
     fn close_by_port_removes_the_rule_and_cancels_the_timer() {
         let harness = Harness::new();
         let backend = FakeBackend::new();
@@ -798,9 +880,24 @@ mod tests {
         ]);
         let clock = FixedClock(NOW);
 
-        // A rule the backend has never issued a handle for: closing it fails.
-        // It is inserted first, so close_all meets the failure before the
-        // healthy rule and has to keep going to reach it.
+        // A rule the backend genuinely holds -- unlike a handle it never
+        // issued, which reconciliation's own sweep (now run at the top of
+        // close_all) would quietly clean up before this loop ever saw it --
+        // but whose close is forced to fail, so close_all still has to keep
+        // going to reach the healthy rule after it.
+        let stuck = backend
+            .open(
+                &OpenRequest {
+                    port: 9999,
+                    protocol: Protocol::Tcp,
+                    target: Target::Anywhere,
+                    lifetime: Lifetime::UntilReboot,
+                },
+                "porthole:stuck",
+            )
+            .unwrap();
+        backend.fail_close_for("porthole:stuck");
+
         let mut store = harness.store();
         store.insert(ManagedRule {
             id: "stale".to_string(),
@@ -811,10 +908,7 @@ mod tests {
             opened_at: NOW,
             expires_at: None,
             uid: 1000,
-            handle: RuleHandle::Firewalld {
-                zone: "TestZone".to_string(),
-                rich_rule: "a rule the fake backend never issued".to_string(),
-            },
+            handle: stuck.clone(),
         });
 
         let mut engine = make_engine(&backend, &runner, &clock, store);
@@ -830,15 +924,16 @@ mod tests {
 
         let (closed, errors) = engine.close_all(false);
 
-        assert_eq!(errors.len(), 1, "the stale rule must fail to close");
+        assert_eq!(errors.len(), 1, "the stuck rule must fail to close");
         assert_eq!(closed.len(), 1, "the healthy rule must close regardless");
         assert_eq!(closed[0].port, 5173);
-        assert!(
-            backend.handles().is_empty(),
-            "the healthy rule must be gone from the firewall"
+        assert_eq!(
+            backend.handles(),
+            vec![stuck],
+            "the stuck rule is still in the firewall; only the healthy one closed"
         );
-        // The stale rule stays recorded: porthole could not close it, so it must
-        // not pretend it did.
+        // The stuck rule stays recorded: porthole could not close it, so it
+        // must not pretend it did.
         assert_eq!(engine.rules().len(), 1);
         assert_eq!(engine.rules()[0].id, "stale");
     }
@@ -1011,7 +1106,7 @@ mod tests {
             Output::stdout(ADDR_JSON),
         ]);
         let clock = FixedClock(NOW);
-        let engine = make_engine(&backend, &runner, &clock, harness.store());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
 
         let status = engine.status().unwrap();
         assert!(status.health.active);

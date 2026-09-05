@@ -6,6 +6,7 @@
 use super::{BackendHealth, BackendId, FirewallBackend, Ownership, RuleHandle};
 use crate::error::{Error, Result};
 use crate::model::OpenRequest;
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 pub const FAKE_ZONE: &str = "TestZone";
@@ -15,6 +16,16 @@ pub struct FakeBackend {
     opened: Mutex<Vec<OpenRequest>>,
     handles: Mutex<Vec<RuleHandle>>,
     markers: Mutex<Vec<String>>,
+    /// (handle, marker) for every rule currently open, kept in sync with
+    /// `handles` across a successful `close` -- unlike `markers`, which is a
+    /// deliberate append-only history. `close` needs this to look up which
+    /// marker a handle belongs to, so `fail_close_for` can inject a failure
+    /// by marker rather than by a handle the caller would have to fabricate.
+    live: Mutex<Vec<(RuleHandle, String)>>,
+    /// Markers whose `close` must fail without removing the rule. Set by
+    /// `fail_close_for`, for tests exercising "one stuck rule must not abort
+    /// the rest of a sweep or a `close --all`".
+    fail_close: Mutex<HashSet<String>>,
 }
 
 impl FakeBackend {
@@ -54,6 +65,8 @@ impl FakeBackend {
             opened: Mutex::new(Vec::new()),
             handles: Mutex::new(Vec::new()),
             markers: Mutex::new(Vec::new()),
+            live: Mutex::new(Vec::new()),
+            fail_close: Mutex::new(HashSet::new()),
         }
     }
 
@@ -71,6 +84,18 @@ impl FakeBackend {
     /// the `porthole:<uuid>` marker actually reached the backend.
     pub fn markers(&self) -> Vec<String> {
         self.markers.lock().expect("not poisoned").clone()
+    }
+
+    /// Make the rule opened under `marker` refuse to close, without removing
+    /// it. For reconciliation's tests: one stuck rule must not stop the rest
+    /// of a sweep, and this is how a test proves that without needing a
+    /// handle the backend never issued at all -- `close` already rejects
+    /// that for an unrelated reason.
+    pub fn fail_close_for(&self, marker: &str) {
+        self.fail_close
+            .lock()
+            .expect("not poisoned")
+            .insert(marker.to_string());
     }
 }
 
@@ -102,20 +127,39 @@ impl FirewallBackend for FakeBackend {
             .lock()
             .expect("not poisoned")
             .push(marker.to_string());
+        self.live
+            .lock()
+            .expect("not poisoned")
+            .push((handle.clone(), marker.to_string()));
         Ok(handle)
     }
 
     fn close(&self, handle: &RuleHandle) -> Result<()> {
-        let mut handles = self.handles.lock().expect("not poisoned");
-        match handles.iter().position(|h| h == handle) {
-            Some(index) => {
-                handles.remove(index);
-                Ok(())
-            }
-            None => Err(Error::Unexpected(format!(
+        let mut live = self.live.lock().expect("not poisoned");
+        let Some(index) = live.iter().position(|(h, _)| h == handle) else {
+            return Err(Error::Unexpected(format!(
                 "fake backend has no such rule: {handle:?}"
-            ))),
+            )));
+        };
+        let marker = live[index].1.clone();
+        if self
+            .fail_close
+            .lock()
+            .expect("not poisoned")
+            .contains(&marker)
+        {
+            return Err(Error::Unexpected(format!(
+                "fake backend: close forced to fail for {marker}"
+            )));
         }
+        live.remove(index);
+        drop(live);
+
+        let mut handles = self.handles.lock().expect("not poisoned");
+        if let Some(index) = handles.iter().position(|h| h == handle) {
+            handles.remove(index);
+        }
+        Ok(())
     }
 
     fn list_rules(&self) -> Result<Vec<RuleHandle>> {

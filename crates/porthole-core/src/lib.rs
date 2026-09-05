@@ -21,5 +21,6 @@ pub mod expiry;
 pub mod ipc;
 pub mod model;
 pub mod net;
+pub mod reconcile;
 pub mod state;
 pub mod validate;

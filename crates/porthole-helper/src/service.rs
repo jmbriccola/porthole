@@ -300,8 +300,12 @@ impl Porthole {
 
         let runner = RealRunner;
         let backend = backend::detect(&runner).map_err(HelperError::from)?;
+        // Read-only open: reconciliation may still save a corrected state
+        // file if it finds drift, but that save is best effort here, not
+        // required for status to answer correctly, and status must not
+        // block behind a writer to do it.
         let state = StateStore::open(&self.state_path).map_err(HelperError::from)?;
-        let engine = Engine::new(
+        let mut engine = Engine::new(
             backend.as_ref(),
             &runner,
             &SYSTEM_CLOCK,

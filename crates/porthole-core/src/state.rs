@@ -16,6 +16,7 @@ use std::fs::File;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub const STATE_DIR: &str = "/run/porthole";
 pub const STATE_FILE: &str = "/run/porthole/state.json";
@@ -206,6 +207,19 @@ impl StateStore {
         })?;
         Ok(())
     }
+
+    /// A value that changes if and only if [`StateStore::save`] has actually
+    /// written the file since the last time this was read.
+    ///
+    /// Built from the file's own mtime rather than an added counter: `save`
+    /// already renames a freshly-written file into place, so its mtime is a
+    /// free signal that needs no change to `save` itself. `None` before the
+    /// file has ever been written. Test-only: reconciliation's "nothing
+    /// changed, nothing written" test is the reason this exists.
+    #[cfg(test)]
+    pub fn saved_generation(&self) -> Option<std::time::SystemTime> {
+        fs::metadata(&self.path).and_then(|m| m.modified()).ok()
+    }
 }
 
 fn ensure_dir(dir: &Path) -> Result<()> {
@@ -223,10 +237,32 @@ fn ensure_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// How long [`lock_exclusive`] retries before giving up with [`Error::Busy`].
+///
+/// Bounded on purpose, not merely as a tuning knob: the D-Bus helper serves
+/// every method call from one internal driver thread (zbus runs with default
+/// features, so it is not backed by tokio's worker pool), and a blocked
+/// `flock` there wedges the whole service -- including the call that would
+/// release the lock. An indefinite wait is the failure mode this guards
+/// against; the exact bound only needs to comfortably exceed how long this
+/// codebase's own critical sections take (a handful of backend commands and
+/// a `systemd-run`), which is on the order of tens of milliseconds, not
+/// hundreds.
+const LOCK_TIMEOUT: Duration = Duration::from_millis(500);
+/// How often [`lock_exclusive`] retries within [`LOCK_TIMEOUT`].
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 /// Take an exclusive advisory lock on a sidecar file next to the state.
 ///
 /// A sidecar rather than the state file itself, because `save` replaces the
 /// state file by rename — a lock held on the old inode would protect nothing.
+///
+/// Non-blocking and bounded, not a single blocking `flock(LOCK_EX)`: see
+/// [`LOCK_TIMEOUT`]. Contention is rare enough in practice — today's only
+/// other taker is the expiry timer's own `close`, and reconciliation's sweep
+/// runs inside a lock a caller already holds rather than acquiring its own —
+/// that this is expected to never actually retry; it exists so a helper that
+/// somehow does meet contention degrades to "try again" instead of hanging.
 fn lock_exclusive(path: &Path) -> Result<File> {
     let lock_path = path.with_extension("lock");
     let file = std::fs::OpenOptions::new()
@@ -239,15 +275,29 @@ fn lock_exclusive(path: &Path) -> Result<File> {
             path: lock_path.display().to_string(),
             detail: e.to_string(),
         })?;
-    // SAFETY: flock takes a valid file descriptor and a flag constant. It
-    // cannot touch memory, and the descriptor is owned by `file` above.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(Error::State {
-            path: lock_path.display().to_string(),
-            detail: std::io::Error::last_os_error().to_string(),
-        });
+
+    let deadline = Instant::now() + LOCK_TIMEOUT;
+    loop {
+        // SAFETY: flock takes a valid file descriptor and a flag constant. It
+        // cannot touch memory, and the descriptor is owned by `file` above.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(Error::State {
+                path: lock_path.display().to_string(),
+                detail: err.to_string(),
+            });
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Busy(format!(
+                "{} is held by another porthole process; try again",
+                lock_path.display()
+            )));
+        }
+        std::thread::sleep(LOCK_POLL_INTERVAL);
     }
-    Ok(file)
 }
 
 /// The state path implied by a given `PORTHOLE_STATE_FILE` value.
@@ -489,5 +539,37 @@ mod tests {
             2,
             "neither writer may lose the other's rule"
         );
+    }
+
+    #[test]
+    fn open_exclusive_gives_up_with_busy_rather_than_blocking_forever() {
+        // The whole reason `lock_exclusive` polls instead of taking a single
+        // blocking `flock`: on the D-Bus helper's one driver thread, an
+        // indefinite wait there wedges the entire service, including the
+        // call that would release the lock. This proves the bound is real,
+        // not just documented -- the holder here releases the lock long
+        // after the second attempt must already have given up.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.json");
+
+        let held_path = path.clone();
+        let holder = std::thread::spawn(move || {
+            let _first = StateStore::open_exclusive(&held_path).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            // The lock is released when `_first` is dropped here.
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        let err = StateStore::open_exclusive(&path).unwrap_err();
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(900),
+            "must give up well before the holder releases the lock, got {:?}",
+            started.elapsed()
+        );
+        assert_eq!(err.exit_code(), crate::error::ExitCode::Busy, "got: {err}");
+
+        holder.join().unwrap();
     }
 }

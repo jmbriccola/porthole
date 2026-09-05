@@ -40,8 +40,11 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
             let status = match backend::detect(runner.as_ref()) {
                 Ok(backend) => {
                     // Never for_write: status only ever reads, regardless of
-                    // --dry-run.
-                    let engine = make_engine(backend.as_ref(), runner.as_ref(), false)?;
+                    // --dry-run. `Engine::status` now reconciles first, which
+                    // can save a corrected state file if it finds drift; that
+                    // save is opportunistic here (best effort, no lock held
+                    // for it), never required for status to answer correctly.
+                    let mut engine = make_engine(backend.as_ref(), runner.as_ref(), false)?;
                     engine.status()?
                 }
                 Err(Error::BackendUnavailable(detail)) => Status {

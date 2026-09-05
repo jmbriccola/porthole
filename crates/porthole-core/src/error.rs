@@ -30,6 +30,9 @@ pub enum ExitCode {
     RuleNotFound = 7,
     /// There is no usable network interface to open towards.
     NoNetwork = 8,
+    /// The state lock is held by another porthole process and did not free up
+    /// within a bounded wait. Not a permanent failure: retry.
+    Busy = 9,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -83,6 +86,17 @@ pub enum Error {
     #[error("state file {path}: {detail}")]
     State { path: String, detail: String },
 
+    /// The exclusive state lock could not be acquired within a bounded wait.
+    ///
+    /// Deliberately distinct from [`Error::State`]: the driver thread that
+    /// serves the D-Bus interface must never block on `flock` indefinitely,
+    /// because a blocked handler wedges the whole service, including the
+    /// call that would release the lock (`state::lock_exclusive` bounds the
+    /// wait for exactly this reason). This is the caller's signal to retry,
+    /// not a sign that anything is actually broken.
+    #[error("{0}")]
+    Busy(String),
+
     #[error("{0}")]
     Unexpected(String),
 
@@ -114,6 +128,7 @@ impl Error {
             Error::DeviceUnreachable(_) => ExitCode::DeviceUnreachable,
             Error::RuleNotFound(_) => ExitCode::RuleNotFound,
             Error::NoNetwork(_) => ExitCode::NoNetwork,
+            Error::Busy(_) => ExitCode::Busy,
             Error::Remote { code, .. } => *code,
             Error::CommandFailed { .. }
             | Error::CommandSpawn { .. }
@@ -133,6 +148,7 @@ impl Error {
             Error::DeviceUnreachable(_) => "device_unreachable",
             Error::RuleNotFound(_) => "rule_not_found",
             Error::NoNetwork(_) => "no_network",
+            Error::Busy(_) => "busy",
             Error::Remote { kind, .. } => kind,
             Error::CommandFailed { .. } => "command_failed",
             Error::CommandSpawn { .. } => "command_spawn_failed",
@@ -159,6 +175,7 @@ mod tests {
         assert_eq!(ExitCode::DeviceUnreachable as i32, 6);
         assert_eq!(ExitCode::RuleNotFound as i32, 7);
         assert_eq!(ExitCode::NoNetwork as i32, 8);
+        assert_eq!(ExitCode::Busy as i32, 9);
     }
 
     #[test]
