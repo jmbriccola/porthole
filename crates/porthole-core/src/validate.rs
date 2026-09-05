@@ -37,6 +37,10 @@ pub fn parse_protocol(raw: &str) -> Result<Protocol> {
 
 /// Parse a duration written as an integer plus a `s`, `m` or `h` suffix.
 ///
+/// One value and one unit: `90m`, never `1h30m`. The grammar is deliberately
+/// this small because this runs on the privileged side, where every accepted
+/// input shape is attack surface.
+///
 /// Rejects zero, and rejects anything above [`MAX_DURATION`]. The ceiling is a
 /// product decision, not a limitation: see `MAX_DURATION`.
 pub fn parse_duration(raw: &str) -> Result<Duration> {
@@ -46,47 +50,27 @@ pub fn parse_duration(raw: &str) -> Result<Duration> {
         ))
     };
 
-    let mut total_secs = 0u64;
-    let mut remaining = raw;
+    let (value, unit_secs) = match raw.as_bytes().last() {
+        Some(b's') => (&raw[..raw.len() - 1], 1u64),
+        Some(b'm') => (&raw[..raw.len() - 1], 60),
+        Some(b'h') => (&raw[..raw.len() - 1], 3600),
+        _ => return Err(invalid()),
+    };
 
-    while !remaining.is_empty() {
-        let (value, unit_secs) = match remaining.as_bytes().last() {
-            Some(b's') => (&remaining[..remaining.len() - 1], 1u64),
-            Some(b'm') => (&remaining[..remaining.len() - 1], 60),
-            Some(b'h') => (&remaining[..remaining.len() - 1], 3600),
-            _ => return Err(invalid()),
-        };
-
-        if value.is_empty() {
-            return Err(invalid());
-        }
-
-        // Find where the last number ends (right-to-left from where unit starts)
-        let mut i = value.len();
-        while i > 0 && value.as_bytes()[i - 1].is_ascii_digit() {
-            i -= 1;
-        }
-
-        let (num_str, next_remaining) = (&value[i..], &value[..i]);
-
-        if num_str.is_empty() || !num_str.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(invalid());
-        }
-
-        let amount: u64 = num_str.parse().map_err(|_| invalid())?;
-        let secs = amount.checked_mul(unit_secs).ok_or_else(invalid)?;
-        total_secs = total_secs.checked_add(secs).ok_or_else(invalid)?;
-
-        remaining = next_remaining;
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
     }
 
-    if total_secs == 0 {
+    let amount: u64 = value.parse().map_err(|_| invalid())?;
+    let secs = amount.checked_mul(unit_secs).ok_or_else(invalid)?;
+
+    if secs == 0 {
         return Err(Error::InvalidArgument(
             "a duration of zero would open nothing; use at least 1s".to_string(),
         ));
     }
 
-    let duration = Duration::from_secs(total_secs);
+    let duration = Duration::from_secs(secs);
     if duration > MAX_DURATION {
         return Err(Error::InvalidArgument(format!(
             "{raw} is longer than the 8 hours porthole allows; \
@@ -192,8 +176,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_and_unsuffixed_durations() {
-        for bad in ["0m", "0", "", "h", "1", "1d", "-5m", "1.5h", "1 h"] {
+    fn rejects_zero_unsuffixed_and_compound_durations() {
+        // "8h1s" and "1h30m" are compound durations. porthole takes one value
+        // and one unit: write 90m, not 1h30m. Keeping the grammar this small
+        // matters because this code runs on the privileged side.
+        for bad in [
+            "0m", "0", "", "h", "1", "1d", "-5m", "1.5h", "1 h", "8h1s", "1h30m",
+        ] {
             assert!(
                 parse_duration(bad).is_err(),
                 "expected {bad:?} to be rejected"
@@ -204,7 +193,9 @@ mod tests {
     #[test]
     fn enforces_the_eight_hour_ceiling() {
         assert!(parse_duration("8h").is_ok());
-        let err = parse_duration("8h1s").unwrap_err();
+        // Exactly one second over the ceiling, written with a single unit.
+        // porthole takes one value and one unit — never a compound like "8h1s".
+        let err = parse_duration("28801s").unwrap_err();
         assert!(err.to_string().contains("--until-reboot"), "got: {err}");
         assert!(parse_duration("481m").is_err());
         assert!(parse_duration("24h").is_err());
