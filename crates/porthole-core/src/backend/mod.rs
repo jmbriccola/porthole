@@ -275,18 +275,35 @@ mod tests {
                     check(&ufw::Ufw::new(&RecordingRunner::new()));
                 }
                 super::BackendId::Nftables => {
-                    // A bare `RecordingRunner::new()` answers every read with
-                    // empty stdout, and empty stdout is not valid `nft -j`
-                    // output -- unlike ufw's and firewalld's parsers, this one
-                    // would then error rather than report zero rules. So this
-                    // scripts the smallest *valid* answer instead: an envelope
-                    // with no chain at the input hook, which is a legitimate
-                    // (if unenforced) nftables state, not a parse failure.
-                    const NO_INPUT_CHAIN: &str = r#"{"nftables":[
-                        {"metainfo":{"version":"1.1.3","json_schema_version":1}}
+                    // Two responses, because `owned_rules` reads twice: it
+                    // discovers the single input base chain, then lists that
+                    // chain's rules. A bare `RecordingRunner::new()` will not
+                    // do -- empty stdout is not valid `nft -j` output, and
+                    // unlike ufw's and firewalld's text parsers this one errors
+                    // rather than reporting zero rules.
+                    //
+                    // The fixture deliberately carries one marked rule of the
+                    // shape porthole writes and one unmarked rule, so this arm
+                    // exercises the ownership filter rather than agreeing
+                    // vacuously over an empty list.
+                    const ONE_INPUT_CHAIN: &str = r#"{"nftables":[
+                        {"metainfo":{"version":"1.1.3","json_schema_version":1}},
+                        {"chain":{"family":"inet","table":"filter","name":"input","handle":1,
+                                  "type":"filter","hook":"input","prio":0,"policy":"drop"}}
+                    ]}"#;
+                    const ITS_RULES: &str = r#"{"nftables":[
+                        {"metainfo":{"version":"1.1.3","json_schema_version":1}},
+                        {"rule":{"family":"inet","table":"filter","chain":"input","handle":4,
+                                 "comment":"porthole:a1",
+                                 "expr":[
+                                   {"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":5173}},
+                                   {"accept":null}
+                                 ]}},
+                        {"rule":{"family":"inet","table":"filter","chain":"input","handle":5,
+                                 "expr":[{"drop":null}]}}
                     ]}"#;
                     check(&nftables::Nftables::new(&RecordingRunner::with_responses(
-                        vec![Output::stdout(NO_INPUT_CHAIN)],
+                        vec![Output::stdout(ONE_INPUT_CHAIN), Output::stdout(ITS_RULES)],
                     )));
                 }
             }
