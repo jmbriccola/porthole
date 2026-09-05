@@ -283,9 +283,17 @@ mod tests {
                     // rather than reporting zero rules.
                     //
                     // The fixture deliberately carries one marked rule of the
-                    // shape porthole writes and one unmarked rule, so this arm
-                    // exercises the ownership filter rather than agreeing
-                    // vacuously over an empty list.
+                    // shape porthole writes and one unmarked rule -- a
+                    // realistic ruleset, not an empty one -- so this arm
+                    // proves `owned_rules` actually succeeds and returns
+                    // `Some` for a `Marked` backend, rather than agreeing
+                    // vacuously by erroring or returning an empty list for a
+                    // trivial reason. `check()` only compares
+                    // `owned_rules().is_none()` against `ownership() ==
+                    // Unprovable`; it never inspects the returned Vec, so the
+                    // shape filter itself (a `porthole:` comment alone is not
+                    // enough) is exercised by the dedicated tests in
+                    // `nftables.rs`, not here.
                     const ONE_INPUT_CHAIN: &str = r#"{"nftables":[
                         {"metainfo":{"version":"1.1.3","json_schema_version":1}},
                         {"chain":{"family":"inet","table":"filter","name":"input","handle":1,

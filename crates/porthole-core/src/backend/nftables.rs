@@ -67,9 +67,17 @@ struct ChainJson {
     #[serde(default)]
     hook: Option<String>,
     /// `hook == "input"` alone is not enough: nat has its own `input` hook
-    /// (used for locally-destined DNAT/REDIRECT), and a `type nat hook input`
-    /// chain is a real base chain there that filters nothing. Only a `filter`
-    /// chain at that hook decides whether the packet is delivered at all.
+    /// (used for locally-destined DNAT/REDIRECT), so a `type nat hook input`
+    /// chain is a real base chain there that filters nothing.
+    ///
+    /// `type == "filter"` alone is not enough either. `man nft`: bridge
+    /// family's filter priority applies to all hooks including `input`, and
+    /// arp family "supports only the input and output hooks, both in chains
+    /// of type filter". Both are genuine `type filter hook input` base
+    /// chains and neither has anything to do with whether a routed IPv4
+    /// packet is delivered locally -- see the family check where this field
+    /// is used, which is what actually narrows the candidates down to
+    /// chains porthole's own rule could ever be reached through.
     #[serde(default, rename = "type")]
     kind: Option<String>,
     #[serde(default)]
@@ -103,7 +111,18 @@ fn parse_input_chains(json: &str) -> Result<Vec<InputChain>> {
                 "could not parse a chain in `nft -j list chains` output: {e}"
             ))
         })?;
-        if chain.hook.as_deref() == Some("input") && chain.kind.as_deref() == Some("filter") {
+        // `inet` and `ip` are the only families porthole's own rule can ever
+        // land in -- a `tcp`/`udp dport` plus `ip saddr` match is not a
+        // bridge or arp match. A bridge chain's own `type filter hook input`
+        // (bridge's filter priority applies at every hook, `input` included)
+        // or an arp chain's (arp supports only input/output, both `type
+        // filter`) is real, but filters a different kind of traffic
+        // entirely; counting either as a candidate would turn a normal
+        // machine that happens to have a bridge into a spurious refusal.
+        if chain.hook.as_deref() == Some("input")
+            && chain.kind.as_deref() == Some("filter")
+            && matches!(chain.family.as_str(), "inet" | "ip")
+        {
             chains.push(InputChain {
                 family: chain.family,
                 table: chain.table,
@@ -151,6 +170,30 @@ fn find_rule_handle(json: &str, marker: &str) -> Result<Option<u64>> {
         .map(|rule| rule.handle))
 }
 
+/// Whether a `match` statement's `right` value is one of the two shapes an
+/// `ip saddr` match against a single porthole-written target actually takes
+/// in `nft -j` output. Neither is a bare scalar the way `tcp dport`'s is.
+///
+/// Captured directly from a real `nft -j list chain` (root, in a container),
+/// not composed from the schema documentation -- reasoning about the format
+/// instead of observing it is exactly how the bug this function fixes got
+/// written in the first place:
+///
+/// - a subnet (`ip saddr 10.10.10.0/24`, porthole's default scope) comes
+///   back as an object, `{"prefix": {"addr": "10.10.10.0", "len": 24}}`;
+/// - a single host (`ip saddr 10.10.10.42/32`) comes back as a bare string,
+///   `"10.10.10.42"` -- nft does not distinguish a host address from a `/32`
+///   prefix in its JSON output, so the `/32` is simply gone, and a bare
+///   string here always means one.
+fn is_ip_saddr_shape(right: &serde_json::Value) -> bool {
+    if right.is_string() {
+        return true;
+    }
+    right
+        .get("prefix")
+        .is_some_and(|prefix| prefix.get("addr").is_some() && prefix.get("len").is_some())
+}
+
 /// Whether a rule's expression list is exactly the shape `open_impl` writes:
 /// a single tcp/udp `dport` match, an optional `ip saddr` match, and a
 /// terminal `accept` -- nothing else.
@@ -175,19 +218,25 @@ fn rule_matches_porthole_shape(rule: &RuleJson) -> bool {
             let field = payload
                 .and_then(|p| p.get("field"))
                 .and_then(|v| v.as_str());
-            // A plain scalar right-hand side, not a range or a set -- those
-            // are matches porthole never writes, so they disqualify the rule
-            // from this shape rather than being treated as some other kind
-            // of dport/saddr match.
-            let scalar_right = m
-                .get("right")
-                .is_some_and(|r| r.is_string() || r.is_number());
+            let right = m.get("right");
 
             match (protocol, field) {
-                (Some("tcp") | Some("udp"), Some("dport")) if !has_dport && scalar_right => {
+                // `tcp`/`udp dport` is always a bare port number in `nft -j`
+                // output -- a range or a named set is a different shape
+                // porthole never writes, and disqualifies the rule.
+                (Some("tcp") | Some("udp"), Some("dport"))
+                    if !has_dport && right.is_some_and(|r| r.is_number()) =>
+                {
                     has_dport = true;
                 }
-                (Some("ip"), Some("saddr")) if !has_saddr && scalar_right => {
+                // `ip saddr` is never a bare scalar -- see `is_ip_saddr_shape`
+                // for the two real shapes and why an earlier version of this
+                // function, which required one, rejected every subnet-scoped
+                // rule porthole writes (the default scope, i.e. the common
+                // case).
+                (Some("ip"), Some("saddr"))
+                    if !has_saddr && right.is_some_and(is_ip_saddr_shape) =>
+                {
                     has_saddr = true;
                 }
                 _ => return false,
@@ -201,6 +250,12 @@ fn rule_matches_porthole_shape(rule: &RuleJson) -> bool {
         }
     }
 
+    // No `ip saddr` match at all is a valid shape, not a failed one: it is
+    // exactly what `open_impl` writes for `Target::Anywhere` (confirmed
+    // against the same real `nft -j` capture -- there is no saddr match in
+    // `expr` at all, not an empty or null one), and must not be confused
+    // with the "extra unexpected statement" case above that disqualifies a
+    // rule. `has_saddr` is therefore never checked here.
     has_dport && has_accept
 }
 
@@ -687,6 +742,35 @@ mod tests {
     }
 
     #[test]
+    fn a_bridge_family_filter_chain_at_the_input_hook_is_not_a_candidate() {
+        // `man nft`: bridge family's filter priority applies to all hooks
+        // including `input`, so this is a genuine `type filter hook input`
+        // base chain -- the round-1 `type == "filter"` fix does not exclude
+        // it, unlike the nat case above. It filters bridged traffic, not
+        // whether a routed IPv4 packet is delivered locally; counting it as
+        // a candidate would turn a normal machine that happens to have a
+        // bridge into a spurious refusal. (arp family chains are the same
+        // shape for the same reason -- arp supports only the input/output
+        // hooks, both `type filter` -- and are excluded by the same family
+        // check, so a second fixture for arp would exercise no new code
+        // path.)
+        const CHAINS_WITH_A_BRIDGE_INPUT_CHAIN: &str = r#"{"nftables":[
+          {"metainfo":{"version":"1.1.3","json_schema_version":1}},
+          {"chain":{"family":"inet","table":"filter","name":"input","handle":1,
+                    "type":"filter","hook":"input","prio":0,"policy":"drop"}},
+          {"chain":{"family":"bridge","table":"filter","name":"input","handle":1,
+                    "type":"filter","hook":"input","prio":-200,"policy":"accept"}}
+        ]}"#;
+        let found = parse_input_chains(CHAINS_WITH_A_BRIDGE_INPUT_CHAIN).unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "the bridge chain must not be counted as a candidate: {found:?}"
+        );
+        assert_eq!(found[0].family, "inet");
+    }
+
+    #[test]
     fn open_inserts_into_the_users_chain_not_a_table_of_our_own() {
         // The whole point. `insert` prepends, so the accept precedes any drop
         // already in the chain. `add` would append it after the drop, where it
@@ -973,6 +1057,95 @@ mod tests {
             assert!(!shown.contains(" -f "), "{shown}");
             assert!(!shown.contains('>'), "{shown}");
         }
+    }
+
+    #[test]
+    fn owned_rules_recognises_a_subnet_saddr_match_captured_as_a_nested_prefix_object() {
+        // The `right` value here -- `{"prefix":{"addr":"10.10.10.0","len":24}}`
+        // -- is transcribed verbatim from a real `nft -j list chain`, inserting
+        // exactly the rule `open_impl` emits for a subnet target and dumping
+        // the result, not composed from the schema documentation. A subnet is
+        // porthole's default scope, so this is the common case a rule with a
+        // stray `is_string() || is_number()` check on this field silently
+        // failed to recognise as its own.
+        const CHAIN_WITH_A_SUBNET_SCOPED_RULE: &str = r#"{"nftables":[
+          {"metainfo":{"version":"1.1.3","json_schema_version":1}},
+          {"rule":{"family":"inet","table":"filter","chain":"input","handle":4,
+                   "comment":"porthole:abc",
+                   "expr":[
+                     {"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":5173}},
+                     {"match":{"op":"==","left":{"payload":{"protocol":"ip","field":"saddr"}},"right":{"prefix":{"addr":"10.10.10.0","len":24}}}},
+                     {"accept":null}
+                   ]}}
+        ]}"#;
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(CHAINS_ONE_INPUT),
+            Output::stdout(CHAIN_WITH_A_SUBNET_SCOPED_RULE),
+        ]);
+        let owned = Nftables::new(&runner).owned_rules().unwrap().unwrap();
+        assert_eq!(
+            owned.len(),
+            1,
+            "a subnet-scoped rule -- porthole's default scope -- must be recognised as its own"
+        );
+    }
+
+    #[test]
+    fn owned_rules_recognises_a_host_saddr_match_captured_as_a_bare_string() {
+        // The `right` value here -- the bare string `"10.10.10.42"`, with the
+        // `/32` gone entirely -- is transcribed verbatim from a real `nft -j
+        // list chain` dump of the rule `open_impl` emits for a single-host
+        // target. nft does not distinguish a host address from a /32 prefix
+        // in its JSON output, so a bare string here always means one.
+        const CHAIN_WITH_A_HOST_SCOPED_RULE: &str = r#"{"nftables":[
+          {"metainfo":{"version":"1.1.3","json_schema_version":1}},
+          {"rule":{"family":"inet","table":"filter","chain":"input","handle":4,
+                   "comment":"porthole:abc",
+                   "expr":[
+                     {"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":5173}},
+                     {"match":{"op":"==","left":{"payload":{"protocol":"ip","field":"saddr"}},"right":"10.10.10.42"}},
+                     {"accept":null}
+                   ]}}
+        ]}"#;
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(CHAINS_ONE_INPUT),
+            Output::stdout(CHAIN_WITH_A_HOST_SCOPED_RULE),
+        ]);
+        let owned = Nftables::new(&runner).owned_rules().unwrap().unwrap();
+        assert_eq!(
+            owned.len(),
+            1,
+            "a host-scoped rule (bare-string saddr) must be recognised as its own"
+        );
+    }
+
+    #[test]
+    fn owned_rules_recognises_an_anywhere_rule_with_no_saddr_match_at_all() {
+        // Captured the same way: for `Target::Anywhere`, `open_impl` never
+        // writes an `ip saddr` statement at all, so `expr` holds only the
+        // dport match and the accept. Absence of a saddr match is a valid
+        // shape, not a failed one, and must not be confused with the "extra
+        // unexpected statement" case that disqualifies a rule of some other
+        // shape.
+        const CHAIN_WITH_AN_ANYWHERE_SCOPED_RULE: &str = r#"{"nftables":[
+          {"metainfo":{"version":"1.1.3","json_schema_version":1}},
+          {"rule":{"family":"inet","table":"filter","chain":"input","handle":4,
+                   "comment":"porthole:abc",
+                   "expr":[
+                     {"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":5173}},
+                     {"accept":null}
+                   ]}}
+        ]}"#;
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(CHAINS_ONE_INPUT),
+            Output::stdout(CHAIN_WITH_AN_ANYWHERE_SCOPED_RULE),
+        ]);
+        let owned = Nftables::new(&runner).owned_rules().unwrap().unwrap();
+        assert_eq!(
+            owned.len(),
+            1,
+            "an anywhere-scoped rule (no saddr match at all) must be recognised as its own"
+        );
     }
 
     #[test]
