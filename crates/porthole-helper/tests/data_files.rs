@@ -33,13 +33,17 @@ fn the_severities_are_the_ones_the_spec_chose() {
     // Opening towards the current subnet: authenticate once, then valid for
     // the session. Towards everyone: every single time. Closing and listing:
     // never — closing reduces exposure and must never be discouraged.
+    // Bounded like the others: an unbounded search would pass merely because
+    // `auth_admin_keep` appears somewhere later in the file, which is exactly
+    // the "matches the wrong section" trap this test exists to avoid.
     let open_subnet = policy
         .split(r#"<action id="com.jacopobriccola.Porthole.open-subnet">"#)
         .nth(1)
         .expect("open-subnet is declared");
+    let open_subnet_head = &open_subnet[..open_subnet.len().min(400)];
     assert!(
-        open_subnet.contains("auth_admin_keep"),
-        "got: {open_subnet}"
+        open_subnet_head.contains("auth_admin_keep"),
+        "got: {open_subnet_head}"
     );
 
     let open_any = policy
@@ -72,9 +76,25 @@ fn the_bus_configuration_names_the_service_the_code_owns() {
     let conf = data("com.jacopobriccola.Porthole.conf");
     assert!(conf.contains(porthole_core::ipc::SERVICE), "got: {conf}");
     // Only root may own the name; anyone may talk to it. Authorization is
-    // polkit's job, not the bus's.
-    assert!(conf.contains(r#"<policy user="root">"#), "got: {conf}");
-    assert!(conf.contains("<allow own="), "got: {conf}");
+    // polkit's job, not the bus's — so `close` stays reachable by everyone.
+    //
+    // Confined to the root block: `<allow own=` appearing anywhere in the file
+    // would also satisfy a loose check, including inside a policy that granted
+    // ownership to somebody else.
+    let root_block = conf
+        .split(r#"<policy user="root">"#)
+        .nth(1)
+        .expect("a root policy block")
+        .split("</policy>")
+        .next()
+        .expect("the root block is closed");
+    assert!(
+        root_block.contains(&format!(
+            r#"<allow own="{}"/>"#,
+            porthole_core::ipc::SERVICE
+        )),
+        "only root may own the name, got: {root_block}"
+    );
 }
 
 #[test]

@@ -19,6 +19,17 @@ use std::path::PathBuf;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session = std::env::args().any(|a| a == "--session");
 
+    // Debug builds only. A release helper honouring this would let anyone who
+    // could start it as root serve a privileged interface on a session bus
+    // with no polkit anywhere — contrived, but free to close. Same reasoning
+    // and same guard as PORTHOLE_STATE_FILE in porthole-core::state.
+    if session && !cfg!(debug_assertions) {
+        eprintln!(
+            "porthole-helper: --session exists for tests and is not available in release builds"
+        );
+        std::process::exit(2);
+    }
+
     let (bus, serving) = if session {
         eprintln!("porthole-helper: session bus, authorization disabled — tests only");
         (
