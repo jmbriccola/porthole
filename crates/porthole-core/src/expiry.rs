@@ -38,9 +38,12 @@ pub fn schedule_close(
             format!("--unit={}", unit_name(&rule.id)),
             format!("--on-active={seconds}s"),
             "--timer-property=AccuracySec=1s".to_string(),
+            // The uid goes in the description so `systemctl list-timers` and
+            // `systemctl status` say who asked for the opening, not just which
+            // port is due to close.
             format!(
-                "--description=porthole: close {}/{}",
-                rule.port, rule.protocol
+                "--description=porthole: close {}/{} (uid {})",
+                rule.port, rule.protocol, rule.uid
             ),
             executable.display().to_string(),
             "close".to_string(),
@@ -115,7 +118,7 @@ mod tests {
             "systemd-run --collect \
              --unit=porthole-close-1f0c8b6e-0000-4000-8000-000000000001 \
              --on-active=3600s --timer-property=AccuracySec=1s \
-             '--description=porthole: close 5173/tcp' \
+             '--description=porthole: close 5173/tcp (uid 1000)' \
              /usr/bin/porthole close --id 1f0c8b6e-0000-4000-8000-000000000001 --from-timer"
         );
     }
