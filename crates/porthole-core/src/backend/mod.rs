@@ -148,22 +148,36 @@ pub trait FirewallBackend {
 
 /// Pick a backend: firewalld, then ufw, then nftables.
 ///
-/// Milestone 1 only implements firewalld. A backend that is installed but
-/// stopped is still returned: reporting "installed but not running" is more
-/// useful than reporting "absent", and it is the caller's job to refuse to open
-/// anything in that state.
+/// firewalld and ufw are chosen when **active**; nftables when merely
+/// **present**. That asymmetry is deliberate: installing firewalld or ufw is a
+/// decision about how this machine's firewall is managed, while `nft` exists
+/// on almost every modern Linux and its presence says nothing at all. So nft
+/// is the fallback, never a contender.
+///
+/// A backend that is installed but stopped is still returned. "firewalld is
+/// installed but not running" is a more useful thing to tell someone than "no
+/// firewall found", and refusing to open anything in that state is the
+/// caller's job, not this function's.
 pub fn detect<'a>(runner: &'a dyn CommandRunner) -> Result<Box<dyn FirewallBackend + 'a>> {
     let firewalld = firewalld::Firewalld::new(runner);
     if firewalld.health()?.available {
         return Ok(Box::new(firewalld));
     }
-    Err(Error::BackendUnavailable(format!(
-        "firewalld is not installed. porthole {} manages firewalld only; \
-         support for ufw and nftables is planned. If you use one of those, \
-         porthole cannot see your rules and cannot tell you whether this port \
-         is reachable.",
-        env!("CARGO_PKG_VERSION")
-    )))
+    let ufw = ufw::Ufw::new(runner);
+    if ufw.health()?.available {
+        return Ok(Box::new(ufw));
+    }
+    let nft = nftables::Nftables::new(runner);
+    if nft.health()?.available {
+        return Ok(Box::new(nft));
+    }
+    Err(Error::BackendUnavailable(
+        "no firewall found: none of firewalld, ufw or nftables is installed. \
+         Without a firewall this port is already reachable from your network — \
+         porthole cannot change that, and will not pretend it has. Setting up \
+         a firewall is outside what porthole does."
+            .to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -172,8 +186,9 @@ mod tests {
     use super::firewalld::tests::{ROUTE_JSON, SUBNET_RULE, ZONE};
     use super::nftables;
     use super::ufw;
-    use super::{FirewallBackend, Ownership};
-    use crate::command::{Output, RecordingRunner};
+    use super::{detect, BackendId, FirewallBackend, Ownership};
+    use crate::command::{Command, CommandRunner, Output, RecordingRunner};
+    use crate::error::{Error, ExitCode};
 
     #[test]
     fn firewalld_cannot_prove_ownership_and_says_so() {
@@ -276,5 +291,140 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Delegates every call to an inner [`RecordingRunner`], except for named
+    /// programs, which fail exactly as [`RealRunner`](crate::command::RealRunner)
+    /// would if the binary were not installed at all: a spawn error, not a
+    /// scripted [`Output`].
+    ///
+    /// Every backend's `health()` treats "not installed" as specifically that
+    /// -- see e.g. `Firewalld::health`'s `Err(Error::CommandSpawn { .. })` arm
+    /// -- and a bare `RecordingRunner` can never produce one; it always
+    /// returns `Ok`, even for a scripted [`Output::failure`]. Feeding
+    /// `Output::failure` where a genuine absence is needed is read as
+    /// "installed, but this call failed", which is a different state
+    /// entirely: `Firewalld::health` still reports `available: true` for it,
+    /// because only the `CommandSpawn` early return ever sets `available:
+    /// false`. So simulating "not installed" in a cascade test needs this
+    /// instead.
+    struct AbsentPrograms<'a> {
+        absent: &'a [&'a str],
+        inner: RecordingRunner,
+    }
+
+    impl<'a> AbsentPrograms<'a> {
+        fn new(absent: &'a [&'a str], responses: Vec<Output>) -> Self {
+            Self {
+                absent,
+                inner: RecordingRunner::with_responses(responses),
+            }
+        }
+    }
+
+    impl CommandRunner for AbsentPrograms<'_> {
+        fn run(&self, cmd: &Command) -> crate::error::Result<Output> {
+            if self.absent.contains(&cmd.program.as_str()) {
+                return Err(Error::CommandSpawn {
+                    command: cmd.display(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "no such file or directory",
+                    ),
+                });
+            }
+            self.inner.run(cmd)
+        }
+    }
+
+    #[test]
+    fn firewalld_wins_when_it_is_running() {
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout("2.4.4"),
+            Output::stdout("running"),
+        ]);
+        assert_eq!(detect(&runner).unwrap().id(), BackendId::Firewalld);
+    }
+
+    #[test]
+    fn ufw_is_next_when_firewalld_is_absent() {
+        // `firewall-cmd` is genuinely unreachable, so `Firewalld::health`
+        // takes its `CommandSpawn` early return and never calls the runner
+        // again -- nothing is scripted for it, because nothing is read. That
+        // leaves exactly two responses for ufw's own two-call health check:
+        // its version, then its status.
+        let runner = AbsentPrograms::new(
+            &["firewall-cmd"],
+            vec![
+                Output::stdout("ufw 0.36.2"),
+                Output::stdout("Status: active"),
+            ],
+        );
+        assert_eq!(detect(&runner).unwrap().id(), BackendId::Ufw);
+    }
+
+    #[test]
+    fn nftables_is_last_and_is_chosen_on_presence_not_on_activity() {
+        // firewalld and ufw are policy managers: installing one is a choice.
+        // nft ships on nearly every modern Linux, so its presence says
+        // nothing -- which is exactly why it is the fallback and not a
+        // contender.
+        //
+        // firewalld and ufw are both genuinely absent, so neither one ever
+        // touches the queue below. nftables' health check makes exactly two
+        // calls of its own: its version, then `nft -j list chains`. The
+        // chain listing is scripted empty on purpose -- no chain at the
+        // input hook means nothing is enforcing, so `active` comes back
+        // false -- and nftables is still chosen, because `detect` reads
+        // `available`, never `active`, for this backend. That is the whole
+        // point of this test.
+        let runner = AbsentPrograms::new(
+            &["firewall-cmd", "ufw"],
+            vec![
+                Output::stdout("nftables v1.1.6"),
+                Output::stdout(
+                    r#"{"nftables":[{"metainfo":{"version":"1.1.3","json_schema_version":1}}]}"#,
+                ),
+            ],
+        );
+        assert_eq!(detect(&runner).unwrap().id(), BackendId::Nftables);
+    }
+
+    #[test]
+    fn an_installed_but_stopped_firewalld_still_wins_over_ufw() {
+        // Reporting "firewalld is installed but not running" is more useful
+        // than silently managing a different firewall than the one the
+        // machine chose.
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout("2.4.4"),
+            Output::failure("not running"),
+        ]);
+        let backend = detect(&runner).unwrap();
+        assert_eq!(backend.id(), BackendId::Firewalld);
+    }
+
+    #[test]
+    fn no_firewall_at_all_names_all_three_and_refuses_to_pretend() {
+        // All three are genuinely absent, so each health check takes its own
+        // early `CommandSpawn` return before ever calling the runner a
+        // second time. Nothing is scripted, because nothing is ever read.
+        let runner = AbsentPrograms::new(&["firewall-cmd", "ufw", "nft"], vec![]);
+        // `unwrap_err` needs `T: Debug`, and `Box<dyn FirewallBackend>` isn't
+        // one -- the trait has no reason to require it. `.err().unwrap()`
+        // gets the same error without that bound.
+        let err = detect(&runner).err().unwrap();
+        assert_eq!(err.exit_code(), ExitCode::BackendUnavailable);
+        let text = err.to_string();
+        for name in ["firewalld", "ufw", "nftables"] {
+            assert!(text.contains(name), "must name {name}: {text}");
+        }
+        // The spec forbids porthole installing or enabling a firewall, so the
+        // message has to say the port is already reachable and that setting
+        // one up is not porthole's job. Assert the positive statement rather
+        // than the absence of the word "install" -- the message legitimately
+        // contains it ("is installed"), and a negative assertion on a common
+        // word breaks on the next honest rewording.
+        assert!(text.contains("already reachable"), "{text}");
+        assert!(text.contains("outside what porthole does"), "{text}");
     }
 }

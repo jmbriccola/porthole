@@ -95,6 +95,15 @@ impl Output {
         }
     }
 
+    /// A non-zero result with the given text on stderr. For tests.
+    pub fn failure(text: &str) -> Self {
+        Output {
+            status: 1,
+            stdout: String::new(),
+            stderr: text.to_string(),
+        }
+    }
+
     pub fn success(&self) -> bool {
         self.status == 0
     }
