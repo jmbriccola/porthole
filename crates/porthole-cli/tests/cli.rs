@@ -50,9 +50,25 @@ fn state_path(dir: &TempDir) -> std::path::PathBuf {
 #[test]
 fn help_and_version_work() {
     let dir = TempDir::new().unwrap();
+
+    // clap shows `about` for -h and `long_about` for --help, and they do not
+    // share wording. Both must say what porthole is for rather than just
+    // listing flags, so pin a distinctive phrase from each.
+    let out = porthole(&["-h"], &state_path(&dir));
+    assert_eq!(code(&out), 0);
+    assert!(
+        stdout(&out).contains("temporarily"),
+        "got: {}",
+        stdout(&out)
+    );
+
     let out = porthole(&["--help"], &state_path(&dir));
     assert_eq!(code(&out), 0);
-    assert!(stdout(&out).contains("temporarily"));
+    assert!(
+        stdout(&out).contains("bounded amount of time"),
+        "got: {}",
+        stdout(&out)
+    );
 
     let out = porthole(&["--version"], &state_path(&dir));
     assert_eq!(code(&out), 0);
