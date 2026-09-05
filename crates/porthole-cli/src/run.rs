@@ -8,7 +8,6 @@ use porthole_core::command::{CommandRunner, DryRunRunner, RealRunner};
 use porthole_core::engine::Engine;
 use porthole_core::error::{Error, Result};
 use porthole_core::state::StateStore;
-use std::path::PathBuf;
 
 pub fn run(cli: &Cli) -> Result<()> {
     match &cli.command {
@@ -68,30 +67,3 @@ fn make_engine<'a>(
 }
 
 static SYSTEM_CLOCK: SystemClock = SystemClock;
-
-/// Real firewall changes need root in this milestone. `--dry-run` does not:
-/// seeing what porthole would do is what earns a user's trust, and asking for
-/// a password first defeats that.
-pub fn require_root() -> Result<()> {
-    // SAFETY: geteuid takes no arguments, touches no memory and cannot fail.
-    let euid = unsafe { libc::geteuid() };
-    if euid != 0 {
-        return Err(Error::NotAuthorized(
-            "changing firewall rules needs root in this version — run `sudo porthole …`, \
-             or add --dry-run to see what would happen. The unprivileged helper arrives \
-             in the next release."
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// The uid that asked for this, seen through sudo where possible, so the audit
-/// trail names a person rather than root.
-pub fn requesting_uid() -> u32 {
-    std::env::var("SUDO_UID")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        // SAFETY: getuid takes no arguments, touches no memory and cannot fail.
-        .unwrap_or_else(|| unsafe { libc::getuid() })
-}
