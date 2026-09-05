@@ -2,4 +2,5 @@
 
 pub mod authz;
 pub mod error;
+pub mod polkit;
 pub mod service;
