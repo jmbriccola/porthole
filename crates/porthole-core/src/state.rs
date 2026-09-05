@@ -76,14 +76,7 @@ impl StateStore {
     /// Where the state lives. `PORTHOLE_STATE_FILE` overrides it in debug
     /// builds so integration tests do not need root or a real `/run`.
     pub fn default_path() -> PathBuf {
-        if cfg!(debug_assertions) {
-            if let Ok(path) = std::env::var(STATE_FILE_ENV) {
-                if !path.is_empty() {
-                    return PathBuf::from(path);
-                }
-            }
-        }
-        PathBuf::from(STATE_FILE)
+        state_path_from(std::env::var(STATE_FILE_ENV).ok().as_deref())
     }
 
     /// Load the state, or start empty if the file does not exist yet.
@@ -194,6 +187,24 @@ fn ensure_dir(dir: &Path) -> Result<()> {
         detail: e.to_string(),
     })?;
     Ok(())
+}
+
+/// The state path implied by a given `PORTHOLE_STATE_FILE` value.
+///
+/// Split out from [`StateStore::default_path`] so the decision can be tested
+/// without mutating process-global environment state, which is racy under a
+/// parallel test runner. The override is honoured only in debug builds: a
+/// release binary runs privileged and must never take its state location from
+/// the environment.
+fn state_path_from(override_value: Option<&str>) -> PathBuf {
+    if cfg!(debug_assertions) {
+        if let Some(path) = override_value {
+            if !path.is_empty() {
+                return PathBuf::from(path);
+            }
+        }
+    }
+    PathBuf::from(STATE_FILE)
 }
 
 #[cfg(test)]
@@ -337,6 +348,35 @@ mod tests {
             ..rule("def", 5174)
         };
         assert_eq!(forever.expires_in(1_757_000_000), None);
+    }
+
+    #[test]
+    fn an_unset_or_empty_override_falls_back_to_the_real_path() {
+        assert_eq!(state_path_from(None), PathBuf::from(STATE_FILE));
+        assert_eq!(state_path_from(Some("")), PathBuf::from(STATE_FILE));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_state_path_override_is_honoured_in_debug_builds() {
+        // The end-to-end tests depend on this: without it they would need root
+        // and a real /run to exercise the CLI at all.
+        assert_eq!(
+            state_path_from(Some("/tmp/porthole-test/state.json")),
+            PathBuf::from("/tmp/porthole-test/state.json")
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn the_state_path_override_is_ignored_in_release_builds() {
+        // A release binary runs privileged. It must never take its state
+        // location from the environment, so `cargo test --release` proves the
+        // guard from the other side.
+        assert_eq!(
+            state_path_from(Some("/tmp/somewhere-else/state.json")),
+            PathBuf::from(STATE_FILE)
+        );
     }
 
     #[test]
