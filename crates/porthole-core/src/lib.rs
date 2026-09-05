@@ -17,6 +17,7 @@ pub mod command;
 pub mod engine;
 pub mod error;
 pub mod expiry;
+pub mod ipc;
 pub mod model;
 pub mod net;
 pub mod state;
