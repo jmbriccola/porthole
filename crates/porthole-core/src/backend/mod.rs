@@ -12,6 +12,7 @@
 
 pub mod fake;
 pub mod firewalld;
+pub mod ufw;
 
 use crate::command::CommandRunner;
 use crate::error::{Error, Result};
@@ -168,6 +169,7 @@ pub fn detect<'a>(runner: &'a dyn CommandRunner) -> Result<Box<dyn FirewallBacke
 mod tests {
     use super::firewalld;
     use super::firewalld::tests::{ROUTE_JSON, SUBNET_RULE, ZONE};
+    use super::ufw;
     use super::{FirewallBackend, Ownership};
     use crate::command::{Output, RecordingRunner};
 
@@ -252,10 +254,13 @@ mod tests {
                 super::BackendId::Firewalld => {
                     check(&firewalld::Firewalld::new(&RecordingRunner::new()));
                 }
-                // Tasks 2 and 3 add these backends; fill in a construction
-                // and a `check(&...)` call here when they land, rather than
-                // leaving the arm empty.
-                super::BackendId::Ufw | super::BackendId::Nftables => {}
+                super::BackendId::Ufw => {
+                    check(&ufw::Ufw::new(&RecordingRunner::new()));
+                }
+                // Task 3 adds this backend; fill in a construction and a
+                // `check(&...)` call here when it lands, rather than leaving
+                // the arm empty.
+                super::BackendId::Nftables => {}
             }
         }
     }
