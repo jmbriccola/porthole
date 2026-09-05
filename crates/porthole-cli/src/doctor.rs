@@ -8,10 +8,10 @@
 //! stuck user cannot supply for themselves.
 
 use porthole_core::backend;
+use porthole_core::cli_path;
 use porthole_core::command::RealRunner;
 use porthole_core::ipc::PortholeProxy;
 use porthole_core::net;
-use porthole_core::cli_path;
 use serde_json::{json, Value};
 
 pub struct Check {
@@ -420,9 +420,15 @@ mod tests {
         // way `resolve_cli_for(0)` fails on its own.
         let check = check_expiry_timer(false);
         let expected_ok = cli_path::resolve_cli_for(0).is_ok();
-        assert_eq!(check.ok, expected_ok, "doctor disagreed with resolve_cli_for");
+        assert_eq!(
+            check.ok, expected_ok,
+            "doctor disagreed with resolve_cli_for"
+        );
         if !check.ok {
-            assert!(!check.remedy.is_empty(), "a failing check must say what to do");
+            assert!(
+                !check.remedy.is_empty(),
+                "a failing check must say what to do"
+            );
         }
     }
 

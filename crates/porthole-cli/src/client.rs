@@ -216,10 +216,7 @@ pub fn close_all(session: bool) -> Result<(Vec<ManagedRule>, Vec<Error>)> {
         let p = proxy(session).await?;
         let (closed, errors) = p.close_all().await.map_err(from_dbus)?;
         let rules = closed.iter().map(to_local).collect::<Result<Vec<_>>>()?;
-        Ok((
-            rules,
-            errors.into_iter().map(wire_error_to_local).collect(),
-        ))
+        Ok((rules, errors.into_iter().map(wire_error_to_local).collect()))
     })
 }
 
@@ -407,7 +404,11 @@ mod tests {
         ];
         for (name, local) in cases {
             let reported = from_dbus(method_error(name, "x"));
-            assert_eq!(reported.kind(), local.kind(), "kind slug drifted for {name}");
+            assert_eq!(
+                reported.kind(),
+                local.kind(),
+                "kind slug drifted for {name}"
+            );
             assert_eq!(
                 reported.exit_code(),
                 local.exit_code(),
@@ -432,7 +433,10 @@ mod tests {
         let local = wire_error_to_local(wire);
         assert_eq!(local.kind(), "command_failed");
         assert_eq!(local.exit_code(), ExitCode::Failure);
-        assert_eq!(local.to_string(), "command `firewall-cmd ...` exited with status 1: boom");
+        assert_eq!(
+            local.to_string(),
+            "command `firewall-cmd ...` exited with status 1: boom"
+        );
     }
 
     #[test]

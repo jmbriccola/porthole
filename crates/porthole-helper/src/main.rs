@@ -8,10 +8,10 @@
 //! into serving the real bus without authorization, nor the session bus with
 //! it.
 
+use porthole_core::cli_path;
 use porthole_core::ipc::{PATH, SERVICE};
 use porthole_core::state::StateStore;
 use porthole_helper::authz::{AlwaysAllow, Authorizer};
-use porthole_core::cli_path;
 use porthole_helper::polkit::PolkitAuthorizer;
 use porthole_helper::service::Porthole;
 

@@ -215,9 +215,13 @@ fn the_cli_reaches_the_helper_with_no_sudo_anywhere() {
 
     // list goes over the bus and answers. No sudo, no root, no prompt.
     let out = cli(&state, &["list", "--json"]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    let json: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("one JSON object");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON object");
     assert_eq!(json["rules"].as_array().unwrap().len(), 0);
 }
 
@@ -277,7 +281,12 @@ fn closing_something_that_is_not_open_round_trips_its_exit_code() {
     let out = cli(&state, &["close", "5173"]);
     // 7 is what milestone 1 documented for "no rule matches", and it must be
     // the same whether the CLI did the work or the helper did.
-    assert_eq!(out.status.code(), Some(7), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -315,7 +324,10 @@ fn an_open_reaches_the_firewall_and_changes_nothing_when_refused() {
         "nothing may have been added to the firewall"
     );
     assert!(
-        !state.exists() || std::fs::read_to_string(&state).unwrap().contains(r#""rules": []"#),
+        !state.exists()
+            || std::fs::read_to_string(&state)
+                .unwrap()
+                .contains(r#""rules": []"#),
         "a failed open must leave no rule recorded"
     );
 }
