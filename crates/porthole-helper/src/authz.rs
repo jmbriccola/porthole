@@ -39,8 +39,12 @@ impl Action {
 
 #[async_trait]
 pub trait Authorizer: Send + Sync {
-    /// `sender` is the caller's unique bus name, from the message header.
-    async fn check(&self, action: Action, sender: &str) -> Result<()>;
+    /// `header` is the header of the message making the request. polkit (and
+    /// [`caller_uid`]) resolve an identity from the bus daemon's own record
+    /// of who sent this exact message; there is nothing else here a client
+    /// could claim to be, which is the point of taking the header rather
+    /// than a bus name the caller merely asserts.
+    async fn check(&self, action: Action, header: &zbus::message::Header<'_>) -> Result<()>;
 }
 
 /// Allows everything and remembers what it was asked. Tests only.
@@ -58,26 +62,33 @@ impl AlwaysAllow {
 
 #[async_trait]
 impl Authorizer for AlwaysAllow {
-    async fn check(&self, action: Action, sender: &str) -> Result<()> {
+    async fn check(&self, action: Action, header: &zbus::message::Header<'_>) -> Result<()> {
+        let sender = header.sender().map(|s| s.to_string()).unwrap_or_default();
         self.asked
             .lock()
             .expect("not poisoned")
-            .push((action.id().to_string(), sender.to_string()));
+            .push((action.id().to_string(), sender));
         Ok(())
     }
 }
 
-/// The uid behind a bus name, according to the bus daemon.
+/// The uid behind the sender of a message, according to the bus daemon.
 ///
 /// The helper never takes a client's word for who it is: the audit trail the
 /// spec requires names the *requesting* uid, and a client could claim any.
-pub async fn caller_uid(conn: &zbus::Connection, sender: &str) -> Result<u32> {
+/// Taking the header rather than a bus name string means there is nothing
+/// else here for a caller to have claimed in the first place.
+pub async fn caller_uid(
+    conn: &zbus::Connection,
+    header: &zbus::message::Header<'_>,
+) -> Result<u32> {
+    let sender = header
+        .sender()
+        .ok_or_else(|| Error::Unexpected("the message carried no sender".to_string()))?;
     let dbus = zbus::fdo::DBusProxy::new(conn)
         .await
         .map_err(|e| Error::Unexpected(format!("could not reach the bus daemon: {e}")))?;
-    let name = zbus::names::BusName::try_from(sender.to_string())
-        .map_err(|e| Error::Unexpected(format!("`{sender}` is not a bus name: {e}")))?;
-    dbus.get_connection_unix_user(name)
+    dbus.get_connection_unix_user(sender.clone().into())
         .await
         .map_err(|e| Error::Unexpected(format!("the bus would not name the caller's uid: {e}")))
 }

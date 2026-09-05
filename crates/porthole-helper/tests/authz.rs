@@ -1,8 +1,16 @@
-//! Proves the second D-Bus shape this milestone needs: turning the caller's
-//! bus name — which task 1 proved is available from the message header — into
-//! the uid that every audit line has to carry.
+//! Proves the second D-Bus shape this milestone needs: turning the message
+//! header — which `Authorizer::check` and `caller_uid` now take instead of a
+//! bare sender string, because the bus daemon stamps it and a client cannot
+//! forge it — into the sender bus name and the uid every audit line has to
+//! carry.
+//!
+//! `zbus::message::Header` cannot be built outside the `zbus` crate itself
+//! (its inner `Fields` type is crate-private), so the only way to hand one to
+//! `AlwaysAllow::check` or `caller_uid` from a test is to receive one for
+//! real: serve a tiny probe object on the session bus and call it.
 
 use porthole_helper::authz::{caller_uid, Action, AlwaysAllow, Authorizer};
+use std::sync::Arc;
 
 #[test]
 fn action_ids_match_the_polkit_policy() {
@@ -18,23 +26,93 @@ fn action_ids_match_the_polkit_policy() {
     assert_eq!(Action::List.id(), "com.jacopobriccola.Porthole.list");
 }
 
+/// Hands a real, bus-daemon-stamped header to whichever of `AlwaysAllow` or
+/// `caller_uid` a test wants to exercise.
+struct Probe {
+    conn: zbus::Connection,
+    authorizer: Arc<AlwaysAllow>,
+}
+
+#[zbus::interface(name = "com.jacopobriccola.PortholeTest.Probe1")]
+impl Probe {
+    async fn check_open_any(&self, #[zbus(header)] header: zbus::message::Header<'_>) {
+        self.authorizer
+            .check(Action::OpenAny, &header)
+            .await
+            .expect("AlwaysAllow never refuses");
+    }
+
+    async fn check_close(&self, #[zbus(header)] header: zbus::message::Header<'_>) {
+        self.authorizer
+            .check(Action::Close, &header)
+            .await
+            .expect("AlwaysAllow never refuses");
+    }
+
+    async fn my_uid(&self, #[zbus(header)] header: zbus::message::Header<'_>) -> u32 {
+        caller_uid(&self.conn, &header)
+            .await
+            .expect("the bus knows our uid")
+    }
+}
+
+/// A unique bus name per test, so tests can run in parallel and none of them
+/// ever squats another's.
+async fn serve(suffix: &str, authorizer: Arc<AlwaysAllow>) -> (zbus::Connection, String) {
+    let conn = zbus::Connection::session()
+        .await
+        .expect("a session bus is available");
+    let probe = Probe {
+        conn: conn.clone(),
+        authorizer,
+    };
+    let name = format!("com.jacopobriccola.PortholeTestProbe{suffix}");
+    let server = zbus::connection::Builder::session()
+        .unwrap()
+        .name(name.clone())
+        .unwrap()
+        .serve_at("/com/jacopobriccola/PortholeTest/Probe", probe)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    (server, name)
+}
+
+async fn probe_proxy(name: String) -> zbus::Proxy<'static> {
+    let client = zbus::Connection::session().await.unwrap();
+    zbus::Proxy::new_owned(
+        client,
+        name,
+        "/com/jacopobriccola/PortholeTest/Probe",
+        "com.jacopobriccola.PortholeTest.Probe1",
+    )
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn always_allow_records_what_it_was_asked() {
-    let authorizer = AlwaysAllow::default();
-    authorizer.check(Action::OpenAny, ":1.42").await.unwrap();
-    authorizer.check(Action::Close, ":1.42").await.unwrap();
-    assert_eq!(
-        authorizer.asked(),
-        vec![
-            (
-                "com.jacopobriccola.Porthole.open-any".to_string(),
-                ":1.42".to_string()
-            ),
-            (
-                "com.jacopobriccola.Porthole.close".to_string(),
-                ":1.42".to_string()
-            ),
-        ]
+    let authorizer = Arc::new(AlwaysAllow::default());
+    let (_server, name) = serve("Allow", Arc::clone(&authorizer)).await;
+    let proxy = probe_proxy(name).await;
+
+    proxy.call::<_, _, ()>("CheckOpenAny", &()).await.unwrap();
+    proxy.call::<_, _, ()>("CheckClose", &()).await.unwrap();
+
+    let asked = authorizer.asked();
+    assert_eq!(asked.len(), 2, "both calls must be recorded: {asked:?}");
+    assert_eq!(asked[0].0, Action::OpenAny.id());
+    assert_eq!(asked[1].0, Action::Close.id());
+    // Both calls came from the same client connection, so the sender the
+    // header carried must be the same unique name both times, and it must
+    // actually look like one (`AlwaysAllow` would otherwise silently record
+    // an empty string for a header with no sender).
+    assert_eq!(asked[0].1, asked[1].1);
+    assert!(
+        asked[0].1.starts_with(':'),
+        "expected a unique bus name, got {:?}",
+        asked[0].1
     );
 }
 
@@ -42,16 +120,11 @@ async fn always_allow_records_what_it_was_asked() {
 async fn the_bus_can_tell_us_the_callers_uid() {
     // The audit trail the spec asks for names the requesting uid, and the
     // helper cannot take the client's word for it. It asks the bus daemon
-    // about the sender name instead.
-    let conn = zbus::Connection::session()
-        .await
-        .expect("a session bus is available");
-    let me = conn
-        .unique_name()
-        .expect("we have a unique name")
-        .to_string();
+    // about the sender of the real message it received.
+    let (_server, name) = serve("Uid", Arc::new(AlwaysAllow::default())).await;
+    let proxy = probe_proxy(name).await;
 
-    let uid = caller_uid(&conn, &me).await.expect("the bus knows our uid");
+    let uid: u32 = proxy.call("MyUid", &()).await.unwrap();
 
     // SAFETY: getuid takes no arguments and cannot fail.
     let expected = unsafe { libc::getuid() };

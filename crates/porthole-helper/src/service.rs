@@ -54,13 +54,6 @@ impl Porthole {
             executable,
         }
     }
-
-    fn sender(header: &zbus::message::Header<'_>) -> Result<String, HelperError> {
-        header
-            .sender()
-            .map(|s| s.to_string())
-            .ok_or_else(|| HelperError::Failed("the message carried no sender".to_string()))
-    }
 }
 
 #[zbus::interface(name = "com.jacopobriccola.Porthole1")]
@@ -75,8 +68,6 @@ impl Porthole {
         seconds: u32,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<WireRule, HelperError> {
-        let sender = Self::sender(&header)?;
-
         // 1. Validate. Nothing the client sent is trusted.
         if port == 0 {
             return Err(HelperError::InvalidArgument(
@@ -103,11 +94,11 @@ impl Porthole {
 
         // 3. Authorize.
         self.authorizer
-            .check(action, &sender)
+            .check(action, &header)
             .await
             .map_err(HelperError::from)?;
 
-        let uid = caller_uid(&self.bus, &sender)
+        let uid = caller_uid(&self.bus, &header)
             .await
             .map_err(HelperError::from)?;
 
@@ -146,10 +137,9 @@ impl Porthole {
         protocol: &str,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<WireRule, HelperError> {
-        let sender = Self::sender(&header)?;
         let protocol = validate::parse_protocol(protocol).map_err(HelperError::from)?;
         self.authorizer
-            .check(Action::Close, &sender)
+            .check(Action::Close, &header)
             .await
             .map_err(HelperError::from)?;
 
@@ -175,9 +165,8 @@ impl Porthole {
         id: &str,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<WireRule, HelperError> {
-        let sender = Self::sender(&header)?;
         self.authorizer
-            .check(Action::Close, &sender)
+            .check(Action::Close, &header)
             .await
             .map_err(HelperError::from)?;
 
@@ -202,9 +191,8 @@ impl Porthole {
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<(Vec<WireRule>, Vec<String>), HelperError> {
-        let sender = Self::sender(&header)?;
         self.authorizer
-            .check(Action::Close, &sender)
+            .check(Action::Close, &header)
             .await
             .map_err(HelperError::from)?;
 
@@ -232,9 +220,8 @@ impl Porthole {
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<Vec<WireRule>, HelperError> {
-        let sender = Self::sender(&header)?;
         self.authorizer
-            .check(Action::List, &sender)
+            .check(Action::List, &header)
             .await
             .map_err(HelperError::from)?;
         // Read-only: the plain constructor, so a reader never blocks behind a
@@ -247,9 +234,8 @@ impl Porthole {
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<WireStatus, HelperError> {
-        let sender = Self::sender(&header)?;
         self.authorizer
-            .check(Action::List, &sender)
+            .check(Action::List, &header)
             .await
             .map_err(HelperError::from)?;
 
@@ -281,7 +267,7 @@ impl Porthole {
 // authorizer was asked while the service owns it.
 #[async_trait::async_trait]
 impl Authorizer for std::sync::Arc<crate::authz::AlwaysAllow> {
-    async fn check(&self, action: Action, sender: &str) -> Result<(), Error> {
-        (**self).check(action, sender).await
+    async fn check(&self, action: Action, header: &zbus::message::Header<'_>) -> Result<(), Error> {
+        (**self).check(action, header).await
     }
 }

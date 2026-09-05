@@ -1,10 +1,9 @@
 //! Asking polkit whether the caller may do this.
 //!
 //! polkit is a system service: it tracks names on the **system** bus, and no
-//! polkit exists on a session bus. So a real authorizer here cannot be
-//! exercised end to end without root, which is exactly why
-//! [`crate::authz::Authorizer`] is a trait and why `AlwaysAllow` exists for
-//! tests.
+//! polkit exists on a session bus. So this type cannot be exercised end to
+//! end without root, which is exactly why [`crate::authz::Authorizer`] is a
+//! trait and why `AlwaysAllow` exists for tests.
 //!
 //! The severity difference between the actions is the whole point, and it
 //! lives in the installed policy file rather than here: `open-subnet` is
@@ -13,50 +12,76 @@
 //! because closing reduces exposure and must never be the thing a user cannot
 //! be bothered to do.
 //!
-//! # Blocked: building a `Subject` needs more than a bus name string
+//! # Why the subject is built from the message header, not a pid
 //!
-//! This module was expected to hold `PolkitAuthorizer`, an
-//! [`crate::authz::Authorizer`] that asks
-//! `zbus_polkit::policykit1::AuthorityProxy::check_authorization` about the
-//! caller's system bus name via
-//! `zbus_polkit::policykit1::Subject::new_for_system_bus_name(sender)`.
-//!
-//! That constructor does not exist in `zbus_polkit` 5.1.0. The `Subject`
-//! constructors that do exist are:
-//!
-//! - `Subject::new_for_owner(pid, start_time, uid)` — needs a pid, not a bus
-//!   name.
-//! - `Subject::new_for_message_header(&zbus::message::Header<'_>)` — builds
-//!   the same "system-bus-name" subject kind this module wants, but it needs
-//!   the message header, not the `sender: &str` that
-//!   [`crate::authz::Authorizer::check`] currently takes.
-//!
-//! `sender: &str` was already flagged by task 3's reviewer as a loose
-//! parameter. This confirms it: polkit's own API wants the header instead.
-//! Widening `Authorizer::check` to take `&zbus::message::Header<'_>` is a
-//! deliberate design change to a shared trait, so it is reported rather than
-//! made unilaterally here — see the task report for the two constructors
-//! found and a recommendation. `PolkitAuthorizer` itself is not implemented
-//! pending that decision.
-//!
-//! What follows — the denial mapping every action shares — does not depend
-//! on that decision either way, so it is real and tested now.
+//! [`zbus_polkit::policykit1::Subject`] has no constructor that takes a bare
+//! bus name string. The two that exist are `new_for_owner(pid, start_time,
+//! uid)` and `new_for_message_header(&header)`. A pid-based subject was
+//! rejected: looking up the caller's pid first and checking it second leaves
+//! a window in which the pid could be reused by a different, unrelated
+//! process, so the authorization decision could be made against a process
+//! that never asked for anything. The bus name in the message header is
+//! stamped by the bus daemon itself and cannot be forged by the sender, so
+//! [`Authorizer::check`](crate::authz::Authorizer::check) takes the header
+//! rather than a sender string a caller could otherwise have supplied.
 
-use crate::authz::Action;
-use porthole_core::error::Error;
+use crate::authz::{Action, Authorizer};
+use async_trait::async_trait;
+use porthole_core::error::{Error, Result};
+use std::collections::HashMap;
+use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
 /// The refusal a caller sees. Separate function so the message is identical
 /// whether polkit said no or the subject could not be built.
-///
-/// Not yet called outside tests: the caller that would call it,
-/// `PolkitAuthorizer::check`, is the part blocked above.
-#[allow(dead_code)]
 fn denied(action: Action) -> Error {
     Error::NotAuthorized(format!(
         "polkit refused {}. Opening towards the current subnet asks once per \
          session; opening towards everyone asks every time.",
         action.id()
     ))
+}
+
+pub struct PolkitAuthorizer {
+    authority: AuthorityProxy<'static>,
+}
+
+impl PolkitAuthorizer {
+    pub async fn new(conn: &zbus::Connection) -> Result<Self> {
+        let authority = AuthorityProxy::new(conn)
+            .await
+            .map_err(|e| Error::Unexpected(format!("polkit is not reachable: {e}")))?;
+        Ok(PolkitAuthorizer { authority })
+    }
+}
+
+#[async_trait]
+impl Authorizer for PolkitAuthorizer {
+    async fn check(&self, action: Action, header: &zbus::message::Header<'_>) -> Result<()> {
+        // The subject is the caller's *system bus name*, taken from the
+        // header the bus daemon stamped. polkit resolves it to a process
+        // itself, so nothing the client says about who it is matters.
+        let subject = Subject::new_for_message_header(header).map_err(|_| denied(action))?;
+
+        let result = self
+            .authority
+            .check_authorization(
+                &subject,
+                action.id(),
+                &HashMap::new(),
+                // The user may be asked. That is the point: the whole design
+                // is one authentication instead of a sudo per gesture.
+                CheckAuthorizationFlags::AllowUserInteraction.into(),
+                "",
+            )
+            .await
+            .map_err(|e| Error::Unexpected(format!("polkit would not answer: {e}")))?;
+
+        if result.is_authorized {
+            Ok(())
+        } else {
+            Err(denied(action))
+        }
+    }
 }
 
 #[cfg(test)]
