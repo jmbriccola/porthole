@@ -55,7 +55,7 @@ Distribution packages are not published yet. To build from source you need Rust
 1.85 or newer:
 
 ```bash
-git clone https://github.com/jacopobriccola/porthole
+git clone https://github.com/jmbriccola/porthole
 cd porthole
 cargo build --release
 sudo install -m 0755 target/release/porthole /usr/local/bin/porthole

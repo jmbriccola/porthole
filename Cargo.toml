@@ -7,8 +7,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/jacopobriccola/porthole"
-authors = ["Jacopo Maria Briccola <jacopo@maswitzerland.com>"]
+repository = "https://github.com/jmbriccola/porthole"
+authors = ["Jacopo Maria Briccola <jmbriccola@gmail.com>"]
 description = "Open a port to your local network, temporarily and on purpose."
 
 [workspace.dependencies]
