@@ -45,6 +45,9 @@ pub enum Commands {
     List,
     /// Show the firewall backend, the current network, and what is open.
     Status,
+    /// Diagnose why porthole is not working: firewall, helper, polkit,
+    /// network, Docker, and IPv6.
+    Doctor,
 }
 
 #[derive(Debug, Args)]

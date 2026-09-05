@@ -70,6 +70,20 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
         }
         Commands::Open(args) => open(cli, args),
         Commands::Close(args) => close(cli, args),
+        Commands::Doctor => {
+            let checks = crate::doctor::run(cli.session);
+            if cli.json {
+                println!("{}", crate::doctor::json(&checks));
+            } else {
+                crate::doctor::print_human(&checks);
+            }
+            // 1 when anything needs attention, so a script can gate on it.
+            Ok(if checks.iter().all(|c| c.ok) {
+                ExitCode::Success
+            } else {
+                ExitCode::Failure
+            })
+        }
     }
 }
 

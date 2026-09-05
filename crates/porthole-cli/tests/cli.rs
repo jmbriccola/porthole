@@ -366,3 +366,93 @@ fn from_timer_is_hidden_from_the_help() {
         "an internal flag has no business in the help"
     );
 }
+
+#[test]
+fn doctor_runs_unprivileged_and_says_something_about_every_check() {
+    let dir = TempDir::new().unwrap();
+    let out = porthole(&["doctor"], &state_path(&dir));
+    // 0 when everything passes, 1 when something needs attention. Either is a
+    // successful run of doctor itself.
+    assert!(
+        code(&out) == 0 || code(&out) == 1,
+        "doctor should report, not crash: {} / {}",
+        code(&out),
+        stderr(&out)
+    );
+    let text = stdout(&out);
+    for expected in ["Firewall", "Helper", "polkit", "Network", "Docker", "IPv6"] {
+        assert!(text.contains(expected), "no line about {expected}: {text}");
+    }
+}
+
+#[test]
+fn every_failing_check_says_what_to_do_about_it() {
+    // A diagnostic that reports a problem without a remedy has done half the
+    // job, and it is the half a stuck user cannot supply themselves.
+    let dir = TempDir::new().unwrap();
+    let out = porthole(&["doctor", "--json"], &state_path(&dir));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    assert_eq!(json["schema"], 1);
+    let checks = json["checks"].as_array().expect("a checks array");
+    assert!(!checks.is_empty());
+    for check in checks {
+        assert!(check["name"].is_string(), "got: {check}");
+        assert!(check["ok"].is_boolean(), "got: {check}");
+        assert!(
+            !check["detail"].as_str().unwrap().is_empty(),
+            "got: {check}"
+        );
+        if !check["ok"].as_bool().unwrap() {
+            assert!(
+                !check["remedy"].as_str().unwrap().is_empty(),
+                "a failing check must say what to do: {check}"
+            );
+        }
+    }
+}
+
+#[test]
+fn doctor_notices_docker_on_a_machine_that_has_it() {
+    // This machine runs Docker, and Docker publishes container ports below
+    // the firewall — porthole cannot close what it never opened.
+    if !std::path::Path::new("/sys/class/net/docker0").exists() {
+        eprintln!("skipped: no docker0 on this machine");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let out = porthole(&["doctor", "--json"], &state_path(&dir));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let docker = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "Docker")
+        .expect("a Docker check");
+    assert!(
+        docker["detail"].as_str().unwrap().contains("0.0.0.0")
+            || docker["detail"].as_str().unwrap().contains("publish"),
+        "the Docker check must explain the consequence, got: {docker}"
+    );
+}
+
+#[test]
+fn doctor_says_the_helper_is_missing_when_it_is() {
+    // No helper is running in the test environment, so this check must fail —
+    // and its remedy must name both things that could be missing.
+    let dir = TempDir::new().unwrap();
+    let out = porthole(&["doctor", "--json"], &state_path(&dir));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let helper = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "Helper")
+        .expect("a Helper check");
+    assert_eq!(helper["ok"], false);
+    let remedy = helper["remedy"].as_str().unwrap();
+    assert!(
+        remedy.contains("/usr/libexec/porthole-helper"),
+        "got: {remedy}"
+    );
+    assert!(remedy.contains("dbus"), "got: {remedy}");
+}
