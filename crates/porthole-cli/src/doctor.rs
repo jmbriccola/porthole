@@ -180,18 +180,53 @@ fn check_ipv6(runner: &RealRunner) -> Check {
     }
 }
 
+/// Wrap prose to a readable width.
+///
+/// Counts characters, not bytes: this output contains `·` and `—`, and a
+/// byte-counting wrap would break early on any line holding them.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
 pub fn print_human(checks: &[Check]) {
+    // Align the detail column so the eye can run down it. Names are ASCII.
+    let name_width = checks.iter().map(|c| c.name.len()).max().unwrap_or(0);
+
     for c in checks {
-        println!(
-            "{}  {}  {}",
+        let head = format!(
+            "{}  {:name_width$}  ",
             if c.ok { "ok  " } else { "FAIL" },
             c.name,
-            c.detail
         );
-        if !c.remedy.is_empty() {
-            for line in c.remedy.split_whitespace().collect::<Vec<_>>().chunks(11) {
-                println!("        {}", line.join(" "));
-            }
+        let continuation = " ".repeat(head.chars().count());
+
+        // Details are prose too, and some of them are long — wrap them rather
+        // than emitting a 160-character line nobody will read to the end of.
+        let mut detail = wrap(&c.detail, 72).into_iter();
+        match detail.next() {
+            Some(first) => println!("{head}{first}"),
+            None => println!("{}", head.trim_end()),
+        }
+        for line in detail {
+            println!("{continuation}{line}");
+        }
+
+        for line in wrap(&c.remedy, 68) {
+            println!("        {line}");
         }
     }
 }
