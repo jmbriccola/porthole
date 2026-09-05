@@ -4,6 +4,7 @@
 //! The JSON shape is a public interface and is documented in
 //! `docs/json-schema.md`. Add fields; do not rename or remove them.
 
+use porthole_core::command::Command;
 use porthole_core::engine::Status;
 use porthole_core::error::Error;
 use porthole_core::model::Target;
@@ -131,6 +132,39 @@ pub fn print_rules(rules: &[ManagedRule], now: u64) {
             ])
         );
     }
+}
+
+pub fn json_opened(rule: &ManagedRule, now: u64, dry_run: bool, commands: &[Command]) -> Value {
+    json!({
+        "schema": JSON_SCHEMA,
+        "dry_run": dry_run,
+        "rule": rule_json(rule, now),
+        "commands": commands.iter().map(Command::display).collect::<Vec<_>>(),
+    })
+}
+
+pub fn print_opened(rule: &ManagedRule, now: u64) {
+    println!(
+        "Opened {}/{} towards {} · closes {}",
+        rule.port,
+        rule.protocol,
+        rule.target,
+        format_remaining(rule.expires_in(now))
+    );
+}
+
+pub fn print_dry_run(commands: &[Command]) {
+    println!();
+    if commands.is_empty() {
+        println!("No firewall changes would be made.");
+        return;
+    }
+    println!("Would run:");
+    for command in commands {
+        println!("  {}", command.display());
+    }
+    println!();
+    println!("Nothing was changed.");
 }
 
 pub fn print_status(status: &Status, now: u64) {

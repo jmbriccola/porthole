@@ -17,3 +17,6 @@ porthole-core = { path = "../porthole-core" }
 clap.workspace = true
 libc.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
