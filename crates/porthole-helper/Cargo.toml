@@ -18,12 +18,12 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait.workspace = true
-libc.workspace = true
 porthole-core = { path = "../porthole-core" }
 zbus.workspace = true
 zbus_polkit.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+libc.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

@@ -31,27 +31,52 @@ pub fn schedule_close(
     rule: &ManagedRule,
     seconds: u64,
 ) -> Result<()> {
-    let cmd = Command::mutate(
-        "systemd-run",
-        [
-            "--collect".to_string(),
-            format!("--unit={}", unit_name(&rule.id)),
-            format!("--on-active={seconds}s"),
-            "--timer-property=AccuracySec=1s".to_string(),
-            // The uid goes in the description so `systemctl list-timers` and
-            // `systemctl status` say who asked for the opening, not just which
-            // port is due to close.
-            format!(
-                "--description=porthole: close {}/{} (uid {})",
-                rule.port, rule.protocol, rule.uid
-            ),
-            executable.display().to_string(),
-            "close".to_string(),
-            "--id".to_string(),
-            rule.id.clone(),
-            "--from-timer".to_string(),
-        ],
-    );
+    // SAFETY: geteuid takes no arguments, touches no memory and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    schedule_close_for(euid, runner, executable, rule, seconds)
+}
+
+/// [`schedule_close`], but taking the euid as a parameter instead of calling
+/// `geteuid` itself — the same command, computed for a caller (real or a
+/// test) that already knows or wants to simulate the privilege level in
+/// question. Mirrors `cli_path::resolve_cli_for`.
+fn schedule_close_for(
+    euid: u32,
+    runner: &dyn CommandRunner,
+    executable: &Path,
+    rule: &ManagedRule,
+    seconds: u64,
+) -> Result<()> {
+    let mut args = vec![
+        "--collect".to_string(),
+        format!("--unit={}", unit_name(&rule.id)),
+        format!("--on-active={seconds}s"),
+        "--timer-property=AccuracySec=1s".to_string(),
+        // The uid goes in the description so `systemctl list-timers` and
+        // `systemctl status` say who asked for the opening, not just which
+        // port is due to close.
+        format!(
+            "--description=porthole: close {}/{} (uid {})",
+            rule.port, rule.protocol, rule.uid
+        ),
+    ];
+
+    // A non-root process cannot create a system unit anyway — systemd would
+    // demand `org.freedesktop.systemd1.manage-units`. Asking for a user unit
+    // instead makes the timer run as the same user that scheduled it, which
+    // is what `cli_path`'s privilege reasoning assumes: when nothing here is
+    // root, the binary the timer runs is not a root-execution target.
+    if euid != 0 {
+        args.push("--user".to_string());
+    }
+
+    args.push(executable.display().to_string());
+    args.push("close".to_string());
+    args.push("--id".to_string());
+    args.push(rule.id.clone());
+    args.push("--from-timer".to_string());
+
+    let cmd = Command::mutate("systemd-run", args);
     runner.run(&cmd)?.into_ok(&cmd)?;
     Ok(())
 }
@@ -106,9 +131,18 @@ mod tests {
     }
 
     #[test]
-    fn schedule_close_builds_the_expected_systemd_run_invocation() {
+    fn schedule_close_as_root_builds_a_system_unit_invocation() {
+        // Root can create a system unit, and the timer will run as root, so
+        // no `--user` is asked for.
         let runner = RecordingRunner::new();
-        schedule_close(&runner, &PathBuf::from("/usr/bin/porthole"), &rule(), 3600).unwrap();
+        schedule_close_for(
+            0,
+            &runner,
+            &PathBuf::from("/usr/bin/porthole"),
+            &rule(),
+            3600,
+        )
+        .unwrap();
 
         let commands = runner.recorded();
         assert_eq!(commands.len(), 1);
@@ -119,6 +153,35 @@ mod tests {
              --unit=porthole-close-1f0c8b6e-0000-4000-8000-000000000001 \
              --on-active=3600s --timer-property=AccuracySec=1s \
              '--description=porthole: close 5173/tcp (uid 1000)' \
+             /usr/bin/porthole close --id 1f0c8b6e-0000-4000-8000-000000000001 --from-timer"
+        );
+    }
+
+    #[test]
+    fn schedule_close_as_non_root_asks_for_a_user_unit() {
+        // A non-root caller cannot create a system unit -- systemd would
+        // demand `org.freedesktop.systemd1.manage-units` -- so `--user` must
+        // be requested instead, which makes the timer run as this same
+        // unprivileged user.
+        let runner = RecordingRunner::new();
+        schedule_close_for(
+            1000,
+            &runner,
+            &PathBuf::from("/usr/bin/porthole"),
+            &rule(),
+            3600,
+        )
+        .unwrap();
+
+        let commands = runner.recorded();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].effect, Effect::Mutate);
+        assert_eq!(
+            commands[0].display(),
+            "systemd-run --collect \
+             --unit=porthole-close-1f0c8b6e-0000-4000-8000-000000000001 \
+             --on-active=3600s --timer-property=AccuracySec=1s \
+             '--description=porthole: close 5173/tcp (uid 1000)' --user \
              /usr/bin/porthole close --id 1f0c8b6e-0000-4000-8000-000000000001 --from-timer"
         );
     }

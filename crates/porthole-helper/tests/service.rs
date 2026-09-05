@@ -96,11 +96,23 @@ async fn opening_towards_everyone_asks_for_the_stronger_action() {
     // first, which happens before any firewall call.
     let _ = proxy.open(15173, "tcp", "0.0.0.0/0", 60).await;
 
+    // I4's classifier (`is_open_any`) also treats a half of the address space
+    // as open-any — 0.0.0.0/1 and 128.0.0.0/1 together are total exposure,
+    // and neither one is literally 0.0.0.0/0 — and that half is covered by a
+    // unit test on the classifier directly (`engine.rs`'s
+    // `splitting_the_whole_address_space_in_half_does_not_hide_it_from_open_any`).
+    // Nothing exercised it through the service, which is where the action is
+    // actually chosen, until this call.
+    let _ = proxy.open(25173, "tcp", "0.0.0.0/1", 60).await;
+
     let asked: Vec<String> = authz.asked().into_iter().map(|(a, _)| a).collect();
     assert_eq!(
         asked,
-        vec![Action::OpenAny.id().to_string()],
-        "a /0 must take the same action as `any`"
+        vec![
+            Action::OpenAny.id().to_string(),
+            Action::OpenAny.id().to_string(),
+        ],
+        "both a /0 and a /1 must take the same action as `any`"
     );
 }
 

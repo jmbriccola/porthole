@@ -25,11 +25,15 @@ pub const CLI_CANDIDATES: [&str; 2] = ["/usr/bin/porthole", "/usr/local/bin/port
 /// file owned by uid 0 and not group- or world-writable, or an attacker who
 /// can write it gets root through a mechanism the user never sees.
 ///
-/// When the helper is *not* root, the timer runs as the same unprivileged user
-/// and there is nothing for that check to protect — so it does not apply, and
-/// the CLI built alongside this helper is a legitimate candidate. This is what
-/// lets the end-to-end tests drive a real helper without installing anything,
-/// and it is a statement about privilege, not a concession to the tests.
+/// When the helper is *not* root, `expiry::schedule_close` asks `systemd-run`
+/// for a *user* unit rather than a system one — a non-root process could not
+/// create a system unit anyway, since systemd would demand
+/// `org.freedesktop.systemd1.manage-units` for that. So the timer runs as that
+/// same unprivileged user, and there is nothing for the ownership check above
+/// to protect: it does not apply, and the CLI built alongside this helper is a
+/// legitimate candidate. This is what lets the end-to-end tests drive a real
+/// helper without installing anything, and it is a statement about privilege,
+/// not a concession to the tests.
 pub fn resolve_cli() -> Result<PathBuf, String> {
     // SAFETY: geteuid takes no arguments, touches no memory and cannot fail.
     let euid = unsafe { libc::geteuid() };

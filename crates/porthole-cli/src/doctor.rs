@@ -228,6 +228,16 @@ fn check_expiry_timer(session: bool) -> Check {
     } else {
         0
     };
+    // `resolve_cli_for`'s rules can never drift from what the real helper
+    // applies -- both read this doctor process's own `CLI_CANDIDATES` -- but
+    // in the unprivileged (`session`) branch, the *sibling* candidate it adds
+    // is derived from `std::env::current_exe()` of whichever process calls
+    // it: here, this `porthole` binary's own directory, not the session
+    // helper's. They agree in the test layout only because `cargo
+    // build`/`cargo test` put both binaries in the same `target/debug`, not
+    // because anything guarantees it -- a `porthole` installed somewhere
+    // other than alongside the `--session` helper it is diagnosing would get
+    // a verdict that disagrees with what that helper actually resolves.
     match cli_path::resolve_cli_for(euid) {
         Ok(path) => Check::good(
             "Expiry timer",

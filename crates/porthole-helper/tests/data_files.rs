@@ -2,6 +2,7 @@
 //! A typo in an action id disables a severity distinction silently: polkit
 //! falls back to its default and nothing errors.
 
+use porthole_core::cli_path::CLI_CANDIDATES;
 use porthole_helper::authz::Action;
 
 fn data(name: &str) -> String {
@@ -165,16 +166,17 @@ fn the_cli_path_the_helper_resolves_is_documented() {
     // Coupling code to documentation is an unusual thing for a test to do,
     // but this exact drift -- the expiry timer pointed at a path the install
     // docs never named at all, while the README installed somewhere else --
-    // is what C3 was. These two literals must stay in lockstep with
-    // CLI_CANDIDATES in crates/porthole-helper/src/main.rs; a change to one
-    // without the other silently reopens the exact bug this test exists to
-    // catch.
+    // is what C3 was. Importing CLI_CANDIDATES (in
+    // crates/porthole-core/src/cli_path.rs) rather than repeating its two
+    // literals here means a change to one automatically reopens the exact bug
+    // this test exists to catch, instead of quietly checking stale literals
+    // forever.
     let installing = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../docs/installing.md"
     ))
     .unwrap_or_else(|e| panic!("docs/installing.md: {e}"));
-    for candidate in ["/usr/bin/porthole", "/usr/local/bin/porthole"] {
+    for candidate in CLI_CANDIDATES {
         assert!(
             installing.contains(candidate),
             "docs/installing.md must document {candidate} as a path the \

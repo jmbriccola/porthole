@@ -346,12 +346,27 @@ fn closing_a_seeded_rule_reaches_the_real_backend_and_never_falsely_reports_succ
     // hangs for firewalld's own ~25s reply timeout and then fails with a
     // generic "Did not receive a reply", regardless of whether the rule
     // being removed exists, and regardless of the zone named. So this test
-    // cannot reach `log_close` for real, and does not claim to. The claim
-    // that the audit line names both uids is proven instead, quickly and
-    // without touching any firewall, by
-    // `porthole_helper::service::tests::the_close_line_names_both_uids_when_they_differ`,
-    // which is what would actually fail if every line of `log_close` were
-    // deleted.
+    // cannot reach `log_close` for real, and does not claim to. What is
+    // proven instead, quickly and without touching any firewall, is the
+    // *format* of the audit line:
+    // `porthole_helper::service::tests::the_close_line_names_both_uids_when_they_differ`
+    // calls `format_close_log` directly and checks both uids appear in it.
+    //
+    // That is not proof that `log_close` is ever called. `log_close`
+    // (`service.rs:323-325`) is a different function -- it just wraps
+    // `format_close_log`'s output in an `eprintln!` -- and nothing in this
+    // suite calls it. Deleting `log_close` and its three call sites
+    // (`service.rs:183,225,259`) would leave every test green; the only
+    // tripwire is indirect, `format_close_log` becoming dead code and
+    // failing the build under `-D warnings`, not a test asserting the call
+    // happens.
+    //
+    // No test closes that gap because `Porthole::close_by_id`,
+    // `Porthole::close_all` and `Porthole::status` all construct `RealRunner`
+    // and call `backend::detect` internally, with no seam through which a
+    // fake backend could be injected to make a close succeed
+    // deterministically and observe `log_close` actually firing. Adding that
+    // seam is a bigger change than this one.
     //
     // What this test does prove end to end: a close that reaches a real,
     // unauthorized backend fails as a real failure — not a silent or false
@@ -360,6 +375,20 @@ fn closing_a_seeded_rule_reaches_the_real_backend_and_never_falsely_reports_succ
     // underlying D-Bus call is the ~25s timeout described above, this test is
     // slow by the same amount `an_open_reaches_the_firewall_and_changes_nothing_when_refused`
     // above already is, for the same underlying reason.
+    //
+    // That reasoning holds only when this test itself is unprivileged: as
+    // root, firewalld would not require an interactive polkit answer for a
+    // local root caller, so the close's `Some(0)` branch below would run for
+    // real — a real `firewall-cmd --remove-rich-rule` against this machine's
+    // default zone. Harmless here since the seeded rule (TEST-NET-3, port
+    // 25198) was never actually added, but it is the same class of test
+    // `an_open_reaches_the_firewall_and_changes_nothing_when_refused` already
+    // guards against, and the inconsistency is what would get copied next
+    // time. `cli.rs` guards its own real-firewall tests the same way.
+    if is_root() {
+        eprintln!("skipped: running as root, where firewalld would not refuse this close");
+        return;
+    }
     let _guard = lock_helper();
     let dir = TempDir::new().unwrap();
     let state = dir.path().join("state.json");

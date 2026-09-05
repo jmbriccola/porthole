@@ -107,10 +107,10 @@ failure's code.
 ```
 
 One object per check, always in the same order — the order a failure cascades
-in: `Firewall`, `Helper`, `polkit`, `State`, `Network`, `Docker`, `IPv6`.
-`remedy` is `""` when there is nothing to do. The process exits `1` if any
-check's `ok` is `false`, `0` if every check passed — a script can gate on the
-exit code without parsing the JSON at all.
+in: `Firewall`, `Helper`, `Expiry timer`, `polkit`, `State`, `Network`, `Docker`,
+`IPv6`. `remedy` is `""` when there is nothing to do. The process exits `1` if
+any check's `ok` is `false`, `0` if every check passed — a script can gate on
+the exit code without parsing the JSON at all.
 
 ## Errors
 
@@ -130,4 +130,8 @@ This shape is identical whether `open` or `close` did the work locally
 sends back the same `code` and the same `kind` slug milestone 1 defined, and
 the CLI reports them verbatim rather than re-deriving them. A script reading
 `--json` output cannot tell, and does not need to, whether the work happened
-in-process or across the bus.
+in-process or across the bus — with two exceptions: `command_spawn_failed`
+and `io_error` are distinct kinds locally, but both collapse into the same
+`unexpected` kind once they cross the bus, since the helper's own error type
+has no request-specific meaning worth distinguishing on the wire for either
+one.

@@ -379,10 +379,33 @@ fn doctor_runs_unprivileged_and_says_something_about_every_check() {
         code(&out),
         stderr(&out)
     );
-    let text = stdout(&out);
-    for expected in ["Firewall", "Helper", "polkit", "Network", "Docker", "IPv6"] {
-        assert!(text.contains(expected), "no line about {expected}: {text}");
-    }
+    let json = porthole(&["doctor", "--json"], &state_path(&dir));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&json)).expect("valid JSON");
+    let names: Vec<&str> = json["checks"]
+        .as_array()
+        .expect("a checks array")
+        .iter()
+        .map(|c| c["name"].as_str().expect("a name"))
+        .collect();
+    // The full ordered list, not just containment: docs/json-schema.md
+    // documents this exact order, and a check inserted anywhere but the end
+    // (as `Expiry timer` was) must fail this test until the doc is updated
+    // too, rather than passing silently because every name still appears
+    // somewhere.
+    assert_eq!(
+        names,
+        vec![
+            "Firewall",
+            "Helper",
+            "Expiry timer",
+            "polkit",
+            "State",
+            "Network",
+            "Docker",
+            "IPv6",
+        ],
+        "doctor's check order drifted from what docs/json-schema.md promises"
+    );
 }
 
 #[test]
