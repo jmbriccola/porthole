@@ -605,6 +605,7 @@ dependencies = [
  "async-trait",
  "libc",
  "porthole-core",
+ "tempfile",
  "tokio",
  "zbus",
 ]

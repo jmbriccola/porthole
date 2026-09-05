@@ -22,6 +22,32 @@ use crate::validate;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+/// Turn what the caller asked for into the network a backend can use.
+///
+/// A free function because the privileged helper needs to resolve a scope —
+/// and decide which polkit action applies — *before* it takes the state lock.
+/// A polkit check can block for as long as a human takes to type a password,
+/// and holding an advisory lock across that would stall every other writer.
+pub fn resolve_scope(runner: &dyn CommandRunner, spec: &ScopeSpec) -> Result<Target> {
+    Ok(match spec {
+        ScopeSpec::CurrentSubnet => Target::Network {
+            cidr: net::current_network(runner)?.cidr,
+        },
+        ScopeSpec::Anywhere => Target::Anywhere,
+        ScopeSpec::Network(cidr) => {
+            // A /0 is everyone, however it was spelled.
+            if cidr.prefix_len() == 0 {
+                Target::Anywhere
+            } else {
+                Target::Network { cidr: *cidr }
+            }
+        }
+        ScopeSpec::Host(addr) => Target::Network {
+            cidr: validate::host_to_network(*addr),
+        },
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct Status {
     pub backend: BackendId,
@@ -65,26 +91,7 @@ impl<'a> Engine<'a> {
 
     /// Turn what the user asked for into the network a backend can use.
     pub fn resolve(&self, spec: &ScopeSpec) -> Result<Target> {
-        Ok(match spec {
-            ScopeSpec::CurrentSubnet => Target::Network {
-                cidr: net::current_network(self.runner)?.cidr,
-            },
-            ScopeSpec::Anywhere => Target::Anywhere,
-            ScopeSpec::Network(cidr) => {
-                // A /0 is everyone, however it was spelled. Classify it as such:
-                // milestone 2 gives "open to anywhere" a stronger polkit action
-                // than "open to a subnet", and `--to 0.0.0.0/0` must not take
-                // the weaker path.
-                if cidr.prefix_len() == 0 {
-                    Target::Anywhere
-                } else {
-                    Target::Network { cidr: *cidr }
-                }
-            }
-            ScopeSpec::Host(addr) => Target::Network {
-                cidr: validate::host_to_network(*addr),
-            },
-        })
+        resolve_scope(self.runner, spec)
     }
 
     pub fn open(
