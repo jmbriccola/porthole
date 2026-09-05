@@ -381,6 +381,34 @@ mod tests {
     }
 
     #[test]
+    fn open_writes_the_same_id_into_the_marker_and_the_state() {
+        // The marker handed to the backend and the id written into the state
+        // file must be one identity, or reconciliation has nothing to match
+        // them by. Asserted against the returned rule's own id, not a
+        // hardcoded uuid: a second `Uuid::new_v4()` reintroduced by a future
+        // refactor would desync the two silently, and only comparing against
+        // `rule.id` is guaranteed to catch that rather than pass by
+        // coincidence.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::with_responses(subnet_open_script());
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let rule = engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::For(Duration::from_secs(3600)),
+                1000,
+            )
+            .unwrap();
+
+        assert_eq!(backend.markers(), vec![format!("porthole:{}", rule.id)]);
+    }
+
+    #[test]
     fn open_schedules_a_close_timer() {
         let harness = Harness::new();
         let backend = FakeBackend::new();

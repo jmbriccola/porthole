@@ -41,10 +41,10 @@ impl std::fmt::Display for BackendId {
 /// Serialised into `/run/porthole/state.json`, so changing a variant's shape is
 /// a state-file format change.
 ///
-/// Note on markers: ufw and nftables rules will carry a `porthole:<uuid>`
-/// comment (milestone 3). firewalld rich rules cannot — the rich language has
-/// no comment element — so for firewalld the stored `rich_rule` string, exactly
-/// as firewalld normalised it, *is* the identity.
+/// Note on markers: ufw and nftables rules carry a `porthole:<uuid>` comment
+/// (the `marker` field below). firewalld rich rules cannot — the rich
+/// language has no comment element — so for firewalld the stored `rich_rule`
+/// string, exactly as firewalld normalised it, *is* the identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "backend", rename_all = "snake_case")]
 pub enum RuleHandle {
@@ -205,7 +205,15 @@ mod tests {
     fn list_rules_on_firewalld_returns_the_users_rules_too() {
         // Documents the hazard in an executable place: this list is diagnostic,
         // not evidence. A user rule porthole never created appears here.
-        const USER_RULE: &str = r#"rule family="ipv4" source address="192.168.0.0/16" port port="22" protocol="tcp" accept"#;
+        //
+        // family="ipv6" is the load-bearing part of this fixture, not the
+        // source/port/protocol. `Firewalld::rich_rule` hardcodes
+        // `family="ipv4"` in both of its match arms (porthole v1 does not
+        // manage IPv6 — see the module doc), so no `OpenRequest` porthole
+        // builds can ever produce an ipv6 rich rule. A rule that only varies
+        // the CIDR or port from `rich_rule`'s own template would not prove
+        // anything: porthole could have written that one too.
+        const USER_RULE: &str = r#"rule family="ipv6" source address="2001:db8::/32" port port="22" protocol="tcp" accept"#;
         let runner = RecordingRunner::with_responses(vec![
             Output::stdout(ROUTE_JSON),
             Output::stdout(ZONE),
@@ -213,5 +221,42 @@ mod tests {
         ]);
         let rules = firewalld::Firewalld::new(&runner).list_rules().unwrap();
         assert_eq!(rules.len(), 2, "the user's own rule is in this list");
+    }
+
+    #[test]
+    fn ownership_and_owned_rules_agree_for_every_backend() {
+        // `owned_rules` returns None if and only if `ownership()` is
+        // Unprovable. They are two hand-written answers to one question, so
+        // this asserts they are the same answer — for every backend, not
+        // just the one whose author remembered to check.
+        //
+        // The match on BackendId is exhaustive on purpose: adding a backend
+        // without adding it here does not compile, which is the only version
+        // of this test that stays true.
+        fn check(backend: &dyn FirewallBackend) {
+            let expected_none = backend.ownership() == Ownership::Unprovable;
+            assert_eq!(
+                backend.owned_rules().unwrap().is_none(),
+                expected_none,
+                "{:?} disagrees with itself about whether it can prove ownership",
+                backend.id()
+            );
+        }
+
+        for id in [
+            super::BackendId::Firewalld,
+            super::BackendId::Ufw,
+            super::BackendId::Nftables,
+        ] {
+            match id {
+                super::BackendId::Firewalld => {
+                    check(&firewalld::Firewalld::new(&RecordingRunner::new()));
+                }
+                // Tasks 2 and 3 add these backends; fill in a construction
+                // and a `check(&...)` call here when they land, rather than
+                // leaving the arm empty.
+                super::BackendId::Ufw | super::BackendId::Nftables => {}
+            }
+        }
     }
 }

@@ -176,10 +176,14 @@ impl FirewallBackend for Firewalld<'_> {
                 }
             }
             // A caller bug, not a firewall state: the engine only ever hands a
-            // backend the handle it itself produced.
-            other => Err(Error::Unexpected(format!(
-                "firewalld cannot close a handle from another backend: {other:?}"
-            ))),
+            // backend the handle it itself produced. Enumerated rather than a
+            // wildcard so the next variant this enum gains breaks the build
+            // here instead of being silently absorbed.
+            other @ (RuleHandle::Ufw { .. } | RuleHandle::Nftables { .. }) => {
+                Err(Error::Unexpected(format!(
+                    "firewalld cannot close a handle from another backend: {other:?}"
+                )))
+            }
         }
     }
 
