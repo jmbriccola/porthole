@@ -212,3 +212,84 @@ fn the_default_scope_is_the_current_subnet_never_anywhere() {
         "the default target must be a CIDR"
     );
 }
+
+#[test]
+fn close_without_a_target_says_what_is_missing() {
+    let dir = TempDir::new().unwrap();
+    let out = porthole(&["close"], &state_path(&dir));
+    assert_eq!(code(&out), 2);
+    let message = stderr(&out);
+    assert!(message.contains("--all"), "got: {message}");
+}
+
+#[test]
+fn close_rejects_conflicting_targets() {
+    let dir = TempDir::new().unwrap();
+    let out = porthole(&["close", "5173", "--all"], &state_path(&dir));
+    assert_eq!(code(&out), 2);
+}
+
+#[test]
+fn closing_without_privileges_exits_not_authorized() {
+    if is_root() {
+        eprintln!("skipped: running as root");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let out = porthole(&["close", "5173"], &state_path(&dir));
+    assert_eq!(code(&out), 4);
+}
+
+#[test]
+fn closing_a_port_that_is_not_open_exits_rule_not_found() {
+    if !have("firewall-cmd") || !have("ip") {
+        eprintln!("skipped: needs firewall-cmd and ip");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let out = porthole(&["close", "5173", "--dry-run"], &state_path(&dir));
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("5173/tcp"), "got: {}", stderr(&out));
+}
+
+#[test]
+fn close_all_on_an_empty_state_succeeds_quietly() {
+    if !have("firewall-cmd") || !have("ip") {
+        eprintln!("skipped: needs firewall-cmd and ip");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let out = porthole(&["close", "--all", "--dry-run"], &state_path(&dir));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("Nothing to close"),
+        "got: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn close_all_json_on_an_empty_state_is_an_empty_array() {
+    if !have("firewall-cmd") || !have("ip") {
+        eprintln!("skipped: needs firewall-cmd and ip");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let out = porthole(
+        &["close", "--all", "--dry-run", "--json"],
+        &state_path(&dir),
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(json["closed"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn from_timer_is_hidden_from_the_help() {
+    let dir = TempDir::new().unwrap();
+    let out = porthole(&["close", "--help"], &state_path(&dir));
+    assert_eq!(code(&out), 0);
+    assert!(
+        !stdout(&out).contains("--from-timer"),
+        "an internal flag has no business in the help"
+    );
+}

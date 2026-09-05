@@ -167,6 +167,28 @@ pub fn print_dry_run(commands: &[Command]) {
     println!("Nothing was changed.");
 }
 
+pub fn json_closed(rules: &[ManagedRule], now: u64, dry_run: bool, commands: &[Command]) -> Value {
+    json!({
+        "schema": JSON_SCHEMA,
+        "dry_run": dry_run,
+        "closed": rules.iter().map(|r| rule_json(r, now)).collect::<Vec<_>>(),
+        "commands": commands.iter().map(Command::display).collect::<Vec<_>>(),
+    })
+}
+
+pub fn print_closed(rules: &[ManagedRule]) {
+    if rules.is_empty() {
+        println!("Nothing to close.");
+        return;
+    }
+    for rule in rules {
+        println!(
+            "Closed {}/{} towards {}",
+            rule.port, rule.protocol, rule.target
+        );
+    }
+}
+
 pub fn print_status(status: &Status, now: u64) {
     let firewall = if !status.health.available {
         // Not "firewalld (NOT running)" — there is no firewalld to run.

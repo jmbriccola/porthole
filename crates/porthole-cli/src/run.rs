@@ -66,7 +66,7 @@ pub fn run(cli: &Cli) -> Result<()> {
             Ok(())
         }
         Commands::Open(args) => open(cli, args),
-        Commands::Close(_) => Err(Error::Unexpected("not implemented yet".to_string())),
+        Commands::Close(args) => close(cli, args),
     }
 }
 
@@ -140,6 +140,77 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<()> {
+    let protocol = validate::parse_protocol(&args.proto)?;
+    let port = args.port.as_deref().map(validate::parse_port).transpose()?;
+
+    if port.is_none() && args.id.is_none() && !args.all {
+        return Err(Error::InvalidArgument(
+            "say what to close: a port number, --id <ID>, or --all".to_string(),
+        ));
+    }
+
+    if !cli.dry_run {
+        require_root()?;
+    }
+
+    let runner = make_runner(cli);
+    let backend = backend::detect(runner.as_ref())?;
+    let mut engine = make_engine(backend.as_ref(), runner.as_ref())?;
+
+    let mut failures: Vec<Error> = Vec::new();
+    let closed = if args.all {
+        let (closed, errors) = engine.close_all(args.from_timer);
+        failures = errors;
+        closed
+    } else if let Some(id) = &args.id {
+        vec![engine.close_by_id(id, args.from_timer)?]
+    } else {
+        vec![engine.close_by_port(
+            port.expect("a port, an id or --all was required above"),
+            protocol,
+            args.from_timer,
+        )?]
+    };
+
+    // Same rule as `open`: a dry run records nothing, because nothing happened.
+    for rule in closed.iter().filter(|_| !cli.dry_run) {
+        // The rule's own uid, not the caller's. When the expiry timer fires,
+        // this runs as root under systemd with no SUDO_UID, so `requesting_uid()`
+        // would report 0 and the audit line would lose the person who actually
+        // asked for the opening — and that timer-fired close is precisely the
+        // one that reaches the journal in this milestone.
+        eprintln!(
+            "porthole: closed {}/{} towards {} (opened by uid={}{})",
+            rule.port,
+            rule.protocol,
+            rule.target,
+            rule.uid,
+            if args.from_timer { ", expired" } else { "" }
+        );
+    }
+
+    let now = SystemClock.now();
+    if cli.json {
+        println!(
+            "{}",
+            output::json_closed(&closed, now, cli.dry_run, &runner.recorded())
+        );
+    } else {
+        output::print_closed(&closed);
+        if cli.dry_run {
+            output::print_dry_run(&runner.recorded());
+        }
+    }
+
+    // Report what did close, then fail on what did not. Silently succeeding
+    // after a failed close would tell the user a port is shut when it is open.
+    match failures.into_iter().next() {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn make_runner(cli: &Cli) -> Box<dyn CommandRunner> {
