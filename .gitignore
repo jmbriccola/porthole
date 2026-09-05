@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+
+# Internal working documents: Italian, not part of the published project.
+/docs/superpowers/
+/INITIAL_PROMPT.md
