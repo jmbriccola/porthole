@@ -602,6 +602,8 @@ dependencies = [
 name = "porthole-helper"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "libc",
  "porthole-core",
  "tokio",
  "zbus",

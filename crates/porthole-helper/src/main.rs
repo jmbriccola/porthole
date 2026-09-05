@@ -1,4 +1,4 @@
-//! porthole's privileged half. Task 5 gives it a real body.
+//! porthole's privileged half. Task 6 gives it a real body.
 
 fn main() {
     eprintln!("porthole-helper: not implemented yet");

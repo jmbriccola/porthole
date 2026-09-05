@@ -8,14 +8,20 @@ repository.workspace = true
 authors.workspace = true
 description = "Privileged D-Bus service for porthole."
 
+[lib]
+name = "porthole_helper"
+path = "src/lib.rs"
+
 [[bin]]
 name = "porthole-helper"
 path = "src/main.rs"
 
 [dependencies]
+async-trait.workspace = true
 porthole-core = { path = "../porthole-core" }
 zbus.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+libc.workspace = true
 tokio.workspace = true
