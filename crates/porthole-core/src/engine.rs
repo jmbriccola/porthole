@@ -1,0 +1,669 @@
+//! The order of operations.
+//!
+//! Everything the engine calls is independently testable; this module is the
+//! only place that knows the sequence. One ordering decision matters more than
+//! the rest: the state is written **before** the expiry timer is scheduled, and
+//! if scheduling fails the rule is closed again and the state rolled back. An
+//! open rule with no timer is exactly the failure porthole exists to prevent,
+//! so it must not be reachable.
+//!
+//! When milestone 2 introduces the D-Bus helper, this module moves behind it
+//! very nearly unchanged, and the CLI becomes a client.
+
+use crate::backend::{BackendHealth, BackendId, FirewallBackend};
+use crate::clock::Clock;
+use crate::command::CommandRunner;
+use crate::error::{Error, Result};
+use crate::expiry;
+use crate::model::{Lifetime, OpenRequest, Protocol, ScopeSpec, Target};
+use crate::net::{self, LocalNetwork};
+use crate::state::{ManagedRule, StateStore};
+use crate::validate;
+use std::path::PathBuf;
+use uuid::Uuid;
+
+#[derive(Debug, Clone)]
+pub struct Status {
+    pub backend: BackendId,
+    pub health: BackendHealth,
+    /// `None` when the machine is not on a usable network.
+    pub network: Option<LocalNetwork>,
+    /// The firewalld zone, or whatever the backend calls its location.
+    pub location: Option<String>,
+    pub rules: Vec<ManagedRule>,
+}
+
+pub struct Engine<'a> {
+    backend: &'a dyn FirewallBackend,
+    runner: &'a dyn CommandRunner,
+    clock: &'a dyn Clock,
+    state: StateStore,
+    /// The porthole binary the expiry timer will invoke.
+    executable: PathBuf,
+}
+
+impl<'a> Engine<'a> {
+    pub fn new(
+        backend: &'a dyn FirewallBackend,
+        runner: &'a dyn CommandRunner,
+        clock: &'a dyn Clock,
+        state: StateStore,
+        executable: PathBuf,
+    ) -> Self {
+        Engine {
+            backend,
+            runner,
+            clock,
+            state,
+            executable,
+        }
+    }
+
+    pub fn rules(&self) -> &[ManagedRule] {
+        self.state.rules()
+    }
+
+    /// Turn what the user asked for into the network a backend can use.
+    pub fn resolve(&self, spec: &ScopeSpec) -> Result<Target> {
+        Ok(match spec {
+            ScopeSpec::CurrentSubnet => Target::Network {
+                cidr: net::current_network(self.runner)?.cidr,
+            },
+            ScopeSpec::Anywhere => Target::Anywhere,
+            ScopeSpec::Network(cidr) => Target::Network { cidr: *cidr },
+            ScopeSpec::Host(addr) => Target::Network {
+                cidr: validate::host_to_network(*addr),
+            },
+        })
+    }
+
+    pub fn open(
+        &mut self,
+        port: u16,
+        protocol: Protocol,
+        spec: &ScopeSpec,
+        lifetime: Lifetime,
+        uid: u32,
+    ) -> Result<ManagedRule> {
+        let health = self.backend.health()?;
+        if !health.active {
+            return Err(Error::BackendUnavailable(format!(
+                "{}. porthole will not open anything while the firewall is not enforcing \
+                 rules: the port is either already reachable or blocked by something \
+                 porthole does not manage",
+                health.detail
+            )));
+        }
+
+        if let Some(existing) = self.state.find_by_port(port, protocol) {
+            return Err(Error::AlreadyOpen {
+                port,
+                protocol,
+                detail: format!(
+                    "open towards {} since {}; close it first if you want a different scope",
+                    existing.target, existing.opened_at
+                ),
+            });
+        }
+
+        let target = self.resolve(spec)?;
+        let request = OpenRequest {
+            port,
+            protocol,
+            target,
+            lifetime,
+        };
+        let handle = self.backend.open(&request)?;
+
+        let now = self.clock.now();
+        let rule = ManagedRule {
+            id: Uuid::new_v4().to_string(),
+            port,
+            protocol,
+            target,
+            backend: self.backend.id(),
+            opened_at: now,
+            expires_at: match lifetime {
+                Lifetime::For(d) => Some(now + d.as_secs()),
+                Lifetime::UntilReboot => None,
+            },
+            uid,
+            handle,
+        };
+
+        if !self.runner.is_dry_run() {
+            self.state.insert(rule.clone());
+            self.state.save()?;
+        }
+
+        if let Lifetime::For(duration) = lifetime {
+            if let Err(e) =
+                expiry::schedule_close(self.runner, &self.executable, &rule, duration.as_secs())
+            {
+                self.roll_back(&rule);
+                return Err(e);
+            }
+        }
+
+        Ok(rule)
+    }
+
+    /// Undo an opening that could not be completed. Best effort on every step:
+    /// the caller is already returning an error, and leaving the port open is
+    /// worse than any secondary failure here.
+    fn roll_back(&mut self, rule: &ManagedRule) {
+        let _ = self.backend.close(&rule.handle);
+        if !self.runner.is_dry_run() {
+            self.state.remove(&rule.id);
+            let _ = self.state.save();
+        }
+    }
+
+    pub fn close_by_id(&mut self, id: &str, from_timer: bool) -> Result<ManagedRule> {
+        let rule = self
+            .state
+            .find_by_id(id)
+            .cloned()
+            .ok_or_else(|| Error::RuleNotFound(id.to_string()))?;
+        self.close_rule(rule, from_timer)
+    }
+
+    pub fn close_by_port(
+        &mut self,
+        port: u16,
+        protocol: Protocol,
+        from_timer: bool,
+    ) -> Result<ManagedRule> {
+        let rule = self
+            .state
+            .find_by_port(port, protocol)
+            .cloned()
+            .ok_or_else(|| Error::RuleNotFound(format!("{port}/{protocol}")))?;
+        self.close_rule(rule, from_timer)
+    }
+
+    /// Close everything. Keeps going after a failure: one rule that will not
+    /// close must not leave the others open.
+    pub fn close_all(&mut self, from_timer: bool) -> (Vec<ManagedRule>, Vec<Error>) {
+        let ids: Vec<String> = self.state.rules().iter().map(|r| r.id.clone()).collect();
+        let mut closed = Vec::new();
+        let mut errors = Vec::new();
+        for id in ids {
+            match self.close_by_id(&id, from_timer) {
+                Ok(rule) => closed.push(rule),
+                Err(e) => errors.push(e),
+            }
+        }
+        (closed, errors)
+    }
+
+    fn close_rule(&mut self, rule: ManagedRule, from_timer: bool) -> Result<ManagedRule> {
+        self.backend.close(&rule.handle)?;
+
+        // A close invoked *by* the expiry timer must not try to stop that timer.
+        if !from_timer && rule.expires_at.is_some() {
+            expiry::cancel_close(self.runner, &rule.id)?;
+        }
+
+        if !self.runner.is_dry_run() {
+            self.state.remove(&rule.id);
+            self.state.save()?;
+        }
+        Ok(rule)
+    }
+
+    pub fn status(&self) -> Result<Status> {
+        Ok(Status {
+            backend: self.backend.id(),
+            health: self.backend.health()?,
+            // Not being on a network is a fact to report, not a failure.
+            network: net::current_network(self.runner).ok(),
+            location: self.backend.location().unwrap_or(None),
+            rules: self.state.rules().to_vec(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::fake::FakeBackend;
+    use crate::clock::FixedClock;
+    use crate::command::{DryRunRunner, Output, RecordingRunner};
+    use crate::model::Protocol;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    const NOW: u64 = 1_757_000_000;
+    const ROUTE_JSON: &str = r#"[{"dst":"default","dev":"wlo1","metric":600}]"#;
+    const ADDR_JSON: &str = r#"[{"ifindex":2,"ifname":"wlo1","addr_info":[{"family":"inet","local":"10.10.10.119","prefixlen":24,"scope":"global"}]}]"#;
+
+    /// Responses for one `--to subnet` open: two `ip` reads, then systemd-run.
+    fn subnet_open_script() -> Vec<Output> {
+        vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ADDR_JSON),
+            Output::stdout("Running timer as unit: porthole-close-x.timer"),
+        ]
+    }
+
+    struct Harness {
+        _dir: TempDir,
+        path: std::path::PathBuf,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("state.json");
+            Harness { _dir: dir, path }
+        }
+
+        fn store(&self) -> StateStore {
+            StateStore::open(&self.path).unwrap()
+        }
+    }
+
+    fn make_engine<'a>(
+        backend: &'a dyn FirewallBackend,
+        runner: &'a dyn CommandRunner,
+        clock: &'a FixedClock,
+        store: StateStore,
+    ) -> Engine<'a> {
+        Engine::new(
+            backend,
+            runner,
+            clock,
+            store,
+            std::path::PathBuf::from("/usr/bin/porthole"),
+        )
+    }
+
+    #[test]
+    fn open_resolves_the_current_subnet_and_records_the_rule() {
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::with_responses(subnet_open_script());
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let rule = engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::For(Duration::from_secs(3600)),
+                1000,
+            )
+            .unwrap();
+
+        assert_eq!(rule.port, 5173);
+        assert_eq!(
+            rule.target,
+            Target::Network {
+                cidr: "10.10.10.0/24".parse().unwrap()
+            }
+        );
+        assert_eq!(rule.opened_at, NOW);
+        assert_eq!(rule.expires_at, Some(NOW + 3600));
+        assert_eq!(rule.uid, 1000);
+        assert_eq!(backend.opened().len(), 1);
+
+        // Persisted, and readable by a fresh reader.
+        let reloaded = StateStore::open(&harness.path).unwrap();
+        assert_eq!(reloaded.rules().len(), 1);
+        assert_eq!(reloaded.rules()[0].id, rule.id);
+    }
+
+    #[test]
+    fn open_schedules_a_close_timer() {
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::with_responses(subnet_open_script());
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let rule = engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::For(Duration::from_secs(900)),
+                1000,
+            )
+            .unwrap();
+
+        let last = runner.recorded().pop().unwrap();
+        assert_eq!(last.program, "systemd-run");
+        assert!(last.args.contains(&"--on-active=900s".to_string()));
+        assert!(last.args.contains(&rule.id));
+    }
+
+    #[test]
+    fn until_reboot_schedules_no_timer() {
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ADDR_JSON),
+        ]);
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let rule = engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        assert_eq!(rule.expires_at, None);
+        assert!(
+            !runner.recorded().iter().any(|c| c.program == "systemd-run"),
+            "an until-reboot rule needs no timer: the reboot removes it"
+        );
+    }
+
+    #[test]
+    fn open_rolls_back_when_the_timer_cannot_be_scheduled() {
+        // A rule with no timer would never close. Better no rule at all.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ADDR_JSON),
+            Output {
+                status: 1,
+                stdout: String::new(),
+                stderr: "Failed to start transient timer unit".into(),
+            },
+        ]);
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let err = engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::For(Duration::from_secs(3600)),
+                1000,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("transient timer"), "got: {err}");
+
+        assert!(
+            backend.handles().is_empty(),
+            "the rule must be closed again"
+        );
+        assert!(engine.rules().is_empty(), "the state must be rolled back");
+        let reloaded = StateStore::open(&harness.path).unwrap();
+        assert!(reloaded.rules().is_empty());
+    }
+
+    #[test]
+    fn open_refuses_while_the_firewall_is_not_running() {
+        let harness = Harness::new();
+        let backend = FakeBackend::inactive();
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let err = engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::For(Duration::from_secs(3600)),
+                1000,
+            )
+            .unwrap_err();
+        assert_eq!(err.exit_code(), crate::error::ExitCode::BackendUnavailable);
+        assert!(backend.opened().is_empty());
+    }
+
+    #[test]
+    fn open_refuses_a_port_that_is_already_open() {
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::with_responses(
+            subnet_open_script()
+                .into_iter()
+                .chain(subnet_open_script())
+                .collect(),
+        );
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+        let err = engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::Anywhere,
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap_err();
+
+        assert_eq!(err.exit_code(), crate::error::ExitCode::AlreadyOpen);
+        assert_eq!(backend.opened().len(), 1);
+
+        // Same port, other protocol, is a different rule.
+        assert!(engine
+            .open(
+                5173,
+                Protocol::Udp,
+                &ScopeSpec::Anywhere,
+                Lifetime::UntilReboot,
+                1000
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn close_by_port_removes_the_rule_and_cancels_the_timer() {
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::with_responses(subnet_open_script());
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::For(Duration::from_secs(3600)),
+                1000,
+            )
+            .unwrap();
+        let closed = engine.close_by_port(5173, Protocol::Tcp, false).unwrap();
+
+        assert_eq!(closed.port, 5173);
+        assert!(backend.handles().is_empty());
+        assert!(engine.rules().is_empty());
+
+        let last = runner.recorded().pop().unwrap();
+        assert_eq!(last.program, "systemctl");
+        assert_eq!(
+            last.args,
+            vec![
+                "stop".to_string(),
+                format!("porthole-close-{}.timer", closed.id)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_close_from_the_timer_does_not_stop_its_own_timer() {
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::with_responses(subnet_open_script());
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let rule = engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::For(Duration::from_secs(3600)),
+                1000,
+            )
+            .unwrap();
+        engine.close_by_id(&rule.id, true).unwrap();
+
+        assert!(
+            !runner.recorded().iter().any(|c| c.program == "systemctl"),
+            "the timer's own service must not try to stop the timer"
+        );
+    }
+
+    #[test]
+    fn closing_something_that_is_not_open_is_rule_not_found() {
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let err = engine
+            .close_by_port(5173, Protocol::Tcp, false)
+            .unwrap_err();
+        assert_eq!(err.exit_code(), crate::error::ExitCode::RuleNotFound);
+        assert!(err.to_string().contains("5173/tcp"), "got: {err}");
+    }
+
+    #[test]
+    fn close_all_closes_everything_and_reports_what_it_closed() {
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ADDR_JSON),
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ADDR_JSON),
+        ]);
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+        engine
+            .open(
+                5432,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        let (closed, errors) = engine.close_all(false);
+        assert_eq!(closed.len(), 2);
+        assert!(errors.is_empty());
+        assert!(engine.rules().is_empty());
+        assert!(backend.handles().is_empty());
+    }
+
+    #[test]
+    fn dry_run_changes_nothing_and_writes_no_state() {
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let inner = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ADDR_JSON),
+        ]);
+        let runner = DryRunRunner::new(Box::new(inner));
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let rule = engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::For(Duration::from_secs(3600)),
+                1000,
+            )
+            .unwrap();
+
+        // The subnet was really read, so a dry run tells the truth about scope.
+        assert_eq!(
+            rule.target,
+            Target::Network {
+                cidr: "10.10.10.0/24".parse().unwrap()
+            }
+        );
+        assert!(
+            !harness.path.exists(),
+            "dry-run must not write the state file"
+        );
+        assert_eq!(
+            runner.recorded().len(),
+            1,
+            "one withheld mutation: the systemd-run"
+        );
+    }
+
+    #[test]
+    fn resolve_widens_a_single_host_to_a_slash_32() {
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+        let engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        assert_eq!(
+            engine
+                .resolve(&ScopeSpec::Host("10.10.10.42".parse().unwrap()))
+                .unwrap(),
+            Target::Network {
+                cidr: "10.10.10.42/32".parse().unwrap()
+            }
+        );
+        assert_eq!(
+            engine.resolve(&ScopeSpec::Anywhere).unwrap(),
+            Target::Anywhere
+        );
+    }
+
+    #[test]
+    fn status_reports_the_backend_the_zone_and_the_network() {
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ADDR_JSON),
+        ]);
+        let clock = FixedClock(NOW);
+        let engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let status = engine.status().unwrap();
+        assert!(status.health.active);
+        assert_eq!(status.location.as_deref(), Some("TestZone"));
+        assert_eq!(
+            status.network.unwrap().cidr,
+            "10.10.10.0/24".parse().unwrap()
+        );
+    }
+}

@@ -14,6 +14,7 @@
 pub mod backend;
 pub mod clock;
 pub mod command;
+pub mod engine;
 pub mod error;
 pub mod expiry;
 pub mod model;

@@ -70,6 +70,13 @@ pub trait FirewallBackend {
     /// reconciliation pass (milestone 3).
     fn list_managed(&self) -> Result<Vec<RuleHandle>>;
     fn health(&self) -> Result<BackendHealth>;
+
+    /// Where this backend keeps porthole's rules — the firewalld zone, the ufw
+    /// chain. Shown by `porthole status`; `None` when the concept does not
+    /// apply.
+    fn location(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// Pick a backend: firewalld, then ufw, then nftables.

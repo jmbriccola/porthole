@@ -113,6 +113,10 @@ impl FirewallBackend for FakeBackend {
     fn health(&self) -> Result<BackendHealth> {
         Ok(self.health.clone())
     }
+
+    fn location(&self) -> Result<Option<String>> {
+        Ok(Some(FAKE_ZONE.to_string()))
+    }
 }
 
 #[cfg(test)]

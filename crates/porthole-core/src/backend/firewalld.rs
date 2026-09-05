@@ -224,6 +224,10 @@ impl FirewallBackend for Firewalld<'_> {
             detail,
         })
     }
+
+    fn location(&self) -> Result<Option<String>> {
+        self.managed_zone().map(Some)
+    }
 }
 
 /// firewalld's way of saying "that rule is not there".
