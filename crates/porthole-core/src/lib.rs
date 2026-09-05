@@ -11,6 +11,7 @@
 //! 2. Every external command goes through [`command::CommandRunner`], which is
 //!    what makes dry-run and unit testing possible.
 
+pub mod backend;
 pub mod clock;
 pub mod command;
 pub mod error;
