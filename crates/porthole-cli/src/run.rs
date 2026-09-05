@@ -199,7 +199,12 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
             output::json_closed(&closed, &failures, now, cli.dry_run, &runner.recorded())
         );
     } else {
-        output::print_closed(&closed);
+        // "Nothing to close." would be a lie when there WAS something and every
+        // attempt failed: the ports are still open. Say nothing on stdout in
+        // that case and let the errors below speak.
+        if !closed.is_empty() || failures.is_empty() {
+            output::print_closed(&closed);
+        }
         for error in &failures {
             eprintln!("porthole: {error}");
         }
