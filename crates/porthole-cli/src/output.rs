@@ -61,6 +61,17 @@ pub fn json_status(status: &Status, now: u64) -> Value {
         "backend": status.backend.to_string(),
         "firewall_available": status.health.available,
         "firewall_active": status.health.active,
+        // `false` in every case that exists before this field was added, and
+        // a script reading only `firewall_active` behaves exactly as it
+        // always has: this is `true` only in the one new case --
+        // `firewall_active: false` because ufw or nftables refused a
+        // permission-denied ruleset read, not because porthole confirmed
+        // nothing is enforcing. Without this, a script has strictly less
+        // information than a human running plain `status`, who at least
+        // sees `firewall_caveat`-adjacent detail prose explaining the
+        // difference -- see `BackendHealth::active_unknown`'s own doc
+        // comment for why the two facts cannot share one boolean.
+        "firewall_active_unknown": status.health.active_unknown,
         "firewall_version": status.health.version,
         "firewall_caveat": status.health.caveat,
         "location": status.location,
@@ -401,6 +412,9 @@ mod tests {
         let json = json_status(&status, 1_757_000_000);
         assert_eq!(json["firewall_available"], false);
         assert_eq!(json["firewall_active"], false);
+        // No firewall at all is not the permission-denied case: there is
+        // nothing porthole failed to read, only nothing to read at all.
+        assert_eq!(json["firewall_active_unknown"], false);
         assert!(json["firewall_version"].is_null());
         assert!(json["firewall_caveat"].is_null());
         assert!(json["network"].is_null());
@@ -482,7 +496,17 @@ mod tests {
         // running word is absent), not the exact wording of the word this
         // state does print, so a future rewording of either cannot quietly
         // collapse the two states back together.
-        use porthole_core::backend::BackendHealth;
+        //
+        // Both renderers are checked against the *same* fixture here rather
+        // than in two separate tests, human (`firewall_state_word`, the
+        // piece `print_status` uses) and machine (`json_status`'s
+        // `firewall_active_unknown`) alike: a script reading `--json` has no
+        // sentence to fall back on the way a human reading `detail` does, so
+        // it needs this distinction at least as much, and the two output
+        // modes disagreeing about what exists is exactly the hazard this
+        // milestone has already had once.
+        use porthole_core::backend::{BackendHealth, BackendId};
+        use porthole_core::engine::Status;
 
         let confirmed_inactive = BackendHealth {
             available: true,
@@ -508,6 +532,23 @@ mod tests {
             "an unread ruleset must not print the same word as a confirmed one"
         );
         assert_ne!(word, "running", "porthole did not confirm this either");
+
+        let status = Status {
+            backend: BackendId::Ufw,
+            health: unknown,
+            network: None,
+            location: None,
+            rules: Vec::new(),
+        };
+        let json = json_status(&status, 1_757_000_000);
+        assert_eq!(
+            json["firewall_active"], false,
+            "unchanged: a script reading only this field must behave exactly as before"
+        );
+        assert_eq!(
+            json["firewall_active_unknown"], true,
+            "a script that cares can now tell this apart from a confirmed-inactive backend"
+        );
     }
 
     #[test]

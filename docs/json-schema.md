@@ -47,6 +47,7 @@ Used in `list`, `status`, `open` and `close`.
   "backend": "firewalld",
   "firewall_available": true,
   "firewall_active": true,
+  "firewall_active_unknown": false,
   "firewall_version": "2.4.4",
   "firewall_caveat": null,
   "location": "FedoraWorkstation",
@@ -62,9 +63,26 @@ porthole detected on this machine, in that priority order, **when
 `firewall_available` is `true`**. When it is `false` — no supported firewall
 was found at all — `backend` still holds `"firewalld"`, but that value is
 arbitrary and carries no information: nothing was actually detected, and a
-script must not read anything into it in that case. `location` means
-something different for each, and a script that assumes it is always a
-firewalld zone will misread the other two:
+script must not read anything into it in that case.
+
+`firewall_active: false` is two different facts, and `firewall_active_unknown`
+is what tells them apart. `firewall_active_unknown: false` — every case that
+existed before this field was added, `firewall_active` either `true` or
+`false` — means porthole actually read the firewall's state and got a
+definite answer, whichever way it came out. `firewall_active_unknown: true`
+means it could not: ufw's and nftables' own reads both need more privilege
+than `porthole status` runs with, so a permission-denied read reports
+`firewall_active: false` too, but that is not a confirmed absence, only an
+unanswered question. `firewall_active_unknown` is always `false` for
+firewalld (its reads never need more privilege than any user has) and always
+`false` when `firewall_available` is itself `false` (there is nothing to
+have failed to read). A script that only reads `firewall_active` behaves
+exactly as it always has; one that reads `firewall_active_unknown` too can
+avoid treating "porthole could not tell" as "porthole confirmed this is
+off."
+
+`location` means something different for each, and a script that assumes it
+is always a firewalld zone will misread the other two:
 
 | `backend` | what `location` holds |
 |---|---|
