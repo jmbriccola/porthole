@@ -12,13 +12,17 @@
 //! refused by the helper, and refusing something the app itself put on
 //! screen is an avoidable dead end.
 //!
-//! **"Anyone".** [`build_targets`] always puts it last, marks it (an icon,
-//! not colour alone -- colour alone fails a colour-blind user and a
-//! high-contrast theme), and never preselects it. [`anyone_note`] is the one
-//! dry sentence the spec asks for: "niente toni allarmistici o didattici,
-//! solo una frase asciutta su cosa comporta." A warning that lectures gets
-//! dismissed unread, which makes the genuinely significant choice less safe,
-//! not more.
+//! **"Anyone".** [`build_targets`] always puts it last and marks it (an
+//! icon, not colour alone -- colour alone fails a colour-blind user and a
+//! high-contrast theme). `build_targets` carries no selection state at all,
+//! though -- never being preselected is [`rebuild_targets`]'s doing: it
+//! defaults `Inner::selected_target_index` to `0` ("This network") and only
+//! ever moves it in response to a real click on a check button, so "Anyone"
+//! (never index `0`) starts unselected and stays that way until a user
+//! chooses it. [`anyone_note`] is the one dry sentence the spec asks for:
+//! "niente toni allarmistici o didattici, solo una frase asciutta su cosa
+//! comporta." A warning that lectures gets dismissed unread, which makes the
+//! genuinely significant choice less safe, not more.
 //!
 //! ## What this dialog does not do
 //!
@@ -65,7 +69,7 @@ use gtk::glib;
 use ipnet::Ipv4Net;
 
 use porthole_core::ipc::{PortholeProxy, WireRule};
-use porthole_core::model::{Lifetime, Protocol, ScopeSpec, DEFAULT_DURATION};
+use porthole_core::model::{Lifetime, Protocol, ScopeSpec, DEFAULT_DURATION, MAX_DURATION};
 
 /// What this dialog hands the client once the user presses Open: the same
 /// four things the CLI's `open` subcommand sends -- port, protocol,
@@ -80,16 +84,25 @@ pub struct Request {
 }
 
 /// The five duration chips, in this exact order and exactly these five --
-/// see this module's own doc comment for why the ceiling matters. Every
-/// `Lifetime::For` here is `<= MAX_DURATION` by construction; the "1 hour"
-/// entry is built from [`DEFAULT_DURATION`] rather than a second hardcoded
-/// `3600`, so the two can never quietly drift apart.
+/// see this module's own doc comment for why the ceiling matters.
+///
+/// The chip that *is* the ceiling is built from [`MAX_DURATION`] itself,
+/// not a second hardcoded `8 * 60 * 60`: that is what makes "no chip exceeds
+/// the ceiling" true by construction for this entry rather than true only
+/// because nobody has changed `MAX_DURATION` since the literal was copied
+/// down here. Lowering `MAX_DURATION` lowers this chip with it. The "1 hour"
+/// entry is built from [`DEFAULT_DURATION`] for the identical reason. The
+/// 15-minute and 4-hour entries are independent literals with no such tie --
+/// comfortably under the ceiling today, but not linked to it at compile
+/// time -- which is why the property test below (`no_duration_option_exceeds_the_ceiling`)
+/// stays, checking every entry against `MAX_DURATION` at run time rather
+/// than trusting that only the two tied ones could ever need it.
 fn duration_options() -> Vec<(&'static str, Lifetime)> {
     vec![
         ("15 minutes", Lifetime::For(Duration::from_secs(15 * 60))),
         ("1 hour", Lifetime::For(DEFAULT_DURATION)),
         ("4 hours", Lifetime::For(Duration::from_secs(4 * 60 * 60))),
-        ("8 hours", Lifetime::For(Duration::from_secs(8 * 60 * 60))),
+        ("8 hours", Lifetime::For(MAX_DURATION)),
         ("Until reboot", Lifetime::UntilReboot),
     ]
 }
@@ -174,10 +187,12 @@ struct DurationChip {
 }
 
 /// One target row: the scope it represents, the real `adw::ActionRow` and
-/// `gtk::CheckButton` a test or a click reads back, and the icon that exists
-/// only for the significant entry -- its presence *is* the marking
-/// [`OpenDialog::is_marked_significant`] reports, not a separately tracked
-/// flag that could drift from what is actually on screen.
+/// `gtk::CheckButton` a test or a click reads back, and the `gtk::Image`
+/// built only for the significant entry.
+/// [`OpenDialog::is_marked_significant`] does not trust this field's mere
+/// `Some`-ness -- that would only prove an icon was *constructed*, not that
+/// it was ever actually attached to `row` -- so it also checks the icon's
+/// own `parent()` against the live widget tree.
 struct TargetRow {
     scope: ScopeSpec,
     row: adw::ActionRow,
@@ -491,8 +506,10 @@ impl OpenDialog {
         Self { inner }
     }
 
-    /// A dialog pre-filled with `port`, the way a click on the listening
-    /// list's own Open button arrives at this dialog.
+    /// A dialog pre-filled with `port`, for a caller that already knows
+    /// which port it means before presenting the dialog -- e.g. a specific
+    /// listening service's own Open button, wherever one exists and is
+    /// wired to this constructor.
     pub fn for_port(port: u16) -> Self {
         let dialog = Self::new();
         dialog.set_port_text(&port.to_string());
@@ -547,15 +564,22 @@ impl OpenDialog {
     }
 
     /// Whether the target row titled `label` carries the significant-choice
-    /// icon -- the actual visual marking, not a copy of the data that
-    /// produced it.
+    /// icon, checked against the live widget tree -- the icon's own
+    /// `parent()` -- rather than only whether `significant_icon` is `Some`.
+    /// `Some` alone would only prove an icon was constructed; a future edit
+    /// that built one and never reached `add_suffix` would leave it `Some`
+    /// while nothing actually rendered, and `parent()` is what catches that.
     pub fn is_marked_significant(&self, label: &str) -> bool {
         self.inner
             .target_rows
             .borrow()
             .iter()
             .find(|r| r.row.title() == label)
-            .is_some_and(|r| r.significant_icon.is_some())
+            .is_some_and(|r| {
+                r.significant_icon
+                    .as_ref()
+                    .is_some_and(|icon| icon.parent().is_some())
+            })
     }
 
     /// The one dry sentence about what "Anyone" means -- see this module's
@@ -614,7 +638,6 @@ impl OpenDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use porthole_core::model::MAX_DURATION;
     use porthole_core::validate::parse_scope;
 
     // Pure-function coverage, independent of GTK -- these run in the
