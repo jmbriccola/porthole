@@ -36,14 +36,17 @@
 //! network" and "Anyone" in that one function -- a data change, not a
 //! redesign.
 //!
-//! ## Two things this task leaves for a later one, on purpose
+//! ## One thing this task left for a later one, on purpose
 //!
 //! [`OpenDialog::on_opened`] is a hook a caller can register to learn a
 //! request actually succeeded (the new [`WireRule`] the helper returned).
-//! Nothing in this crate calls it yet: `window.rs`'s header-bar button
-//! presents a fresh dialog and nothing more, because refreshing "Open now"
-//! belongs with whatever later gives this window a real, repeatable refresh
-//! action, not with the dialog that merely triggered one open.
+//! This task left it uncalled, because refreshing "Open now" belongs with
+//! whatever later gives this window a real, repeatable refresh action, not
+//! with the dialog that merely triggered one open -- and task 6 is that
+//! later task: `window.rs`'s header-bar button and each of the "Listening"
+//! section's own per-row Open buttons now register it, so a successful
+//! open re-populates both sections and the status line from the helper and
+//! `/proc` again, the same refresh construction itself already runs.
 //!
 //! And, like [`crate::open_now::OpenNowSection`]'s close button before it,
 //! the "Open" button's real D-Bus round trip has no automated test: the

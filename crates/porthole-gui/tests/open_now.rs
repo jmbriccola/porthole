@@ -278,13 +278,90 @@ fn an_expired_rule_reads_as_closing_not_as_a_negative_time() -> Result<(), Strin
     Ok(())
 }
 
+/// Task 6's own case: a failure to reach the helper must not render as
+/// "No ports open" -- see `src/open_now.rs`'s own module doc for why
+/// conflating "confirmed nothing is open" with "could not ask" is this
+/// project's characteristic defect. Checked structurally (icon, CSS
+/// classes, and that the calm page is genuinely gone, not merely covered),
+/// the same way `an_empty_list_is_a_calm_status_page_not_an_error` checks
+/// the calm state's own icon/CSS rather than only its title.
+fn an_unreachable_helper_does_not_render_as_the_calm_empty_state() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenNowUnreachable",
+        move |_app| {
+            let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
+            section.set_unreachable("could not reach the porthole helper: timed out");
+            let calm = section.status_page();
+            let error = section.error_page();
+            let icon_name = error
+                .as_ref()
+                .and_then(|p| p.icon_name())
+                .map(|s| s.to_string());
+            let css_classes: Vec<String> = error
+                .as_ref()
+                .map(|p| p.css_classes().iter().map(|c| c.to_string()).collect())
+                .unwrap_or_default();
+            let description = error
+                .as_ref()
+                .and_then(|p| p.description())
+                .map(|s| s.to_string());
+            let rows_empty = section.rows().is_empty();
+            *seen.borrow_mut() = Some((
+                calm.is_some(),
+                error.is_some(),
+                icon_name,
+                css_classes,
+                description,
+                rows_empty,
+            ));
+        },
+    );
+    let (calm_showing, error_showing, icon_name, css_classes, description, rows_empty) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if calm_showing {
+        return Err(
+            "the calm \"No ports open\" page must not be showing once the helper is \
+                     known to be unreachable"
+                .to_string(),
+        );
+    }
+    if !error_showing {
+        return Err("an unreachable helper must render its own, distinguishable state".to_string());
+    }
+    let icon = icon_name.unwrap_or_default();
+    if !(icon.contains("error") || icon.contains("warning")) {
+        return Err(format!(
+            "the unreachable state's icon must read as trouble, unlike the calm state's: {icon:?}"
+        ));
+    }
+    if !css_classes.iter().any(|c| c == "error" || c == "warning") {
+        return Err(format!(
+            "the unreachable state must carry an error/warning CSS class: {css_classes:?}"
+        ));
+    }
+    match description.as_deref() {
+        Some(d) if d.contains("timed out") => {}
+        other => {
+            return Err(format!(
+                "the helper's own reason must be shown, verbatim: {other:?}"
+            ))
+        }
+    }
+    if !rows_empty {
+        return Err("there must be no rows when the helper could not even be asked".to_string());
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below -- see `tests/window.rs`'s own
 /// `Case` alias for why this is a type alias rather than spelled out
 /// inline (the clippy finding that alias itself fixed there).
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 5] = [
+    let cases: [Case; 6] = [
         (
             "an_empty_list_is_a_calm_status_page_not_an_error",
             an_empty_list_is_a_calm_status_page_not_an_error,
@@ -304,6 +381,10 @@ fn main() {
         (
             "an_expired_rule_reads_as_closing_not_as_a_negative_time",
             an_expired_rule_reads_as_closing_not_as_a_negative_time,
+        ),
+        (
+            "an_unreachable_helper_does_not_render_as_the_calm_empty_state",
+            an_unreachable_helper_does_not_render_as_the_calm_empty_state,
         ),
     ];
 

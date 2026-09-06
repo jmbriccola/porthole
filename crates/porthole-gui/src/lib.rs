@@ -9,4 +9,5 @@ pub mod app;
 pub mod listening_section;
 pub mod open_dialog;
 pub mod open_now;
+pub mod status_bar;
 pub mod window;

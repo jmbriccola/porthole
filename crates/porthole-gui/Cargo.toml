@@ -53,6 +53,16 @@ name = "open_dialog"
 path = "tests/open_dialog.rs"
 harness = false
 
+# Same reasoning again: `tests/status_bar.rs` is task 6's own GTK-touching
+# suite for `StatusBar`. Task 6's other additions -- the initial load, the
+# keyboard-reachability check, and the breakpoint accessor -- extend
+# `tests/window.rs` and `tests/open_now.rs` instead, since both already
+# exist for the exact things those additions changed.
+[[test]]
+name = "status_bar"
+path = "tests/status_bar.rs"
+harness = false
+
 [dependencies]
 porthole-core = { path = "../porthole-core" }
 gtk = { package = "gtk4", version = "0.9" }

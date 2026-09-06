@@ -18,9 +18,14 @@
 //! adding more cases here.
 
 use std::cell::{Cell, RefCell};
+use std::net::{IpAddr, Ipv4Addr};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
+use porthole_core::ipc::WireRule;
+use porthole_core::listening::{Binding, Service};
+use porthole_core::model::Protocol;
 use porthole_gui::window::PortholeWindow;
 
 /// Runs `f` inside a real `adw::Application` activation, on a session bus
@@ -93,6 +98,63 @@ fn pump_main_context() {
     let context = gtk::glib::MainContext::default();
     for _ in 0..50 {
         while context.iteration(false) {}
+    }
+}
+
+/// Like `pump_main_context`, but for waiting on genuinely asynchronous
+/// work (a D-Bus round trip's own connect attempt) rather than a single
+/// layout pass: `iteration(false)` alone only drains what is *already*
+/// pending, and a connection attempt's completion can arrive from a
+/// background thread after this function has already found nothing
+/// pending. Retries on a short sleep instead of blocking on
+/// `iteration(true)`, which could in principle wait forever if nothing
+/// ever wakes it -- this always returns within `timeout`, condition met or
+/// not, so a stuck async path fails the test rather than hanging the
+/// process.
+fn pump_until(condition: impl Fn() -> bool, timeout: Duration) -> bool {
+    let context = gtk::glib::MainContext::default();
+    let deadline = Instant::now() + timeout;
+    loop {
+        while context.iteration(false) {}
+        if condition() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return condition();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A rule as the wire reports it -- just enough to give
+/// `every_action_is_reachable_from_the_keyboard` a real close button to
+/// check, the same shape `tests/open_now.rs`'s own `wire_rule` fixture
+/// uses.
+fn wire_rule_fixture() -> WireRule {
+    WireRule {
+        id: "5173/tcp".to_string(),
+        port: 5173,
+        protocol: "tcp".to_string(),
+        target: "10.10.10.0/24".to_string(),
+        scope: "network".to_string(),
+        backend: "firewalld".to_string(),
+        opened_at: 1_757_100_000,
+        expires_at: 1_757_103_600,
+        uid: 1000,
+    }
+}
+
+/// A service as `porthole_core::listening::scan` would produce one --
+/// network-facing, so it gets a real, focusable Open button, the same
+/// shape `tests/listening.rs`'s own `svc` fixture uses.
+fn listening_service_fixture() -> Service {
+    Service {
+        port: 5173,
+        protocol: Protocol::Tcp,
+        address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        binding: Binding::AllInterfaces,
+        process: Some("node".to_string()),
+        pid: None,
     }
 }
 
@@ -200,6 +262,144 @@ fn the_window_has_an_open_button_that_is_reachable_from_the_keyboard() -> Result
     Ok(())
 }
 
+/// Task 6's own check: every action a click can reach must also be
+/// reachable from the keyboard -- a GNOME app that needs a mouse is not a
+/// GNOME app. Populates both sections with real fixture data first (via
+/// the same public setters `window.rs`'s own `refresh` calls), since an
+/// empty window only has the header button to check; `actionable_widgets`
+/// is a structural readback of the real, currently-rendered buttons, so
+/// this is asserting focusability on the exact widgets a user would tab
+/// through, not a hand-maintained list of what should be there.
+fn every_action_is_reachable_from_the_keyboard() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate("com.jacopobriccola.Porthole.Test.Keyboard", move |app| {
+        let win = PortholeWindow::new(app);
+        win.open_now().set_rules(&[wire_rule_fixture()]);
+        win.listening().set_services(&[listening_service_fixture()]);
+        win.present();
+        let flags: Vec<bool> = win
+            .actionable_widgets()
+            .iter()
+            .map(|w| w.is_focusable())
+            .collect();
+        seen.replace(Some(flags));
+    });
+    let flags = result.borrow_mut().take().ok_or("activation never ran")?;
+    // The header button, one "Open now" close button, one "Listening" Open
+    // button: proof the fixtures above actually produced rows to check,
+    // not just the one widget an empty window would have had anyway.
+    if flags.len() < 3 {
+        return Err(format!(
+            "expected at least 3 actionable widgets (header button + one row from each \
+             section), got {}",
+            flags.len()
+        ));
+    }
+    if let Some(index) = flags.iter().position(|focusable| !focusable) {
+        return Err(format!(
+            "actionable widget at index {index} cannot be reached by keyboard"
+        ));
+    }
+    Ok(())
+}
+
+/// `AdwBreakpoint` is a spec requirement and a missing one fails silently:
+/// the window simply becomes cramped, which no test notices unless it
+/// asks. `the_window_is_usable_at_a_narrow_width` above already proves the
+/// stronger, end-to-end version of this (a real window, really laid out,
+/// really narrow); this is the same property read structurally, through
+/// `has_breakpoint_below`, without presenting anything.
+fn a_narrow_window_keeps_every_row_readable() -> Result<(), String> {
+    let result = Rc::new(Cell::new(false));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.BreakpointAccessor",
+        move |app| {
+            let win = PortholeWindow::new(app);
+            seen.set(win.has_breakpoint_below(400.0));
+        },
+    );
+    if result.get() {
+        Ok(())
+    } else {
+        Err("no registered breakpoint applies at or below 400px".to_string())
+    }
+}
+
+/// The planning defect task 6 exists to repair, proven the strongest way
+/// available: a real `PortholeWindow::new`, in this milestone's own test
+/// container, which has no live `porthole-helper` and -- unlike the
+/// session bus `dbus-run-session` provides for `adw::Application`'s own
+/// identity -- no **system** bus either (see `Containerfile.gui`: it
+/// installs `dbus-daemon` but nothing here ever starts a system instance
+/// of it). So the construction's own initial `refresh`, which reaches the
+/// helper over the system bus (`window.rs`'s own module doc explains why),
+/// genuinely fails here -- this is the real failure path running, not a
+/// substitute for it. `pump_until` (bounded, never blocks indefinitely)
+/// waits for that failure to propagate all the way to `OpenNowSection`'s
+/// own rendered state and the status line.
+///
+/// This is also the one place in this crate proving the distinction this
+/// task exists to draw: a window that could not reach the helper must
+/// **not** show the same calm "No ports open" page a window that
+/// genuinely has nothing open would.
+fn a_construction_with_an_unreachable_helper_does_not_show_the_calm_empty_state(
+) -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.UnreachableConstruction",
+        move |app| {
+            let win = PortholeWindow::new(app);
+            win.present();
+            let settled = pump_until(
+                || win.open_now().status_page().is_none() && win.open_now().error_page().is_some(),
+                Duration::from_secs(5),
+            );
+            let calm_showing = win.open_now().status_page().is_some();
+            let error_showing = win.open_now().error_page().is_some();
+            let status_bar_prominent = win.status_bar().is_prominent();
+            seen.replace(Some((
+                settled,
+                calm_showing,
+                error_showing,
+                status_bar_prominent,
+            )));
+        },
+    );
+    let (settled, calm_showing, error_showing, status_bar_prominent) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if !settled {
+        return Err(
+            "the helper-unreachable state never settled within the timeout -- see this \
+             test's own comment on why the container has no system bus to fail against"
+                .to_string(),
+        );
+    }
+    if calm_showing {
+        return Err(
+            "a window constructed with no reachable helper must not show the calm \"No ports \
+             open\" page"
+                .to_string(),
+        );
+    }
+    if !error_showing {
+        return Err(
+            "a window constructed with no reachable helper must show its own, distinguishable \
+             state"
+                .to_string(),
+        );
+    }
+    if !status_bar_prominent {
+        return Err(
+            "the status line must say, prominently, that the helper could not be reached"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below. A type alias rather than spelling
 /// `(&str, fn() -> Result<(), String>)` out at the call site: clippy's
 /// `type_complexity` flagged the inline form (the actual finding from the
@@ -212,7 +412,7 @@ fn main() {
     // A plain array, not `vec![]`: the list is fixed at compile time and
     // never grows, so there is nothing a `Vec` buys here, independently of
     // what clippy does or does not flag.
-    let cases: [Case; 6] = [
+    let cases: [Case; 9] = [
         (
             "the_window_is_actually_realized_not_merely_constructed",
             the_window_is_actually_realized_not_merely_constructed,
@@ -236,6 +436,18 @@ fn main() {
         (
             "the_window_has_an_open_button_that_is_reachable_from_the_keyboard",
             the_window_has_an_open_button_that_is_reachable_from_the_keyboard,
+        ),
+        (
+            "every_action_is_reachable_from_the_keyboard",
+            every_action_is_reachable_from_the_keyboard,
+        ),
+        (
+            "a_narrow_window_keeps_every_row_readable",
+            a_narrow_window_keeps_every_row_readable,
+        ),
+        (
+            "a_construction_with_an_unreachable_helper_does_not_show_the_calm_empty_state",
+            a_construction_with_an_unreachable_helper_does_not_show_the_calm_empty_state,
         ),
     ];
 

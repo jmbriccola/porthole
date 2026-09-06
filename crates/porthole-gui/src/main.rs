@@ -1,15 +1,16 @@
 //! porthole-gui: the GTK4/libadwaita front end.
 //!
-//! No D-Bus code exists in this crate yet -- `zbus` and `tokio` are declared
-//! dependencies with nothing calling them, here only for the tasks that
-//! follow this one. The binding invariant those tasks must hold, stated here
-//! as the forward requirement it is rather than as present-tense behaviour
-//! this crate does not yet have: the GUI is to be a **session-bus client**,
-//! exactly like the CLI (see `porthole-cli/src/client.rs`) -- it must reach
-//! `com.jacopobriccola.Porthole` only through the helper's
-//! `com.jacopobriccola.Porthole1` interface (`porthole_core::ipc`), never
-//! touch the system bus directly, and never run a firewall command of its
-//! own.
+//! Two different D-Bus buses, and it is deliberate that they share a name
+//! (`com.jacopobriccola.Porthole`) without being the same bus -- see
+//! `app.rs`'s own module doc for why. The `adw::Application` this binary
+//! builds claims that name on the **session** bus, purely as its own
+//! single-instance identity; every actual call to the helper (`open_now.rs`,
+//! `open_dialog.rs`, `window.rs`'s own initial-load and refresh path) goes
+//! over the **system** bus instead, the same bus the CLI reaches the helper
+//! on by default (`porthole-cli/src/client.rs`). Every one of those calls
+//! reaches the helper only through its `com.jacopobriccola.Porthole1`
+//! interface (`porthole_core::ipc`) -- never a rule composed in this crate,
+//! and never a firewall command run by this crate's own process.
 
 use adw::prelude::*;
 

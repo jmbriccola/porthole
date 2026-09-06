@@ -255,6 +255,7 @@ fn apply(inner: &Rc<Inner>) {
 /// The lower section of the main window: services running on this machine
 /// that are not open to the network, each offering an Open button only when
 /// pressing it could actually change something.
+#[derive(Clone)]
 pub struct ListeningSection {
     inner: Rc<Inner>,
 }
