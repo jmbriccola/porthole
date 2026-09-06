@@ -6,10 +6,11 @@ use crate::output;
 use porthole_core::backend::{self, BackendHealth, BackendId, FirewallBackend};
 use porthole_core::clock::{Clock, SystemClock};
 use porthole_core::command::{CommandRunner, DryRunRunner, RealRunner};
+use porthole_core::devices;
 use porthole_core::engine::{Engine, Status};
 use porthole_core::error::{Error, ExitCode, Result};
 use porthole_core::listening::{self, RealProcFs};
-use porthole_core::model::{Lifetime, DEFAULT_DURATION};
+use porthole_core::model::{Lifetime, ScopeSpec, DEFAULT_DURATION};
 use porthole_core::net;
 use porthole_core::state::StateStore;
 use porthole_core::validate;
@@ -126,6 +127,7 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::Success)
         }
+        Commands::Devices { command } => devices_command(cli, command),
     }
 }
 
@@ -135,7 +137,23 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
     // that opening means a polkit prompt — no authentication prompt either.
     let port = validate::parse_port(&args.port)?;
     let protocol = validate::parse_protocol(&args.proto)?;
-    let scope = validate::parse_scope(&args.to)?;
+
+    // `--to` may name a saved device instead of an ordinary scope.
+    // Resolution happens here, client-side: the helper (and, under
+    // --dry-run, the local engine below) must only ever see an
+    // already-resolved IP -- see `porthole_core::devices`'s own module doc
+    // for why. `wire_to` is what actually crosses the bus for a real (non
+    // dry-run) open; for anything but a device it is `args.to` unchanged.
+    let (scope, wire_to): (ScopeSpec, String) = match crate::cli::parse_to(&args.to) {
+        crate::cli::ToSpec::Scope(scope) => (scope, args.to.clone()),
+        crate::cli::ToSpec::Invalid(err) => return Err(err),
+        crate::cli::ToSpec::Device(name) => {
+            let book = devices::Book::load(&devices::default_path())?;
+            let runner = make_runner(cli);
+            let addr = devices::resolve(&book, &name, runner.as_ref())?;
+            (ScopeSpec::Host(addr), addr.to_string())
+        }
+    };
     let lifetime = match (&args.duration, args.until_reboot) {
         (Some(raw), false) => Lifetime::For(validate::parse_duration(raw)?),
         (None, true) => Lifetime::UntilReboot,
@@ -188,7 +206,7 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
         // No engine, no runner, no local audit line: the helper does the work
         // and, being a system service, its own journal entry is the audit
         // trail now — in every case, not just under the expiry timer.
-        let rule = client::open(cli.session, port, &args.proto, &args.to, seconds)?;
+        let rule = client::open(cli.session, port, &args.proto, &wire_to, seconds)?;
         let now = rule.opened_at;
 
         if cli.json {
@@ -333,6 +351,95 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
             None => Ok(ExitCode::Success),
         }
     }
+}
+
+/// `porthole devices <list|add|rm>`. Unprivileged and local, like `list` and
+/// `status`: the address book lives client-side, and nothing here ever
+/// touches the helper or a firewall backend.
+fn devices_command(cli: &Cli, command: &crate::cli::DevicesCommand) -> Result<ExitCode> {
+    let path = devices::default_path();
+    match command {
+        crate::cli::DevicesCommand::List => {
+            let book = devices::Book::load(&path)?;
+            let runner = make_runner(cli);
+            let rows = devices::list_status(&book, runner.as_ref());
+            if cli.json {
+                println!("{}", output::json_devices(&rows));
+            } else {
+                output::print_devices(&rows);
+            }
+            Ok(ExitCode::Success)
+        }
+        crate::cli::DevicesCommand::Add => add_device(cli, &path),
+        crate::cli::DevicesCommand::Rm { name } => {
+            let mut book = devices::Book::load(&path)?;
+            if !book.remove(name) {
+                return Err(Error::InvalidArgument(format!(
+                    "no saved device named `{name}`"
+                )));
+            }
+            book.save(&path)?;
+            println!("Forgot `{name}`.");
+            Ok(ExitCode::Success)
+        }
+    }
+}
+
+/// `porthole devices add`: presents the neighbours currently seen on this
+/// network and lets the user pick one, rather than typing a MAC address by
+/// hand -- typing one is exactly what saved devices exist to avoid.
+fn add_device(cli: &Cli, path: &std::path::Path) -> Result<ExitCode> {
+    use std::io::Write as _;
+
+    let mut book = devices::Book::load(path)?;
+    let runner = make_runner(cli);
+    let neighbours = net::neighbours(runner.as_ref())?;
+    if neighbours.is_empty() {
+        eprintln!(
+            "porthole: nothing seen on this network yet to pick from -- make sure the device \
+             has talked to this machine recently, or add it by hand in {}",
+            path.display()
+        );
+        return Ok(ExitCode::Failure);
+    }
+
+    println!("Seen on this network:");
+    for (i, n) in neighbours.iter().enumerate() {
+        println!("  {}) {}  {}  ({})", i + 1, n.mac, n.address, n.interface);
+    }
+    print!("Pick a number: ");
+    std::io::stdout().flush().ok();
+    let choice = read_line()?;
+    let index: usize = choice.parse().map_err(|_| {
+        Error::InvalidArgument(format!("`{choice}` is not one of the numbers above"))
+    })?;
+    let chosen = index
+        .checked_sub(1)
+        .and_then(|i| neighbours.get(i))
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!("{index} is not one of the numbers above"))
+        })?;
+
+    print!("Name this device: ");
+    std::io::stdout().flush().ok();
+    let name = read_line()?;
+    if name.is_empty() {
+        return Err(Error::InvalidArgument("a device needs a name".to_string()));
+    }
+
+    book.add(devices::Device {
+        name: name.clone(),
+        address: devices::DeviceAddress::Mac(chosen.mac.clone()),
+    });
+    book.save(path)?;
+    println!("Saved `{name}` as {}.", chosen.mac);
+    Ok(ExitCode::Success)
+}
+
+fn read_line() -> Result<String> {
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).map_err(Error::Io)?;
+    Ok(line.trim().to_string())
 }
 
 fn make_runner(cli: &Cli) -> Box<dyn CommandRunner> {

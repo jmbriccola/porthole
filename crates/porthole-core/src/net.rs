@@ -130,6 +130,65 @@ pub fn default_route_interface(runner: &dyn CommandRunner) -> Result<String> {
     parse_default_route(&out.stdout)
 }
 
+/// One entry in the kernel's neighbour (ARP) table: an IPv4 address this
+/// machine has actually seen on some interface, and the link-layer address it
+/// answered with, when the kernel still has one recorded for it.
+///
+/// Used to resolve a saved device's MAC address to whatever IPv4 address it
+/// currently holds -- see `devices.rs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Neighbour {
+    pub address: Ipv4Addr,
+    pub interface: String,
+    /// Lower-case, e.g. `bc:24:11:5e:1c:6e`.
+    pub mac: String,
+}
+
+/// Parse `ip -4 neigh show`'s text output.
+///
+/// Not a positional parse: `dev <iface>` and `lladdr <mac>` are found by
+/// their own keyword, not by column index. That distinction is load-bearing
+/// here specifically because an `INCOMPLETE` entry has no `lladdr` field at
+/// all -- a parse that assumed a fixed column held the MAC would read the
+/// state word `INCOMPLETE` itself as one. `STALE` (and any other state word)
+/// still carries a usable link-layer address and is kept; only an entry with
+/// no `lladdr` token anywhere on its line is skipped.
+fn parse_neighbours(text: &str) -> Result<Vec<Neighbour>> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let Some(address) = fields.first().and_then(|f| f.parse::<Ipv4Addr>().ok()) else {
+            continue;
+        };
+
+        let mut interface = None;
+        let mut mac = None;
+        for i in 1..fields.len().saturating_sub(1) {
+            match fields[i] {
+                "dev" => interface = Some(fields[i + 1].to_string()),
+                "lladdr" => mac = Some(fields[i + 1].to_ascii_lowercase()),
+                _ => {}
+            }
+        }
+
+        if let (Some(interface), Some(mac)) = (interface, mac) {
+            out.push(Neighbour {
+                address,
+                interface,
+                mac,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The kernel's IPv4 neighbour table.
+pub fn neighbours(runner: &dyn CommandRunner) -> Result<Vec<Neighbour>> {
+    let cmd = Command::read("ip", ["-4", "neigh", "show"]);
+    let out = runner.run(&cmd)?.into_ok(&cmd)?;
+    parse_neighbours(&out.stdout)
+}
+
 /// The subnet porthole opens towards by default.
 pub fn current_network(runner: &dyn CommandRunner) -> Result<LocalNetwork> {
     let interface = default_route_interface(runner)?;
@@ -263,5 +322,58 @@ mod tests {
                 .all(|c| c.effect == crate::command::Effect::Read),
             "network detection must never mutate anything"
         );
+    }
+
+    /// Captured from `ip -4 neigh show` on this machine. The third line is
+    /// the case that matters: an `INCOMPLETE` entry has no `lladdr` field at
+    /// all, so a positional parse that assumed field 5 held the MAC would
+    /// read the state word itself as one.
+    const IP_NEIGH: &str = "\
+10.10.10.1 dev wlo1 lladdr 50:e6:36:51:42:fd REACHABLE
+10.10.10.245 dev wlo1 lladdr bc:24:11:5e:1c:6e STALE
+10.10.10.101 dev wlo1 INCOMPLETE
+10.10.10.17 dev wlo1 lladdr bc:24:11:99:5d:f3 STALE
+";
+
+    #[test]
+    fn an_incomplete_neighbour_has_no_mac_and_is_skipped_not_misread() {
+        let found = parse_neighbours(IP_NEIGH).unwrap();
+        assert_eq!(found.len(), 3);
+        assert!(found.iter().all(|n| n.mac != "incomplete"));
+    }
+
+    #[test]
+    fn a_stale_neighbour_still_resolves() {
+        // STALE means the kernel has not confirmed the entry recently, not
+        // that it is wrong. Requiring REACHABLE would make a phone that has
+        // been idle for a minute "unreachable", which is most of the time.
+        let found = parse_neighbours(IP_NEIGH).unwrap();
+        let phone = found.iter().find(|n| n.mac == "bc:24:11:5e:1c:6e").unwrap();
+        assert_eq!(phone.address, "10.10.10.245".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(phone.interface, "wlo1");
+    }
+
+    #[test]
+    fn a_mac_is_lower_cased_regardless_of_how_ip_printed_it() {
+        let found =
+            parse_neighbours("10.10.10.1 dev wlo1 lladdr AA:BB:CC:DD:EE:FF REACHABLE\n").unwrap();
+        assert_eq!(found[0].mac, "aa:bb:cc:dd:ee:ff");
+    }
+
+    #[test]
+    fn a_blank_line_is_skipped_not_an_error() {
+        assert!(parse_neighbours("\n").unwrap().is_empty());
+        assert!(parse_neighbours("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn neighbours_reads_the_ipv4_only_table() {
+        let runner = RecordingRunner::with_responses(vec![Output::stdout(IP_NEIGH)]);
+        let found = neighbours(&runner).unwrap();
+        assert_eq!(found.len(), 3);
+
+        let commands = runner.recorded();
+        assert_eq!(commands[0].display(), "ip -4 neigh show");
+        assert_eq!(commands[0].effect, crate::command::Effect::Read);
     }
 }

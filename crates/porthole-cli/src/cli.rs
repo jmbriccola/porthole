@@ -54,6 +54,68 @@ pub enum Commands {
     /// only over IPv6 (porthole manages IPv4 rules only, and can neither
     /// open nor close those).
     Listen,
+    /// Manage saved devices, so `--to <name>` can open towards one instead of
+    /// typing its address by hand.
+    Devices {
+        #[command(subcommand)]
+        command: DevicesCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DevicesCommand {
+    /// List saved devices and whether each resolves on this network right
+    /// now.
+    List,
+    /// Save a device, picked from the machines currently seen on this
+    /// network.
+    Add,
+    /// Forget a saved device.
+    Rm {
+        /// The device's name, as shown by `devices list`.
+        name: String,
+    },
+}
+
+/// What `--to` named, before a saved device's name (if any) is resolved to
+/// an address.
+///
+/// Kept out of `porthole_core::validate` on purpose: that module's
+/// `parse_scope` is also what the privileged helper runs on its own copy of
+/// the wire string, and the helper must never gain a reason to know saved
+/// devices exist -- see `porthole_core::devices`'s own module doc for why
+/// resolution happens client-side, before either the bus or the local engine
+/// ever sees the string.
+#[derive(Debug)]
+pub enum ToSpec {
+    Scope(porthole_core::model::ScopeSpec),
+    Device(String),
+    /// `--to` was rejected, and not as a candidate device name either --
+    /// see `parse_to`'s own doc comment.
+    Invalid(porthole_core::error::Error),
+}
+
+/// Parse `--to`. The ordinary scope grammar (`subnet`, `any`, a CIDR, an IP)
+/// takes priority; when that grammar rejects the string, this still checks
+/// whether the string looks like it was an attempt at that grammar rather
+/// than a name -- containing a `/` or a `:` (a CIDR or an IPv6 address, e.g.
+/// `fe80::1`), or being empty -- and keeps `parse_scope`'s own error for
+/// that case, since it is far more specific than "no such device" (naming
+/// IPv6 explicitly, for instance). A device name is never going to contain
+/// any of those, so anything else is treated as a candidate saved-device
+/// name instead -- `porthole_core::devices::resolve` is what actually
+/// decides whether that name exists.
+pub fn parse_to(raw: &str) -> ToSpec {
+    match porthole_core::validate::parse_scope(raw) {
+        Ok(scope) => ToSpec::Scope(scope),
+        Err(err) => {
+            if raw.is_empty() || raw.contains('/') || raw.contains(':') {
+                ToSpec::Invalid(err)
+            } else {
+                ToSpec::Device(raw.to_string())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -73,7 +135,8 @@ pub struct OpenArgs {
     #[arg(long)]
     pub until_reboot: bool,
 
-    /// Who to open towards: subnet, any, a CIDR, or an IP address.
+    /// Who to open towards: subnet, any, a CIDR, an IP address, or the name
+    /// of a device saved with `porthole devices add`.
     #[arg(long, default_value = "subnet")]
     pub to: String,
 }

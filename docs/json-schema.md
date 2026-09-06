@@ -260,6 +260,44 @@ needs to tell "not resolved" from "a process actually named that" can rely on
 this: the field is `null` in the first case and always a real string in the
 second.
 
+## `porthole devices list --json`
+
+```json
+{
+  "schema": 1,
+  "devices": [
+    {
+      "name": "phone",
+      "kind": "mac",
+      "address": "bc:24:11:5e:1c:6e",
+      "resolvable": true,
+      "resolved_address": "10.10.10.245"
+    },
+    {
+      "name": "printer",
+      "kind": "host",
+      "address": "printer.local",
+      "resolvable": false,
+      "resolved_address": null
+    }
+  ]
+}
+```
+
+Saved devices live client-side, in `~/.config/porthole/devices.toml` -- the
+privileged helper never reads this file, and `--to <name>` resolves a saved
+device to an address before anything crosses the D-Bus boundary.
+
+`kind` is `"mac"` (resolved through the kernel's neighbour table) or `"host"`
+(resolved through the system resolver, e.g. an mDNS `.local` name); `address`
+is the saved MAC or hostname, unchanged. `resolvable` is whether the device
+answers on this network right now -- a saved device is not always present,
+and this is not an error, only a fact: opening `--to` an unresolvable device
+fails with the `device_unreachable` kind and exit code 6, in the same
+`{code, kind, message}` shape the Errors section below describes for every
+other failure. `resolved_address` is the address it currently resolves to, or
+`null` when it does not resolve right now.
+
 ## `porthole doctor --json`
 
 ```json

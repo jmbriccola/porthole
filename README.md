@@ -105,12 +105,22 @@ see [docs/installing.md](docs/installing.md).
 
 ```
 porthole open <PORT> [--proto tcp|udp] [--for 30m | --until-reboot]
-                     [--to subnet|any|<CIDR>|<IP>]
+                     [--to subnet|any|<CIDR>|<IP>|<device name>]
 porthole close <PORT> | --id <ID> | --all
 porthole list
 porthole status
 porthole doctor
+porthole devices list | add | rm <name>
 ```
+
+`--to <name>` opens towards a saved device, resolved to its current address
+(by MAC, via the neighbour table, or by hostname) at the moment the port is
+opened — never earlier, since under DHCP that address can change. `porthole
+devices add` shows the devices currently seen on this network to pick a MAC
+from, so there is no need to type one by hand; an mDNS hostname is added by
+editing `~/.config/porthole/devices.toml` directly. See
+[docs/json-schema.md](docs/json-schema.md#porthole-devices-list---json) for
+`devices list --json`.
 
 Global flags:
 

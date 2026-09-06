@@ -6,6 +6,7 @@
 
 use porthole_core::backend::BackendId;
 use porthole_core::command::Command;
+use porthole_core::devices::{DeviceAddress, DeviceStatus};
 use porthole_core::engine::Status;
 use porthole_core::error::Error;
 use porthole_core::listening::{Binding, Service};
@@ -521,6 +522,73 @@ fn append_listening_rows(
     }
 }
 
+fn device_address_string(address: &DeviceAddress) -> String {
+    match address {
+        DeviceAddress::Mac(mac) => mac.clone(),
+        DeviceAddress::Host(host) => host.clone(),
+    }
+}
+
+fn device_json(row: &DeviceStatus) -> Value {
+    let (kind, address) = match &row.device.address {
+        DeviceAddress::Mac(mac) => ("mac", mac.clone()),
+        DeviceAddress::Host(host) => ("host", host.clone()),
+    };
+    json!({
+        "name": row.device.name,
+        "kind": kind,
+        "address": address,
+        "resolvable": row.resolved.is_some(),
+        "resolved_address": row.resolved.map(|a| a.to_string()),
+    })
+}
+
+pub fn json_devices(rows: &[DeviceStatus]) -> Value {
+    json!({
+        "schema": JSON_SCHEMA,
+        "devices": rows.iter().map(device_json).collect::<Vec<_>>(),
+    })
+}
+
+pub fn print_devices(rows: &[DeviceStatus]) {
+    print!("{}", render_devices(rows));
+}
+
+/// The text `print_devices` prints, built as a `String` so tests can assert
+/// on it directly -- the same split `render_listening` uses, for the same
+/// reason.
+fn render_devices(rows: &[DeviceStatus]) -> String {
+    use std::fmt::Write as _;
+    let w = "writing to a String cannot fail";
+    let mut out = String::new();
+
+    if rows.is_empty() {
+        writeln!(out, "No saved devices.").expect(w);
+        return out;
+    }
+
+    let name_width = rows.iter().map(|r| r.device.name.len()).max().unwrap_or(0);
+    let address_width = rows
+        .iter()
+        .map(|r| device_address_string(&r.device.address).len())
+        .max()
+        .unwrap_or(0);
+    for row in rows {
+        let address = device_address_string(&row.device.address);
+        let status = match row.resolved {
+            Some(addr) => format!("resolves to {addr}"),
+            None => "not on this network right now".to_string(),
+        };
+        writeln!(
+            out,
+            "{:name_width$}  {address:address_width$}  {status}",
+            row.device.name
+        )
+        .expect(w);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,5 +1062,93 @@ mod tests {
         );
         assert!(rows[0].contains("0.0.0.0"), "got: {text}");
         assert!(rows[1].contains("::"), "got: {text}");
+    }
+
+    fn device_status(name: &str, address: DeviceAddress, resolved: Option<&str>) -> DeviceStatus {
+        use porthole_core::devices::Device;
+        DeviceStatus {
+            device: Device {
+                name: name.to_string(),
+                address,
+            },
+            resolved: resolved.map(|a| a.parse().unwrap()),
+        }
+    }
+
+    #[test]
+    fn json_devices_has_the_documented_shape() {
+        let rows = vec![device_status(
+            "phone",
+            DeviceAddress::Mac("bc:24:11:5e:1c:6e".to_string()),
+            Some("10.10.10.245"),
+        )];
+        let json = json_devices(&rows);
+        assert_eq!(json["schema"], 1);
+        let d = &json["devices"][0];
+        assert_eq!(d["name"], "phone");
+        assert_eq!(d["kind"], "mac");
+        assert_eq!(d["address"], "bc:24:11:5e:1c:6e");
+        assert_eq!(d["resolvable"], true);
+        assert_eq!(d["resolved_address"], "10.10.10.245");
+    }
+
+    #[test]
+    fn an_unresolvable_device_reports_resolvable_false_and_a_null_address() {
+        let rows = vec![device_status(
+            "tablet",
+            DeviceAddress::Mac("aa:bb:cc:dd:ee:ff".to_string()),
+            None,
+        )];
+        let json = json_devices(&rows);
+        assert_eq!(json["devices"][0]["resolvable"], false);
+        assert!(json["devices"][0]["resolved_address"].is_null());
+    }
+
+    #[test]
+    fn a_host_device_reports_the_host_kind() {
+        let rows = vec![device_status(
+            "printer",
+            DeviceAddress::Host("printer.local".to_string()),
+            Some("10.10.10.55"),
+        )];
+        let json = json_devices(&rows);
+        assert_eq!(json["devices"][0]["kind"], "host");
+        assert_eq!(json["devices"][0]["address"], "printer.local");
+    }
+
+    #[test]
+    fn the_empty_device_list_is_an_empty_array_not_a_missing_key() {
+        let json = json_devices(&[]);
+        assert_eq!(json["devices"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn render_devices_says_nothing_saved_when_the_book_is_empty() {
+        assert_eq!(render_devices(&[]), "No saved devices.\n");
+    }
+
+    #[test]
+    fn render_devices_shows_the_resolved_address_or_says_it_is_absent() {
+        let rows = vec![
+            device_status(
+                "phone",
+                DeviceAddress::Mac("bc:24:11:5e:1c:6e".to_string()),
+                Some("10.10.10.245"),
+            ),
+            device_status(
+                "tablet",
+                DeviceAddress::Mac("aa:bb:cc:dd:ee:ff".to_string()),
+                None,
+            ),
+        ];
+        let text = render_devices(&rows);
+        assert!(
+            text.contains("phone") && text.contains("resolves to 10.10.10.245"),
+            "got: {text}"
+        );
+        assert!(
+            text.contains("tablet") && text.contains("not on this network right now"),
+            "got: {text}"
+        );
     }
 }
