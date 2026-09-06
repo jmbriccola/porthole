@@ -1,0 +1,22 @@
+# The ufw image: milestone 3's mandatory acceptance test runs here.
+#
+# ufw itself is what makes this container worth having: it is the one backend
+# whose rules are permanent (`ufw allow` writes /etc/ufw/user.rules, reloaded
+# by ufw.service at boot), so it is the one backend that needs reconciliation
+# to uphold "nothing survives a reboot" -- see
+# `crates/porthole-cli/tests/container.rs`.
+#
+# No Rust toolchain, no copy of the porthole binaries: those are built once on
+# the host as a static musl binary and bind-mounted in at container-run time,
+# so this image never needs rebuilding when porthole's source changes.
+FROM docker.io/library/debian:13
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update -qq \
+    && apt-get install -y -qq \
+       ufw \
+       dbus \
+       iproute2 \
+       procps \
+    && rm -rf /var/lib/apt/lists/*

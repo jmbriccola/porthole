@@ -1,0 +1,24 @@
+# The firewalld image.
+#
+# firewalld is a D-Bus system service, so this image also carries a system
+# `dbus-daemon` -- there is no systemd PID 1 in a container to start one, so
+# the test itself starts `dbus-daemon --system` and `firewalld --nofork`
+# directly. Verified empirically (see
+# .superpowers/sdd/milestone-3-verified-facts.md and the container test file
+# itself): running everything as the container's own root is enough for
+# firewalld to accept `--add-rich-rule` with no polkit agent anywhere --
+# unlike the real desktop `helper_e2e.rs` suite, which relies on the opposite
+# being true for an *unprivileged* caller against a *real* system firewalld.
+#
+# No Rust toolchain, no copy of the porthole binaries: those are built once on
+# the host as a static musl binary and bind-mounted in at container-run time.
+FROM registry.fedoraproject.org/fedora:44
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+      firewalld \
+      dbus-daemon \
+      dbus-tools \
+      iproute \
+      nftables \
+      procps-ng \
+    && dnf clean all
