@@ -58,7 +58,11 @@ Used in `list`, `status`, `open` and `close`.
 `network` is `null` when the machine is not on a usable network.
 
 `backend` is one of `"firewalld"`, `"ufw"` or `"nftables"` — whichever
-porthole detected on this machine, in that priority order. `location` means
+porthole detected on this machine, in that priority order, **when
+`firewall_available` is `true`**. When it is `false` — no supported firewall
+was found at all — `backend` still holds `"firewalld"`, but that value is
+arbitrary and carries no information: nothing was actually detected, and a
+script must not read anything into it in that case. `location` means
 something different for each, and a script that assumes it is always a
 firewalld zone will misread the other two:
 

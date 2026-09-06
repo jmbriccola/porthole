@@ -3,11 +3,46 @@
 //!
 //! A real `porthole-helper` runs as a child process on the session bus and the
 //! real `porthole` binary drives it. What this proves and what it cannot is
-//! written out in each test — the helper talks to the real firewalld, whose own
-//! polkit policy requires an admin password for config actions, so an ordinary
-//! user cannot change the firewall through it. That makes this safe to run, and
-//! it means the "firewalld agrees" half belongs to the human checklist.
+//! written out in each test.
+//!
+//! # Why this is safe to run, precisely
+//!
+//! An earlier version of this comment said the reason was that the helper
+//! talks to the real firewalld, whose own polkit policy requires an admin
+//! password for config actions. That is true of the ordinary `open`/`close`
+//! path, but it is backend-specific, and it stopped being the whole story the
+//! moment this milestone added reconciliation: starting the helper at all --
+//! for *every* test below, not only the ones that call `open` or `close` --
+//! runs its start-up sweep (`reconcile_at_startup` in `porthole-helper`'s
+//! `main.rs`) against whatever firewall backend this real machine actually
+//! has, before any client request exists to gate it.
+//!
+//! What actually makes that safe:
+//!
+//! - On firewalld, the sweep can never remove a rule it did not create --
+//!   rich rules carry no marker, so `Ownership::Unprovable` skips that half
+//!   of reconciliation outright, on every account, privileged or not.
+//! - On ufw or nftables, the sweep *can* prove ownership and does remove an
+//!   orphan it finds, straight through `ufw`/`nft` rather than through
+//!   firewalld's D-Bus/polkit path -- so this suite's `--session`
+//!   `AlwaysAllow` authorizer (which stands in for polkit here) has no
+//!   bearing on it at all. The only thing standing between that sweep and a
+//!   real rule on either of those backends is the OS's own root check on
+//!   `ufw`/`nft` themselves.
+//!
+//! So the condition this suite's safety actually depends on is: this process
+//! is not genuinely root, or the detected backend is one whose sweep cannot
+//! remove anything (firewalld). `start_helper` below checks exactly that and
+//! refuses to start the helper otherwise, rather than let a start-up sweep
+//! mutate a real firewall on the machine running the tests. Run as an
+//! ordinary user, nothing in this file can mutate the real firewall on any
+//! backend: reaching the ordinary `open`/`close` mutations still needs
+//! firewalld's own polkit (which refuses an unauthenticated request) or, on
+//! ufw/nftables, real root that an ordinary test process does not have
+//! either.
 
+use porthole_core::backend::{self, BackendId};
+use porthole_core::command::RealRunner;
 use std::process::{Child, Command, Stdio};
 use tempfile::TempDir;
 
@@ -21,7 +56,7 @@ impl Drop for Helper {
     }
 }
 
-/// All five tests below spawn a helper claiming the *same* well-known name on
+/// All six tests below spawn a helper claiming the *same* well-known name on
 /// the *same* session bus, and `cargo test` runs the `#[test]` functions in
 /// one process on separate threads by default. Two helpers racing for that
 /// one name — or one test's `Drop` killing its helper while another test's
@@ -43,6 +78,31 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// The backend whose start-up reconciliation sweep could remove a real rule
+/// from this machine's real firewall if the helper were started right now --
+/// see the module docs for why this is the condition this suite's safety
+/// actually depends on, not "the helper talks to firewalld".
+///
+/// Two things have to hold at once: this process is genuinely root (not
+/// merely authorized by this suite's own `--session` `AlwaysAllow`, which the
+/// sweep bypasses entirely -- it runs before the bus is even served), and the
+/// backend `backend::detect` finds on this real machine is one whose sweep
+/// can prove ownership (`Ufw` or `Nftables`; firewalld's rich rules cannot be
+/// marked, so its half of reconciliation that removes an orphan never runs at
+/// all, on any account). `detect` failing outright -- no firewall installed
+/// on this machine at all -- is the same as firewalld for this purpose:
+/// nothing for the sweep to touch either way, so that case returns `None`
+/// too.
+fn unsafe_startup_sweep_backend() -> Option<BackendId> {
+    if !is_root() {
+        return None;
+    }
+    match backend::detect(&RealRunner).map(|b| b.id()) {
+        Ok(id @ (BackendId::Ufw | BackendId::Nftables)) => Some(id),
+        _ => None,
+    }
+}
+
 /// `CARGO_BIN_EXE_<name>` only ever resolves for a binary target in the *same*
 /// package as the integration test — verified empirically, since it is easy
 /// to assume (as this test once did) that it reaches across the workspace to
@@ -60,7 +120,7 @@ fn helper_bin() -> std::path::PathBuf {
 
 /// Every reason [`start_helper`] can fail to hand back a running helper, each
 /// carrying enough to say *which* it was rather than one blanket "skipped"
-/// that hides all four behind the same sentence — which is exactly how a
+/// that hides all five behind the same sentence — which is exactly how a
 /// missing `porthole` at `/usr/bin` and `/usr/local/bin` made every test below
 /// silently skip while `cargo test` still reported the suite `ok`.
 enum StartFailure {
@@ -75,6 +135,13 @@ enum StartFailure {
     /// The process is still alive, but never showed up on the session bus
     /// within the timeout — a missing session bus, or `busctl` unavailable.
     NeverAppearedOnTheBus,
+    /// Starting the helper here, right now, would let its start-up
+    /// reconciliation sweep run as genuine root against a backend whose
+    /// orphan removal can actually prove ownership — see the module docs.
+    /// Refused rather than risk a real rule on the machine running the
+    /// suite: there is no way to let the sweep run without also letting it
+    /// act.
+    UnsafeStartupSweep(BackendId),
 }
 
 impl StartFailure {
@@ -100,6 +167,13 @@ impl StartFailure {
                  bus within 5s — no session bus reachable, or `busctl` unavailable"
                     .to_string()
             }
+            StartFailure::UnsafeStartupSweep(id) => format!(
+                "running as root with {id} detected — starting the helper would let its \
+                 start-up reconciliation sweep remove a real {id} rule this machine may \
+                 actually be enforcing, with no polkit and no authorization step in the \
+                 way. Skipped rather than risk it; run this suite as an ordinary user \
+                 instead"
+            ),
         }
     }
 }
@@ -108,6 +182,16 @@ fn start_helper(state: &std::path::Path) -> Result<Helper, StartFailure> {
     // --session is debug-only, so this test cannot run under --release.
     if !cfg!(debug_assertions) {
         return Err(StartFailure::ReleaseBuild);
+    }
+
+    // C2: refuse before ever spawning the helper -- see the module docs and
+    // `unsafe_startup_sweep_backend`'s own doc comment for exactly what this
+    // guards against. Checked here, once, rather than in each test: every
+    // single test below goes through this function, and the start-up sweep
+    // this guards against runs unconditionally the moment the helper starts,
+    // whether or not the test that started it ever calls `open` or `close`.
+    if let Some(id) = unsafe_startup_sweep_backend() {
+        return Err(StartFailure::UnsafeStartupSweep(id));
     }
 
     let bin = helper_bin();

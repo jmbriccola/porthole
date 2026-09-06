@@ -120,13 +120,16 @@ never renumbered.
   network with IPv6 enabled, opening or closing an IPv4 port tells you nothing
   about IPv6 reachability. Do not assume you are protected.
 - **Three backends, chosen for you, never asked about.** porthole detects and
-  drives whichever firewall this machine already runs — firewalld, then ufw,
-  then nftables, in that order — and each one is honestly weaker than
-  firewalld in a way you cannot see from the CLI alone: ufw's rules survive a
-  reboot until the next porthole command sweeps them, and nftables refuses to
-  guess when it cannot prove which chain decides a packet's fate. See
-  [docs/backends.md](docs/backends.md) for what each backend can do, what it
-  cannot, and why — `porthole doctor` also names the one it found.
+  drives whichever firewall this machine already has installed — firewalld,
+  then ufw, then nftables, in that order — and each one has its own honest
+  limitation the others do not share, in a way you cannot see from the CLI
+  alone: firewalld can never prove which of its rich rules are porthole's, so
+  it will not remove one it did not create even after losing track of it;
+  ufw's rules survive a reboot until the next porthole command sweeps them;
+  and nftables refuses to guess when it cannot prove which chain decides a
+  packet's fate. See [docs/backends.md](docs/backends.md) for what each
+  backend can do, what it cannot, and why — `porthole doctor` also names the
+  one it found.
 - **Docker publishes ports below the firewall.** Docker writes its own iptables
   rules, evaluated before firewalld, so a container published on `0.0.0.0` is
   already reachable and closing that port with porthole will not close it.

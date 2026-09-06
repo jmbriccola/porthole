@@ -165,13 +165,17 @@ impl<'a> Engine<'a> {
     /// tidy up, and refusing that because an unrelated stale rule would not
     /// delete is a worse outcome than a rule left behind.
     ///
-    /// Two distinct kinds of "went wrong", both logged: `sweep` itself
-    /// returning `Err` (a failure to list rules, or to save), and a
-    /// successful sweep whose `Report::failures` is non-empty (an
-    /// individual orphan that would not close, or `owned_rules` itself
-    /// failing -- see `reconcile.rs`). The second used to be invisible: it
-    /// no longer aborts `sweep` with `?`, so silently dropping it here would
-    /// have turned a real, reportable failure into one nothing ever prints.
+    /// Several distinct kinds of "went wrong", all logged: `sweep` itself
+    /// returning `Err` (a failure to list rules, or to save); a successful
+    /// sweep whose `Report::failures` is non-empty (an individual orphan
+    /// that would not close); `Report::orphan_sweep_error` (`owned_rules`
+    /// itself failing -- see `reconcile.rs` for why that is a different fact
+    /// from `failures`, not folded into it); and `Report::foreign_backend`
+    /// (I1: a state entry recorded under a backend that is no longer the one
+    /// just detected, which neither sweep direction may touch -- see that
+    /// field's own doc comment). None of these abort `sweep` with `?`
+    /// internally, so silently dropping any of them here would turn a real,
+    /// reportable problem into one nothing ever prints.
     fn run_sweep(&mut self, mode: reconcile::SweepMode) {
         match reconcile::sweep(self.backend, &mut self.state, mode) {
             Ok(report) => {
@@ -179,6 +183,26 @@ impl<'a> Engine<'a> {
                     eprintln!(
                         "porthole: reconciliation could not remove one orphaned rule, \
                          continuing: {failure}"
+                    );
+                }
+                if let Some(e) = &report.orphan_sweep_error {
+                    eprintln!(
+                        "porthole: reconciliation could not check for orphaned rules, \
+                         continuing: {e}"
+                    );
+                }
+                for rule in &report.foreign_backend {
+                    eprintln!(
+                        "porthole: reconciliation found {}/{} recorded under backend {}, but \
+                         {} is what this machine has now -- porthole cannot tell whether that \
+                         rule is still open in the old firewall, so it is left in state \
+                         unclosed rather than guessed away; close it by hand, or switch back \
+                         to {} and let the next command reconcile it",
+                        rule.port,
+                        rule.protocol,
+                        rule.backend,
+                        self.backend.id(),
+                        rule.backend,
                     );
                 }
             }

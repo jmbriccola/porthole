@@ -156,11 +156,14 @@ pub trait FirewallBackend {
 
 /// Pick a backend: firewalld, then ufw, then nftables.
 ///
-/// firewalld and ufw are chosen when **active**; nftables when merely
-/// **present**. That asymmetry is deliberate: installing firewalld or ufw is a
+/// All three are chosen on being **available** (installed), never on being
+/// **active** -- every check below reads `BackendHealth::available` and none
+/// of them reads `active` to decide. What differs is only the *order*:
+/// nftables is checked last and only as a fallback, never a contender ahead
+/// of the other two. Installing firewalld or ufw is a
 /// decision about how this machine's firewall is managed, while `nft` exists
-/// on almost every modern Linux and its presence says nothing at all. So nft
-/// is the fallback, never a contender.
+/// on almost every modern Linux and its mere presence says nothing about
+/// whether anyone uses it as one.
 ///
 /// A backend that is installed but stopped is still returned. "firewalld is
 /// installed but not running" is a more useful thing to tell someone than "no

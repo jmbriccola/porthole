@@ -317,19 +317,49 @@ impl FirewallBackend for Ufw<'_> {
             Err(other) => return Err(other),
         };
 
-        // `ufw status` exits 0 whether the firewall is enabled or not, so the
-        // status is the answer, not an error.
+        // `ufw status` exits 0 whether the firewall is enabled or not -- when
+        // it can run at all. For a non-root caller it refuses outright
+        // ("ERROR: You need to be root to run this script"), and that
+        // refusal is not the same fact as "ufw is not active": `available`
+        // must never depend on this call succeeding, because a ufw this
+        // process cannot read is still installed, and may well still be
+        // enforcing rules porthole simply cannot see from here. Degrading to
+        // `active: false` with an explanation, rather than propagating the
+        // failure with `?` as this used to, is what keeps a permission
+        // problem from reading as "no firewall at all" once it reaches
+        // `detect` -- see C1 in the milestone 3 merge-wave review.
         let status_cmd = Command::read("ufw", ["status"]);
-        let status_out = self.runner.run(&status_cmd)?.into_ok(&status_cmd)?;
-        let active = status_out.stdout.contains("Status: active");
-
-        let detail = if active {
-            match &version {
-                Some(v) => format!("{v} is active"),
-                None => "ufw is active".to_string(),
+        let (active, detail) = match self.runner.run(&status_cmd) {
+            Ok(out) if out.success() => {
+                let active = out.stdout.contains("Status: active");
+                let detail = if active {
+                    match &version {
+                        Some(v) => format!("{v} is active"),
+                        None => "ufw is active".to_string(),
+                    }
+                } else {
+                    "ufw is installed but not active, so no rule it holds is being enforced"
+                        .to_string()
+                };
+                (active, detail)
             }
-        } else {
-            "ufw is installed but not active, so no rule it holds is being enforced".to_string()
+            Ok(out) => (
+                false,
+                format!(
+                    "ufw is installed, but reading its status needs more privilege than this \
+                     process has ({}) -- that is not the same as ufw being inactive, it may \
+                     already be enforcing rules porthole cannot see from here",
+                    out.stderr.trim()
+                ),
+            ),
+            Err(e) => (
+                false,
+                format!(
+                    "ufw is installed, but reading its status failed: {e} -- that is not the \
+                     same as ufw being inactive, it may already be enforcing rules porthole \
+                     cannot see from here"
+                ),
+            ),
         };
 
         Ok(BackendHealth {
@@ -474,10 +504,6 @@ mod tests {
             shown,
             "ufw --force delete allow from 10.10.10.0/24 to any port 5173 proto tcp"
         );
-        assert!(
-            !shown.contains(char::is_numeric) || !shown.contains("delete 1"),
-            "must not delete by index"
-        );
     }
 
     #[test]
@@ -602,6 +628,43 @@ mod tests {
         let health = Ufw::new(&runner).health().unwrap();
         assert!(health.available);
         assert!(!health.active, "inactive ufw enforces nothing");
+    }
+
+    #[test]
+    fn a_permission_denied_status_read_is_still_available_not_an_error() {
+        // C1: `ufw --version` works unprivileged; `ufw status` refuses
+        // outright for a non-root caller ("ERROR: You need to be root to run
+        // this script", verified against the real binary). Before this fix,
+        // `health()` propagated that failure with `?`, so `detect()` returned
+        // `Err` for an ordinary user on a genuinely installed and possibly
+        // active ufw -- turning `status`, `doctor` and `--dry-run` into hard
+        // failures on exactly the machines the README promises they need no
+        // privilege on. `available` must come from `--version` alone, and a
+        // permission failure on the second call must degrade to `active:
+        // false` with an explanation, never propagate as an `Err` that makes
+        // a running firewall look absent.
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout("ufw 0.36.2"),
+            Output {
+                status: 1,
+                stdout: String::new(),
+                stderr: "ERROR: You need to be root to run this script".to_string(),
+            },
+        ]);
+        let health = Ufw::new(&runner).health().unwrap();
+        assert!(
+            health.available,
+            "the binary is there; that must stand alone"
+        );
+        assert!(
+            !health.active,
+            "porthole cannot claim it is enforcing anything it could not read"
+        );
+        assert!(
+            health.detail.contains("root") || health.detail.contains("privilege"),
+            "the detail must say the answer needs privilege, not that ufw is inactive: {}",
+            health.detail
+        );
     }
 
     #[test]

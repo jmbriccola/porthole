@@ -47,13 +47,28 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
                     let mut engine = make_engine(backend.as_ref(), runner.as_ref())?;
                     engine.status()?
                 }
-                Err(Error::BackendUnavailable(detail)) => Status {
+                // Any failure to detect a backend at all -- not only the
+                // documented "no firewall installed" case -- must still
+                // answer in this shape. C1: `detect` used to also fail this
+                // way whenever the active backend's own privileged read
+                // errored (ufw and nftables both need root to say whether
+                // they are enforcing anything), and returning `Err` here made
+                // `status` exit non-zero with a raw error -- breaking the
+                // promise, two paragraphs up, that a script reading `--json`
+                // never has to handle two different top-level shapes. That
+                // specific case no longer reaches here (both backends now
+                // degrade `health()` instead of erroring), but folding every
+                // `detect` failure into this shape, not only
+                // `BackendUnavailable`, is what makes the promise hold
+                // regardless of what a future backend's `detect` path can
+                // fail with.
+                Err(e) => Status {
                     backend: BackendId::Firewalld,
                     health: BackendHealth {
                         available: false,
                         active: false,
                         version: None,
-                        detail,
+                        detail: e.to_string(),
                         caveat: None,
                     },
                     network: net::current_network(runner.as_ref()).ok(),
@@ -62,7 +77,6 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
                         .rules()
                         .to_vec(),
                 },
-                Err(other) => return Err(other),
             };
 
             if cli.json {

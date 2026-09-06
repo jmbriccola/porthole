@@ -135,6 +135,7 @@ fn reconcile_at_startup() {
             return;
         }
     };
+    let backend_id = backend.id();
     match reconcile::sweep(
         backend.as_ref(),
         &mut state,
@@ -145,6 +146,21 @@ fn reconcile_at_startup() {
                 eprintln!(
                     "porthole-helper: start-up reconciliation could not remove one orphaned \
                      rule, continuing: {failure}"
+                );
+            }
+            if let Some(e) = &report.orphan_sweep_error {
+                eprintln!(
+                    "porthole-helper: start-up reconciliation could not check for orphaned \
+                     rules, continuing: {e}"
+                );
+            }
+            for rule in &report.foreign_backend {
+                eprintln!(
+                    "porthole-helper: start-up reconciliation found {}/{} recorded under \
+                     backend {}, but {backend_id} is what this machine has now -- leaving it \
+                     in state unclosed rather than guessing whether it is still open in the \
+                     old firewall",
+                    rule.port, rule.protocol, rule.backend,
                 );
             }
         }

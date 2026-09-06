@@ -127,6 +127,19 @@ impl Default for FakeBackend {
 }
 
 impl FirewallBackend for FakeBackend {
+    // This method returns `Firewalld` while `ownership()`, further down this
+    // same impl, returns `Marked` -- a pairing no real backend has (the real
+    // `Firewalld` is `Unprovable`; the two backends that are `Marked` report
+    // `Ufw` or `Nftables`). Deliberate, not an oversight: most of this
+    // suite's tests care about the marked-ownership behaviour
+    // reconciliation's orphan sweep exercises, not about which id happens to
+    // come back, and inventing a fourth `BackendId` just for this fake would
+    // need one added everywhere `BackendId` is matched exhaustively
+    // (`RuleHandle`, `output.rs`'s `location_label`, this crate's own
+    // `ownership_and_owned_rules_agree_for_every_backend` test, and more) for
+    // a value nothing serialises or reads meaningfully. Keep this pairing in
+    // mind before trusting `FakeBackend` for anything that depends on the two
+    // agreeing the way a real backend's do.
     fn id(&self) -> BackendId {
         BackendId::Firewalld
     }

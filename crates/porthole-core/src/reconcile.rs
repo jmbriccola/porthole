@@ -84,28 +84,62 @@ pub struct Report {
     /// stays `None` there regardless.
     ///
     /// This is reported rather than left implicit: "found no orphans" and
-    /// "could not look for orphans" are different facts, and a caller that
-    /// cannot tell them apart will eventually present the second as the
-    /// first.
+    /// "could not look for orphans" are different facts. No production
+    /// caller reads this today -- `Engine::run_sweep` and the helper's own
+    /// start-up sweep only log `failures`, `orphan_sweep_error` and
+    /// `foreign_backend` -- but it is still part of `sweep`'s contract, is
+    /// covered by its own tests (e.g.
+    /// `on_firewalld_no_rule_is_ever_removed_from_the_firewall`), and exists
+    /// for whichever caller -- a future one, or `porthole doctor`, which
+    /// already explains this per backend some other way -- next needs to
+    /// tell "found nothing" apart from "could not look" without re-deriving
+    /// it from `ownership()` itself.
     pub skipped_orphan_sweep: Option<Ownership>,
+    /// State entries recorded under a different backend than the one just
+    /// detected -- `dnf install firewalld` on an nftables box, or the reverse.
+    /// Neither sweep direction may touch these: a `RuleHandle` from one
+    /// backend's variant is never `==` to anything the newly detected
+    /// backend's `list_rules()` returns, so folding them into the ordinary
+    /// staleness check would drop them from state as if the firewall no
+    /// longer had them -- and then nothing would ever close them, because
+    /// there is no longer any state entry to find them by. Reported here
+    /// instead so a caller can say so loudly rather than silently losing
+    /// track of a rule that may still be sitting in the old firewall.
+    pub foreign_backend: Vec<ManagedRule>,
     /// Things that went wrong while sweeping orphans: an individual rule that
-    /// could not be removed, or -- see [`sweep`]'s doc comment -- a failure
-    /// of [`FirewallBackend::owned_rules`] itself. Never fatal to the sweep:
-    /// one stuck rule, or a backend that cannot currently enumerate its own
-    /// rules, must not stop the rest of the cleanup, and must not cost the
-    /// safe direction its write (see [`sweep`]'s ordering).
+    /// could not be removed. Never fatal to the sweep: one stuck rule must
+    /// not stop the rest of the cleanup, and must not cost the safe
+    /// direction its write (see [`sweep`]'s ordering). Distinct from
+    /// [`Report::orphan_sweep_error`]: every entry here names a rule the
+    /// sweep *did* identify and then could not close, never a failure to
+    /// enumerate them in the first place.
     pub failures: Vec<Error>,
+    /// Set when [`FirewallBackend::owned_rules`] itself returned `Err` -- the
+    /// orphan sweep never got as far as naming a single rule to remove.
+    /// Distinct from [`Report::failures`] on purpose: "could not remove one
+    /// orphaned rule" describes a rule that was identified and then refused
+    /// to go, which is a different fact from "could not even list which
+    /// rules are porthole's" -- e.g. nftables' "more than one chain is
+    /// registered at the input hook" refusal, which is not about any
+    /// particular rule at all. Never fatal to the sweep, for the same reason
+    /// `failures` is not: the safe direction's write already happened by the
+    /// time this can be set (see [`sweep`]'s ordering).
+    pub orphan_sweep_error: Option<Error>,
 }
 
 /// Bring `store` back into agreement with what `backend` actually holds.
 ///
 /// 1. `backend.list_rules()`, once.
-/// 2. Every state entry whose handle is not in that list is stale -- the
+/// 2. Every state entry recorded under a *different* backend than the one
+///    just detected is skipped and recorded in [`Report::foreign_backend`] --
+///    neither confirmed present nor dropped as stale, since it was never
+///    asked about the firewall it actually belongs to. Of the rest, every
+///    entry whose handle is not in `list_rules()`'s answer is stale -- the
 ///    firewall no longer has it -- so it is dropped from `store` and
 ///    recorded in [`Report::dropped_from_state`]. Safe on every backend and
 ///    under every [`SweepMode`]: it never touches the firewall, only
 ///    porthole's own bookkeeping.
-/// 3. Under [`SweepMode::Apply { dry_run: false }`], if step 2 removed
+/// 3. Under [`SweepMode::Apply { dry_run: false }`], if step 2 dropped
 ///    anything, `store` is saved **now** -- before the orphan direction is
 ///    even consulted. The state-firewall direction is safe on every backend;
 ///    making its persistence contingent on the firewall-state direction
@@ -118,9 +152,10 @@ pub struct Report {
 ///    owned handle that no state entry claims, recording each success in
 ///    [`Report::removed_orphans`] and each failure in [`Report::failures`]
 ///    without letting one stop the rest. An `Err` from `owned_rules` itself
-///    is folded into [`Report::failures`] rather than aborting the sweep --
-///    step 3 already ran, so this failure costs nothing that was already
-///    safe. [`SweepMode::ReadOnly`] never reaches this step at all.
+///    is recorded in [`Report::orphan_sweep_error`] -- a different fact from
+///    `failures`, see that field's own doc comment -- rather than aborting
+///    the sweep: step 3 already ran, so this failure costs nothing that was
+///    already safe. [`SweepMode::ReadOnly`] never reaches this step at all.
 ///
 /// A failure to list rules (step 1) or to save the reduced state (step 3)
 /// still returns `Err` rather than being absorbed into the report: nothing
@@ -139,18 +174,34 @@ pub fn sweep(
         dropped_from_state: Vec::new(),
         removed_orphans: Vec::new(),
         skipped_orphan_sweep: None,
+        foreign_backend: Vec::new(),
         failures: Vec::new(),
+        orphan_sweep_error: None,
     };
 
     // state -> firewall: drop anything the firewall no longer has. Safe
     // under every mode -- it only ever shrinks porthole's own bookkeeping.
+    //
+    // An entry recorded under a *different* backend than the one just
+    // detected is neither stale nor current: its `RuleHandle` is a different
+    // enum variant from anything `present` could ever contain (derived
+    // `PartialEq` is false across variants), so it would always compare as
+    // "not present" and be dropped as though the firewall no longer had it --
+    // when in fact porthole never even asked the old firewall. Skip those
+    // rather than guess, and report them so a caller does not silently lose
+    // track of a rule that may still be sitting in the old firewall with no
+    // state entry left to find it by.
     let present = backend.list_rules()?;
-    let stale_ids: Vec<String> = store
-        .rules()
-        .iter()
-        .filter(|rule| !present.contains(&rule.handle))
-        .map(|rule| rule.id.clone())
-        .collect();
+    let mut stale_ids = Vec::new();
+    for rule in store.rules() {
+        if rule.backend != backend.id() {
+            report.foreign_backend.push(rule.clone());
+            continue;
+        }
+        if !present.contains(&rule.handle) {
+            stale_ids.push(rule.id.clone());
+        }
+    }
     for id in stale_ids {
         if let Some(rule) = store.remove(&id) {
             report.dropped_from_state.push(rule);
@@ -191,9 +242,12 @@ pub fn sweep(
                 }
             }
             Err(e) => {
-                // The safe direction's write already happened above, so this
-                // costs nothing that was already known to be correct.
-                report.failures.push(e);
+                // Not a per-rule failure -- see `Report::orphan_sweep_error`'s
+                // own doc comment for why this is a different fact from
+                // `failures` and must not be folded into it. The safe
+                // direction's write already happened above, so this costs
+                // nothing that was already known to be correct.
+                report.orphan_sweep_error = Some(e);
             }
         }
     }
@@ -280,6 +334,49 @@ mod tests {
         let report = sweep(&backend, &mut store, APPLY).unwrap();
         assert_eq!(report.dropped_from_state.len(), 2);
         assert!(store.rules().is_empty());
+    }
+
+    #[test]
+    fn a_state_entry_from_a_different_backend_is_reported_not_silently_dropped() {
+        // I1: `dnf install firewalld` on an nftables box (or the reverse)
+        // leaves a state entry recorded under a backend that is no longer
+        // the one `detect` finds within this same uptime. Its `RuleHandle`
+        // is a different enum variant from anything the *new* backend's
+        // `list_rules()` could ever return (derived `PartialEq` is false
+        // across variants), so the ordinary staleness check
+        // (`!present.contains(&rule.handle)`) is vacuously true for it --
+        // treating a rule that may well still be sitting in the OLD
+        // firewall as though it had simply vanished, and dropping the only
+        // record of it with no timer able to find it again. That is the
+        // under-reporting direction porthole exists to prevent.
+        let backend = FakeBackend::new(); // FakeBackend::id() is always Firewalld.
+        let foreign = ManagedRule {
+            backend: BackendId::Ufw,
+            handle: RuleHandle::Ufw {
+                spec: "from 10.10.10.0/24 to any port 5173 proto tcp".to_string(),
+                marker: "porthole:ufw-leftover".to_string(),
+            },
+            ..managed("leftover", 5173)
+        };
+        let (_dir, mut store) = store_with(vec![foreign.clone()]);
+
+        let report = sweep(&backend, &mut store, APPLY).unwrap();
+
+        assert!(
+            report.dropped_from_state.is_empty(),
+            "a foreign-backend entry must never be treated as stale: {:?}",
+            report.dropped_from_state
+        );
+        assert_eq!(
+            report.foreign_backend,
+            vec![foreign],
+            "it must be reported instead, loudly, not silently discarded"
+        );
+        assert_eq!(
+            store.rules().len(),
+            1,
+            "and it must survive in state -- there is still no other way to find it"
+        );
     }
 
     #[test]
@@ -408,10 +505,14 @@ mod tests {
             1,
             "the safe direction must still run and be reported"
         );
-        assert_eq!(
-            report.failures.len(),
-            1,
+        assert!(
+            report.orphan_sweep_error.is_some(),
             "owned_rules's own failure must be visible, not silently swallowed"
+        );
+        assert!(
+            report.failures.is_empty(),
+            "owned_rules failing outright is a different fact from an individual \
+             rule refusing to close -- see Report::orphan_sweep_error's own doc comment"
         );
         assert!(
             store.rules().is_empty(),

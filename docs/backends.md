@@ -21,6 +21,14 @@ rule porthole did not create is never touched. What differs between them —
 what each one can do, what it cannot, and the caveat that would otherwise
 surprise you later — is everything below.
 
+Reconciliation runs before every command, `--dry-run` included, so the list of
+commands a dry-run `open` prints can contain one you did not ask for: an
+orphan close (a `ufw --force delete ...` or `nft delete rule ...`) for a
+`porthole:`-marked rule reconciliation found and state no longer claims. That
+command belongs to the sweep that always runs alongside your request, not to
+the `open` itself — seeing it is honest, not a bug, but it can look like one
+if you are only expecting commands for the port you named.
+
 ## firewalld
 
 porthole writes **runtime** rich rules only, never `--permanent`: a reload or

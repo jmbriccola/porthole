@@ -194,9 +194,16 @@ fn is_ip_saddr_shape(right: &serde_json::Value) -> bool {
         .is_some_and(|prefix| prefix.get("addr").is_some() && prefix.get("len").is_some())
 }
 
-/// Whether a rule's expression list is exactly the shape `open_impl` writes:
-/// a single tcp/udp `dport` match, an optional `ip saddr` match, and a
-/// terminal `accept` -- nothing else.
+/// Whether a rule's expression list has the shape `open_impl` writes: a
+/// single tcp/udp `dport` match, an optional `ip saddr` match, and a
+/// terminal `accept` -- nothing else recognisable as a different statement.
+///
+/// Not a proof of an exact match: this does not check `match.op` (so a
+/// hand-written rule using `!=` where `open_impl` always writes `==` still
+/// passes) or statement order. Both gaps are only reachable through a
+/// hand-marked `porthole:`-commented rule crafted to exploit them, so they
+/// are negligible in practice -- but say so, rather than call this "exactly"
+/// the shape `open_impl` writes, which it does not actually verify.
 ///
 /// Mirrors `Ufw::parse_status`'s `is_porthole_shape`: a `porthole:`-commented
 /// rule of any other shape is a hand-edited rule or a marker collision, not
@@ -572,69 +579,110 @@ impl FirewallBackend for Nftables<'_> {
             Err(other) => return Err(other),
         };
 
-        let chains = self.list_chains()?;
-        let (active, detail) = match chains.as_slice() {
-            [] => (
-                false,
-                "no nftables chain is registered at the input hook, so nothing is filtering \
-                 incoming traffic and the port is already reachable"
-                    .to_string(),
-            ),
-            [chain] => (
-                true,
-                match &version {
-                    Some(v) => format!("{v}: {chain} is enforcing"),
-                    None => format!("{chain} is enforcing"),
-                },
-            ),
-            many => {
-                let names: Vec<String> = many.iter().map(ToString::to_string).collect();
-                (
-                    true,
-                    format!(
-                        "more than one nftables chain is registered at the input hook ({}); \
-                         porthole cannot tell which one decides a packet's fate",
-                        names.join(", ")
+        // `nft -j list chains` needs root even just to summarise what is
+        // registered ("Operation not permitted (you must be root)" for an
+        // ordinary user, verified against the real binary) -- `available`
+        // must never depend on this succeeding: the binary being present is
+        // already established above, and reading the ruleset is a separate
+        // fact that needs separate privilege. Before this fix, a permission
+        // failure here propagated with `?`, so `detect()` returned `Err` for
+        // an ordinary user on a genuinely installed and possibly enforcing
+        // nftables setup -- see C1 in the milestone 3 merge-wave review.
+        // Degrading to `active: false` with an explanation, rather than
+        // propagating, is what keeps that from reading as "no firewall at
+        // all".
+        //
+        // Only `Error::CommandFailed` degrades this way: that is the shape a
+        // non-zero exit takes (`input_chains`'s own `into_ok()?`), which is
+        // exactly what a permission refusal looks like and the only failure
+        // this measured fact is actually about. A malformed-JSON parse
+        // failure (`Error::Unexpected`, from a genuinely successful exit
+        // whose stdout `porthole` cannot make sense of) is a different
+        // problem `porthole doctor` needs to tell apart from "needs root" --
+        // see `nftables_health_error_names_the_command_to_run_by_hand` in
+        // `doctor.rs` -- so that, and anything else unexpected, still
+        // propagates exactly as before.
+        match self.list_chains() {
+            Ok(chains) => {
+                let (active, detail) = match chains.as_slice() {
+                    [] => (
+                        false,
+                        "no nftables chain is registered at the input hook, so nothing is \
+                         filtering incoming traffic and the port is already reachable"
+                            .to_string(),
                     ),
-                )
-            }
-        };
+                    [chain] => (
+                        true,
+                        match &version {
+                            Some(v) => format!("{v}: {chain} is enforcing"),
+                            None => format!("{chain} is enforcing"),
+                        },
+                    ),
+                    many => {
+                        let names: Vec<String> = many.iter().map(ToString::to_string).collect();
+                        (
+                            true,
+                            format!(
+                                "more than one nftables chain is registered at the input hook \
+                                 ({}); porthole cannot tell which one decides a packet's fate",
+                                names.join(", ")
+                            ),
+                        )
+                    }
+                };
 
-        // The direction that misleads: a chain whose policy is accept and
-        // holds no drop or reject *of its own* might still not be enforcing
-        // anything -- but it might also jump to a chain that does the actual
-        // dropping (exactly how firewalld and ufw lay out their rulesets),
-        // which this backend does not check. Say only what was actually
-        // inspected, with the hedge spelled out, rather than let a user read
-        // a confident guarantee into `active: true` that the chain alone
-        // cannot support. This lives in `caveat`, not appended to `detail`:
-        // it is true regardless of `active` (both are `true` here, but the
-        // distinction matters to callers such as `porthole status`, which
-        // must surface a caveat even when everything else reads as healthy)
-        // and callers that want the standing caution -- `status`, and
-        // `doctor`'s own `remedy` -- read a dedicated field rather than
-        // parsing prose for a "; " separator.
-        let mut caveat = None;
-        if let [chain] = chains.as_slice() {
-            if chain.policy.as_deref() == Some("accept")
-                && !self.chain_itself_has_a_drop_or_reject(chain)?
-            {
-                caveat = Some(
-                    "its policy is accept and no rule in this chain drops or rejects (a \
-                     chain it jumps to might still), so closing a port here is not on its \
-                     own evidence that it becomes unreachable"
-                        .to_string(),
-                );
+                // The direction that misleads: a chain whose policy is accept
+                // and holds no drop or reject *of its own* might still not be
+                // enforcing anything -- but it might also jump to a chain
+                // that does the actual dropping (exactly how firewalld and
+                // ufw lay out their rulesets), which this backend does not
+                // check. Say only what was actually inspected, with the
+                // hedge spelled out, rather than let a user read a confident
+                // guarantee into `active: true` that the chain alone cannot
+                // support. This lives in `caveat`, not appended to `detail`:
+                // it is true regardless of `active` (both are `true` here,
+                // but the distinction matters to callers such as `porthole
+                // status`, which must surface a caveat even when everything
+                // else reads as healthy) and callers that want the standing
+                // caution -- `status`, and `doctor`'s own `remedy` -- read a
+                // dedicated field rather than parsing prose for a "; "
+                // separator.
+                let mut caveat = None;
+                if let [chain] = chains.as_slice() {
+                    if chain.policy.as_deref() == Some("accept")
+                        && !self.chain_itself_has_a_drop_or_reject(chain)?
+                    {
+                        caveat = Some(
+                            "its policy is accept and no rule in this chain drops or rejects \
+                             (a chain it jumps to might still), so closing a port here is not \
+                             on its own evidence that it becomes unreachable"
+                                .to_string(),
+                        );
+                    }
+                }
+
+                Ok(BackendHealth {
+                    available: true,
+                    active,
+                    version,
+                    detail,
+                    caveat,
+                })
             }
+            Err(e @ Error::CommandFailed { .. }) => Ok(BackendHealth {
+                available: true,
+                active: false,
+                version,
+                detail: format!(
+                    "nft is installed, but listing its chains needs more privilege than this \
+                     process has ({e}) -- that is not the same as nothing being registered at \
+                     the input hook, it may already be enforcing traffic porthole cannot see \
+                     from here"
+                ),
+                caveat: None,
+            }),
+            Err(other) => Err(other),
         }
-
-        Ok(BackendHealth {
-            available: true,
-            active,
-            version,
-            detail,
-            caveat,
-        })
     }
 
     fn location(&self) -> Result<Option<String>> {
@@ -1285,6 +1333,48 @@ mod tests {
             !caveat.contains("does not make it unreachable"),
             "must not promise unreachability outright -- a jump target may \
              still drop, and this backend does not follow jump/goto: {caveat}"
+        );
+    }
+
+    #[test]
+    fn a_permission_denied_chain_listing_is_still_available_not_an_error() {
+        // C1: `nft --version` works unprivileged; `nft -j list chains`
+        // refuses for a non-root caller ("Operation not permitted (you must
+        // be root)", verified against the real binary). Before this fix,
+        // `health()` propagated that failure with `?`, so `detect()` returned
+        // `Err` for an ordinary user on a genuinely installed and possibly
+        // enforcing nftables setup -- turning `status`, `doctor` and
+        // `--dry-run` into hard failures on exactly the machines the README
+        // promises they need no privilege on. `available` must come from
+        // `--version` alone, and a permission failure on the second call must
+        // degrade to `active: false` with an explanation, never propagate as
+        // an `Err` that makes a running firewall look absent.
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout("nftables v1.1.6 (Old Doc Yak)"),
+            Output {
+                status: 1,
+                stdout: String::new(),
+                stderr: "Error: Operation not permitted (you must be root)".to_string(),
+            },
+        ]);
+        let health = Nftables::new(&runner).health().unwrap();
+        assert!(
+            health.available,
+            "the binary is there; that must stand alone"
+        );
+        assert!(
+            !health.active,
+            "porthole cannot claim it is enforcing anything it could not read"
+        );
+        assert!(
+            health.detail.contains("root") || health.detail.contains("privilege"),
+            "the detail must say the answer needs privilege, not that nothing is \
+             registered at the input hook: {}",
+            health.detail
+        );
+        assert!(
+            health.caveat.is_none(),
+            "there is nothing to scope a caveat to when the chain could not even be read"
         );
     }
 }
