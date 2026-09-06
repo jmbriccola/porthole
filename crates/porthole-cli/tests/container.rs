@@ -51,37 +51,61 @@
 //! the bus under `--dry-run`, so the dry-run tests below invoke `porthole`
 //! directly.
 //!
-//! # Two deliberate departures from a literal reading of the task brief
+//! # One deliberate departure from a literal reading of the task brief
 //!
-//! - **`--until-reboot`, not `--for 5m`, for the mutating opens.** A real
-//!   `--for <duration>` schedules its own close with `systemd-run`, and these
-//!   containers have no systemd PID 1 to serve it -- confirmed by running
-//!   exactly that and getting `No such file or directory`. `--until-reboot`
-//!   is a first-class, equally real porthole invocation that skips the timer
-//!   entirely (`Lifetime::UntilReboot` in `engine.rs`), and every test here
-//!   controls its own "reboot" directly rather than waiting one out, so
-//!   nothing about what is being proven needs a timer at all. The dry-run
-//!   tests do use `--for 5m` exactly as written: dry-run withholds the
-//!   `systemd-run` command too, so nothing ever tries to run it.
-//! - **The command that reconciles on "boot 2" of the ufw test is
-//!   `close --all`, not `list`.** `porthole list` deliberately touches
-//!   nothing but the state file (see `run.rs`'s own comment on `Commands::List`)
-//!   and never reconciles. `porthole status` reconciles read-only
-//!   (`SweepMode::ReadOnly`) and can never remove an orphan by design --
-//!   [`reconcile.rs`]'s own module docs are explicit that a read path must
-//!   never be able to cause a close. Only `open`, `close_by_port`,
-//!   `close_by_id` and `close_all` run `SweepMode::Apply`, which is the only
-//!   mode that ever calls `FirewallBackend::close` on an orphan. `close --all`
-//!   is the least surprising of those to run when nothing is known to be
-//!   open.
+//! **`--until-reboot`, not `--for 5m`, for the mutating opens.** A real
+//! `--for <duration>` schedules its own close with `systemd-run`, and these
+//! containers have no systemd PID 1 to serve it -- confirmed by running
+//! exactly that and getting `No such file or directory`. `--until-reboot`
+//! is a first-class, equally real porthole invocation that skips the timer
+//! entirely (`Lifetime::UntilReboot` in `engine.rs`), and every test here
+//! controls its own "reboot" directly rather than waiting one out, so
+//! nothing about what is being proven needs a timer at all. The dry-run
+//! tests do use `--for 5m` exactly as written: dry-run withholds the
+//! `systemd-run` command too, so nothing ever tries to run it.
+//!
+//! # Why boot 2 of the ufw test can use plain `list`
+//!
+//! `porthole list` deliberately touches nothing but the state file (see
+//! `run.rs`'s own comment on `Commands::List`) and never calls
+//! `reconcile::sweep` itself. What makes it usable here anyway is a change
+//! that landed in `porthole-helper` after this file's first draft: the
+//! helper now runs one `SweepMode::Apply` sweep at start-up, under the
+//! exclusive lock, *before it ever opens a bus connection* (see
+//! `porthole-helper/src/main.rs`'s `reconcile_at_startup`). So by the time
+//! `porthole --session list` gets an answer at all -- which needs the helper
+//! to have already claimed the bus name -- the orphan is already gone. Using
+//! `list` rather than `close --all` here is what makes the assertion mean
+//! something: `list` has no code path that could itself remove a rule, so
+//! the orphan's disappearance can only be reconciliation, not "the command
+//! this test happens to call also deletes marked rules it finds". Before
+//! that start-up sweep existed, `close --all` was used instead, for the same
+//! reason `list` could not be: the per-operation sweep (`Engine::reconcile`)
+//! that `close --all` triggers was the only Apply-mode sweep available at
+//! all -- but a test built on it could not distinguish reconciliation from
+//! `close --all`'s own literal behaviour, which is exactly the gap this
+//! rewrite closes.
 //!
 //! # Environment this file assumes
 //!
-//! - `podman`, rootless, reachable on `$PATH`.
+//! - `podman`, rootless, reachable on `$PATH`. Once `PORTHOLE_CONTAINER_TESTS`
+//!   is set, this is required, not merely hoped for: a broken `podman
+//!   --version` panics rather than skips.
 //! - The musl binaries already built: `cargo build --target
-//!   x86_64-unknown-linux-musl --bins`. Checked and skipped loudly if
-//!   missing, the same way `helper_e2e.rs` skips loudly rather than silently
-//!   passing when `porthole-helper` was never built.
+//!   x86_64-unknown-linux-musl --bins`, and built recently enough to be
+//!   newer than every source file that went into them. Both are checked, and
+//!   both **panic** rather than skip if they do not hold. That asymmetry
+//!   with `container_tests_enabled()` itself (which does skip) is
+//!   deliberate: the env var is the caller's statement of intent to actually
+//!   run these tests, and once that statement has been made, a missing or
+//!   stale prerequisite is a bug in the run, not a reason to report success
+//!   anyway. This milestone already shipped the alternative once -- five
+//!   end-to-end tests silently skipped while `cargo test` reported the suite
+//!   green, and nobody noticed until an unrelated fix disabled them and the
+//!   loss became visible. `cargo test --package <one-crate>` compounds the
+//!   same hazard from another angle: it does not rebuild a sibling crate's
+//!   binary at all, so a package-scoped run can silently exercise a stale
+//!   `porthole-helper`.
 //! - `--network=none` on every container: measured on this machine, a bare
 //!   `podman run` with no `--network` shares -- via rootless podman's default
 //!   `pasta` network mode -- an interface that mirrors the *host's* own
@@ -114,19 +138,23 @@ fn podman_available() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// Skip loudly and return from the calling test, exactly as
-/// `helper_e2e.rs`'s `start_or_skip!` does -- a gated test nobody can tell
-/// ran is not a test.
+/// Skip loudly and return from the calling test if the caller never opted
+/// in, exactly as `helper_e2e.rs`'s `start_or_skip!` does -- a gated test
+/// nobody can tell ran is not a test. Once opted in, a broken `podman` is a
+/// hard failure, not a second skip: see the module docs on why that
+/// asymmetry is deliberate.
 macro_rules! require_environment {
     () => {
         if !container_tests_enabled() {
             eprintln!("skipped: set PORTHOLE_CONTAINER_TESTS=1 and have podman to run this test");
             return;
         }
-        if !podman_available() {
-            eprintln!("skipped: PORTHOLE_CONTAINER_TESTS is set but `podman --version` failed");
-            return;
-        }
+        assert!(
+            podman_available(),
+            "PORTHOLE_CONTAINER_TESTS=1 was set, so a working `podman` is required, not \
+             optional: `podman --version` failed. Install or fix podman rather than let \
+             this test report success without ever having run."
+        );
     };
 }
 
@@ -150,34 +178,91 @@ fn container_dir() -> PathBuf {
     workspace_root().join("tests/container")
 }
 
+/// The newest modification time among every file that could affect the musl
+/// build: each of the three crates' `src/`, recursively, plus the workspace
+/// and each crate's own `Cargo.toml`, and the workspace's `Cargo.lock`. Not
+/// exhaustive -- it does not follow a `build.rs` or vendored dependencies --
+/// but cheap (a `stat` per file, nothing read or hashed), and enough to catch
+/// the specific hazard this exists for: a source edit made after the last
+/// `cargo build --target x86_64-unknown-linux-musl --bins`, which would
+/// otherwise bind-mount a stale binary into every container silently. `None`
+/// if nothing under any of these paths could even be read, in which case the
+/// staleness check is skipped rather than panicking on a problem it was
+/// never meant to detect -- `musl_binaries`'s own existence check already
+/// covers the binaries themselves being entirely absent.
+fn newest_source_mtime() -> Option<std::time::SystemTime> {
+    fn newest_under(path: &Path) -> Option<std::time::SystemTime> {
+        let meta = std::fs::metadata(path).ok()?;
+        if meta.is_file() {
+            return meta.modified().ok();
+        }
+        if !meta.is_dir() {
+            return None;
+        }
+        std::fs::read_dir(path)
+            .ok()?
+            .flatten()
+            .filter_map(|entry| newest_under(&entry.path()))
+            .max()
+    }
+
+    let root = workspace_root();
+    let mut candidates = vec![root.join("Cargo.toml"), root.join("Cargo.lock")];
+    for crate_name in ["porthole-core", "porthole-cli", "porthole-helper"] {
+        let crate_dir = root.join("crates").join(crate_name);
+        candidates.push(crate_dir.join("src"));
+        candidates.push(crate_dir.join("Cargo.toml"));
+    }
+    candidates.iter().filter_map(|p| newest_under(p)).max()
+}
+
 /// The two binaries every mutating test bind-mounts into its container.
-/// `None` -- with a message identical in spirit to `helper_e2e.rs`'s own
-/// `StartFailure::MissingBinary` -- when they were never built.
-fn musl_binaries() -> Option<(PathBuf, PathBuf)> {
+///
+/// Panics -- does not skip -- if they are missing, or if either looks older
+/// than the newest source file that could have gone into it. Once a caller
+/// has opted in with `PORTHOLE_CONTAINER_TESTS=1`, both are a broken
+/// invocation, not a reason to report the suite green having tested a stale
+/// or absent binary: see the module docs for why this milestone treats that
+/// distinction as load-bearing rather than pedantic.
+fn musl_binaries() -> (PathBuf, PathBuf) {
     let dir = musl_dir();
     let cli = dir.join("porthole");
     let helper = dir.join("porthole-helper");
-    if cli.is_file() && helper.is_file() {
-        Some((cli, helper))
-    } else {
-        None
+    assert!(
+        cli.is_file() && helper.is_file(),
+        "PORTHOLE_CONTAINER_TESTS=1 was set, so the musl binaries are required, not \
+         optional: build them first with `cargo build --target \
+         x86_64-unknown-linux-musl --bins` (looked in {}).",
+        dir.display()
+    );
+
+    if let Some(source_mtime) = newest_source_mtime() {
+        for bin in [&cli, &helper] {
+            let bin_mtime = std::fs::metadata(bin)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            assert!(
+                bin_mtime >= source_mtime,
+                "{} is older than the newest source file under crates/*/src -- rebuild \
+                 with `cargo build --target x86_64-unknown-linux-musl --bins` before \
+                 running these tests, or a stale binary is bind-mounted into every \
+                 container silently. (`cargo test --package <one-crate>` does not \
+                 rebuild a sibling crate's binary either, which is the same hazard \
+                 from a different angle.)",
+                bin.display()
+            );
+        }
     }
+
+    (cli, helper)
 }
 
+/// A thin wrapper so every call site still reads `require_musl_binaries!()`,
+/// matching `require_environment!()`'s naming -- the behaviour underneath is
+/// no longer a skip, it is `musl_binaries`'s own panic.
 macro_rules! require_musl_binaries {
     () => {
-        match musl_binaries() {
-            Some(paths) => paths,
-            None => {
-                eprintln!(
-                    "skipped: build the musl binaries first: \
-                     `cargo build --target x86_64-unknown-linux-musl --bins` \
-                     (looked in {})",
-                    musl_dir().display()
-                );
-                return;
-            }
-        }
+        musl_binaries()
     };
 }
 
@@ -408,6 +493,26 @@ fn assert_container_ok(out: &Output, what: &str) {
 /// actually removes it, or that a real `ufw-init start` really does reload
 /// `/etc/ufw/user.rules` the way the module docs assert. Only running the
 /// real binaries against a real, persisted `/etc/ufw` can.
+///
+/// Boot 1 also directly exercises the third bug named in this file's own
+/// module doc comment -- the worst of the three, and the one this container
+/// test existed to catch but originally did not: a **host-scoped** (`/32`)
+/// open, immediately followed by a second open whose own pre-open sweep
+/// (`Engine::open` calls `Engine::reconcile` first, `SweepMode::Apply`) runs
+/// while the first rule is still live and still known to state. Every other
+/// target in this file is a subnet, and a subnet's spec round-trips through
+/// `ufw status numbered` unchanged -- only a bare, prefix-dropped `/32`
+/// address ever exercised the bug, so a suite that never opens one cannot
+/// catch it no matter how many sweeps it runs. Confirmed by reintroducing
+/// the bug (reverting `Ufw::canonical_source` to the identity function, and
+/// loosening `is_porthole_shape`'s address check to accept a bare
+/// `Ipv4Addr`, matching the code exactly as it stood before both existed):
+/// the second open's own pre-sweep then silently deleted the first,
+/// still-open rule from ufw for real, flipping the "both rules survive"
+/// assertion below from pass to fail. Reverted before committing; not left
+/// behind as a second, permanently-skipped test, because a bug that can only
+/// be seen by hand-editing the fix out of the tree is not covered by the
+/// suite that ships.
 #[test]
 fn on_ufw_a_port_opened_before_a_reboot_is_closed_after_it() {
     require_environment!();
@@ -423,8 +528,14 @@ fn on_ufw_a_port_opened_before_a_reboot_is_closed_after_it() {
     ];
     args.extend(cli_mounts(&cli, &helper));
 
-    // --- Boot 1: enable ufw, add a rule of the user's own, then open a port
-    //     through porthole for real. ---
+    // --- Boot 1: enable ufw, add a rule of the user's own, then open two
+    //     ports through porthole for real -- the first host-scoped (the /32
+    //     self-close bug's target shape), the second anything else, so its
+    //     own pre-open sweep is an Apply sweep running while the first rule
+    //     is still live. ---
+    let boot1_body = "\
+porthole --session open 5173 --to 10.10.10.42 --until-reboot
+porthole --session open 5174 --until-reboot";
     let boot1_script = format!(
         "set -e\n{FAKE_LAN_INTERFACE}\n\
          ufw --force enable\n\
@@ -433,11 +544,11 @@ fn on_ufw_a_port_opened_before_a_reboot_is_closed_after_it() {
          ufw allow 2222/tcp comment 'not-porthole'\n\
          {}\n\
          {}\n",
-        with_helper("porthole --session open 5173 --until-reboot"),
+        with_helper(boot1_body),
         marker_block("BOOT1_STATUS", "ufw status numbered"),
     );
 
-    eprintln!("== ufw reboot test: boot 1 (open, then enable) ==");
+    eprintln!("== ufw reboot test: boot 1 (enable, then open) ==");
     let out1 = podman_run(DEBIAN_IMAGE, &args, &boot1_script);
     eprintln!("{}", String::from_utf8_lossy(&out1.stdout));
     eprintln!("{}", String::from_utf8_lossy(&out1.stderr));
@@ -446,8 +557,16 @@ fn on_ufw_a_port_opened_before_a_reboot_is_closed_after_it() {
     let stdout1 = String::from_utf8_lossy(&out1.stdout).to_string();
     let boot1_status = extract_marker(&stdout1, "BOOT1_STATUS");
     assert!(
-        boot1_status.contains("5173/tcp") && boot1_status.contains("porthole:"),
-        "boot 1 must show porthole's own rule: {boot1_status}"
+        boot1_status.contains("5173/tcp")
+            && boot1_status.contains("10.10.10.42")
+            && boot1_status.contains("porthole:"),
+        "the host-scoped rule must survive the second open's own pre-sweep -- \
+         the /32 self-close bug this test exists to catch would have removed \
+         it right here: {boot1_status}"
+    );
+    assert!(
+        boot1_status.contains("5174/tcp") && boot1_status.contains("10.10.10.0/24"),
+        "the second, subnet-scoped rule must also be there: {boot1_status}"
     );
     assert!(
         boot1_status.contains("2222/tcp"),
@@ -459,13 +578,19 @@ fn on_ufw_a_port_opened_before_a_reboot_is_closed_after_it() {
     let boot2_script = format!(
         "set -e\n\
          {}\n\
+         # /lib/ufw/ufw-init start prints \"sysctl: permission denied on key\n\
+         # ...\" under rootless podman -- it cannot write the host's real\n\
+         # network sysctls, which it has no business doing from inside a\n\
+         # container anyway. Harmless: the rules load regardless, checked by\n\
+         # the very next line. Measured, not assumed -- see\n\
+         # milestone-3-verified-facts.md.\n\
          /lib/ufw/ufw-init start || true\n\
          {}\n\
          {}\n\
          {}\n",
         marker_block("BEFORE_INIT", "ufw status"),
         marker_block("AFTER_INIT", "ufw status numbered"),
-        with_helper("porthole --session close --all --json"),
+        with_helper("porthole --session list --json"),
         marker_block("FINAL_STATUS", "ufw status numbered"),
     );
 
@@ -490,21 +615,29 @@ fn on_ufw_a_port_opened_before_a_reboot_is_closed_after_it() {
     // the whole point of the test is that it does not.
     let after_init = extract_marker(&stdout2, "AFTER_INIT");
     assert!(
-        after_init.contains("5173/tcp") && after_init.contains("porthole:"),
+        after_init.contains("5173/tcp")
+            && after_init.contains("5174/tcp")
+            && after_init.contains("porthole:"),
         "`ufw-init start` -- exactly what ufw.service runs at boot -- must \
-         bring the orphaned rule back before porthole ever runs, or this test \
-         would pass against an implementation that does nothing: {after_init}"
+         bring both orphaned rules back before porthole ever runs, or this \
+         test would pass against an implementation that does nothing: \
+         {after_init}"
     );
     assert!(
         after_init.contains("2222/tcp"),
         "the user's rule must have reloaded too: {after_init}"
     );
 
+    // `porthole --session list` never reconciles itself (see the module docs
+    // on why it is used here anyway): by the time it gets an answer, the
+    // helper it talked to has already run its start-up sweep, and `list`
+    // itself has no code path that could have closed anything -- so if both
+    // rules are gone below, only reconciliation can be why.
     let final_status = extract_marker(&stdout2, "FINAL_STATUS");
     assert!(
         !final_status.contains("porthole:"),
-        "reconciliation must have removed the orphaned rule nobody remembered: \
-         {final_status}"
+        "reconciliation must have removed both orphaned rules nobody \
+         remembered: {final_status}"
     );
     assert!(
         final_status.contains("2222/tcp"),
@@ -637,6 +770,18 @@ fn on_nftables_an_opened_port_is_actually_reachable() {
         !final_ruleset.contains("porthole:"),
         "the rule must be gone from the ruleset after close, not merely \
          unreachable for some other reason: {final_ruleset}"
+    );
+    // Unlike firewalld, the orphan direction genuinely runs on nftables --
+    // `Nftables::ownership()` is `Marked`, so reconciliation's orphan sweep
+    // has a list to consume here. A sweep that flushed the whole chain (the
+    // user's own rules included) would still leave phase 3 BLOCKED under
+    // `policy drop` either way, so reachability alone cannot catch that --
+    // only checking that the user's own rules are still there can.
+    assert!(
+        final_ruleset.contains("ct state established,related accept")
+            && final_ruleset.contains(r#"iif "lo" accept"#),
+        "the user's own rules -- not porthole's -- must survive reconciliation \
+         untouched: {final_ruleset}"
     );
 }
 
@@ -790,6 +935,10 @@ fn dry_run_is_byte_identical_to_reality_on_ufw() {
 
     let script = format!(
         "set -e\n{FAKE_LAN_INTERFACE}\nufw --force enable\n\
+         # A pre-existing rule so BEFORE/AFTER compare something, not two\n\
+         # empty listings -- an empty-to-empty comparison would pass even if\n\
+         # --dry-run silently cleared the rule list.\n\
+         ufw allow 2222/tcp comment 'not-porthole'\n\
          {}\n\
          {}\n\
          {}\n",
@@ -834,11 +983,16 @@ fn dry_run_is_byte_identical_to_reality_on_firewalld() {
 
     let script = format!(
         "set -e\n{FAKE_LAN_INTERFACE}\n{FIREWALLD_DAEMON_SETUP}\n\
+         ZONE=$(firewall-cmd --get-default-zone)\n\
          {}\n\
+         # A pre-existing rule so BEFORE/AFTER compare something, not two\n\
+         # empty listings.\n\
+         firewall-cmd --zone=\"$ZONE\" --add-rich-rule='rule family=\"ipv4\" \
+source address=\"192.168.77.0/24\" port port=\"9999\" protocol=\"tcp\" accept'\n\
          {}\n\
          {}\n\
          {}\n",
-        marker_block("ZONE", "firewall-cmd --get-default-zone"),
+        marker_block("ZONE", "echo \"$ZONE\""),
         marker_block("BEFORE", "firewall-cmd --list-rich-rules"),
         marker_block(
             "DRYRUN_JSON",
@@ -883,22 +1037,44 @@ fn dry_run_is_byte_identical_to_reality_on_nftables() {
         vec!["--cap-add=NET_ADMIN,NET_RAW,SYS_ADMIN,SYS_PTRACE".to_string()];
     args.extend(bind_ro(&cli, "/usr/local/bin/porthole"));
 
-    let script = format!(
-        "set -e\n\
-         nft add table inet filter\n\
-         nft 'add chain inet filter input {{ type filter hook input priority 0; policy drop; }}'\n\
-         nft add rule inet filter input ct state established,related accept\n\
-         nft add rule inet filter input iif lo accept\n\
-         {}\n\
-         {}\n\
-         {}\n",
+    // Built as a joined `Vec<String>` rather than one `format!` template: the
+    // nft chain literal below carries its own `{` `}`, and escaping them as
+    // `{{`/`}}` inside a growing format! string is exactly the kind of thing
+    // that is easy to get wrong silently (as `format!`'s own brace escaping
+    // has no way to tell "a literal brace" from "a mistyped placeholder").
+    let ruleset_setup = "\
+nft add table inet filter
+nft 'add chain inet filter input { type filter hook input priority 0; policy drop; }'
+nft add rule inet filter input ct state established,related accept
+nft add rule inet filter input iif lo accept";
+
+    let script = [
+        "set -e".to_string(),
+        ruleset_setup.to_string(),
         marker_block("BEFORE", "nft -a list ruleset"),
         marker_block(
             "DRYRUN_JSON",
-            "porthole --dry-run open 5173 --to 10.10.10.0/24 --for 5m --json"
+            "porthole --dry-run open 5173 --to 10.10.10.0/24 --for 5m --json",
         ),
         marker_block("AFTER", "nft -a list ruleset"),
-    );
+        // Bug #1 of the three named in this file's own module doc comment
+        // was an emitted `nft` command that could not be parsed *at all* --
+        // and the hardcoded expected string asserted below, written by the
+        // same author who wrote the code it is checked against, is a
+        // restatement of an understanding, not independent evidence of
+        // anything. Feed the actual printed command back through `nft -c`
+        // (check mode: parses and validates against the real ruleset this
+        // container already has, changes nothing) so a real parser, not this
+        // test's author, is the one who says it is valid.
+        "DRYRUN_TEXT=$(porthole --dry-run open 5173 --to 10.10.10.0/24 --for 5m)".to_string(),
+        "NFT_LINE=$(echo \"$DRYRUN_TEXT\" | grep '^  nft ' | sed 's/^  //')".to_string(),
+        "CHECK_LINE=$(echo \"$NFT_LINE\" | sed 's/^nft /nft -c /')".to_string(),
+        marker_block(
+            "NFT_CHECK",
+            "eval \"$CHECK_LINE\" && echo PARSED || echo FAILED",
+        ),
+    ]
+    .join("\n");
 
     eprintln!("== nftables dry-run test ==");
     let out = podman_run(ARCH_IMAGE, &args, &script);
@@ -924,5 +1100,12 @@ fn dry_run_is_byte_identical_to_reality_on_nftables() {
         "the printed command must be exactly what Nftables::open_impl would run for \
          real, quotes included -- see the module docs on why the marker must carry \
          literal double-quote characters"
+    );
+
+    let nft_check = extract_marker(&stdout, "NFT_CHECK");
+    assert_eq!(
+        nft_check, "PARSED",
+        "the printed nft command must parse under a real `nft -c`, not merely \
+         match a hand-written expected string above: {nft_check}"
     );
 }
