@@ -33,11 +33,31 @@
 //! pins this apart directly: the unreachable-helper text must not contain
 //! the reachability claim the no-firewall text does.
 //!
+//! That reachability claim itself is not this module's own to make.
+//! [`no_firewall_title`] shows `WireStatus::detail` verbatim -- the exact
+//! sentence `porthole-core`'s own `backend::detect` failure carries, the
+//! same one `porthole-cli`'s `print_status`/`--json` already show -- rather
+//! than a GUI-authored sentence that merely happens to be true today
+//! because `detect` cannot currently fail any other way. An earlier
+//! version of this module hardcoded that sentence as a constant, which
+//! rested the "already reachable" claim on an invariant held entirely in
+//! `porthole-core`, with nothing in the wire type connecting the two: if a
+//! future `detect` failure mode ever stopped confirming reachability, this
+//! module would have kept claiming it anyway. Showing `detail` verbatim
+//! means this module states only what the helper actually said.
+//!
 //! A third fact needs its own wording too, for the identical reason: a
-//! helper that answered but *refused* the request (a polkit denial, most
-//! often) is not "could not reach" either -- [`StatusBar::set_refused`] is
-//! that third case, and its title never borrows either of the other two's
-//! wording.
+//! helper that *did* answer, but with a typed error, is not "could not
+//! reach" either -- [`StatusBar::set_errored`] is that third case, and its
+//! title never borrows either of the other two's wording. It also does not
+//! claim *why* the helper's answer was an error: a polkit denial is one
+//! cause, but `list` and `status` can just as well fail with a
+//! `StateStore` read error inside the helper, which is not a decision
+//! anyone made to decline anything -- see `window.rs`'s own `HelperFailure`
+//! doc comment, which this module's wording is deliberately built to stay
+//! honest about (an earlier version of this case was named and worded as a
+//! refusal, which was true of a polkit denial and false of everything
+//! else that reaches the same code path).
 //!
 //! The ordinary line carries a second, unrelated distinction:
 //! `enforcing`/`not running`/`status unknown`, for a *different* pair of
@@ -54,21 +74,34 @@
 
 use porthole_core::ipc::WireStatus;
 
-/// [`StatusBar::set_status`]'s no-firewall wording, in one place so the
-/// "these two facts must not merge" test in `tests/status_bar.rs` has
-/// exactly one string to check [`unreachable_title`] never reproduces.
-const NO_FIREWALL_TITLE: &str =
-    "No firewall found — every port on this machine is already reachable from your network.";
+/// [`StatusBar::set_status`]'s no-firewall wording: `status.detail`,
+/// verbatim -- see this module's own doc comment for why this must not be
+/// a sentence of this module's own invention. `detail` is never empty in
+/// practice (every `BackendHealth` this codebase constructs sets it, see
+/// its own doc comment in `porthole-core`), but a client must not assume
+/// the wire will always honour that -- the fallback here is neutral and,
+/// unlike the sentence an earlier version of this function hardcoded,
+/// does not claim reachability porthole has not actually confirmed.
+fn no_firewall_title(status: &WireStatus) -> String {
+    if status.detail.is_empty() {
+        "No firewall detected.".to_string()
+    } else {
+        status.detail.clone()
+    }
+}
 
 fn unreachable_title(message: &str) -> String {
     format!("Could not reach the porthole helper — {message}")
 }
 
-/// [`StatusBar::set_refused`]'s wording -- deliberately not built from
+/// [`StatusBar::set_errored`]'s wording -- deliberately not built from
 /// [`unreachable_title`] or a shared prefix with it: the helper answered
 /// here, so "could not reach" would be a claim this case does not support.
-fn refused_title(message: &str) -> String {
-    format!("The porthole helper refused this request — {message}")
+/// Also deliberately does not say "refused" or "declined": see this
+/// module's own doc comment for why that would overclaim intent for a
+/// `StateStore` failure inside the helper.
+fn errored_title(message: &str) -> String {
+    format!("The porthole helper reported an error — {message}")
 }
 
 /// Three states, not two -- see this module's own doc comment on why
@@ -145,7 +178,7 @@ impl StatusBar {
     /// [`StatusBar::set_unreachable`].
     pub fn set_status(&self, status: &WireStatus) {
         if !status.firewall_available {
-            self.show_banner(NO_FIREWALL_TITLE);
+            self.show_banner(&no_firewall_title(status));
             return;
         }
         self.banner.set_revealed(false);
@@ -156,25 +189,27 @@ impl StatusBar {
         ));
     }
 
-    /// Renders one of the two prominent cases: porthole could not even ask
-    /// the helper, so it has no status to report -- not "no firewall",
+    /// Renders one of the three prominent cases: porthole could not even
+    /// ask the helper, so it has no status to report -- not "no firewall",
     /// which is a claim porthole is not in a position to make here, and not
-    /// [`StatusBar::set_refused`], which is what a helper that *did*
-    /// answer, but declined, gets instead. `message` is the reason,
-    /// verbatim -- the same string `OpenNowSection::set_unreachable`
-    /// receives, from the same failed round trip.
+    /// [`StatusBar::set_errored`], which is what a helper that *did*
+    /// answer gets instead. `message` is the reason, verbatim -- the same
+    /// string `OpenNowSection::set_unreachable` receives, from the same
+    /// failed round trip.
     pub fn set_unreachable(&self, message: &str) {
         self.show_banner(&unreachable_title(message));
     }
 
-    /// The other prominent case besides "unreachable": the helper was
-    /// reached and answered, but refused the request -- a polkit denial,
-    /// most often. `message` is the helper's own text, verbatim, never
-    /// wrapped in "could not reach" -- see this module's own doc comment
-    /// for why folding this into [`StatusBar::set_unreachable`] would be
-    /// the identical collapse one layer further down.
-    pub fn set_refused(&self, message: &str) {
-        self.show_banner(&refused_title(message));
+    /// The other prominent failure case besides "unreachable": the helper
+    /// was reached and answered, and the answer was a typed error --
+    /// `message` is the helper's own text, verbatim, never wrapped in
+    /// "could not reach" (see this module's own doc comment for why
+    /// folding this into [`StatusBar::set_unreachable`] would be the
+    /// identical collapse one layer further down) and never worded as a
+    /// refusal (see the same doc comment for why that would overclaim
+    /// intent this case does not always have).
+    pub fn set_errored(&self, message: &str) {
+        self.show_banner(&errored_title(message));
     }
 
     /// Shared by all three prominent cases: reveals the banner with
@@ -219,46 +254,114 @@ mod tests {
     // crate's ordinary unit-test binary. The GTK-backed proof that the
     // real widgets carry this same text lives in `tests/status_bar.rs`.
 
+    /// A `WireStatus` with `firewall_available: false` and `detail` set to
+    /// `detail` -- everything else is irrelevant to `no_firewall_title`.
+    fn no_firewall_status(detail: &str) -> WireStatus {
+        WireStatus {
+            backend: String::new(),
+            firewall_available: false,
+            firewall_active: false,
+            firewall_active_unknown: false,
+            firewall_version: String::new(),
+            detail: detail.to_string(),
+            location: String::new(),
+            interface: String::new(),
+            address: String::new(),
+            cidr: String::new(),
+            rules: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn no_firewall_title_shows_the_wires_own_detail_verbatim() {
+        // Item 5: this must be the helper's own text, not a sentence this
+        // module invented and merely hoped stayed true -- see this
+        // module's own doc comment.
+        let detail = "no firewall found: none of firewalld, ufw or nftables is installed. \
+                       Without a firewall this port is already reachable from your network.";
+        assert_eq!(no_firewall_title(&no_firewall_status(detail)), detail);
+    }
+
+    #[test]
+    fn no_firewall_title_falls_back_to_a_neutral_sentence_when_detail_is_empty() {
+        // `BackendHealth::detail` is never empty in practice, but this
+        // function must not assume the wire will always honour that by
+        // falling back to a claim ("already reachable") it cannot support
+        // without a `detail` to have gotten that claim from.
+        let title = no_firewall_title(&no_firewall_status(""));
+        assert!(!title.is_empty());
+        assert!(
+            !title.contains("already reachable"),
+            "with no detail to have said so, the fallback must not claim reachability: {title}"
+        );
+    }
+
     #[test]
     fn the_no_firewall_and_unreachable_titles_never_say_the_same_thing() {
         // Pin: these are two different facts (a confirmed absence of any
         // firewall vs. porthole simply not knowing), and collapsing them
         // into the same sentence is exactly the defect this module's own
         // doc comment describes. If a future edit ever makes
-        // `unreachable_title` reuse `NO_FIREWALL_TITLE`'s wording, or vice
+        // `unreachable_title` reuse `no_firewall_title`'s wording, or vice
         // versa, this fails.
+        let no_firewall = no_firewall_title(&no_firewall_status(
+            "no firewall found: none of firewalld, ufw or nftables is installed. Without a \
+             firewall this port is already reachable from your network.",
+        ));
         let unreachable = unreachable_title("could not reach the porthole helper: timed out");
-        assert_ne!(unreachable, NO_FIREWALL_TITLE);
+        assert_ne!(unreachable, no_firewall);
         assert!(
             !unreachable.contains("already reachable"),
             "an unreachable helper must not claim reachability either way: {unreachable}"
         );
         assert!(
-            NO_FIREWALL_TITLE.contains("already reachable"),
-            "the confirmed no-firewall case must still make that claim: {NO_FIREWALL_TITLE}"
+            no_firewall.contains("already reachable"),
+            "the confirmed no-firewall case must still make that claim: {no_firewall}"
         );
     }
 
     #[test]
-    fn a_refused_request_is_worded_apart_from_both_other_cases() {
-        // I2: a helper that answered but refused a request is a third fact,
+    fn an_errored_reply_is_worded_apart_from_both_other_cases() {
+        // I2: a helper that answered with a typed error is a third fact,
         // not a rewording of "could not reach" or "no firewall". Pins all
         // three titles apart the same way the test above pins the first two.
-        let refused = refused_title("not authorized: com.jacopobriccola.Porthole.List");
+        let errored = errored_title("not authorized: com.jacopobriccola.Porthole.List");
         let unreachable = unreachable_title("could not reach the porthole helper: timed out");
-        assert_ne!(refused, unreachable);
-        assert_ne!(refused, NO_FIREWALL_TITLE);
+        let no_firewall = no_firewall_title(&no_firewall_status(
+            "no firewall found: none of firewalld, ufw or nftables is installed. Without a \
+             firewall this port is already reachable from your network.",
+        ));
+        assert_ne!(errored, unreachable);
+        assert_ne!(errored, no_firewall);
         assert!(
-            !refused.contains("already reachable"),
-            "a refused request must not claim reachability either way: {refused}"
+            !errored.contains("already reachable"),
+            "an errored reply must not claim reachability either way: {errored}"
         );
         assert!(
-            !refused.to_lowercase().contains("could not reach"),
-            "the helper answered here -- \"could not reach\" is the other case's claim: {refused}"
+            !errored.to_lowercase().contains("could not reach"),
+            "the helper answered here -- \"could not reach\" is the other case's claim: {errored}"
         );
         assert!(
-            refused.contains("not authorized"),
-            "the helper's own refusal reason must survive verbatim: {refused}"
+            errored.contains("not authorized"),
+            "the helper's own error reason must survive verbatim: {errored}"
+        );
+    }
+
+    #[test]
+    fn the_errored_title_does_not_assert_a_refusal() {
+        // I4: a `StateStore` failure inside the helper reaches this exact
+        // rendering too (see `window.rs`'s own `classify_failure`), and it
+        // is not a decision anyone made to decline anything -- pinning
+        // that the wording never claims otherwise, regardless of what the
+        // underlying, verbatim message happens to say.
+        let errored = errored_title("could not read /run/porthole/state.json: permission denied");
+        assert!(
+            !errored.to_lowercase().contains("refus"),
+            "the errored title must not claim a refusal: {errored}"
+        );
+        assert!(
+            !errored.to_lowercase().contains("declin"),
+            "the errored title must not claim a decision to decline: {errored}"
         );
     }
 
@@ -270,6 +373,7 @@ mod tests {
             firewall_active: false,
             firewall_active_unknown: false,
             firewall_version: String::new(),
+            detail: String::new(),
             location: String::new(),
             interface: String::new(),
             address: String::new(),

@@ -48,10 +48,14 @@
 //!
 //! `window.rs` (task 6) is what actually calls `set_rules`, fed from the
 //! helper's `list` over D-Bus -- and that round trip can fail before it
-//! ever produces a list at all: no bus, no helper process, a polkit denial.
-//! [`OpenNowSection::set_unreachable`] and [`OpenNowSection::set_refused`]
+//! ever produces a list at all: no bus, no helper process, or a call the
+//! helper answered with a typed error (a polkit denial among them, but not
+//! only that -- a `StateStore` read failure inside the helper reaches this
+//! crate exactly the same way, see `window.rs`'s own `HelperFailure` doc
+//! comment for why the wording below does not claim which one happened).
+//! [`OpenNowSection::set_unreachable`] and [`OpenNowSection::set_errored`]
 //! are the states for exactly that -- two different facts (no answer at
-//! all, versus an answer that declined the request), both sharing one
+//! all, versus an answer that was itself an error), both sharing one
 //! widget, [`Inner::error_page`], with different titles, and both distinct
 //! from a repurposed calm `status_page`. Rendering "No ports open" when the
 //! true state is "I could not ask" is this project's characteristic defect
@@ -69,13 +73,28 @@
 //! ## Before the first answer arrives
 //!
 //! [`Inner::loading_page`] is what this section shows before `set_rules`,
-//! `set_unreachable` or `set_refused` has ever been called -- a fourth,
+//! `set_unreachable` or `set_errored` has ever been called -- a fourth,
 //! neutral widget, not the calm `status_page`. "No ports open" is a
 //! confirmed fact this section has not yet earned the right to state; a
 //! zbus proxy carries no default per-call timeout, so without this,
 //! construction would assert that confirmed fact for as long as a
 //! live-but-hung helper took to answer, which is unbounded. An
 //! indeterminate initial state is the honest one.
+//!
+//! ## A rule open to anyone is marked, here too
+//!
+//! [`subtitle_for`] already renders "open to anyone" for an anywhere-scoped
+//! rule, distinct from "open to 10.10.10.0/24" for a network-scoped one --
+//! but text alone reads as the same weight at a glance, and the most
+//! exposed state porthole can produce is exactly the row a user scanning
+//! quickly, not reading every subtitle, most needs to be able to spot.
+//! `open_dialog.rs`'s target list marks this identical choice with a
+//! `dialog-warning-symbolic` icon (never colour alone -- colour fails a
+//! colour-blind user and a high-contrast theme), and `listening_section.rs`
+//! marks a lesser concern (`BeyondReach`) the same way; a rule already open
+//! to anyone, here, now used the same icon as neither. Every anywhere-
+//! scoped row gets it too, dry -- no scolding tooltip, matching the spec's
+//! own tone rule for "Anyone" (`open_dialog.rs`'s `anyone_note`).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -95,14 +114,21 @@ struct Row {
     row: adw::ActionRow,
     countdown_label: gtk::Label,
     close_button: gtk::Button,
+    /// `Some` only for a rule open to anyone -- the icon's own presence in
+    /// the widget tree *is* the marking [`OpenNowSection::is_marked_significant`]
+    /// reports, not a separately tracked flag that could drift from what
+    /// the row actually shows (see `open_dialog.rs`'s own
+    /// `TargetRow::significant_icon` for the identical pattern, and the
+    /// reason it exists).
+    significant_icon: Option<gtk::Image>,
 }
 
 struct Inner {
     /// What `PortholeWindow` appends into its `content()` box. Holds
     /// exactly one child at a time: `loading_page` before any answer has
     /// arrived, `status_page` once the list is confirmed empty,
-    /// `error_page` when the helper could not be reached or refused the
-    /// request, `group` otherwise.
+    /// `error_page` when the helper could not be reached or answered with
+    /// an error, `group` otherwise.
     container: gtk::Box,
     group: adw::PreferencesGroup,
     status_page: adw::StatusPage,
@@ -166,10 +192,14 @@ fn format_countdown(expires_at: u64, current: u64) -> String {
 /// all.
 const UNREACHABLE_TITLE: &str = "Porthole helper unreachable";
 
-/// [`OpenNowSection::set_refused`]'s title -- the helper answered and
-/// declined. Deliberately shares no wording with [`UNREACHABLE_TITLE`]:
-/// "unreachable" is not true of a helper that just responded.
-const REFUSED_TITLE: &str = "Porthole helper refused the request";
+/// [`OpenNowSection::set_errored`]'s title -- the helper answered, and the
+/// answer was a typed error. Deliberately shares no wording with
+/// [`UNREACHABLE_TITLE`] ("unreachable" is not true of a helper that just
+/// responded) and does not say "refused": that error can be a polkit
+/// denial, but it can equally be a `StateStore` failure inside the helper,
+/// which is not a decision anyone made -- see `window.rs`'s own
+/// `HelperFailure` doc comment.
+const ERRORED_TITLE: &str = "Porthole helper reported an error";
 
 fn subtitle_for(rule: &WireRule) -> String {
     if rule.scope == "anywhere" {
@@ -178,6 +208,23 @@ fn subtitle_for(rule: &WireRule) -> String {
         format!("open to {}", rule.target)
     }
 }
+
+/// Item 7: the subtitle text above already distinguishes "open to anyone"
+/// from "open to 10.10.10.0/24", but text alone reads as the same weight at
+/// a glance -- two rows scanned quickly, not read word for word, look
+/// identical. `open_dialog.rs`'s target list marks this exact choice with a
+/// `dialog-warning-symbolic` icon (`significant`/`TargetRow::significant_icon`),
+/// and `listening_section.rs` marks the *lesser* concern of a `BeyondReach`
+/// service with the same icon -- so the most exposed state porthole can
+/// produce was, until this, the only one of the three rendered with no
+/// mark at all, in the one list whose job is showing what is currently
+/// open. This tooltip deliberately mirrors `open_dialog.rs`'s own
+/// `anyone_note()` wording (a private function there, not reachable from
+/// here, hence the duplication -- the same shape `helper_message` is
+/// already duplicated in for an unrelated reason) rather than inventing a
+/// second sentence about the identical fact.
+const OPEN_TO_ANYONE_TOOLTIP: &str =
+    "Open to anyone your machine can reach, not just devices on this network.";
 
 /// The helper's own rendered text from a D-Bus method error, verbatim.
 ///
@@ -222,7 +269,7 @@ fn apply(inner: &Rc<Inner>, rules: &[WireRule]) {
 
     // A successful `set_rules` -- even an empty one -- means the helper
     // *was* reached and answered, so any previous "could not reach"/
-    // "refused" state, or the initial "not answered yet" one, is stale and
+    // "errored" state, or the initial "not answered yet" one, is stale and
     // must go, the same way `error_page` and `loading_page` displace
     // `group` and `status_page` in `apply_error` below.
     if inner.error_page.parent().is_some() {
@@ -256,6 +303,23 @@ fn apply(inner: &Rc<Inner>, rules: &[WireRule]) {
             .title(format!("{}/{}", rule.port, rule.protocol))
             .subtitle(subtitle_for(rule))
             .build();
+
+        // Item 7: the most exposed state porthole can produce, marked the
+        // same way the other two surfaces already mark the identical
+        // (`open_dialog.rs`) or a lesser (`listening_section.rs`'s
+        // `BeyondReach`) concern -- an icon, not colour alone, and no
+        // alarming wording in its tooltip (see `OPEN_TO_ANYONE_TOOLTIP`'s
+        // own doc comment).
+        let significant_icon = if rule.scope == "anywhere" {
+            let icon = gtk::Image::from_icon_name("dialog-warning-symbolic");
+            icon.add_css_class("warning");
+            icon.set_valign(gtk::Align::Center);
+            icon.set_tooltip_text(Some(OPEN_TO_ANYONE_TOOLTIP));
+            action_row.add_prefix(&icon);
+            Some(icon)
+        } else {
+            None
+        };
 
         let countdown_label = gtk::Label::builder()
             .label(format_countdown(rule.expires_at, current))
@@ -300,6 +364,7 @@ fn apply(inner: &Rc<Inner>, rules: &[WireRule]) {
             row: action_row,
             countdown_label,
             close_button,
+            significant_icon,
         });
     }
     inner.rows.replace(rows);
@@ -307,7 +372,7 @@ fn apply(inner: &Rc<Inner>, rules: &[WireRule]) {
 
 /// Replaces whatever `inner.container` was showing with `error_page`,
 /// titled `title` and described by `message` -- the shared shape behind
-/// [`OpenNowSection::set_unreachable`] and [`OpenNowSection::set_refused`],
+/// [`OpenNowSection::set_unreachable`] and [`OpenNowSection::set_errored`],
 /// which differ only in which title they pass. Clears `rows`/`rules` too:
 /// whatever list this section last had is now unconfirmed, not merely
 /// stale, so it must not keep being shown (or handed back to a close
@@ -380,13 +445,14 @@ impl OpenNowSection {
             .build();
 
         // The other case an empty list can mean: porthole did not confirm
-        // there is nothing open, it could not ask (or was refused). A
+        // there is nothing open, it could not ask (or asked and the helper
+        // answered with an error). A
         // `dialog-error-symbolic` icon and the `error` style class -- both
         // absent from `status_page` above -- are what make
         // `tests/open_now.rs`'s own test able to tell the two apart
         // structurally, not just by title. See this module's own doc
         // comment. The title itself is set per call by `apply_error`
-        // (`set_unreachable`/`set_refused` each pass their own); the one
+        // (`set_unreachable`/`set_errored` each pass their own); the one
         // given here at construction is only the default until either is
         // first called.
         let error_page = adw::StatusPage::builder()
@@ -459,24 +525,26 @@ impl OpenNowSection {
     /// at all -- no bus, no helper process, the connection lost mid-call.
     /// See this module's own doc comment for why this is a distinct widget
     /// from the calm empty state, not a relabelling of it, and distinct
-    /// again from [`OpenNowSection::set_refused`]. `message` is shown
+    /// again from [`OpenNowSection::set_errored`]. `message` is shown
     /// verbatim, the same convention `helper_message` already holds for a
     /// failed close.
     pub fn set_unreachable(&self, message: &str) {
         apply_error(&self.inner, UNREACHABLE_TITLE, message);
     }
 
-    /// The other failure state: the helper answered, but declined the
-    /// request (a polkit denial, most often). Same widget as
+    /// The other failure state: the helper answered, and the answer was a
+    /// typed error -- a polkit denial is the common case, but not the only
+    /// one (a `StateStore` failure inside the helper reaches here the same
+    /// way), so this does not claim which. Same widget as
     /// [`OpenNowSection::set_unreachable`], a different title -- see this
     /// module's own doc comment for why "unreachable" would be a false
     /// claim here. `message` is the helper's own text, verbatim.
-    pub fn set_refused(&self, message: &str) {
-        apply_error(&self.inner, REFUSED_TITLE, message);
+    pub fn set_errored(&self, message: &str) {
+        apply_error(&self.inner, ERRORED_TITLE, message);
     }
 
     /// `Some` only while the list is confirmed empty -- once there is a
-    /// row, the helper could not be reached or refused the request
+    /// row, the helper could not be reached or answered with an error
     /// ([`OpenNowSection::error_page`]), or no answer has arrived yet
     /// ([`OpenNowSection::loading_page`]), this section shows something
     /// else instead.
@@ -489,7 +557,7 @@ impl OpenNowSection {
     }
 
     /// `Some` only while [`OpenNowSection::set_unreachable`]'s or
-    /// [`OpenNowSection::set_refused`]'s state is showing -- a real,
+    /// [`OpenNowSection::set_errored`]'s state is showing -- a real,
     /// distinct widget from [`OpenNowSection::status_page`], never both at
     /// once. A test reads this (and its title, its icon, and its CSS
     /// classes) rather than trusting that "the list is empty" and "the
@@ -506,7 +574,7 @@ impl OpenNowSection {
     /// `Some` only before this section has ever heard back from anything
     /// -- the very first widget a freshly constructed section shows, and
     /// gone for good the moment `set_rules`, `set_unreachable` or
-    /// `set_refused` is called even once. See this module's own doc
+    /// `set_errored` is called even once. See this module's own doc
     /// comment for why the calm `status_page` must not be that first
     /// widget instead.
     pub fn loading_page(&self) -> Option<adw::StatusPage> {
@@ -532,6 +600,19 @@ impl OpenNowSection {
             .borrow()
             .get(index)
             .map(|r| r.close_button.clone())
+    }
+
+    /// Item 7: whether row `index` carries the "open to anyone" marking --
+    /// the icon's real presence on the row, not a copy of the data
+    /// (`rule.scope == "anywhere"`) that produced it, so this cannot drift
+    /// from what a user actually sees. Mirrors `OpenDialog::
+    /// is_marked_significant`'s own reasoning for the identical pattern.
+    pub fn is_marked_significant(&self, index: usize) -> bool {
+        self.inner
+            .rows
+            .borrow()
+            .get(index)
+            .is_some_and(|r| r.significant_icon.is_some())
     }
 
     /// The countdown text as it actually reads on screen right now --

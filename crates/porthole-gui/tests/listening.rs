@@ -455,13 +455,92 @@ fn a_scan_failure_does_not_render_as_the_calm_empty_state() -> Result<(), String
     Ok(())
 }
 
+/// Fix round 2, item 1: the actual bug. `refresh` (`window.rs`) runs the
+/// `/proc` scan and the helper's `list`/`status` round trip as two
+/// independent futures, and a scan failure calling `set_scan_failed`
+/// followed by a *successful* helper fetch calling `set_open_ports` is the
+/// *likely* arrival order in practice (a `/proc` read on the thread pool
+/// reliably beats a system-bus connect plus two polkit-checked calls), not
+/// an edge case. `set_open_ports` alone must not be able to rebuild the
+/// calm "Nothing else is listening" page out from under a scan failure --
+/// before this fix it did, because `apply` decided from `services.is_empty()`,
+/// which `set_scan_failed` itself made true.
+fn a_scan_failure_survives_a_later_set_open_ports() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningScanFailedThenPorts",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_scan_failed("could not check what is listening: permission denied");
+            section.set_open_ports(&[5173]);
+            *seen.borrow_mut() = Some((
+                section.status_page().is_some(),
+                section.error_page().is_some(),
+            ));
+        },
+    );
+    let (calm_showing, error_showing) = result.borrow_mut().take().ok_or("activation never ran")?;
+    if calm_showing {
+        return Err(
+            "a set_open_ports arriving after a scan failure must not resurrect the calm \
+             \"Nothing else is listening\" page"
+                .to_string(),
+        );
+    }
+    if !error_showing {
+        return Err(
+            "the scan-failed state must survive a set_open_ports that arrives after it".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The other half of the same hole (I5, the loading state): with no scan
+/// having run at all yet, a `set_open_ports` arriving first (the helper
+/// answering before `/proc` has been read) must not manufacture the calm
+/// page either -- the loading state exists precisely to keep this section
+/// from asserting "nothing is listening" before it has asked.
+fn the_loading_state_survives_a_set_open_ports_before_any_scan() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningPortsBeforeScan",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_open_ports(&[5173]);
+            *seen.borrow_mut() = Some((
+                section.loading_page().is_some(),
+                section.status_page().is_some(),
+            ));
+        },
+    );
+    let (loading_showing, calm_showing) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if calm_showing {
+        return Err(
+            "a set_open_ports arriving before any scan must not produce the calm \"Nothing \
+             else is listening\" page"
+                .to_string(),
+        );
+    }
+    if !loading_showing {
+        return Err(
+            "the loading state must survive a set_open_ports that arrives before any \
+                     scan"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below -- see `tests/window.rs`'s own
 /// `Case` alias for why this is a type alias rather than spelled out
 /// inline.
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 12] = [
+    let cases: [Case; 14] = [
         (
             "a_service_shows_its_name_and_port_the_way_the_spec_writes_it",
             a_service_shows_its_name_and_port_the_way_the_spec_writes_it,
@@ -509,6 +588,14 @@ fn main() {
         (
             "a_scan_failure_does_not_render_as_the_calm_empty_state",
             a_scan_failure_does_not_render_as_the_calm_empty_state,
+        ),
+        (
+            "a_scan_failure_survives_a_later_set_open_ports",
+            a_scan_failure_survives_a_later_set_open_ports,
+        ),
+        (
+            "the_loading_state_survives_a_set_open_ports_before_any_scan",
+            the_loading_state_survives_a_set_open_ports_before_any_scan,
         ),
     ];
 

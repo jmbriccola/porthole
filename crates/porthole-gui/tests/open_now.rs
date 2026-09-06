@@ -190,6 +190,45 @@ fn each_rule_shows_port_protocol_target_and_a_close_button() -> Result<(), Strin
     Ok(())
 }
 
+/// Item 7: the most exposed state porthole can produce -- a rule open to
+/// anyone -- must be visually distinguishable from an ordinary
+/// subnet-scoped one, not just by the subtitle's own text (which already
+/// differed) but by shape: a warning icon, mirroring `open_dialog.rs`'s
+/// own marking for the identical choice and `listening_section.rs`'s for
+/// a lesser one. Both rows render side by side here specifically so a
+/// regression that made them look identical again would be caught the way
+/// a person scanning the list quickly, not reading every subtitle, would
+/// notice it.
+fn an_anywhere_scoped_rule_is_marked_and_a_subnet_scoped_one_is_not() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenNowAnyone",
+        move |_app| {
+            let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
+            let mut anywhere = wire_rule(BASE_TIME, 8080, "tcp", "anywhere", 3600);
+            anywhere.scope = "anywhere".to_string();
+            let subnet = wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 3600);
+            section.set_rules(&[anywhere, subnet]);
+            *seen.borrow_mut() = Some((
+                section.is_marked_significant(0),
+                section.is_marked_significant(1),
+            ));
+        },
+    );
+    let (anywhere_marked, subnet_marked) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if !anywhere_marked {
+        return Err("a rule open to anyone must carry the significant-choice marking".to_string());
+    }
+    if subnet_marked {
+        return Err(
+            "a subnet-scoped rule must not carry the marking reserved for \"anyone\"".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// A countdown that renders once and freezes is worse than no countdown: it
 /// states a specific remaining time, confidently, and is wrong. This reads
 /// `countdown_text`, which is the real `gtk::Label`'s actual displayed text
@@ -355,7 +394,7 @@ fn an_unreachable_helper_does_not_render_as_the_calm_empty_state() -> Result<(),
     Ok(())
 }
 
-/// I5: before any of `set_rules`/`set_unreachable`/`set_refused` has ever
+/// I5: before any of `set_rules`/`set_unreachable`/`set_errored` has ever
 /// been called, this section must not be sitting on the calm "No ports
 /// open" claim -- a fresh `OpenNowSection` has not earned the right to
 /// state that, and a zbus proxy carries no default per-call timeout to
@@ -394,18 +433,21 @@ fn the_initial_state_before_any_answer_is_neither_calm_nor_populated() -> Result
     Ok(())
 }
 
-/// I2: a helper that answered but refused a request is a different fact
-/// from one that could not be reached at all, and must not share its
-/// wording -- the same distinction `status_bar.rs`'s own pinned test
-/// checks, proven here on the real widget this section actually shows.
-fn a_refused_request_reads_differently_from_an_unreachable_helper() -> Result<(), String> {
+/// I2: a helper that answered with a typed error is a different fact from
+/// one that could not be reached at all, and must not share its wording --
+/// the same distinction `status_bar.rs`'s own pinned test checks, proven
+/// here on the real widget this section actually shows. I4: it also must
+/// not claim a refusal the error may not be -- `set_errored` renders the
+/// identical error-page state for a `StateStore` failure inside the
+/// helper (not a decision anyone made) as it does for a polkit denial.
+fn an_errored_reply_reads_differently_from_an_unreachable_helper() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
     activate(
-        "com.jacopobriccola.Porthole.Test.OpenNowRefused",
+        "com.jacopobriccola.Porthole.Test.OpenNowErrored",
         move |_app| {
             let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
-            section.set_refused("not authorized: com.jacopobriccola.Porthole.List");
+            section.set_errored("not authorized: com.jacopobriccola.Porthole.List");
             let page = section.error_page();
             let title = page.as_ref().map(|p| p.title().to_string());
             let description = page
@@ -416,18 +458,24 @@ fn a_refused_request_reads_differently_from_an_unreachable_helper() -> Result<()
         },
     );
     let (title, description) = result.borrow_mut().take().ok_or("activation never ran")?;
-    let title = title.ok_or("a refused request must render the error page")?;
+    let title = title.ok_or("an errored reply must render the error page")?;
     if title.to_lowercase().contains("unreachable") {
         return Err(format!(
-            "a refused request must not be titled as if the helper could not be reached: \
+            "an errored reply must not be titled as if the helper could not be reached: \
              {title:?}"
+        ));
+    }
+    if title.to_lowercase().contains("refus") || title.to_lowercase().contains("declin") {
+        return Err(format!(
+            "an errored reply's title must not assert a refusal/decision the error may not \
+             be: {title:?}"
         ));
     }
     match description.as_deref() {
         Some(d) if d.contains("not authorized") => {}
         other => {
             return Err(format!(
-                "the helper's own refusal must survive verbatim: {other:?}"
+                "the helper's own error reason must survive verbatim: {other:?}"
             ))
         }
     }
@@ -440,7 +488,7 @@ fn a_refused_request_reads_differently_from_an_unreachable_helper() -> Result<()
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 8] = [
+    let cases: [Case; 9] = [
         (
             "an_empty_list_is_a_calm_status_page_not_an_error",
             an_empty_list_is_a_calm_status_page_not_an_error,
@@ -448,6 +496,10 @@ fn main() {
         (
             "each_rule_shows_port_protocol_target_and_a_close_button",
             each_rule_shows_port_protocol_target_and_a_close_button,
+        ),
+        (
+            "an_anywhere_scoped_rule_is_marked_and_a_subnet_scoped_one_is_not",
+            an_anywhere_scoped_rule_is_marked_and_a_subnet_scoped_one_is_not,
         ),
         (
             "the_countdown_is_live_and_counts_down",
@@ -470,8 +522,8 @@ fn main() {
             the_initial_state_before_any_answer_is_neither_calm_nor_populated,
         ),
         (
-            "a_refused_request_reads_differently_from_an_unreachable_helper",
-            a_refused_request_reads_differently_from_an_unreachable_helper,
+            "an_errored_reply_reads_differently_from_an_unreachable_helper",
+            an_errored_reply_reads_differently_from_an_unreachable_helper,
         ),
     ];
 

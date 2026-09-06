@@ -42,14 +42,32 @@ fn activate<F: FnOnce(&adw::Application) + 'static>(app_id: &str, f: F) {
     app.run_with_args::<&str>(&[]);
 }
 
+/// The exact sentence `porthole_core::backend::detect` fails with today
+/// when no firewall is installed -- used here (rather than a shorter
+/// fixture-only string) so `no_firewall_at_all_is_prominent_not_a_footnote`
+/// proves `StatusBar` really does show `WireStatus::detail` verbatim, the
+/// same text a real helper would actually send.
+const NO_FIREWALL_DETAIL: &str = "no firewall found: none of firewalld, ufw or nftables is \
+     installed. Without a firewall this port is already reachable from your network.";
+
 /// A `WireStatus` fixture. `backend_and_version` is `None` for "no firewall
-/// at all" (`firewall_available: false`); `Some((name, version))` for an
-/// installed backend, `active` deciding whether it is reported as
-/// enforcing anything.
+/// at all" (`firewall_available: false`, `detail` set to
+/// [`NO_FIREWALL_DETAIL`]); `Some((name, version))` for an installed
+/// backend, `active` deciding whether it is reported as enforcing anything.
 fn status(backend_and_version: Option<(&str, &str)>, active: bool) -> WireStatus {
-    let (backend, version, available) = match backend_and_version {
-        Some((backend, version)) => (backend.to_string(), version.to_string(), true),
-        None => (String::new(), String::new(), false),
+    let (backend, version, available, detail) = match backend_and_version {
+        Some((backend, version)) => (
+            backend.to_string(),
+            version.to_string(),
+            true,
+            String::new(),
+        ),
+        None => (
+            String::new(),
+            String::new(),
+            false,
+            NO_FIREWALL_DETAIL.to_string(),
+        ),
     };
     WireStatus {
         backend,
@@ -57,6 +75,7 @@ fn status(backend_and_version: Option<(&str, &str)>, active: bool) -> WireStatus
         firewall_active: active,
         firewall_active_unknown: false,
         firewall_version: version,
+        detail,
         location: String::new(),
         interface: String::new(),
         address: String::new(),
@@ -111,6 +130,32 @@ fn no_firewall_at_all_is_prominent_not_a_footnote() -> Result<(), String> {
     }
     if !text.contains("already reachable") {
         return Err(format!("expected \"already reachable\" in {text:?}"));
+    }
+    Ok(())
+}
+
+/// Item 5: the real banner widget shows `WireStatus::detail` verbatim, not
+/// a sentence `StatusBar` invented itself -- checked by exact equality
+/// against the fixture's own [`NO_FIREWALL_DETAIL`], not merely a
+/// substring, so a future edit that started paraphrasing it would be
+/// caught even if the paraphrase still happened to mention "already
+/// reachable".
+fn the_no_firewall_banner_shows_the_wires_own_detail_verbatim() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.StatusNoFirewallDetail",
+        move |_app| {
+            let bar = StatusBar::new();
+            bar.set_status(&status(None, false));
+            *seen.borrow_mut() = Some(bar.text());
+        },
+    );
+    let text = result.borrow_mut().take().ok_or("activation never ran")?;
+    if text != NO_FIREWALL_DETAIL {
+        return Err(format!(
+            "expected the wire's own detail verbatim ({NO_FIREWALL_DETAIL:?}), got {text:?}"
+        ));
     }
     Ok(())
 }
@@ -205,25 +250,23 @@ fn a_firewall_porthole_could_not_read_is_not_confused_with_a_confirmed_stop() ->
     Ok(())
 }
 
-/// I2: a helper that answered but refused a request is prominent too, but
+/// I2: a helper that answered with a typed error is prominent too, but
 /// must not be worded as if the helper could not be reached at all -- the
 /// helper answered here.
-fn a_refused_request_is_prominent_but_not_worded_as_unreachable() -> Result<(), String> {
+fn an_errored_reply_is_prominent_but_not_worded_as_unreachable() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
     activate(
-        "com.jacopobriccola.Porthole.Test.StatusRefused",
+        "com.jacopobriccola.Porthole.Test.StatusErrored",
         move |_app| {
             let bar = StatusBar::new();
-            bar.set_refused("not authorized: com.jacopobriccola.Porthole.List");
+            bar.set_errored("not authorized: com.jacopobriccola.Porthole.List");
             *seen.borrow_mut() = Some((bar.text(), bar.is_prominent()));
         },
     );
     let (text, prominent) = result.borrow_mut().take().ok_or("activation never ran")?;
     if !prominent {
-        return Err(
-            "a refused request must not be rendered as an ordinary status line".to_string(),
-        );
+        return Err("an errored reply must not be rendered as an ordinary status line".to_string());
     }
     if text.to_lowercase().contains("could not reach") {
         return Err(format!(
@@ -232,12 +275,20 @@ fn a_refused_request_is_prominent_but_not_worded_as_unreachable() -> Result<(), 
     }
     if text.contains("already reachable") {
         return Err(format!(
-            "a refused request must not claim reachability either way: {text:?}"
+            "an errored reply must not claim reachability either way: {text:?}"
+        ));
+    }
+    if text.to_lowercase().contains("refus") || text.to_lowercase().contains("declin") {
+        // I4: this same code path renders a `StateStore` failure inside
+        // the helper too, which is not a decision anyone made -- see
+        // `status_bar.rs`'s own module doc.
+        return Err(format!(
+            "the errored reply must not assert a refusal/decision the error may not be: {text:?}"
         ));
     }
     if !text.contains("not authorized") {
         return Err(format!(
-            "the helper's own refusal must survive verbatim: {text:?}"
+            "the helper's own error reason must survive verbatim: {text:?}"
         ));
     }
     Ok(())
@@ -284,7 +335,7 @@ fn the_ordinary_line_is_cleared_once_the_banner_takes_over() -> Result<(), Strin
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 7] = [
+    let cases: [Case; 8] = [
         (
             "the_status_line_names_the_backend_and_whether_it_is_enforcing",
             the_status_line_names_the_backend_and_whether_it_is_enforcing,
@@ -292,6 +343,10 @@ fn main() {
         (
             "no_firewall_at_all_is_prominent_not_a_footnote",
             no_firewall_at_all_is_prominent_not_a_footnote,
+        ),
+        (
+            "the_no_firewall_banner_shows_the_wires_own_detail_verbatim",
+            the_no_firewall_banner_shows_the_wires_own_detail_verbatim,
         ),
         (
             "an_installed_but_stopped_firewall_says_stopped_not_missing",
@@ -306,8 +361,8 @@ fn main() {
             a_firewall_porthole_could_not_read_is_not_confused_with_a_confirmed_stop,
         ),
         (
-            "a_refused_request_is_prominent_but_not_worded_as_unreachable",
-            a_refused_request_is_prominent_but_not_worded_as_unreachable,
+            "an_errored_reply_is_prominent_but_not_worded_as_unreachable",
+            an_errored_reply_is_prominent_but_not_worded_as_unreachable,
         ),
         (
             "the_ordinary_line_is_cleared_once_the_banner_takes_over",

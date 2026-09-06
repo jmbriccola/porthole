@@ -135,6 +135,12 @@ fn fixture_status() -> WireStatus {
         firewall_active: true,
         firewall_active_unknown: false,
         firewall_version: "2.4.4".to_string(),
+        // Not read by anything this fixture exercises (StatusBar's active
+        // branch never shows it -- see `status_bar.rs`'s own `set_status`),
+        // but `WireStatus::detail` (added for `porthole-core`'s own
+        // `BackendHealth::detail`, item 5 of the milestone's task 6 review)
+        // has no default and this call site has to set something.
+        detail: "firewalld is active and enforcing".to_string(),
         location: "FedoraWorkstation".to_string(),
         interface: "wlo1".to_string(),
         address: "10.10.10.119".to_string(),

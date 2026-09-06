@@ -76,12 +76,27 @@
 //! found nothing", the identical collapse `open_now.rs`'s own module doc
 //! describes. [`ListeningSection::set_scan_failed`] is the distinct state
 //! for it: a fourth widget, [`Inner::error_page`], never the calm one.
-//! [`Inner::loading_page`] is the fifth and last: shown before
-//! `set_services` has ever been called at all, since "nothing is
-//! listening" is equally not a fact this section has earned yet at
-//! construction.
+//! [`Inner::loading_page`] is the fifth and last, for the identical reason
+//! before the first scan result has ever arrived at all.
+//!
+//! **Both of those must survive `set_open_ports` on its own**, and an
+//! earlier version of this section did not: `set_open_ports` calls the
+//! same `apply` that renders the calm page, and `apply` used to decide
+//! between the calm page and the row list by checking whether `services`
+//! was empty -- which it also is before the first scan, and after
+//! `set_scan_failed` clears it, since neither of those has a stale row
+//! list to fall back to either. So a `set_open_ports` arriving after a
+//! failed scan (traced in a container: a `/proc` read on the thread pool
+//! reliably beats a system-bus connect plus two polkit-checked calls, so
+//! this is the *likely* arrival order for a real failure, not an edge
+//! case) rebuilt the calm page right out from under `error_page`, and the
+//! same held for `loading_page` before any scan had run. [`Inner::scanned`]
+//! is the fix: `apply` now checks *that* first, not `services.is_empty()`,
+//! and `set_open_ports` alone can no longer produce either page --
+//! `tests/listening.rs`'s own opposite-order tests pin both halves of
+//! this.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -105,19 +120,28 @@ struct Row {
 
 struct Inner {
     /// What `PortholeWindow` appends into its `content()` box. Holds
-    /// exactly one child at a time: `loading_page` before `set_services`
-    /// has ever been called, `status_page` when nothing is listening,
-    /// `error_page` when the last scan failed, `group` otherwise -- the
-    /// same shape `open_now::Inner::container` uses, for the same reason.
+    /// exactly one child at a time: `loading_page` while `scanned` is
+    /// `false` and no row list has ever been confirmed, `status_page` once
+    /// a scan confirmed there is nothing listening, `error_page` when the
+    /// last scan failed, `group` otherwise -- the same shape
+    /// `open_now::Inner::container` uses, for the same reason. `apply`
+    /// (called by both `set_services` and `set_open_ports`) is the only
+    /// place that decides between these, and it decides from `scanned`,
+    /// not from whether `services` happens to be empty -- see this
+    /// module's own doc comment for why that distinction is the whole fix.
     container: gtk::Box,
     group: adw::PreferencesGroup,
     status_page: adw::StatusPage,
     /// A **different** widget from `status_page` -- see this module's own
     /// doc comment on why a scan failure must never render as "nothing is
-    /// listening".
+    /// listening", and stays that way through a `set_open_ports` that
+    /// arrives afterward.
     error_page: adw::StatusPage,
-    /// A **different** widget again, shown only before `set_services` has
-    /// ever been called -- see this module's own doc comment.
+    /// A **different** widget again, shown while `scanned` is `false` --
+    /// see this module's own doc comment. Not "before `set_services` has
+    /// ever been called" alone: `set_open_ports` alone cannot displace it
+    /// either, which is exactly the property an earlier version of this
+    /// section did not have.
     loading_page: adw::StatusPage,
     rows: RefCell<Vec<Row>>,
     /// The last list `set_services` was given. Kept so `set_open_ports`
@@ -126,6 +150,17 @@ struct Inner {
     services: RefCell<Vec<Service>>,
     /// Ports `set_open_ports` was last given, as a set for cheap lookup.
     open_ports: RefCell<HashSet<u16>>,
+    /// Whether `services` is a confirmed scan result right now -- `true`
+    /// only between a `set_services` call and the next `set_scan_failed`
+    /// (which clears it again). `apply` reads this, not
+    /// `services.is_empty()`, to decide whether the calm page may show at
+    /// all: an *empty* `services` can mean either "the scan ran and found
+    /// nothing" or "no confirmed scan exists" (before the first one, or
+    /// after `set_scan_failed` cleared it), and only the first of those
+    /// earns the calm page. Without this flag, `apply` had no way to tell
+    /// the two apart -- see this module's own doc comment on the bug that
+    /// produced.
+    scanned: Cell<bool>,
 }
 
 /// `"node · 5173"` when the owning process is known, `"4000"` alone when it
@@ -204,7 +239,25 @@ fn group_rank(binding: &Binding) -> u8 {
 /// Replaces every row in `inner.group`, built from whatever `set_services`
 /// and `set_open_ports` last stored -- called by both setters, since either
 /// one can change what should be on screen.
+///
+/// Guarded by `inner.scanned`: `set_open_ports` calls this too, and before
+/// this guard existed, an out-of-order `set_open_ports` (arriving after a
+/// `set_scan_failed`, or before the first `set_services` at all) fell
+/// through to the `services.is_empty()` branch below -- `apply_scan_failed`
+/// and the constructor both leave `services` empty -- and rebuilt the calm
+/// "Nothing else is listening" page right out from under `error_page` or
+/// `loading_page`. Traced in a container: a `/proc` read on the thread
+/// pool reliably finishes before a system-bus connect plus two
+/// polkit-checked calls, so `set_scan_failed` → `set_open_ports` is the
+/// likely arrival order for a real scan failure, not an edge case. See
+/// `tests/listening.rs`'s own opposite-order tests for both halves of this
+/// (a scan failure, and the initial loading state) surviving a
+/// `set_open_ports` that arrives after them.
 fn apply(inner: &Rc<Inner>) {
+    if !inner.scanned.get() {
+        return;
+    }
+
     let services = inner.services.borrow().clone();
     let open_ports = inner.open_ports.borrow().clone();
 
@@ -213,9 +266,10 @@ fn apply(inner: &Rc<Inner>) {
     }
 
     // A successful `apply` -- even from an empty list -- means the scan
-    // *did* answer, so any previous "scan failed"/"not scanned yet" state
-    // is stale and must go, the same way `error_page` and `loading_page`
-    // displace `group` and `status_page` in `apply_scan_failed` below.
+    // *did* answer (the guard above already confirmed `scanned`), so any
+    // previous "scan failed"/"not scanned yet" state is stale and must go,
+    // the same way `error_page` and `loading_page` displace `group` and
+    // `status_page` in `apply_scan_failed` below.
     if inner.error_page.parent().is_some() {
         inner.container.remove(&inner.error_page);
     }
@@ -290,14 +344,23 @@ fn apply(inner: &Rc<Inner>) {
 
 /// Replaces whatever `inner.container` was showing with `error_page`,
 /// described by `message` -- [`ListeningSection::set_scan_failed`]'s
-/// state. Clears `services` too (`open_ports` is untouched: it comes from
-/// an entirely different, independent round trip and a scan failure says
-/// nothing about whether it is stale), so a later `set_open_ports` alone
-/// cannot resurrect a stale row list out from under this failure -- it
-/// still needs a fresh `set_services` to get back to `group` or
-/// `status_page` at all.
+/// state. Clears `services` (`open_ports` is untouched: it comes from an
+/// entirely different, independent round trip and a scan failure says
+/// nothing about whether it is stale) and, critically, `scanned` -- it is
+/// `scanned` being `false` afterward, not the empty `services`, that keeps
+/// a later lone `set_open_ports` from rebuilding the calm page over this
+/// failure: `apply` reads `scanned` first and returns before it ever looks
+/// at whether `services` is empty. An earlier version of this function
+/// cleared `services` only and reasoned from that alone, which was the
+/// actual defect -- `apply`'s own `services.is_empty()` branch cannot
+/// distinguish "the scan ran and found nothing" from "there is no
+/// confirmed scan at all", so a `set_open_ports` arriving after this
+/// call did read as the former. Pinned by `tests/listening.rs`'s
+/// `a_scan_failure_survives_a_later_set_open_ports` (`set_scan_failed`,
+/// then `set_open_ports`, then still `error_page`, not `status_page`).
 fn apply_scan_failed(inner: &Rc<Inner>, message: &str) {
     inner.services.replace(Vec::new());
+    inner.scanned.set(false);
     for row in inner.rows.replace(Vec::new()) {
         inner.group.remove(&row.row);
     }
@@ -355,9 +418,10 @@ impl ListeningSection {
             .css_classes(["error"])
             .build();
 
-        // Shown before `set_services` has ever been called -- see this
-        // module's own doc comment on why the calm page must not be the
-        // default. Neutral: no error/warning styling.
+        // Shown while `scanned` is still `false` -- see this module's own
+        // doc comment on why the calm page must not be the default, and on
+        // why "before `set_services`" alone used to be the wrong
+        // condition. Neutral: no error/warning styling.
         let loading_page = adw::StatusPage::builder()
             .title("Checking what's listening…")
             .icon_name("content-loading-symbolic")
@@ -377,6 +441,7 @@ impl ListeningSection {
             rows: RefCell::new(Vec::new()),
             services: RefCell::new(Vec::new()),
             open_ports: RefCell::new(HashSet::new()),
+            scanned: Cell::new(false),
         });
 
         Self { inner }
@@ -393,6 +458,7 @@ impl ListeningSection {
     /// `set_open_ports` last stored, in either call order.
     pub fn set_services(&self, services: &[Service]) {
         self.inner.services.replace(services.to_vec());
+        self.inner.scanned.set(true);
         apply(&self.inner);
     }
 
@@ -437,9 +503,13 @@ impl ListeningSection {
         }
     }
 
-    /// `Some` only before `set_services` has ever been called -- the very
-    /// first widget a freshly constructed section shows, and gone for good
-    /// the moment `set_services` or `set_scan_failed` is called even once.
+    /// `Some` only while `scanned` is still `false` -- the very first
+    /// widget a freshly constructed section shows, and gone for good the
+    /// moment `set_services` or `set_scan_failed` is called even once.
+    /// `set_open_ports` alone, called any number of times before either of
+    /// those, leaves this exactly as it was: `apply` (which
+    /// `set_open_ports` calls) checks `scanned` before it touches the
+    /// container at all.
     pub fn loading_page(&self) -> Option<adw::StatusPage> {
         if self.inner.loading_page.parent().is_some() {
             Some(self.inner.loading_page.clone())

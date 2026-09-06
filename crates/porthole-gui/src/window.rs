@@ -43,11 +43,11 @@
 //!
 //! Neither read blocks the UI thread, and the helper round trip is bounded
 //! by [`HELPER_TIMEOUT`] (zbus proxies carry no default one of their own).
-//! No answer at all, a refused request, and a confirmed empty list are
-//! three different facts and render as three different things -- see
-//! `refresh`'s own doc comment, `open_now.rs`'s and `status_bar.rs`'s
-//! module docs for why conflating any pair of them is this project's
-//! characteristic defect.
+//! No answer at all, a typed error the helper did answer with, and a
+//! confirmed empty list are three different facts and render as three
+//! different things -- see `refresh`'s own doc comment, `open_now.rs`'s and
+//! `status_bar.rs`'s module docs for why conflating any pair of them is
+//! this project's characteristic defect.
 
 use std::ops::Deref;
 
@@ -63,11 +63,12 @@ use crate::open_now::OpenNowSection;
 use crate::status_bar::StatusBar;
 
 /// The width, in CSS pixels, at or below which the narrow layout applies.
-/// Tasks 3-6 attach the actual layout changes to this same `Breakpoint`
-/// object, reachable via [`PortholeWindow::breakpoint`], through
-/// `Breakpoint::add_setter`; this task only establishes that a real
-/// breakpoint exists, is registered on a real window, and genuinely applies
-/// once that window is narrow.
+/// The `Breakpoint` object itself is reachable via
+/// [`PortholeWindow::breakpoint`]; task 6 is what attaches its first real
+/// layout change, `NARROW_MARGIN_PX` below, through `Breakpoint::add_setters`
+/// in [`PortholeWindow::new`] -- a registered breakpoint with no setter
+/// attached activates and changes nothing, which is what this crate shipped
+/// until that call existed.
 const NARROW_WIDTH_PX: f64 = 400.0;
 
 /// `content`'s own margin, in CSS pixels, while the window is narrow --
@@ -261,8 +262,11 @@ impl PortholeWindow {
         &self.content
     }
 
-    /// The narrow-width breakpoint registered on this window, for a later
-    /// task to attach layout changes to via `Breakpoint::add_setter`.
+    /// The narrow-width breakpoint registered on this window --
+    /// `PortholeWindow::new` already attaches its own layout change
+    /// (`NARROW_MARGIN_PX`) to this exact object; a later section that
+    /// wants a second one calls `Breakpoint::add_setters` again on what
+    /// this returns.
     ///
     /// This is the same object `current_breakpoint()` (from
     /// `AdwApplicationWindowExt`, reachable via `Deref`) reports back once
@@ -365,21 +369,33 @@ fn helper_message(e: &zbus::Error) -> String {
 /// `status_bar.rs`'s own module docs for why conflating them is this
 /// project's characteristic defect. `Unreachable` is no answer at all: no
 /// bus, no helper process, the connection lost mid-call, or this refresh's
-/// own bounded wait (`with_timeout`, below) running out. `Refused` is the
-/// helper answering with a typed decision it declined -- a polkit denial
-/// being the common case, since `list` and `status` both go through the
-/// same authorization check `open`/`close` do (see
-/// `porthole-helper/src/service.rs`). [`classify_failure`] is what tells
-/// the two apart: only a `zbus::Error::MethodError` means the helper
+/// own bounded wait (`with_timeout`, below) running out. `Errored` is the
+/// helper answering with a typed error -- [`classify_failure`] is what
+/// tells the two apart: only a `zbus::Error::MethodError` means the helper
 /// actually responded.
+///
+/// `Errored` is deliberately **not** named or worded as a refusal, and an
+/// earlier version of this enum got that wrong (`Refused`, rendered as "The
+/// porthole helper refused this request"): `list` and `status` both go
+/// through the same authorization check `open`/`close` do (see
+/// `porthole-helper/src/service.rs`), so a polkit denial (`HelperError::
+/// NotAuthorized`) really is a declined request and reaches here as a
+/// `MethodError` same as everything else -- but so does a `StateStore`
+/// read failure (`HelperError::State`) or any other error the helper's own
+/// `HelperError::Failed` catch-all carries, and neither of those is a
+/// decision to decline anything; they are the helper trying to answer and
+/// failing. `classify_failure` does not distinguish which one occurred (the
+/// wire's own error name would let a future caller do that, if it became
+/// worth a fourth rendering); what changed here is only that the wording
+/// no longer claims a specific one.
 enum HelperFailure {
     Unreachable(String),
-    Refused(String),
+    Errored(String),
 }
 
 fn classify_failure(e: zbus::Error) -> HelperFailure {
     match &e {
-        zbus::Error::MethodError(..) => HelperFailure::Refused(helper_message(&e)),
+        zbus::Error::MethodError(..) => HelperFailure::Errored(helper_message(&e)),
         _ => HelperFailure::Unreachable(format!("could not reach the porthole helper: {e}")),
     }
 }
@@ -387,14 +403,14 @@ fn classify_failure(e: zbus::Error) -> HelperFailure {
 fn apply_failure_to_open_now(open_now: &OpenNowSection, failure: &HelperFailure) {
     match failure {
         HelperFailure::Unreachable(message) => open_now.set_unreachable(message),
-        HelperFailure::Refused(message) => open_now.set_refused(message),
+        HelperFailure::Errored(message) => open_now.set_errored(message),
     }
 }
 
 fn apply_failure_to_status_bar(status_bar: &StatusBar, failure: &HelperFailure) {
     match failure {
         HelperFailure::Unreachable(message) => status_bar.set_unreachable(message),
-        HelperFailure::Refused(message) => status_bar.set_refused(message),
+        HelperFailure::Errored(message) => status_bar.set_errored(message),
     }
 }
 
@@ -485,18 +501,21 @@ fn present_open_dialog(
 /// `listening_section.rs`'s own doc comment for which rows do not) to a
 /// dialog pre-filled with that row's port.
 ///
-/// Every `set_services`/`set_open_ports` call rebuilds every row from
-/// scratch (`listening_section.rs`'s own `apply`), which drops whatever
-/// click handler a previous call to this function had connected -- so a
-/// caller must call this again *immediately* after whichever of those two
-/// setters it just called, every single time one of them runs, never once
-/// at the end of some larger sequence: calling it after a setter that was
-/// *skipped* (a failed scan, say, which calls `set_scan_failed` instead of
-/// `set_services`) would re-attach a second handler onto buttons that
-/// already have one from the last successful render, and each press would
-/// open two dialogs. It lives here rather than inside `listening_section.rs`
-/// itself because that module renders what it is given and knows nothing
-/// about `OpenDialog` or this window.
+/// Every `set_services`/`set_open_ports` call that actually rebuilds rows
+/// (`listening_section.rs`'s own `apply` -- gated by `scanned`, see its own
+/// module doc) drops whatever click handler a previous call to this
+/// function had connected, since it discards the old `gtk::Button` objects
+/// entirely and builds new ones. This is called again immediately after
+/// each such rebuild so the buttons currently on screen are the ones with
+/// a handler. A call after `set_scan_failed` specifically is harmless, not
+/// merely avoided: `apply_scan_failed` clears `listening`'s rows outright
+/// (`tests/listening.rs`'s own `a_scan_failure_does_not_render_as_the_calm_
+/// empty_state` asserts exactly that), so `listening.rows()` reports none
+/// and this function's loop below simply does nothing -- there is no
+/// leftover button here for a second handler to stack onto. It lives here
+/// rather than inside `listening_section.rs` itself because that module
+/// renders what it is given and knows nothing about `OpenDialog` or this
+/// window.
 fn wire_listening_open_buttons(
     window: &adw::ApplicationWindow,
     open_now: &OpenNowSection,
@@ -552,12 +571,16 @@ fn wire_listening_open_buttons(
 /// is for a single click's own D-Bus call elsewhere in this crate.
 ///
 /// A failure to reach the helper is not an empty list, and a helper that
-/// answered but refused a request is not the same fact as one that never
+/// answered with a typed error is not the same fact as one that never
 /// answered at all -- see `open_now.rs`'s and `status_bar.rs`'s own module
 /// docs for why conflating either pair is this project's characteristic
 /// defect. A `/proc` scan failure is the identical shape one layer down:
 /// [`ListeningSection::set_scan_failed`] is that state, not silence plus a
-/// stderr line standing in for "nothing is listening".
+/// stderr line standing in for "nothing is listening" -- and, one layer
+/// further down still, `listening_section.rs`'s own `apply` now has to be
+/// told a confirmed scan exists at all before it may render that calm page,
+/// not merely infer it from an empty list (see its own module doc for the
+/// bug that produced).
 fn refresh(
     window: &adw::ApplicationWindow,
     open_now: &OpenNowSection,
@@ -621,8 +644,8 @@ fn refresh(
                 None => {
                     // `with_timeout` won the race: the helper never
                     // answered within `HELPER_TIMEOUT` at all, which is
-                    // itself an "unreachable" fact, not a refusal -- the
-                    // helper never got the chance to refuse anything.
+                    // itself an "unreachable" fact, not an errored reply --
+                    // the helper never got the chance to answer at all.
                     let failure = HelperFailure::Unreachable(
                         "could not reach the porthole helper: timed out".to_string(),
                     );
@@ -656,24 +679,49 @@ mod tests {
     }
 
     #[test]
-    fn a_method_error_is_refused_not_unreachable() {
-        // I2: the helper answered here -- a typed refusal, not silence.
+    fn a_method_error_is_errored_not_unreachable() {
+        // I2: the helper answered here -- a typed error, not silence.
         let e = method_error(
             "com.jacopobriccola.Porthole.NotAuthorized",
             Some("not authorized: com.jacopobriccola.Porthole.List"),
         );
         match classify_failure(e) {
-            HelperFailure::Refused(message) => {
+            HelperFailure::Errored(message) => {
                 assert_eq!(message, "not authorized: com.jacopobriccola.Porthole.List");
             }
             HelperFailure::Unreachable(message) => {
-                panic!("a MethodError must classify as Refused, not Unreachable: {message}")
+                panic!("a MethodError must classify as Errored, not Unreachable: {message}")
             }
         }
     }
 
     #[test]
-    fn a_non_method_error_is_unreachable_not_refused() {
+    fn a_state_failure_classifies_the_same_way_as_a_denial_not_as_unreachable() {
+        // I4: `HelperError::State` (a `StateStore` read/write failure) is
+        // just as much a `MethodError` as `HelperError::NotAuthorized` is,
+        // and `classify_failure` does not -- cannot, from the wire alone --
+        // tell them apart. Pinning this is what makes `Errored`'s own doc
+        // comment true rather than aspirational: both really do reach the
+        // same, deliberately non-refusal-claiming, rendering.
+        let e = method_error(
+            "com.jacopobriccola.Porthole.State",
+            Some("could not read /run/porthole/state.json: permission denied"),
+        );
+        match classify_failure(e) {
+            HelperFailure::Errored(message) => {
+                assert_eq!(
+                    message,
+                    "could not read /run/porthole/state.json: permission denied"
+                );
+            }
+            HelperFailure::Unreachable(message) => {
+                panic!("a MethodError must classify as Errored, not Unreachable: {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn a_non_method_error_is_unreachable_not_errored() {
         // The connection-lost case: no typed answer came back at all.
         let e = zbus::Error::Failure("the connection was lost".to_string());
         match classify_failure(e) {
@@ -683,8 +731,8 @@ mod tests {
                     "{message}"
                 );
             }
-            HelperFailure::Refused(message) => {
-                panic!("a non-MethodError must classify as Unreachable, not Refused: {message}")
+            HelperFailure::Errored(message) => {
+                panic!("a non-MethodError must classify as Unreachable, not Errored: {message}")
             }
         }
     }
