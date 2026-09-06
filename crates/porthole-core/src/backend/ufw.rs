@@ -311,6 +311,7 @@ impl FirewallBackend for Ufw<'_> {
                     active: false,
                     version: None,
                     detail: "ufw is not installed".to_string(),
+                    caveat: None,
                 })
             }
             Err(other) => return Err(other),
@@ -336,6 +337,13 @@ impl FirewallBackend for Ufw<'_> {
             active,
             version,
             detail,
+            // ufw's standing persistence caveat ("a rule survives a reboot
+            // until reconciliation notices") is true regardless of `active`,
+            // but it is stated by `porthole-cli`'s doctor.rs and
+            // docs/backends.md, not threaded through here -- unlike
+            // nftables' caveat, it is not something `health()` had to
+            // inspect the ruleset to discover.
+            caveat: None,
         })
     }
 

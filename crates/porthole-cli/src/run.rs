@@ -54,6 +54,7 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
                         active: false,
                         version: None,
                         detail,
+                        caveat: None,
                     },
                     network: net::current_network(runner.as_ref()).ok(),
                     location: None,

@@ -1,11 +1,20 @@
 # The three backends
 
 porthole never asks which firewall to drive. `porthole doctor` and `porthole
-status` say which one it found: [firewalld](#firewalld) if it is installed
-and active, then [ufw](#ufw), then [nftables](#nftables) — nftables last
-because its mere presence says nothing (`nft` ships on nearly every modern
-Linux whether or not anyone uses it as a policy manager), while installing
-firewalld or ufw is a decision about how the machine is meant to be managed.
+status` say which one it found: [firewalld](#firewalld), then [ufw](#ufw),
+then [nftables](#nftables) — nftables last because its mere presence says
+nothing (`nft` ships on nearly every modern Linux whether or not anyone uses
+it as a policy manager), while installing firewalld or ufw is a decision
+about how the machine is meant to be managed.
+
+Every one of the three is picked on being **installed**, never on being
+**active**. An installed-but-stopped firewalld still outranks a running ufw:
+"firewalld is installed but not running" is a more useful thing to tell you
+than silently managing a different firewall than the one this machine
+settled on, and refusing to act while the chosen one is stopped is `open`
+and `close`'s job, not detection's. nftables gets no such exception — mere
+presence is exactly what puts it last, not what would otherwise keep it out
+of consideration.
 
 Every backend keeps the same two promises: no permanent rule, ever, and a
 rule porthole did not create is never touched. What differs between them —
@@ -71,9 +80,9 @@ shortcuts.
 
 ## nftables
 
-nftables is the fallback: chosen when neither firewalld nor ufw is active,
-and by presence rather than activity, because `nft` existing on a machine
-says nothing about whether anyone uses it directly.
+nftables is the fallback: chosen when neither firewalld nor ufw is
+installed, and by presence rather than activity, because `nft` existing on a
+machine says nothing about whether anyone uses it directly.
 
 **porthole edits your own input chain, not a table of its own.** The obvious
 design — an isolated `table inet porthole` at a higher hook priority — does
@@ -96,14 +105,15 @@ Two situations make porthole refuse outright rather than guess:
   into either one on a guess. `porthole doctor` names the chains it found.
 
 And one situation porthole can see but only partially: **a chain whose
-policy is `accept`, with nothing in the chain itself that drops or
-rejects.** Reading this correctly is the entire point of naming it:
-**everything is already allowed here, so closing a port in this chain does
-not make it unreachable.** That is the direction that misleads someone into
-feeling safe, so `porthole doctor` and `porthole status` say it plainly.
-They also say no more than they checked: porthole only inspects this one
-chain — it does not follow `jump` or `goto` targets, which is exactly how
-firewalld and ufw structure their own rulesets internally — so a rule
-elsewhere that this chain jumps to could still be doing the actual
-dropping. The wording is deliberately "no rule in this chain drops or
-rejects", never the stronger and potentially false "nothing here drops".
+policy is `accept`, with no rule in the chain itself that drops or
+rejects.** porthole only inspects this one chain — it does not follow `jump`
+or `goto` targets, which is exactly how firewalld and ufw structure their
+own rulesets internally — so a chain this one jumps to could still be doing
+the actual dropping. That means porthole cannot say the port becomes
+unreachable once closed; it can only say what it actually checked: **no rule
+in this chain drops or rejects, so closing a port here is not, on its own,
+evidence that it becomes unreachable.** That is the direction that misleads
+someone into feeling safe, so `porthole doctor` and `porthole status` say it
+plainly — but they say no more than they checked. The wording is
+deliberately this weaker, true claim, never the stronger and potentially
+false "closing a port here makes it unreachable".

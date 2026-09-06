@@ -4,6 +4,7 @@
 //! The JSON shape is a public interface and is documented in
 //! `docs/json-schema.md`. Add fields; do not rename or remove them.
 
+use porthole_core::backend::BackendId;
 use porthole_core::command::Command;
 use porthole_core::engine::Status;
 use porthole_core::error::Error;
@@ -61,6 +62,7 @@ pub fn json_status(status: &Status, now: u64) -> Value {
         "firewall_available": status.health.available,
         "firewall_active": status.health.active,
         "firewall_version": status.health.version,
+        "firewall_caveat": status.health.caveat,
         "location": status.location,
         "network": status.network.as_ref().map(|n| json!({
             "interface": n.interface,
@@ -69,6 +71,18 @@ pub fn json_status(status: &Status, now: u64) -> Value {
         })),
         "rules": status.rules.iter().map(|r| rule_json(r, now)).collect::<Vec<_>>(),
     })
+}
+
+/// The label `print_status` puts in front of `location` -- the concept
+/// `location` names is different per backend (a firewalld zone is not a ufw
+/// chain), so the word in front of it has to change too, or the label lies
+/// for two out of three backends.
+fn location_label(backend: BackendId) -> &'static str {
+    match backend {
+        BackendId::Firewalld => "Zone",
+        BackendId::Ufw => "Location",
+        BackendId::Nftables => "Chain",
+    }
 }
 
 fn error_json(error: &Error) -> Value {
@@ -218,7 +232,7 @@ pub fn print_status(status: &Status, now: u64) {
     };
     println!("Firewall  {firewall}");
     if let Some(location) = &status.location {
-        println!("Zone      {location}");
+        println!("{:<9} {location}", location_label(status.backend));
     }
     match &status.network {
         Some(n) => println!("Network   {} · {}", n.interface, n.cidr),
@@ -234,6 +248,16 @@ pub fn print_status(status: &Status, now: u64) {
         println!();
     } else if !status.health.available {
         println!("{}", status.health.detail);
+        println!();
+    } else if let Some(caveat) = &status.health.caveat {
+        // A caveat is a standing property of an *active, available* backend
+        // (nftables' accepting-chain warning is the only one today) — the
+        // two branches above already cover "not active"/"not installed", so
+        // this is reached only when neither of those applies. `status` is
+        // where a user actually looks; leaving this out here just because
+        // `active` reads as healthy is exactly the safe-looking silence
+        // docs/backends.md promises does not happen.
+        println!("{caveat}");
         println!();
     }
 
@@ -334,6 +358,7 @@ mod tests {
                 active: false,
                 version: None,
                 detail: "no supported firewall found".to_string(),
+                caveat: None,
             },
             network: None,
             location: None,
@@ -344,8 +369,80 @@ mod tests {
         assert_eq!(json["firewall_available"], false);
         assert_eq!(json["firewall_active"], false);
         assert!(json["firewall_version"].is_null());
+        assert!(json["firewall_caveat"].is_null());
         assert!(json["network"].is_null());
         assert!(json["location"].is_null());
+    }
+
+    #[test]
+    fn a_standing_caveat_reaches_json_status_even_while_active() {
+        // The bug this guards against: `print_status`/`json_status` used to
+        // gate all of `health.detail` on `!active`, so a caveat that only
+        // exists when the backend *is* active (nftables' accepting-chain
+        // warning) could never reach a script reading `--json`, or a person
+        // reading plain `status`. `caveat` must not depend on `active` to be
+        // seen.
+        use porthole_core::backend::{BackendHealth, BackendId};
+        use porthole_core::engine::Status;
+
+        let status = Status {
+            backend: BackendId::Nftables,
+            health: BackendHealth {
+                available: true,
+                active: true,
+                version: Some("1.1.6".to_string()),
+                detail: "1.1.6: inet filter input is enforcing".to_string(),
+                caveat: Some(
+                    "its policy is accept and no rule in this chain drops or rejects".to_string(),
+                ),
+            },
+            network: None,
+            location: Some("inet filter input".to_string()),
+            rules: Vec::new(),
+        };
+
+        let json = json_status(&status, 1_757_000_000);
+        assert_eq!(json["firewall_active"], true);
+        assert_eq!(
+            json["firewall_caveat"],
+            "its policy is accept and no rule in this chain drops or rejects"
+        );
+    }
+
+    #[test]
+    fn a_healthy_backend_with_no_caveat_has_a_null_json_caveat() {
+        // The other half of the same guard: a backend with nothing special
+        // to say must not invent one, or every plain "it's fine" status
+        // would grow a phantom caveat.
+        use porthole_core::backend::{BackendHealth, BackendId};
+        use porthole_core::engine::Status;
+
+        let status = Status {
+            backend: BackendId::Firewalld,
+            health: BackendHealth {
+                available: true,
+                active: true,
+                version: Some("2.4.4".to_string()),
+                detail: "firewalld 2.4.4 is running".to_string(),
+                caveat: None,
+            },
+            network: None,
+            location: Some("FedoraWorkstation".to_string()),
+            rules: Vec::new(),
+        };
+
+        let json = json_status(&status, 1_757_000_000);
+        assert!(json["firewall_caveat"].is_null());
+    }
+
+    #[test]
+    fn location_label_names_the_concept_each_backend_actually_uses() {
+        // "Zone" printed for a ufw or nftables location would be a label
+        // that means nothing there -- see docs/json-schema.md's own table of
+        // what `location` holds per backend.
+        assert_eq!(location_label(BackendId::Firewalld), "Zone");
+        assert_eq!(location_label(BackendId::Ufw), "Location");
+        assert_eq!(location_label(BackendId::Nftables), "Chain");
     }
 
     #[test]

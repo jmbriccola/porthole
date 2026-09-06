@@ -224,6 +224,7 @@ impl FirewallBackend for Firewalld<'_> {
                     active: false,
                     version: None,
                     detail: "firewalld is not installed".to_string(),
+                    caveat: None,
                 })
             }
             Err(other) => return Err(other),
@@ -250,6 +251,7 @@ impl FirewallBackend for Firewalld<'_> {
             active,
             version,
             detail,
+            caveat: None,
         })
     }
 

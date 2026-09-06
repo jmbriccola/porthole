@@ -566,13 +566,14 @@ impl FirewallBackend for Nftables<'_> {
                     active: false,
                     version: None,
                     detail: "nft is not installed".to_string(),
+                    caveat: None,
                 })
             }
             Err(other) => return Err(other),
         };
 
         let chains = self.list_chains()?;
-        let (active, mut detail) = match chains.as_slice() {
+        let (active, detail) = match chains.as_slice() {
             [] => (
                 false,
                 "no nftables chain is registered at the input hook, so nothing is filtering \
@@ -606,15 +607,23 @@ impl FirewallBackend for Nftables<'_> {
         // which this backend does not check. Say only what was actually
         // inspected, with the hedge spelled out, rather than let a user read
         // a confident guarantee into `active: true` that the chain alone
-        // cannot support.
+        // cannot support. This lives in `caveat`, not appended to `detail`:
+        // it is true regardless of `active` (both are `true` here, but the
+        // distinction matters to callers such as `porthole status`, which
+        // must surface a caveat even when everything else reads as healthy)
+        // and callers that want the standing caution -- `status`, and
+        // `doctor`'s own `remedy` -- read a dedicated field rather than
+        // parsing prose for a "; " separator.
+        let mut caveat = None;
         if let [chain] = chains.as_slice() {
             if chain.policy.as_deref() == Some("accept")
                 && !self.chain_itself_has_a_drop_or_reject(chain)?
             {
-                detail.push_str(
-                    "; its policy is accept and no rule in this chain drops or rejects (a \
-                     chain it jumps to might still), so closing a port here is not on its own \
-                     evidence that it becomes unreachable",
+                caveat = Some(
+                    "its policy is accept and no rule in this chain drops or rejects (a \
+                     chain it jumps to might still), so closing a port here is not on its \
+                     own evidence that it becomes unreachable"
+                        .to_string(),
                 );
             }
         }
@@ -624,6 +633,7 @@ impl FirewallBackend for Nftables<'_> {
             active,
             version,
             detail,
+            caveat,
         })
     }
 
@@ -1245,7 +1255,9 @@ mod tests {
         // does not follow. The message must say what was actually inspected
         // ("in this chain"), never a blanket "closing a port here does not
         // make it unreachable" -- that sentence is false on this very common
-        // layout.
+        // layout. This lives in `caveat`, not `detail` -- see `health()`'s
+        // own comment on why a caveat true regardless of `active` gets its
+        // own field rather than being appended to the prose `detail`.
         const CHAINS_ACCEPT_POLICY_SINGLE_INPUT: &str = r#"{"nftables":[
           {"metainfo":{"version":"1.1.3","json_schema_version":1}},
           {"chain":{"family":"inet","table":"filter","name":"input","handle":1,
@@ -1261,16 +1273,18 @@ mod tests {
         ]);
         let health = Nftables::new(&runner).health().unwrap();
         assert!(health.active);
+        let caveat = health
+            .caveat
+            .as_deref()
+            .expect("an accepting chain with no drop of its own must carry a caveat");
         assert!(
-            health.detail.contains("in this chain"),
-            "must scope the claim to what was actually inspected: {}",
-            health.detail
+            caveat.contains("in this chain"),
+            "must scope the claim to what was actually inspected: {caveat}"
         );
         assert!(
-            !health.detail.contains("does not make it unreachable"),
+            !caveat.contains("does not make it unreachable"),
             "must not promise unreachability outright -- a jump target may \
-             still drop, and this backend does not follow jump/goto: {}",
-            health.detail
+             still drop, and this backend does not follow jump/goto: {caveat}"
         );
     }
 }

@@ -133,8 +133,8 @@ fn firewall_check(backend: &dyn backend::FirewallBackend, runner: &dyn CommandRu
     // chain decides, so doctor must surface that as a failure here too,
     // rather than let the ambiguity read as a plain "ok".
     if backend.id() == BackendId::Nftables {
-        if let Ok(chains) = nftables::input_chains(runner) {
-            if chains.len() > 1 {
+        match nftables::input_chains(runner) {
+            Ok(chains) if chains.len() > 1 => {
                 return Check::bad(
                     "Firewall",
                     health.detail,
@@ -142,6 +142,21 @@ fn firewall_check(backend: &dyn backend::FirewallBackend, runner: &dyn CommandRu
                      one base chain is registered at the input hook, because it cannot \
                      prove which one decides a packet's fate. Remove or merge the extra \
                      chain, or manage this port with whatever wrote it instead.",
+                );
+            }
+            Ok(_) => {}
+            // `health()` just ran this exact command successfully -- this is
+            // re-running it, not learning something new -- so an error here
+            // is unexpected, not confirmation of a healthy single chain. A
+            // diagnostic tool that discards this and falls through to "ok"
+            // fails *open* on a discarded error, which is the wrong
+            // direction for the one command whose entire job is surfacing
+            // problems.
+            Err(e) => {
+                return Check::bad(
+                    "Firewall",
+                    format!("could not re-check the input hook's chains: {e}"),
+                    health_error_remedy(BackendId::Nftables),
                 );
             }
         }
@@ -170,7 +185,20 @@ fn firewall_check(backend: &dyn backend::FirewallBackend, runner: &dyn CommandRu
         };
     }
 
-    Check::good("Firewall", health.detail)
+    // Every other standing caveat (currently: nftables' accepting-chain
+    // warning) follows the same convention `Docker` and `IPv6` already use --
+    // the plain fact in `detail`, the standing caution in `remedy`, even
+    // though `ok` is `true` -- rather than appending it to `detail` with
+    // nothing in `remedy` to find it by.
+    match &health.caveat {
+        Some(caveat) => Check {
+            name: "Firewall",
+            ok: true,
+            detail: health.detail,
+            remedy: caveat.clone(),
+        },
+        None => Check::good("Firewall", health.detail),
+    }
 }
 
 /// What to tell someone when the detected backend's own health check itself
@@ -574,8 +602,11 @@ mod tests {
     fn nftables_accept_policy_with_no_drop_stays_ok_but_says_so_plainly() {
         // The direction that misleads: everything is already allowed, so
         // closing a port here does not make it unreachable. This must still
-        // read as "ok" (porthole did what it could prove), but the detail
-        // must say the dangerous part in words, not just imply it.
+        // read as "ok" (porthole did what it could prove), but the standing
+        // caveat must say the dangerous part in words, not just imply it --
+        // in `remedy`, following the same convention `Docker` and `IPv6`
+        // already use for a standing caution on an `ok: true` check, not
+        // buried in `detail` where nothing points a reader at it.
         let runner = RecordingRunner::with_responses(vec![
             Output::stdout("nftables v1.1.6"),      // --version
             Output::stdout(ONE_INPUT_CHAIN_ACCEPT), // health()'s list_chains
@@ -586,9 +617,35 @@ mod tests {
         let check = firewall_check(&backend, &runner);
         assert!(check.ok);
         assert!(
-            check.detail.contains("closing a port here"),
+            check.remedy.contains("closing a port here"),
             "the misleading direction must be spelled out, got: {}",
-            check.detail
+            check.remedy
+        );
+    }
+
+    #[test]
+    fn nftables_input_chains_error_on_the_recheck_fails_closed_not_open() {
+        // health() itself just ran `nft -j list chains` successfully -- this
+        // test's first response -- so firewall_check's own re-check of the
+        // same command failing is not evidence of a healthy single chain.
+        // Discarding that error and falling through to "ok" would be a
+        // diagnostic tool hiding a problem it could not actually rule out.
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout("nftables v1.1.6"),      // --version
+            Output::stdout(ONE_INPUT_CHAIN_ACCEPT), // health()'s list_chains
+            Output::stdout(NO_RULES),               // chain_itself_has_a_drop_or_reject
+            Output::failure("boom"),                // firewall_check's own input_chains
+        ]);
+        let backend = Nftables::new(&runner);
+        let check = firewall_check(&backend, &runner);
+        assert!(
+            !check.ok,
+            "a failed re-check must not be silently treated as a healthy chain"
+        );
+        assert!(
+            check.remedy.contains("nft -j list chains"),
+            "got: {}",
+            check.remedy
         );
     }
 

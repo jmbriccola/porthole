@@ -68,16 +68,23 @@
 //!
 //! `porthole list` deliberately touches nothing but the state file (see
 //! `run.rs`'s own comment on `Commands::List`) and never calls
-//! `reconcile::sweep` itself. What makes it usable here anyway is a change
-//! that landed in `porthole-helper` after this file's first draft: the
+//! `reconcile::sweep` itself -- in fact it never crosses the bus at all:
+//! `run.rs` answers a `list` from the local state file directly, without
+//! going through `client.rs`, which exposes no `list` method for it to call.
+//! So `list` cannot be what "needs the helper to have already claimed the bus
+//! name"; the harness itself does. What makes this test usable anyway is a
+//! change that landed in `porthole-helper` after this file's first draft: the
 //! helper now runs one `SweepMode::Apply` sweep at start-up, under the
 //! exclusive lock, *before it ever opens a bus connection* (see
-//! `porthole-helper/src/main.rs`'s `reconcile_at_startup`). So by the time
-//! `porthole --session list` gets an answer at all -- which needs the helper
-//! to have already claimed the bus name -- the orphan is already gone. Using
-//! `list` rather than `close --all` here is what makes the assertion mean
-//! something: `list` has no code path that could itself remove a rule, so
-//! the orphan's disappearance can only be reconciliation, not "the command
+//! `porthole-helper/src/main.rs`'s `reconcile_at_startup`). [`with_helper`]'s
+//! own readiness poll waits on `org.freedesktop.DBus.Peer.Ping`, which cannot
+//! succeed until something owns the bus name -- and the helper claims that
+//! name strictly after the start-up sweep has already run. So by the time the
+//! poll succeeds and `body` runs at all, the sweep has already completed and
+//! the orphan is already gone, regardless of what `body` itself asks for.
+//! Using `list` rather than `close --all` here is what makes the assertion
+//! mean something: `list` has no code path that could itself remove a rule,
+//! so the orphan's disappearance can only be reconciliation, not "the command
 //! this test happens to call also deletes marked rules it finds". Before
 //! that start-up sweep existed, `close --all` was used instead, for the same
 //! reason `list` could not be: the per-operation sweep (`Engine::reconcile`)

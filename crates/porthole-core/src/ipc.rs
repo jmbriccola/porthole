@@ -248,6 +248,7 @@ mod tests {
                 active: true,
                 version: Some("1.3.2".to_string()),
                 detail: "running".to_string(),
+                caveat: None,
             },
             network: Some(LocalNetwork {
                 interface: "wlo1".to_string(),

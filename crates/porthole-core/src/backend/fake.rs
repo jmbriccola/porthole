@@ -42,6 +42,7 @@ impl FakeBackend {
             active: true,
             version: Some("0.0.0-fake".into()),
             detail: "fake backend, running".into(),
+            caveat: None,
         })
     }
 
@@ -52,6 +53,7 @@ impl FakeBackend {
             active: false,
             version: Some("0.0.0-fake".into()),
             detail: "fake backend, not running".into(),
+            caveat: None,
         })
     }
 
@@ -62,6 +64,7 @@ impl FakeBackend {
             active: false,
             version: None,
             detail: "fake backend, not installed".into(),
+            caveat: None,
         })
     }
 

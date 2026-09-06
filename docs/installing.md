@@ -24,12 +24,14 @@ by anything automatically — you copy them into place yourself.
 | `data/com.jacopobriccola.Porthole.conf` | `/usr/share/dbus-1/system.d/` | The bus's own policy: only `root` may own the name — a bus-level guard against anything else posing as the helper — and any user may address it, because deciding *who may do what* is the next file's job, not the bus's. |
 | `data/com.jacopobriccola.Porthole.policy` | `/usr/share/polkit-1/actions/` | The polkit actions and their severities: opening towards your own subnet asks once per session, opening towards everyone (`--to any`) asks every time, and closing or listing never ask. Without this file, polkit falls back to its own default for an unrecognised action and every one of those severity choices disappears — `porthole doctor` is what notices and says so. |
 
-These paths mirror where `firewalld` — the only backend porthole drives —
-installs the equivalent pieces of itself on this project's reference
-distribution (Fedora); a distribution that keeps D-Bus system policy under
-`/etc/dbus-1/system.d/` instead of `/usr/share/dbus-1/system.d/` still reads
-it from either location, so use whichever your distribution's dbus-daemon
-documents.
+These paths mirror where `firewalld` — one of the three firewalls porthole
+can drive (see [docs/backends.md](backends.md) for the other two, ufw and
+nftables), and the one this project used as the reference for its own D-Bus
+system service, since it already ships one — installs the equivalent pieces
+of itself on this project's reference distribution (Fedora); a distribution
+that keeps D-Bus system policy under `/etc/dbus-1/system.d/` instead of
+`/usr/share/dbus-1/system.d/` still reads it from either location, so use
+whichever your distribution's dbus-daemon documents.
 
 ## Installing by hand
 

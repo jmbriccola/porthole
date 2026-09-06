@@ -100,6 +100,14 @@ pub struct BackendHealth {
     pub version: Option<String>,
     /// A sentence fit to show the user.
     pub detail: String,
+    /// A standing caveat about this backend's enforcement that is true
+    /// regardless of `active`/`available` and worth a user knowing on every
+    /// run, not only when something has gone wrong — e.g. nftables' "this
+    /// chain's policy is accept and nothing here drops, but a chain it jumps
+    /// to might still" warning. `None` when there is nothing beyond `detail`
+    /// to add. `porthole status` and `porthole doctor` both surface this, so
+    /// it must never depend on `active` to decide whether to exist.
+    pub caveat: Option<String>,
 }
 
 pub trait FirewallBackend {
@@ -365,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn firewalld_wins_when_it_is_running() {
+    fn detect_prefers_firewalld_when_it_is_running() {
         let runner = RecordingRunner::with_responses(vec![
             Output::stdout("2.4.4"),
             Output::stdout("running"),
@@ -374,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn ufw_is_next_when_firewalld_is_absent() {
+    fn detect_prefers_ufw_next_when_firewalld_is_absent() {
         // `firewall-cmd` is genuinely unreachable, so `Firewalld::health`
         // takes its `CommandSpawn` early return and never calls the runner
         // again -- nothing is scripted for it, because nothing is read. That
@@ -391,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn nftables_is_last_and_is_chosen_on_presence_not_on_activity() {
+    fn detect_picks_nftables_last_and_on_presence_not_activity() {
         // firewalld and ufw are policy managers: installing one is a choice.
         // nft ships on nearly every modern Linux, so its presence says
         // nothing -- which is exactly why it is the fallback and not a
@@ -418,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn an_installed_but_stopped_firewalld_still_wins_over_ufw() {
+    fn detect_still_prefers_an_installed_but_stopped_firewalld_over_ufw() {
         // Reporting "firewalld is installed but not running" is more useful
         // than silently managing a different firewall than the one the
         // machine chose.
@@ -431,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn no_firewall_at_all_names_all_three_and_refuses_to_pretend() {
+    fn detect_names_all_three_and_refuses_to_pretend_when_none_found() {
         // All three are genuinely absent, so each health check takes its own
         // early `CommandSpawn` return before ever calling the runner a
         // second time. Nothing is scripted, because nothing is ever read.

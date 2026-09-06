@@ -48,6 +48,7 @@ Used in `list`, `status`, `open` and `close`.
   "firewall_available": true,
   "firewall_active": true,
   "firewall_version": "2.4.4",
+  "firewall_caveat": null,
   "location": "FedoraWorkstation",
   "network": { "interface": "wlo1", "address": "10.10.10.119", "cidr": "10.10.10.0/24" },
   "rules": [ /* rule objects */ ]
@@ -70,6 +71,21 @@ firewalld zone will misread the other two:
 `location` is `null` when it could not be determined — on nftables this
 happens when there is no input-hook chain, or more than one, since porthole
 has not picked a single chain to name; see [docs/backends.md](backends.md).
+Plain `porthole status` labels this line to match: `Zone` for firewalld,
+`Chain` for nftables, `Location` for ufw.
+
+`firewall_caveat` is a standing warning about the detected backend that is
+true regardless of `firewall_active`, and `null` when there is nothing more
+to say beyond the fields above. Today the only backend that ever sets it is
+nftables, when the single chain it found has policy `accept` and no rule of
+its own that drops or rejects — e.g. `"its policy is accept and no rule in
+this chain drops or rejects (a chain it jumps to might still), so closing a
+port here is not on its own evidence that it becomes unreachable"`. This is
+the direction that misleads someone into feeling safe, so it is surfaced
+here even while `firewall_active` is `true` — see
+[docs/backends.md](backends.md#nftables). Plain `porthole status` prints the
+same sentence, without a label, directly under the `Firewall`/location/
+`Network` lines.
 
 ## `porthole open --json`
 
