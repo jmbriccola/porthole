@@ -84,6 +84,7 @@
 //! whenever the banner takes over, so a stale confirmed claim from a
 //! previous, better refresh cannot linger underneath it.
 
+use adw::prelude::*;
 use porthole_core::ipc::WireStatus;
 
 /// [`StatusBar::set_status`]'s no-firewall banner title -- short, and
@@ -209,6 +210,13 @@ impl StatusBar {
         if !status.firewall_available {
             self.show_banner(NO_FIREWALL_TITLE);
             self.line.set_label(&status.detail);
+            // `show_banner` restores `dim-label` (the ordinary line's
+            // default styling) along with clearing the text -- wrong here:
+            // `status.detail` is the explanation of the banner sitting at
+            // the opposite end of the window, not an ordinary dim caption,
+            // and rendering it small and grey made it easy for the eye to
+            // never connect the two. See this module's own doc comment.
+            self.line.remove_css_class("dim-label");
             return;
         }
         self.banner.set_revealed(false);
@@ -217,6 +225,10 @@ impl StatusBar {
             backend_name(status),
             state_word(status)
         ));
+        // The ordinary case always restores the dim styling -- a caller
+        // going no-firewall -> installed-and-active must not leave the line
+        // looking like it is still explaining a banner that is gone.
+        self.line.add_css_class("dim-label");
     }
 
     /// Renders one of the three prominent cases: porthole could not even
@@ -257,6 +269,14 @@ impl StatusBar {
         self.banner.set_title(title);
         self.banner.set_revealed(true);
         self.line.set_label("");
+        // Restores the line's ordinary dim styling -- `set_status`'s own
+        // no-firewall branch is the one caller that immediately removes it
+        // again, since that is the one case where `line` goes on to carry
+        // meaningful text of its own (see this module's own doc comment).
+        // For the other two callers the line is empty anyway, but leaving
+        // this unconditional keeps a stale non-dim style from surviving
+        // into whichever case runs next.
+        self.line.add_css_class("dim-label");
     }
 
     /// The banner's own title while it is the one showing, the line's own

@@ -15,7 +15,10 @@ use crate::state::ManagedRule;
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::Type;
 
-/// The well-known name the helper owns on the system bus.
+/// The well-known name the helper owns -- the system bus in production, or
+/// the session bus when the helper is started with `--session` (tests only;
+/// see `porthole_helper::main`'s own module doc). The name itself is
+/// identical either way.
 pub const SERVICE: &str = "com.jacopobriccola.Porthole";
 /// The object the helper serves.
 pub const PATH: &str = "/com/jacopobriccola/Porthole";

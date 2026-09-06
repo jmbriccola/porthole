@@ -185,11 +185,8 @@ const LOOPBACK_SUBTITLE: &str = "listening only on this machine — the firewall
 /// worded so it shares no sentence with [`LOOPBACK_SUBTITLE`] -- see this
 /// module's own doc comment, and `porthole_core::listening::Binding`'s, for
 /// why merging these two is the exact mistake a past review caught here.
-fn beyond_reach_subtitle() -> String {
-    "reachable over IPv6 — porthole manages IPv4 rules only and cannot open \
-     or close it. Run `porthole doctor` to check your IPv6 exposure."
-        .to_string()
-}
+const BEYOND_REACH_SUBTITLE: &str = "reachable over IPv6 — porthole manages IPv4 rules only and \
+     cannot open or close it. Run `porthole doctor` to check your IPv6 exposure.";
 
 /// Every row's subtitle. Always `Some` in this section's own design: even a
 /// service with no Docker/loopback/reach caveat and no already-open
@@ -199,10 +196,17 @@ fn beyond_reach_subtitle() -> String {
 fn subtitle_for(service: &Service, open_ports: &HashSet<u16>) -> String {
     match service.binding {
         Binding::LoopbackOnly => LOOPBACK_SUBTITLE.to_string(),
-        Binding::BeyondReach(_) => beyond_reach_subtitle(),
+        Binding::BeyondReach(_) => BEYOND_REACH_SUBTITLE.to_string(),
         Binding::AllInterfaces | Binding::Specific(_) => {
             if open_ports.contains(&service.port) {
-                "already open".to_string()
+                // The address stays on this branch too -- see this module's
+                // own doc comment on dual-stack rows. Two sockets that share
+                // a port *and* are already open bypassed that
+                // disambiguation before this fix: both produced the bare
+                // string "already open", identical text for two genuinely
+                // different sockets, the same collapse the plain address
+                // branch below exists to prevent.
+                format!("already open · {}", service.address)
             } else {
                 service.address.to_string()
             }
@@ -633,8 +637,30 @@ mod tests {
         open.insert(5173);
         assert_eq!(
             subtitle_for(&svc(5173, Some("node"), Binding::AllInterfaces), &open),
-            "already open"
+            "already open · 0.0.0.0"
         );
+    }
+
+    #[test]
+    fn two_already_open_dual_stack_rows_still_read_as_two_sockets() {
+        // The already-open branch used to bypass the address-based
+        // disambiguation entirely, so two dual-stack rows that share a
+        // port that is *also* already open both rendered the bare string
+        // "already open" -- identical text for two different sockets, the
+        // exact collapse this module's own doc comment on dual-stack rows
+        // says the subtitle must never produce.
+        let mut open = HashSet::new();
+        open.insert(53);
+        let v4 = svc(53, None, Binding::AllInterfaces);
+        let v6 = svc(53, None, Binding::Specific("10.0.0.5".parse().unwrap()));
+        let v4_subtitle = subtitle_for(&v4, &open);
+        let v6_subtitle = subtitle_for(&v6, &open);
+        assert_ne!(
+            v4_subtitle, v6_subtitle,
+            "two already-open sockets sharing a port must not render identically"
+        );
+        assert!(v4_subtitle.contains("0.0.0.0"), "got: {v4_subtitle}");
+        assert!(v6_subtitle.contains("10.0.0.5"), "got: {v6_subtitle}");
     }
 
     #[test]

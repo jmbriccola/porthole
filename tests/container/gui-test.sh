@@ -18,6 +18,19 @@
 #
 # Usage: tests/container/gui-test.sh [extra cargo-test args, e.g. a filter]
 set -e
+# rust-version = "1.87" (the workspace's own Cargo.toml) is a binding floor
+# on porthole-gui too, and nothing else ever checks the crate against it --
+# the plain `cargo` below is Fedora's own current stable, always newer than
+# 1.87. The explicit path and RUSTUP_HOME/CARGO_HOME reach the rustup-managed
+# 1.87 toolchain Containerfile.gui installs off to the side (see that file's
+# own comment for why: pointing rustup at the default `~/.cargo` breaks dnf's
+# own `cargo clippy`, since Cargo's subcommand search always checks
+# `$CARGO_HOME/bin` regardless of `PATH`). Only this one command gets those
+# variables -- clippy and the tests below run with the ordinary environment,
+# untouched. Runs before clippy for the same reason clippy runs before the
+# tests: fail the cheapest check first.
+RUSTUP_HOME=/opt/rustup-1.87/home CARGO_HOME=/opt/rustup-1.87/cargo \
+  /opt/rustup-1.87/cargo/bin/cargo +1.87 check -p porthole-gui --all-targets
 cargo clippy -p porthole-gui --all-targets -- -D warnings
 Xvfb :99 -screen 0 1024x768x24 >/dev/null 2>&1 &
 sleep 2

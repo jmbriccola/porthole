@@ -354,13 +354,53 @@ fn the_ordinary_line_is_cleared_once_the_banner_takes_over() -> Result<(), Strin
     Ok(())
 }
 
+/// The re-reviewer's own residual on item 9's original fix: the no-firewall
+/// detail sits on the same `gtk::Label` `StatusBar::new` gives `dim-label`/
+/// `caption` unconditionally, so the explanation of a prominent warning
+/// banner rendered small and grey at the opposite end of the window from the
+/// banner it explains. This checks the real widget's own CSS classes, not
+/// just its text: the no-firewall case must drop `dim-label`, and an
+/// ordinary enforcing refresh -- including one that follows a no-firewall
+/// refresh -- must still carry it.
+fn the_no_firewall_detail_line_is_not_styled_as_a_dim_caption() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.StatusNoFirewallStyling",
+        move |_app| {
+            let bar = StatusBar::new();
+            bar.set_status(&status(None, false));
+            let dim_while_no_firewall = bar.line_widget().has_css_class("dim-label");
+            bar.set_status(&status(Some(("firewalld", "2.4.4")), true));
+            let dim_after_recovering = bar.line_widget().has_css_class("dim-label");
+            *seen.borrow_mut() = Some((dim_while_no_firewall, dim_after_recovering));
+        },
+    );
+    let (dim_while_no_firewall, dim_after_recovering) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if dim_while_no_firewall {
+        return Err(
+            "the no-firewall detail must not be styled as a dim caption while it is showing"
+                .to_string(),
+        );
+    }
+    if !dim_after_recovering {
+        return Err(
+            "an ordinary enforcing refresh following a no-firewall one must restore the \
+             line's usual dim styling"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below -- see `tests/window.rs`'s own
 /// `Case` alias for why this is a type alias rather than spelled out
 /// inline.
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 8] = [
+    let cases: [Case; 9] = [
         (
             "the_status_line_names_the_backend_and_whether_it_is_enforcing",
             the_status_line_names_the_backend_and_whether_it_is_enforcing,
@@ -392,6 +432,10 @@ fn main() {
         (
             "the_ordinary_line_is_cleared_once_the_banner_takes_over",
             the_ordinary_line_is_cleared_once_the_banner_takes_over,
+        ),
+        (
+            "the_no_firewall_detail_line_is_not_styled_as_a_dim_caption",
+            the_no_firewall_detail_line_is_not_styled_as_a_dim_caption,
         ),
     ];
 

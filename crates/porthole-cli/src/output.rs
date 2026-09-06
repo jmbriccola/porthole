@@ -425,6 +425,17 @@ fn render_listening(services: &[Service]) -> String {
         .map(|s| s.process.as_deref().unwrap_or("—").chars().count())
         .max()
         .unwrap_or(0);
+    // A dual-stack service (one socket on `0.0.0.0`, another on `::`) shares
+    // its port and process name with its own other socket, so without this
+    // column the two rows print as visually identical pairs -- on an
+    // ordinary desktop, half the list or more. `address_width` over every
+    // service, the same way `port_width`/`name_width` already are, so this
+    // column lines up across every group too.
+    let address_width = services
+        .iter()
+        .map(|s| s.address.to_string().chars().count())
+        .max()
+        .unwrap_or(0);
 
     let network_facing: Vec<&Service> = services
         .iter()
@@ -439,7 +450,13 @@ fn render_listening(services: &[Service]) -> String {
         .filter(|s| s.binding == Binding::LoopbackOnly)
         .collect();
 
-    append_listening_rows(&mut out, &network_facing, port_width, name_width);
+    append_listening_rows(
+        &mut out,
+        &network_facing,
+        port_width,
+        name_width,
+        address_width,
+    );
 
     if !beyond_reach.is_empty() {
         if !network_facing.is_empty() {
@@ -451,7 +468,13 @@ fn render_listening(services: &[Service]) -> String {
              open or close these:"
         )
         .expect(w);
-        append_listening_rows(&mut out, &beyond_reach, port_width, name_width);
+        append_listening_rows(
+            &mut out,
+            &beyond_reach,
+            port_width,
+            name_width,
+            address_width,
+        );
     }
 
     if !loopback.is_empty() {
@@ -463,29 +486,36 @@ fn render_listening(services: &[Service]) -> String {
             "Loopback only — opening the firewall for these changes nothing:"
         )
         .expect(w);
-        append_listening_rows(&mut out, &loopback, port_width, name_width);
+        append_listening_rows(&mut out, &loopback, port_width, name_width, address_width);
     }
 
     out
 }
 
+/// `address_width` disambiguates a dual-stack service's two rows -- the same
+/// port and process name, one bound to `0.0.0.0`, the other to `::` -- so
+/// they read as two distinct sockets rather than one service printed twice.
+/// See this function's own caller for why the width is computed once, over
+/// every service, rather than per group.
 fn append_listening_rows(
     out: &mut String,
     services: &[&Service],
     port_width: usize,
     name_width: usize,
+    address_width: usize,
 ) {
     use std::fmt::Write as _;
     for service in services {
         let port_proto = format!("{}/{}", service.port, service.protocol);
         let process = service.process.as_deref().unwrap_or("—").to_string();
+        let address = service.address.to_string();
         let pid = service
             .pid
             .map(|p| p.to_string())
             .unwrap_or_else(|| "unknown".to_string());
         writeln!(
             out,
-            "  {port_proto:port_width$}  {process:name_width$}  pid {pid}"
+            "  {port_proto:port_width$}  {process:name_width$}  {address:address_width$}  pid {pid}"
         )
         .expect("writing to a String cannot fail");
     }
@@ -925,5 +955,44 @@ mod tests {
         let services = vec![service(53, Binding::LoopbackOnly, None, None)];
         let text = render_listening(&services);
         assert!(text.contains("Loopback only — opening the firewall for these changes nothing:"));
+    }
+
+    #[test]
+    fn dual_stack_rows_sharing_a_port_read_as_two_sockets_not_one_listed_twice() {
+        // A dual-stack service (one socket on `0.0.0.0`, one on `::`) shares
+        // its port, protocol and process name -- both classify as
+        // `AllInterfaces` -- so without an address column the two rows were
+        // literally identical text, which reads as a duplicate rather than
+        // two real sockets. `service()` always derives its address from the
+        // binding, so this test builds both rows directly rather than
+        // through that helper.
+        use porthole_core::model::Protocol;
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        let v4 = Service {
+            port: 53,
+            protocol: Protocol::Tcp,
+            address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            binding: Binding::AllInterfaces,
+            process: Some("dnsmasq".to_string()),
+            pid: Some(100),
+        };
+        let v6 = Service {
+            port: 53,
+            protocol: Protocol::Tcp,
+            address: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            binding: Binding::AllInterfaces,
+            process: Some("dnsmasq".to_string()),
+            pid: Some(100),
+        };
+        let text = render_listening(&[v4, v6]);
+        let rows: Vec<&str> = text.lines().filter(|l| l.contains("53/tcp")).collect();
+        assert_eq!(rows.len(), 2, "expected both rows, got: {text}");
+        assert_ne!(
+            rows[0], rows[1],
+            "two distinct sockets must not render as identical lines: {text}"
+        );
+        assert!(rows[0].contains("0.0.0.0"), "got: {text}");
+        assert!(rows[1].contains("::"), "got: {text}");
     }
 }

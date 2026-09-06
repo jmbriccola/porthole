@@ -189,8 +189,8 @@ fn capture(win: &PortholeWindow, path: &Path) -> Result<(), String> {
     // ordinarily resolves to on a `PortholeWindow` -- an entirely different,
     // smaller widget nested inside this one, whose own screenshot would
     // exclude the header bar, banner and bottom status line entirely). This
-    // is the `adw::ToolbarView` `PortholeWindow::new`'s own construction
-    // gives the window as a whole.
+    // is the `adw::ToolbarView` that gives the window its content as a
+    // whole.
     let content = AdwApplicationWindowExt::content(&**win)
         .ok_or_else(|| "the window has no content widget to render".to_string())?;
     let parent = content
