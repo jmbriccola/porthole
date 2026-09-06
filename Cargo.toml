@@ -1,6 +1,32 @@
 [workspace]
 resolver = "2"
-members = ["crates/porthole-core", "crates/porthole-cli", "crates/porthole-helper"]
+members = [
+    "crates/porthole-core",
+    "crates/porthole-cli",
+    "crates/porthole-helper",
+    "crates/porthole-gui",
+]
+# porthole-gui links gtk4/libadwaita, which need GTK4 development headers
+# that are not installed -- and must not be installed -- on this development
+# host, so here it only ever builds and runs inside
+# tests/container/Containerfile.gui. The shipped product is a desktop
+# application; this is a statement about this host's build environment, not
+# about where the GUI is meant to run. Leaving it out of `default-members`
+# keeps a flagless `cargo build`/`cargo test` at the workspace root working
+# on this host exactly as before this crate existed. `--workspace` overrides
+# `default-members` (it always means literally every member), so a command
+# that passes `--workspace` explicitly still needs `--exclude porthole-gui`
+# on this host, e.g. `cargo test --workspace --exclude porthole-gui`,
+# `cargo clippy --workspace --all-targets --exclude porthole-gui -- -D warnings`,
+# and `cargo +1.87 check --workspace --all-targets --exclude porthole-gui`.
+# `porthole-gui` itself is built and tested only in the container:
+#   podman build -t porthole-gui-test -f tests/container/Containerfile.gui tests/container
+#   podman run --rm -v .:/src:z -w /src porthole-gui-test bash tests/container/gui-test.sh
+default-members = [
+    "crates/porthole-core",
+    "crates/porthole-cli",
+    "crates/porthole-helper",
+]
 
 [workspace.package]
 version = "0.1.0"

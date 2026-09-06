@@ -172,6 +172,94 @@ never share an entry, and a script must not treat an entry in `forgotten` the
 way it would treat one in `closed`: the port it named may still be open in
 whatever firewall created it.
 
+## `porthole listen --json`
+
+```json
+{
+  "schema": 1,
+  "services": [
+    {
+      "port": 5173,
+      "protocol": "tcp",
+      "address": "0.0.0.0",
+      "binding": "all_interfaces",
+      "process": "node",
+      "pid": 12043
+    },
+    {
+      "port": 46715,
+      "protocol": "tcp",
+      "address": "127.0.0.1",
+      "binding": "loopback_only",
+      "process": "code",
+      "pid": 9816
+    },
+    {
+      "port": 8443,
+      "protocol": "tcp",
+      "address": "2001:db8::1",
+      "binding": "beyond_reach",
+      "process": null,
+      "pid": null
+    }
+  ]
+}
+```
+
+Every TCP socket in `LISTEN` state on this machine, from `/proc/net/tcp` and
+`/proc/net/tcp6`. `protocol` is always `"tcp"` today — the underlying `udp`
+files are not read.
+
+`address` is the literal bound address: `"0.0.0.0"`, `"127.0.0.1"`, `"::"`,
+`"::1"`, or a specific interface address.
+
+`binding` is the derived fact that actually matters: not just whether opening
+porthole's firewall for this port could change anything, but whether the
+service is even reachable from outside this machine in the first place.
+
+| `binding` | meaning |
+|---|---|
+| `"loopback_only"` | bound to `127.0.0.0/8`, or its IPv6 loopback equivalent (`::1`) — only this machine can reach it, and no firewall rule changes that. |
+| `"all_interfaces"` | bound to `0.0.0.0` or `::` — every interface, including whichever one the local network is reachable through. |
+| `"specific"` | bound to one interface's own IPv4 address rather than the wildcard — still network-facing. |
+| `"beyond_reach"` | bound to a genuine IPv6 address — not the wildcard, not loopback, not v4-mapped. This service **is** reachable over IPv6, but porthole v1 manages IPv4 rules only and can neither open nor close a firewall rule for it. |
+
+`"loopback_only"` and `"beyond_reach"` both mean "porthole cannot act on
+this port", but for opposite reasons a script or a person must not conflate:
+a loopback-only service is safe — nothing outside this machine can reach it
+regardless of any firewall — while a `beyond_reach` service is exposed to the
+network and porthole is simply blind to it. Reading `beyond_reach` as a
+variant of "safe to ignore" is exactly the false-in-the-dangerous-direction
+mistake this field exists to prevent; a caller that only branches on whether
+`binding` is `"loopback_only"` to decide "nothing to worry about" must treat
+`"beyond_reach"` as its own case, not fold it in.
+
+On an ordinary desktop `loopback_only` is typically the *majority* of the
+list, not an edge case: on the machine this was built and measured on, six of
+the seven listening TCP sockets were loopback-only. `porthole listen` (plain
+or `--json`) marks them so that opening the firewall for one is never mistaken
+for a fix.
+
+A `::` listener is included as `all_interfaces`, not filtered out for being
+IPv6: on most systems it also accepts IPv4-mapped connections, so it is
+reachable over IPv4 too. porthole itself only ever opens IPv4 rules — see
+`porthole doctor`'s `IPv6` check for that standing caveat, which is exactly
+the caveat that makes `beyond_reach` possible: porthole can **see** a service
+bound to a real IPv6 address — it is in this very listing — but has no rule it
+can open or close for it, whether or not it is actually reachable from the
+public internet. Seeing it and being unable to act on it is the whole point of
+reporting the binding separately.
+
+`process` and `pid` are `null` — never the string `"unknown"` — when the
+owning process could not be identified. Resolving a listening socket to a
+process needs read access to that process's own `/proc/<pid>/fd`, which an
+unprivileged `porthole listen` only has for its own user's processes; a
+socket owned by another user (or root) still appears, with `process` and
+`pid` both `null`, so the list is never quietly incomplete. A script that
+needs to tell "not resolved" from "a process actually named that" can rely on
+this: the field is `null` in the first case and always a real string in the
+second.
+
 ## `porthole doctor --json`
 
 ```json

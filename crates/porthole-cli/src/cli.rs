@@ -48,6 +48,12 @@ pub enum Commands {
     /// Diagnose why porthole is not working: firewall, helper, polkit,
     /// network, Docker, and IPv6.
     Doctor,
+    /// List TCP services listening on this machine, so you can pick a port
+    /// instead of typing one. Marks loopback-only services separately
+    /// (opening the firewall for those changes nothing) from ones reachable
+    /// only over IPv6 (porthole manages IPv4 rules only, and can neither
+    /// open nor close those).
+    Listen,
 }
 
 #[derive(Debug, Args)]

@@ -1,0 +1,32 @@
+FROM registry.fedoraproject.org/fedora:44
+RUN dnf install -y --setopt=install_weak_deps=False \
+      gtk4-devel libadwaita-devel cargo rust clippy pkgconf-pkg-config \
+      xorg-x11-server-Xvfb dbus-daemon gcc curl \
+    && dnf clean all
+
+# A pinned 1.87 toolchain, installed alongside (not instead of) the dnf
+# `cargo`/`rust`/`clippy` above -- those stay whatever Fedora currently
+# calls stable (1.98 as of this image) and remain what `gui-test.sh`'s own
+# clippy and test runs use, unchanged. rust-version = "1.87" in the
+# workspace's own Cargo.toml is a binding constraint on `porthole-gui` too,
+# and until now nothing anywhere checked the crate against it -- Fedora's
+# stable proves only that the crate builds on *some* toolchain newer than
+# the floor, never on the floor itself. `--default-toolchain none` so this
+# install adds exactly one toolchain rather than a second copy of stable;
+# `--profile minimal` skips docs/rustfmt, which the MSRV check does not use.
+#
+# RUSTUP_HOME/CARGO_HOME point off the default `~/.rustup`/`~/.cargo`
+# deliberately, and only for these two RUN steps, not as image-wide `ENV`:
+# Cargo's own subcommand search always also checks `$CARGO_HOME/bin`,
+# regardless of `PATH`, and rustup's installer drops a `cargo-clippy` proxy
+# there that errors unless the *default* rustup toolchain has a clippy
+# component installed. Discovered empirically -- pointing rustup at the
+# default `~/.cargo/bin` broke the dnf clippy this script already relies on,
+# even though `PATH` itself never changed. Kept off `PATH` and out of
+# `CARGO_HOME` for every other step, so dnf's own `cargo`/`cargo-clippy`
+# stay exactly what they were before this toolchain existed.
+RUN RUSTUP_HOME=/opt/rustup-1.87/home CARGO_HOME=/opt/rustup-1.87/cargo \
+    sh -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+      sh -s -- -y --default-toolchain none --profile minimal"
+RUN RUSTUP_HOME=/opt/rustup-1.87/home CARGO_HOME=/opt/rustup-1.87/cargo \
+    /opt/rustup-1.87/cargo/bin/rustup toolchain install 1.87 --profile minimal

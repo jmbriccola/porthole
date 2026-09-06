@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Porthole
+GenericName=Firewall Port Opener
+Comment=Open a port to your local network, temporarily and on purpose
+Exec=porthole-gui
+Icon=com.jacopobriccola.Porthole
+Terminal=false
+StartupNotify=true
+Categories=Network;
+Keywords=firewall;port;network;temporary;localnetwork;

@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- com.jacopobriccola.Porthole: the app icon. A ship's porthole, literally:
+     a round window that opens onto the network beyond, then closes again by
+     itself. 128x128 viewBox per the freedesktop hicolor "scalable" size
+     class; every shape is relative to that so it scales cleanly. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <radialGradient id="glass" cx="42%" cy="38%" r="70%">
+      <stop offset="0%" stop-color="#a8dcf0"/>
+      <stop offset="55%" stop-color="#4fa8d8"/>
+      <stop offset="100%" stop-color="#1c6ea4"/>
+    </radialGradient>
+    <linearGradient id="frame" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5b6b78"/>
+      <stop offset="100%" stop-color="#33414c"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Outer frame -->
+  <circle cx="64" cy="64" r="56" fill="url(#frame)"/>
+  <circle cx="64" cy="64" r="56" fill="none" stroke="#22292f" stroke-width="1.5"/>
+
+  <!-- Inner rim -->
+  <circle cx="64" cy="64" r="46" fill="#22292f"/>
+
+  <!-- The view through the porthole -->
+  <circle cx="64" cy="64" r="41" fill="url(#glass)"/>
+  <circle cx="64" cy="64" r="41" fill="none" stroke="#15496b" stroke-width="1"/>
+
+  <!-- A single soft highlight, so the glass reads as glass, not a disc -->
+  <ellipse cx="50" cy="46" rx="14" ry="8" fill="#ffffff" opacity="0.28"/>
+
+  <!-- Eight rivets around the frame, the detail that reads as "porthole"
+       rather than "circle" even at small sizes. -->
+  <g fill="#8b98a3">
+    <circle cx="64" cy="12" r="4"/>
+    <circle cx="102.6" cy="25.4" r="4"/>
+    <circle cx="116" cy="64" r="4"/>
+    <circle cx="102.6" cy="102.6" r="4"/>
+    <circle cx="64" cy="116" r="4"/>
+    <circle cx="25.4" cy="102.6" r="4"/>
+    <circle cx="12" cy="64" r="4"/>
+    <circle cx="25.4" cy="25.4" r="4"/>
+  </g>
+  <g fill="#c7d0d8" opacity="0.6">
+    <circle cx="64" cy="11" r="1.6"/>
+    <circle cx="103.2" cy="24.9" r="1.6"/>
+    <circle cx="117" cy="64" r="1.6"/>
+    <circle cx="103.2" cy="103.1" r="1.6"/>
+    <circle cx="64" cy="117" r="1.6"/>
+    <circle cx="24.8" cy="103.1" r="1.6"/>
+    <circle cx="11" cy="64" r="1.6"/>
+    <circle cx="24.8" cy="24.9" r="1.6"/>
+  </g>
+</svg>

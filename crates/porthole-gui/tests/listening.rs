@@ -1,0 +1,718 @@
+//! Runs a real `ListeningSection` inside an activated `adw::Application`,
+//! the same way `tests/window.rs` and `tests/open_now.rs` do and for the
+//! identical reason: `harness = false` (see `Cargo.toml`) because cargo's
+//! normal test harness spawns each `#[test]` function on its own OS thread,
+//! and gtk4-rs locks GTK to whichever thread makes its first call -- a
+//! second GTK-touching test thread wedges the whole process. This is its
+//! own `[[test]]` target, not a case added to either of those files,
+//! exactly as their own comments ask a later task's implementer to do.
+//!
+//! Every widget property here is read back *without* pumping the main
+//! loop, the same way `tests/open_now.rs`'s do: these tests assert on
+//! properties this section sets directly at construction time (title,
+//! subtitle, button presence), none of which need a GTK layout pass to
+//! become true.
+//!
+//! The pure logic behind these renders -- what a title/subtitle string
+//! actually says, which bindings are actionable, how rows are ordered --
+//! is unit-tested directly in `src/listening_section.rs`, with no GTK
+//! involved. What this file adds is proof that the real widgets carry that
+//! same text and behaviour once actually built.
+
+use std::cell::RefCell;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::rc::Rc;
+
+use adw::prelude::*;
+use porthole_core::listening::{Binding, Service};
+use porthole_core::model::Protocol;
+use porthole_gui::listening_section::ListeningSection;
+
+/// Identical in shape to `tests/window.rs` and `tests/open_now.rs`'s own
+/// `activate` helper: runs `f` inside a real `adw::Application` activation,
+/// on the session bus `dbus-run-session` provides (see
+/// `tests/container/gui-test.sh`).
+fn activate<F: FnOnce(&adw::Application) + 'static>(app_id: &str, f: F) {
+    let app = adw::Application::builder().application_id(app_id).build();
+    let f = Rc::new(RefCell::new(Some(f)));
+    app.connect_activate(move |app| {
+        if let Some(f) = f.borrow_mut().take() {
+            f(app);
+        }
+        app.quit();
+    });
+    app.run_with_args::<&str>(&[]);
+}
+
+/// A `Service` as `porthole_core::listening::scan` would produce one, with
+/// an address consistent with `binding` -- the same fixture shape the
+/// task's own brief specifies, so a reader comparing this file to the brief
+/// can tell they match.
+fn svc(port: u16, process: Option<&str>, binding: Binding) -> Service {
+    let address = match binding {
+        Binding::LoopbackOnly => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        Binding::AllInterfaces => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        Binding::Specific(a) => IpAddr::V4(a),
+        Binding::BeyondReach(a) => IpAddr::V6(a),
+    };
+    Service {
+        port,
+        protocol: Protocol::Tcp,
+        address,
+        binding,
+        process: process.map(str::to_string),
+        pid: None,
+    }
+}
+
+fn a_service_shows_its_name_and_port_the_way_the_spec_writes_it() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningTitle",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_services(&[svc(5173, Some("node"), Binding::AllInterfaces)]);
+            *seen.borrow_mut() = Some(section.rows()[0].title().to_string());
+        },
+    );
+    let title = result.borrow_mut().take().ok_or("activation never ran")?;
+    if title != "node · 5173" {
+        return Err(format!("expected \"node · 5173\", got {title:?}"));
+    }
+    Ok(())
+}
+
+fn a_nameless_service_shows_its_port_alone_not_a_fake_name() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningNoName",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_services(&[svc(4000, None, Binding::AllInterfaces)]);
+            *seen.borrow_mut() = Some(section.rows()[0].title().to_string());
+        },
+    );
+    let title = result.borrow_mut().take().ok_or("activation never ran")?;
+    if title != "4000" {
+        return Err(format!("expected \"4000\", got {title:?}"));
+    }
+    Ok(())
+}
+
+/// Opening the firewall for a loopback-only service does nothing at all.
+/// Offering an Open button would let the user perform a no-op and believe
+/// it worked -- and on this machine six of seven listening sockets are
+/// loopback-only, so it is the most likely row to click.
+fn a_loopback_only_service_is_shown_but_marked_and_cannot_be_opened() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningLoopback",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_services(&[svc(46715, Some("code"), Binding::LoopbackOnly)]);
+            let subtitle = section.rows()[0].subtitle().map(|s| s.to_string());
+            let has_open_button = section.open_button_for(0).is_some();
+            *seen.borrow_mut() = Some((subtitle, has_open_button));
+        },
+    );
+    let (subtitle, has_open_button) = result.borrow_mut().take().ok_or("activation never ran")?;
+    match subtitle.as_deref() {
+        Some(s) if s.contains("only on this machine") => {}
+        other => {
+            return Err(format!(
+                "expected a subtitle mentioning \"only on this machine\", got {other:?}"
+            ))
+        }
+    }
+    if has_open_button {
+        return Err(
+            "there must be no Open button for a service the firewall cannot affect".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The opposite direction from loopback-only: this service *is* reachable
+/// from the network over IPv6, and porthole simply cannot open or close a
+/// rule for it. Task 1's review caught an earlier draft that folded this
+/// into the loopback wording -- this section must not reintroduce that.
+fn a_beyond_reach_service_gets_a_different_more_concerning_reason() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningBeyondReach",
+        move |_app| {
+            let section = ListeningSection::new();
+            let global: Ipv6Addr = "2001:db8::1".parse().unwrap();
+            section.set_services(&[svc(22, Some("sshd"), Binding::BeyondReach(global))]);
+            let subtitle = section.rows()[0].subtitle().map(|s| s.to_string());
+            let has_open_button = section.open_button_for(0).is_some();
+            *seen.borrow_mut() = Some((subtitle, has_open_button));
+        },
+    );
+    let (subtitle, has_open_button) = result.borrow_mut().take().ok_or("activation never ran")?;
+    let subtitle = subtitle.ok_or("a BeyondReach row must have a subtitle explaining why")?;
+    if subtitle.contains("only on this machine") {
+        return Err(format!(
+            "a BeyondReach subtitle must not reuse LoopbackOnly's reassurance: {subtitle:?}"
+        ));
+    }
+    if !subtitle.contains("IPv6") || !subtitle.contains("porthole doctor") {
+        return Err(format!(
+            "a BeyondReach subtitle must name IPv6 and point at porthole doctor: {subtitle:?}"
+        ));
+    }
+    if has_open_button {
+        return Err(
+            "there must be no Open button for a service porthole cannot open over IPv4".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The rows a user can act on must not be buried under the ones they
+/// cannot.
+fn network_facing_services_come_first() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningOrder",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_services(&[
+                svc(46715, Some("code"), Binding::LoopbackOnly),
+                svc(5173, Some("node"), Binding::AllInterfaces),
+            ]);
+            *seen.borrow_mut() = Some(section.rows()[0].title().to_string());
+        },
+    );
+    let title = result.borrow_mut().take().ok_or("activation never ran")?;
+    if title != "node · 5173" {
+        return Err(format!(
+            "expected the network-facing row first, got {title:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn opening_from_a_row_pre_fills_the_port() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningActivate",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_services(&[svc(5173, Some("node"), Binding::AllInterfaces)]);
+            *seen.borrow_mut() = Some(section.activate_open(0));
+        },
+    );
+    let activated = result.borrow_mut().take().ok_or("activation never ran")?;
+    if activated != Some(5173) {
+        return Err(format!("expected Some(5173), got {activated:?}"));
+    }
+    Ok(())
+}
+
+/// It is in the section above, with a countdown. Offering "Open" here as
+/// well invites a second attempt that the helper answers with "already
+/// open" -- a refusal the user could not have anticipated from the screen.
+fn a_port_already_open_is_not_offered_again() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningAlreadyOpen",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_open_ports(&[5173]);
+            section.set_services(&[svc(5173, Some("node"), Binding::AllInterfaces)]);
+            *seen.borrow_mut() = Some(section.open_button_for(0).is_some());
+        },
+    );
+    let has_open_button = result.borrow_mut().take().ok_or("activation never ran")?;
+    if has_open_button {
+        return Err("a port already open must not be offered again".to_string());
+    }
+    Ok(())
+}
+
+/// I6: a helper round trip that fails must withdraw an "already open" claim
+/// it can no longer confirm, not leave it standing on whatever
+/// `set_open_ports` last said -- `set_open_ports_unknown` is the method a
+/// caller reaches for that.
+fn a_helper_failure_withdraws_a_stale_already_open_claim() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningOpenPortsUnknown",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_open_ports(&[5173]);
+            section.set_services(&[svc(5173, Some("node"), Binding::AllInterfaces)]);
+            let had_button_before = section.open_button_for(0).is_some();
+            let subtitle_before = section
+                .rows()
+                .first()
+                .and_then(|r| r.subtitle())
+                .map(|s| s.to_string());
+
+            section.set_open_ports_unknown();
+
+            let has_button_after = section.open_button_for(0).is_some();
+            let subtitle_after = section
+                .rows()
+                .first()
+                .and_then(|r| r.subtitle())
+                .map(|s| s.to_string());
+            *seen.borrow_mut() = Some((
+                had_button_before,
+                subtitle_before,
+                has_button_after,
+                subtitle_after,
+            ));
+        },
+    );
+    let (had_button_before, subtitle_before, has_button_after, subtitle_after) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if had_button_before {
+        return Err(
+            "fixture setup: expected the port to read as already open before the failure"
+                .to_string(),
+        );
+    }
+    match subtitle_before.as_deref() {
+        Some(s) if s.contains("already open") => {}
+        other => {
+            return Err(format!(
+                "fixture setup: expected \"already open\" in the subtitle before the \
+                 failure, got {other:?}"
+            ))
+        }
+    }
+    if !has_button_after {
+        return Err(
+            "set_open_ports_unknown must stop withholding the Open button on a claim \
+             porthole can no longer confirm"
+                .to_string(),
+        );
+    }
+    if subtitle_after
+        .as_deref()
+        .is_some_and(|s| s.contains("already open"))
+    {
+        return Err(format!(
+            "set_open_ports_unknown must stop the stale \"already open\" claim: {subtitle_after:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The control half of the disambiguation check below: `LoopbackOnly`'s
+/// subtitle is a fixed safety fact, not an address report, so two
+/// `LoopbackOnly` rows on the same port -- a genuine `127.0.0.1` +
+/// `::1` dual-stack pair -- correctly render the *same* text. There is no
+/// button to click twice here either way, so unlike the network-facing
+/// case this is not the readability problem the milestone's final wave
+/// tracks; this test only pins that the fixed wording really is fixed.
+fn loopback_only_rows_share_the_same_reassurance_regardless_of_address() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningDualStack",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_services(&[svc(53, Some("systemd-resolve"), Binding::LoopbackOnly), {
+                let mut s = svc(53, Some("systemd-resolve"), Binding::LoopbackOnly);
+                s.address = IpAddr::V6(Ipv6Addr::LOCALHOST);
+                s
+            }]);
+            let rows = section.rows();
+            let subtitle_a = rows[0].subtitle().map(|s| s.to_string());
+            let subtitle_b = rows
+                .get(1)
+                .and_then(|r| r.subtitle())
+                .map(|s| s.to_string());
+            *seen.borrow_mut() = Some((subtitle_a, subtitle_b));
+        },
+    );
+    let (subtitle_a, subtitle_b) = result.borrow_mut().take().ok_or("activation never ran")?;
+    // Both are LoopbackOnly, so both render the same fixed reassurance --
+    // that binding's subtitle deliberately does not vary by address (the
+    // safety fact is identical either way). This is the control half of
+    // the disambiguation check: proof the two rows really did both render,
+    // not proof of disambiguation itself.
+    if subtitle_a != subtitle_b {
+        return Err(format!(
+            "two LoopbackOnly rows should share the same reassurance text: {subtitle_a:?} vs {subtitle_b:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Same idea, but for the case that actually needs disambiguating: two
+/// network-facing rows on the same port. Their subtitles must differ,
+/// because they are shown as the literal bind address.
+fn dual_stack_network_facing_rows_show_different_addresses() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningDualStackFacing",
+        move |_app| {
+            let section = ListeningSection::new();
+            let v4 = svc(5355, Some("systemd-resolve"), Binding::AllInterfaces);
+            let mut v6 = svc(5355, Some("systemd-resolve"), Binding::AllInterfaces);
+            v6.address = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+            section.set_services(&[v4, v6]);
+            let rows = section.rows();
+            let subtitle_a = rows[0].subtitle().map(|s| s.to_string());
+            let subtitle_b = rows
+                .get(1)
+                .and_then(|r| r.subtitle())
+                .map(|s| s.to_string());
+            *seen.borrow_mut() = Some((subtitle_a, subtitle_b));
+        },
+    );
+    let (subtitle_a, subtitle_b) = result.borrow_mut().take().ok_or("activation never ran")?;
+    if subtitle_a == subtitle_b {
+        return Err(format!(
+            "two same-port network-facing rows must not read as identical: both {subtitle_a:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// A calm empty state, not an error -- mirrors `OpenNowSection`'s own
+/// `an_empty_list_is_a_calm_status_page_not_an_error`, checked the same way:
+/// title, icon and CSS classes, not title alone. A title-only check would
+/// still pass if the calm page grew `.css_classes(["error"])` and an error
+/// glyph.
+fn nothing_listening_is_a_calm_status_page_not_an_error() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningEmpty",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_services(&[]);
+            let status = section.status_page();
+            let title = status.as_ref().map(|p| p.title().to_string());
+            let icon_name = status
+                .as_ref()
+                .and_then(|p| p.icon_name())
+                .map(|s| s.to_string());
+            let css_classes: Vec<String> = status
+                .as_ref()
+                .map(|p| p.css_classes().iter().map(|c| c.to_string()).collect())
+                .unwrap_or_default();
+            let rows_empty = section.rows().is_empty();
+            *seen.borrow_mut() = Some((title, icon_name, css_classes, rows_empty));
+        },
+    );
+    let (title, icon_name, css_classes, rows_empty) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if title.as_deref() != Some("Nothing else is listening") {
+        return Err(format!(
+            "expected a status page titled \"Nothing else is listening\", got {title:?}"
+        ));
+    }
+    let icon = icon_name.unwrap_or_default();
+    if icon.contains("warning") || icon.contains("error") {
+        return Err(format!(
+            "the empty state's icon reads as a problem, not the ordinary state it is: {icon:?}"
+        ));
+    }
+    if css_classes.iter().any(|c| c == "error" || c == "warning") {
+        return Err(format!(
+            "the empty state carries an error/warning CSS class: {css_classes:?}"
+        ));
+    }
+    if !rows_empty {
+        return Err("rows must be empty when nothing is listening".to_string());
+    }
+    Ok(())
+}
+
+/// I5: before `set_services` has ever been called, this section must not
+/// be sitting on the calm "Nothing else is listening" claim -- a fresh
+/// `ListeningSection` has not scanned anything yet to earn that.
+fn the_initial_state_before_any_scan_is_neither_calm_nor_populated() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningLoading",
+        move |_app| {
+            let section = ListeningSection::new();
+            *seen.borrow_mut() = Some((
+                section.loading_page().is_some(),
+                section.status_page().is_some(),
+                section.error_page().is_some(),
+                section.rows().is_empty(),
+            ));
+        },
+    );
+    let (loading, calm, error, rows_empty) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if !loading {
+        return Err("a freshly constructed section must show its loading state".to_string());
+    }
+    if calm {
+        return Err(
+            "\"Nothing else is listening\" must not be the default before any scan has run"
+                .to_string(),
+        );
+    }
+    if error {
+        return Err("there is no scan failure to report yet either".to_string());
+    }
+    if !rows_empty {
+        return Err("there must be no rows before a scan has ever run".to_string());
+    }
+    Ok(())
+}
+
+/// I4: a `/proc` scan that fails outright must not leave the calm
+/// "Nothing else is listening" page up -- a stderr line is not a UI, and
+/// from the user's side "porthole could not check" and "porthole checked
+/// and found nothing" are exactly the collapse this project keeps finding.
+/// Checked structurally (icon, CSS class), the same way
+/// `nothing_listening_is_a_calm_status_page_not_an_error` above checks the
+/// calm state's own icon.
+fn a_scan_failure_does_not_render_as_the_calm_empty_state() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningScanFailed",
+        move |_app| {
+            let section = ListeningSection::new();
+            // A prior successful scan, so this also proves the failure
+            // state actually *displaces* real data rather than merely
+            // never having shown any.
+            section.set_services(&[svc(5173, Some("node"), Binding::AllInterfaces)]);
+            section.set_scan_failed("could not check what is listening: permission denied");
+            let calm = section.status_page();
+            let error = section.error_page();
+            let icon_name = error
+                .as_ref()
+                .and_then(|p| p.icon_name())
+                .map(|s| s.to_string());
+            let css_classes: Vec<String> = error
+                .as_ref()
+                .map(|p| p.css_classes().iter().map(|c| c.to_string()).collect())
+                .unwrap_or_default();
+            let description = error
+                .as_ref()
+                .and_then(|p| p.description())
+                .map(|s| s.to_string());
+            let rows_empty = section.rows().is_empty();
+            *seen.borrow_mut() = Some((
+                calm.is_some(),
+                error.is_some(),
+                icon_name,
+                css_classes,
+                description,
+                rows_empty,
+            ));
+        },
+    );
+    let (calm_showing, error_showing, icon_name, css_classes, description, rows_empty) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if calm_showing {
+        return Err(
+            "the calm \"Nothing else is listening\" page must not survive a scan \
+                     failure that came after it"
+                .to_string(),
+        );
+    }
+    if !error_showing {
+        return Err("a scan failure must render its own, distinguishable state".to_string());
+    }
+    let icon = icon_name.unwrap_or_default();
+    if !(icon.contains("error") || icon.contains("warning")) {
+        return Err(format!(
+            "the scan-failed state's icon must read as trouble: {icon:?}"
+        ));
+    }
+    if !css_classes.iter().any(|c| c == "error" || c == "warning") {
+        return Err(format!(
+            "the scan-failed state must carry an error/warning CSS class: {css_classes:?}"
+        ));
+    }
+    match description.as_deref() {
+        Some(d) if d.contains("permission denied") => {}
+        other => {
+            return Err(format!(
+                "the scan's own reason must be shown, verbatim: {other:?}"
+            ))
+        }
+    }
+    if !rows_empty {
+        return Err("the stale row from before the failure must not still be showing".to_string());
+    }
+    Ok(())
+}
+
+/// Fix round 2, item 1: the actual bug. `refresh` (`window.rs`) runs the
+/// `/proc` scan and the helper's `list`/`status` round trip as two
+/// independent futures, and a scan failure calling `set_scan_failed`
+/// followed by a *successful* helper fetch calling `set_open_ports` is the
+/// *likely* arrival order in practice (a `/proc` read on the thread pool
+/// reliably beats a system-bus connect plus two polkit-checked calls), not
+/// an edge case. `set_open_ports` alone must not be able to rebuild the
+/// calm "Nothing else is listening" page out from under a scan failure --
+/// before this fix it did, because `apply` decided from `services.is_empty()`,
+/// which `set_scan_failed` itself made true.
+fn a_scan_failure_survives_a_later_set_open_ports() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningScanFailedThenPorts",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_scan_failed("could not check what is listening: permission denied");
+            section.set_open_ports(&[5173]);
+            *seen.borrow_mut() = Some((
+                section.status_page().is_some(),
+                section.error_page().is_some(),
+            ));
+        },
+    );
+    let (calm_showing, error_showing) = result.borrow_mut().take().ok_or("activation never ran")?;
+    if calm_showing {
+        return Err(
+            "a set_open_ports arriving after a scan failure must not resurrect the calm \
+             \"Nothing else is listening\" page"
+                .to_string(),
+        );
+    }
+    if !error_showing {
+        return Err(
+            "the scan-failed state must survive a set_open_ports that arrives after it".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The other half of the same hole (I5, the loading state): with no scan
+/// having run at all yet, a `set_open_ports` arriving first (the helper
+/// answering before `/proc` has been read) must not manufacture the calm
+/// page either -- the loading state exists precisely to keep this section
+/// from asserting "nothing is listening" before it has asked.
+fn the_loading_state_survives_a_set_open_ports_before_any_scan() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningPortsBeforeScan",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_open_ports(&[5173]);
+            *seen.borrow_mut() = Some((
+                section.loading_page().is_some(),
+                section.status_page().is_some(),
+            ));
+        },
+    );
+    let (loading_showing, calm_showing) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if calm_showing {
+        return Err(
+            "a set_open_ports arriving before any scan must not produce the calm \"Nothing \
+             else is listening\" page"
+                .to_string(),
+        );
+    }
+    if !loading_showing {
+        return Err(
+            "the loading state must survive a set_open_ports that arrives before any \
+                     scan"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// One named check, run by `main` below -- see `tests/window.rs`'s own
+/// `Case` alias for why this is a type alias rather than spelled out
+/// inline.
+type Case = (&'static str, fn() -> Result<(), String>);
+
+fn main() {
+    let cases: [Case; 15] = [
+        (
+            "a_service_shows_its_name_and_port_the_way_the_spec_writes_it",
+            a_service_shows_its_name_and_port_the_way_the_spec_writes_it,
+        ),
+        (
+            "a_nameless_service_shows_its_port_alone_not_a_fake_name",
+            a_nameless_service_shows_its_port_alone_not_a_fake_name,
+        ),
+        (
+            "a_loopback_only_service_is_shown_but_marked_and_cannot_be_opened",
+            a_loopback_only_service_is_shown_but_marked_and_cannot_be_opened,
+        ),
+        (
+            "a_beyond_reach_service_gets_a_different_more_concerning_reason",
+            a_beyond_reach_service_gets_a_different_more_concerning_reason,
+        ),
+        (
+            "network_facing_services_come_first",
+            network_facing_services_come_first,
+        ),
+        (
+            "opening_from_a_row_pre_fills_the_port",
+            opening_from_a_row_pre_fills_the_port,
+        ),
+        (
+            "a_port_already_open_is_not_offered_again",
+            a_port_already_open_is_not_offered_again,
+        ),
+        (
+            "a_helper_failure_withdraws_a_stale_already_open_claim",
+            a_helper_failure_withdraws_a_stale_already_open_claim,
+        ),
+        (
+            "loopback_only_rows_share_the_same_reassurance_regardless_of_address",
+            loopback_only_rows_share_the_same_reassurance_regardless_of_address,
+        ),
+        (
+            "dual_stack_network_facing_rows_show_different_addresses",
+            dual_stack_network_facing_rows_show_different_addresses,
+        ),
+        (
+            "nothing_listening_is_a_calm_status_page_not_an_error",
+            nothing_listening_is_a_calm_status_page_not_an_error,
+        ),
+        (
+            "the_initial_state_before_any_scan_is_neither_calm_nor_populated",
+            the_initial_state_before_any_scan_is_neither_calm_nor_populated,
+        ),
+        (
+            "a_scan_failure_does_not_render_as_the_calm_empty_state",
+            a_scan_failure_does_not_render_as_the_calm_empty_state,
+        ),
+        (
+            "a_scan_failure_survives_a_later_set_open_ports",
+            a_scan_failure_survives_a_later_set_open_ports,
+        ),
+        (
+            "the_loading_state_survives_a_set_open_ports_before_any_scan",
+            the_loading_state_survives_a_set_open_ports_before_any_scan,
+        ),
+    ];
+
+    let mut any_failed = false;
+    for (name, case) in cases {
+        match case() {
+            Ok(()) => println!("test {name} ... ok"),
+            Err(message) => {
+                println!("test {name} ... FAILED: {message}");
+                any_failed = true;
+            }
+        }
+    }
+
+    if any_failed {
+        std::process::exit(1);
+    }
+}

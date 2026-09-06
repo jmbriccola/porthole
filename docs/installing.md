@@ -12,17 +12,30 @@ Until it is, do the steps below by hand.
 ## The pieces
 
 Building the workspace (`cargo build --release`) produces the helper binary
-and the CLI. Four more pieces are checked into `data/` and are not installed
-by anything automatically — you copy them into place yourself.
+and the CLI; the workspace's own `default-members` leaves the GUI out of that
+command, so it needs its own `cargo build --release -p porthole-gui`, and (see
+"The GUI", below) GTK4/libadwaita development headers installed first, unlike
+the helper and CLI. This project's own development host has no GTK4 installed
+and builds/tests the GUI only inside the container described in the top-level
+README, but that is a statement about this host, not a requirement — any
+machine with those headers builds it the same way `cargo build --release`
+already builds the other two. Eight more pieces are checked into `data/` and
+are not installed by anything automatically — you copy them into place
+yourself.
 
 | Piece | Goes to | What it does |
 |---|---|---|
 | `target/release/porthole` (built, not in `data/` — install it per the top-level README, not by the commands below) | `/usr/local/bin/porthole` (a packaged install may instead use `/usr/bin/porthole`) | The CLI. Listed here, not just in the README, because its path is no longer only a `$PATH` convenience: `porthole open --for` schedules its own close with a transient systemd timer whose `ExecStart` is this exact absolute path, run **as root**. The helper looks for it at `/usr/bin/porthole` first, then `/usr/local/bin/porthole`, and refuses to start at all if neither is a regular file owned by root and unwritable by anyone else — so install it at one of those two paths, not somewhere else. |
 | `target/release/porthole-helper` (built, not in `data/`) | `/usr/libexec/porthole-helper` | The privileged binary itself. It is never setuid and never run directly — only D-Bus activation or systemd starts it, always as root. |
+| `target/release/porthole-gui` (built with `cargo build --release -p porthole-gui`, not in `data/`) | `/usr/local/bin/porthole-gui` (a packaged install may instead use `/usr/bin/porthole-gui`) | The GTK4/libadwaita application. Unlike `porthole`'s own install path, nothing else on the system reads this one back — it only has to be on `$PATH` for the desktop file below to find it. |
 | `data/com.jacopobriccola.Porthole.service` | `/usr/share/dbus-1/system-services/` | Tells the system bus daemon how to start the helper the first time something addresses `com.jacopobriccola.Porthole`: which binary to run, and — via `SystemdService=` — which systemd unit actually owns the process. |
 | `data/porthole-helper.service` | `/usr/lib/systemd/system/` | The systemd unit the activation file names. `Type=dbus` plus `BusName=` makes systemd wait until the name is actually claimed before treating the service as started; `RuntimeDirectory=porthole` creates `/run/porthole` mode `0755` so an unprivileged `porthole list` can read the state file that only the helper writes, and `RuntimeDirectoryPreserve=yes` keeps `state.json` there across a restart or a crash instead of systemd deleting it with the directory; the unit has no `WantedBy=`, so nothing starts it at boot — D-Bus activation starts it the first time something addresses the bus name. It does not exit on its own once running: it stops only when something stops it. |
 | `data/com.jacopobriccola.Porthole.conf` | `/usr/share/dbus-1/system.d/` | The bus's own policy: only `root` may own the name — a bus-level guard against anything else posing as the helper — and any user may address it, because deciding *who may do what* is the next file's job, not the bus's. |
 | `data/com.jacopobriccola.Porthole.policy` | `/usr/share/polkit-1/actions/` | The polkit actions and their severities: opening towards your own subnet asks once per session, opening towards everyone (`--to any`) asks every time, and closing or listing never ask. Without this file, polkit falls back to its own default for an unrecognised action and every one of those severity choices disappears — `porthole doctor` is what notices and says so. |
+| `data/com.jacopobriccola.Porthole.desktop` | `/usr/share/applications/` | The desktop entry: what `Name=`, icon and `Exec=` line a launcher (GNOME's Activities overview, an app grid, `gtk-launch`) uses to show and start the GUI. Unrelated to the D-Bus files above — this is what makes the app *appear*, not what lets it *talk to the helper*, which it still does exactly as the CLI does, over the system bus. |
+| `data/icons/hicolor/scalable/apps/com.jacopobriccola.Porthole.svg` | `/usr/share/icons/hicolor/scalable/apps/` | The full-colour app icon the desktop file's `Icon=com.jacopobriccola.Porthole` resolves to via the freedesktop icon theme spec — the basename is what has to match, not the path. |
+| `data/icons/hicolor/symbolic/apps/com.jacopobriccola.Porthole-symbolic.svg` | `/usr/share/icons/hicolor/symbolic/apps/` | The single-colour variant the same spec expects alongside the full-colour icon, used in menus, lists and high-contrast themes rather than shown standalone. |
+| `data/com.jacopobriccola.Porthole.metainfo.xml` | `/usr/share/metainfo/` | AppStream metadata: what a software centre (GNOME Software, KDE Discover) reads for the name, summary, description and screenshot it shows *before* anyone has installed anything. Without this file the desktop entry above still makes the app launchable once installed, but a software centre listing it has nothing to show beside a bare name. |
 
 These paths mirror where `firewalld` — one of the three firewalls porthole
 can drive (see [docs/backends.md](backends.md) for the other two, ufw and
@@ -65,6 +78,50 @@ Verify with `porthole doctor`: a fresh install should show `Firewall`, `State`
 and `Network` unaffected by any of this, `Helper` going from "not answering on
 the bus" to "answering", and `polkit` going from "not installed" to naming the
 file that now exists.
+
+## The GUI: making it appear in the app grid
+
+Building it needs GTK4/libadwaita development headers installed first — the
+helper and CLI built above need none of this. On Fedora:
+
+```bash
+sudo dnf install gtk4-devel libadwaita-devel pkgconf-pkg-config
+cargo build --release -p porthole-gui
+```
+
+Once built, the GUI works with none of what follows below — run
+`porthole-gui` from a terminal and it talks to the helper over the system bus
+exactly as `porthole` does, needing that half installed but nothing else.
+Putting the binary itself on `$PATH`, plus the four files after it, is what
+makes it *appear* anywhere without a terminal instead — GNOME's Activities
+overview, an app grid, a software centre — five `install` commands below.
+
+```bash
+sudo install -Dm755 target/release/porthole-gui /usr/local/bin/porthole-gui
+
+sudo install -Dm644 data/com.jacopobriccola.Porthole.desktop \
+  /usr/share/applications/com.jacopobriccola.Porthole.desktop
+sudo install -Dm644 data/icons/hicolor/scalable/apps/com.jacopobriccola.Porthole.svg \
+  /usr/share/icons/hicolor/scalable/apps/com.jacopobriccola.Porthole.svg
+sudo install -Dm644 data/icons/hicolor/symbolic/apps/com.jacopobriccola.Porthole-symbolic.svg \
+  /usr/share/icons/hicolor/symbolic/apps/com.jacopobriccola.Porthole-symbolic.svg
+sudo install -Dm644 data/com.jacopobriccola.Porthole.metainfo.xml \
+  /usr/share/metainfo/com.jacopobriccola.Porthole.metainfo.xml
+
+# Neither is strictly required for the desktop entry to work -- most desktop
+# environments notice a new file under these directories on their own -- but
+# without them an icon or a software-centre listing can lag behind an
+# install until something else happens to trigger a rescan.
+sudo gtk-update-icon-cache -f /usr/share/icons/hicolor 2>/dev/null || true
+sudo update-desktop-database /usr/share/applications 2>/dev/null || true
+```
+
+Verify by opening the Activities overview and typing "Porthole": the icon
+above should appear, launching the same window `cargo run -p porthole-gui`
+would inside the container this project builds and tests it in. A software
+centre that reads AppStream metadata (GNOME Software, KDE Discover) should
+show the summary and description from the `.metainfo.xml` file once you find
+the app there, not just a bare name.
 
 ## Why there is no Flatpak, and there will not be one
 

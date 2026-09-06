@@ -1,0 +1,75 @@
+[package]
+name = "porthole-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "GTK4/libadwaita application for porthole."
+
+[lib]
+name = "porthole_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "porthole-gui"
+path = "src/main.rs"
+
+# `harness = false`: see the module doc comment at the top of tests/window.rs
+# for why. In short, gtk4-rs enforces that every GTK call in a process comes
+# from whichever OS thread made the *first* one -- and cargo's normal test
+# harness spawns each `#[test]` function on its own fresh thread, which trips
+# that check the moment a second test touches GTK. Each `[[test]]` target is
+# its own process, so a plain `fn main()` that runs its checks in sequence
+# keeps everything on that process's one real main thread. A later task
+# adding a new GTK-touching test file follows the same pattern: a new
+# `[[test]]` entry here with `harness = false`, not more tests crammed into
+# this one.
+[[test]]
+name = "window"
+path = "tests/window.rs"
+harness = false
+
+# Same reasoning, same shape, its own process: `tests/open_now.rs` is task
+# 3's own GTK-touching suite, kept out of `tests/window.rs` for exactly the
+# reason that file's comment (and this one) says to.
+[[test]]
+name = "open_now"
+path = "tests/open_now.rs"
+harness = false
+
+# Same reasoning again: `tests/listening.rs` is task 4's own GTK-touching
+# suite for `ListeningSection`.
+[[test]]
+name = "listening"
+path = "tests/listening.rs"
+harness = false
+
+# Same reasoning again: `tests/open_dialog.rs` is task 5's own GTK-touching
+# suite for `OpenDialog`.
+[[test]]
+name = "open_dialog"
+path = "tests/open_dialog.rs"
+harness = false
+
+# Same reasoning again: `tests/status_bar.rs` is task 6's own GTK-touching
+# suite for `StatusBar`. Task 6's other additions -- the initial load, the
+# keyboard-reachability check, and the breakpoint accessor -- extend
+# `tests/window.rs` and `tests/open_now.rs` instead, since both already
+# exist for the exact things those additions changed.
+[[test]]
+name = "status_bar"
+path = "tests/status_bar.rs"
+harness = false
+
+[dependencies]
+porthole-core = { path = "../porthole-core" }
+gtk = { package = "gtk4", version = "0.9" }
+# v1_5: `adw::Dialog` (task 5's `OpenDialog`) was added in libadwaita 1.5.
+# Implies v1_4/v1_3/v1_2/v1_1 through the crate's own feature chain, so
+# nothing tasks 3-4 already used stops compiling.
+adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
+ipnet.workspace = true
+zbus.workspace = true
+tokio.workspace = true

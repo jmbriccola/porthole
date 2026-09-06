@@ -58,6 +58,30 @@ opened. That is the whole design, not a limitation.
 - **Automatic close runs on a systemd transient timer**, so you can see it with
   `systemctl list-timers` and it does not depend on any process staying alive.
 
+## The GUI
+
+Everything above is also a window. `porthole-gui` shows what is open now with
+a live countdown, shows what is listening on this machine so you can open a
+port without typing a number, and opens one in two clicks. It talks to the
+same privileged helper over the same D-Bus interface the CLI uses, so it
+inherits the 8-hour ceiling and the polkit prompts without restating either —
+nothing about *what* porthole will do changes depending on which one you run.
+A window has no exit code to inherit; a failed request shows the helper's own
+message in the GUI instead, the same wording the CLI would have printed.
+
+![The Porthole window: two rules under "Open now", one with a live countdown and one until reboot, and five services under "Listening", one of them already open and one reachable only over IPv6](docs/screenshot.png)
+
+*Rendered by the app itself, under Xvfb, from invented example data — not a
+real machine's, which would either show nothing on a machine with no ports
+open or leak whatever is genuinely listening on the machine that took it.*
+
+GTK4/libadwaita is not required to build or run the CLI or the helper — the
+GUI lives in its own crate, `porthole-gui`, built and tested in a container
+(`tests/container/Containerfile.gui`) because this project's own development
+host has no GTK4 installed. See [docs/installing.md](docs/installing.md) for
+the desktop file, icon and AppStream metadata that make it appear in an app
+grid or a software centre once installed.
+
 ## Install
 
 Distribution packages are not published yet. To build from source you need Rust

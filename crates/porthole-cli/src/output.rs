@@ -8,6 +8,7 @@ use porthole_core::backend::BackendId;
 use porthole_core::command::Command;
 use porthole_core::engine::Status;
 use porthole_core::error::Error;
+use porthole_core::listening::{Binding, Service};
 use porthole_core::model::Target;
 use porthole_core::state::ManagedRule;
 use serde_json::{json, Value};
@@ -345,6 +346,181 @@ pub fn print_status(status: &Status, now: u64) {
     print_rules(&status.rules, now);
 }
 
+/// The `binding` tag `porthole listen --json` reports. A plain string, not
+/// `Target`'s `{"kind": ...}` shape: `Binding::Specific`'s address is already
+/// carried in `address` above it, so there is nothing more for the tag to
+/// hold than which case this is.
+fn binding_tag(binding: &Binding) -> &'static str {
+    match binding {
+        Binding::LoopbackOnly => "loopback_only",
+        Binding::AllInterfaces => "all_interfaces",
+        Binding::Specific(_) => "specific",
+        Binding::BeyondReach(_) => "beyond_reach",
+    }
+}
+
+fn service_json(service: &Service) -> Value {
+    json!({
+        "port": service.port,
+        "protocol": service.protocol.to_string(),
+        "address": service.address.to_string(),
+        "binding": binding_tag(&service.binding),
+        "process": service.process,
+        "pid": service.pid,
+    })
+}
+
+pub fn json_listening(services: &[Service]) -> Value {
+    json!({
+        "schema": JSON_SCHEMA,
+        "services": services.iter().map(service_json).collect::<Vec<_>>(),
+    })
+}
+
+/// `porthole listen` for a person. Grouped into up to three labelled
+/// sections rather than one flat list with a per-row "open" affordance:
+///
+/// - network-facing rows (`AllInterfaces`/`Specific`), unlabelled, at the
+///   top — these are the actionable ones, worth `porthole open`ing.
+/// - `BeyondReach` rows, if any: reachable over IPv6, but porthole manages
+///   IPv4 rules only and cannot open or close a rule for them. This is
+///   deliberately **not** worded as "changes nothing" -- unlike loopback-only,
+///   these sockets are exposed to the network; porthole is simply blind to
+///   that exposure. Conflating the two headings would be exactly the
+///   understated-risk bug `Binding::BeyondReach`'s own doc comment guards
+///   against.
+/// - `LoopbackOnly` rows, labelled plainly: on an ordinary desktop these are
+///   usually the majority of the list (see `milestone-4-verified-facts.md`),
+///   and opening the firewall for one of them genuinely changes nothing,
+///   since the process is not listening on a network interface at all.
+pub fn print_listening(services: &[Service]) {
+    print!("{}", render_listening(services));
+}
+
+/// The text `print_listening` prints, built as a `String` rather than
+/// printed line-by-line so tests can assert on it directly -- see the
+/// `BeyondReach` tests below, which check a *property* of this text (it must
+/// never claim the service is unreachable), not a literal sentence.
+fn render_listening(services: &[Service]) -> String {
+    use std::fmt::Write as _;
+    let w = "writing to a String cannot fail";
+    let mut out = String::new();
+    writeln!(out, "Listening on this machine").expect(w);
+    writeln!(out).expect(w);
+
+    if services.is_empty() {
+        writeln!(out, "Nothing is listening.").expect(w);
+        return out;
+    }
+
+    // One set of column widths across every group, so the lists still read
+    // as one table rather than several differently-aligned ones.
+    let port_width = services
+        .iter()
+        .map(|s| format!("{}/{}", s.port, s.protocol).len())
+        .max()
+        .unwrap_or(0);
+    let name_width = services
+        .iter()
+        .map(|s| s.process.as_deref().unwrap_or("—").chars().count())
+        .max()
+        .unwrap_or(0);
+    // A dual-stack service (one socket on `0.0.0.0`, another on `::`) shares
+    // its port and process name with its own other socket, so without this
+    // column the two rows print as visually identical pairs -- on an
+    // ordinary desktop, half the list or more. `address_width` over every
+    // service, the same way `port_width`/`name_width` already are, so this
+    // column lines up across every group too.
+    let address_width = services
+        .iter()
+        .map(|s| s.address.to_string().chars().count())
+        .max()
+        .unwrap_or(0);
+
+    let network_facing: Vec<&Service> = services
+        .iter()
+        .filter(|s| matches!(s.binding, Binding::AllInterfaces | Binding::Specific(_)))
+        .collect();
+    let beyond_reach: Vec<&Service> = services
+        .iter()
+        .filter(|s| matches!(s.binding, Binding::BeyondReach(_)))
+        .collect();
+    let loopback: Vec<&Service> = services
+        .iter()
+        .filter(|s| s.binding == Binding::LoopbackOnly)
+        .collect();
+
+    append_listening_rows(
+        &mut out,
+        &network_facing,
+        port_width,
+        name_width,
+        address_width,
+    );
+
+    if !beyond_reach.is_empty() {
+        if !network_facing.is_empty() {
+            writeln!(out).expect(w);
+        }
+        writeln!(
+            out,
+            "Reachable over IPv6 — porthole manages IPv4 firewall rules only and cannot \
+             open or close these:"
+        )
+        .expect(w);
+        append_listening_rows(
+            &mut out,
+            &beyond_reach,
+            port_width,
+            name_width,
+            address_width,
+        );
+    }
+
+    if !loopback.is_empty() {
+        if !network_facing.is_empty() || !beyond_reach.is_empty() {
+            writeln!(out).expect(w);
+        }
+        writeln!(
+            out,
+            "Loopback only — opening the firewall for these changes nothing:"
+        )
+        .expect(w);
+        append_listening_rows(&mut out, &loopback, port_width, name_width, address_width);
+    }
+
+    out
+}
+
+/// `address_width` disambiguates a dual-stack service's two rows -- the same
+/// port and process name, one bound to `0.0.0.0`, the other to `::` -- so
+/// they read as two distinct sockets rather than one service printed twice.
+/// See this function's own caller for why the width is computed once, over
+/// every service, rather than per group.
+fn append_listening_rows(
+    out: &mut String,
+    services: &[&Service],
+    port_width: usize,
+    name_width: usize,
+    address_width: usize,
+) {
+    use std::fmt::Write as _;
+    for service in services {
+        let port_proto = format!("{}/{}", service.port, service.protocol);
+        let process = service.process.as_deref().unwrap_or("—").to_string();
+        let address = service.address.to_string();
+        let pid = service
+            .pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        writeln!(
+            out,
+            "  {port_proto:port_width$}  {process:name_width$}  {address:address_width$}  pid {pid}"
+        )
+        .expect("writing to a String cannot fail");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,5 +835,164 @@ mod tests {
         let json = json_closed(&[rule()], &[], 1_757_000_000, false, false, &[]);
         assert_eq!(json["closed"].as_array().unwrap().len(), 1);
         assert_eq!(json["forgotten"].as_array().unwrap().len(), 0);
+    }
+
+    fn service(port: u16, binding: Binding, process: Option<&str>, pid: Option<u32>) -> Service {
+        use porthole_core::model::Protocol;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let address = match binding {
+            Binding::LoopbackOnly => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Binding::AllInterfaces => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            Binding::Specific(a) => IpAddr::V4(a),
+            Binding::BeyondReach(a) => IpAddr::V6(a),
+        };
+        Service {
+            port,
+            protocol: Protocol::Tcp,
+            address,
+            binding,
+            process: process.map(str::to_string),
+            pid,
+        }
+    }
+
+    #[test]
+    fn json_listening_has_the_documented_shape() {
+        let services = vec![service(
+            5173,
+            Binding::AllInterfaces,
+            Some("node"),
+            Some(12043),
+        )];
+        let json = json_listening(&services);
+        assert_eq!(json["schema"], 1);
+        let svc = &json["services"][0];
+        assert_eq!(svc["port"], 5173);
+        assert_eq!(svc["protocol"], "tcp");
+        assert_eq!(svc["address"], "0.0.0.0");
+        assert_eq!(svc["binding"], "all_interfaces");
+        assert_eq!(svc["process"], "node");
+        assert_eq!(svc["pid"], 12043);
+    }
+
+    #[test]
+    fn an_unresolved_process_is_null_in_json_never_a_placeholder_string() {
+        // A script must be able to tell "porthole could not resolve this" from
+        // "the process is actually named that" -- a literal "unknown" string
+        // would erase exactly that distinction.
+        let services = vec![service(53, Binding::LoopbackOnly, None, None)];
+        let json = json_listening(&services);
+        assert!(json["services"][0]["process"].is_null());
+        assert!(json["services"][0]["pid"].is_null());
+    }
+
+    #[test]
+    fn a_specific_binding_reports_the_specific_tag() {
+        let services = vec![service(
+            8080,
+            Binding::Specific("10.10.10.5".parse().unwrap()),
+            None,
+            None,
+        )];
+        let json = json_listening(&services);
+        assert_eq!(json["services"][0]["binding"], "specific");
+        assert_eq!(json["services"][0]["address"], "10.10.10.5");
+    }
+
+    #[test]
+    fn the_empty_listening_list_is_an_empty_array_not_a_missing_key() {
+        let json = json_listening(&[]);
+        assert_eq!(json["services"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_beyond_reach_binding_reports_its_own_tag_and_address() {
+        let services = vec![service(
+            9999,
+            Binding::BeyondReach("2001:db8::1".parse().unwrap()),
+            None,
+            None,
+        )];
+        let json = json_listening(&services);
+        assert_eq!(json["services"][0]["binding"], "beyond_reach");
+        assert_eq!(json["services"][0]["address"], "2001:db8::1");
+    }
+
+    #[test]
+    fn a_beyond_reach_row_never_reads_as_unreachable_from_the_network() {
+        // The bug this guards against: an earlier version of this renderer
+        // (inherited from classify_v6's own earlier bug) would have put this
+        // row under the loopback heading, or worded a heading for it the
+        // same way -- both claim "porthole cannot help" *because the socket
+        // is not reachable from the network*, which is false here: this
+        // address is reachable over IPv6, and porthole simply cannot open or
+        // close a rule for it. Assert the property (neither false claim
+        // appears), not today's exact sentence, so a future rewording cannot
+        // quietly reintroduce either one.
+        let services = vec![service(
+            9999,
+            Binding::BeyondReach("2001:db8::1".parse().unwrap()),
+            None,
+            None,
+        )];
+        let text = render_listening(&services);
+        let lower = text.to_lowercase();
+        assert!(
+            !lower.contains("changes nothing"),
+            "must not claim opening the firewall is a no-op for an exposed service: {text}"
+        );
+        assert!(
+            !lower.contains("only this machine"),
+            "must not claim this listener is unreachable from the network: {text}"
+        );
+    }
+
+    #[test]
+    fn a_loopback_row_still_says_the_firewall_change_is_a_no_op() {
+        // The other half of the same guard: fixing BeyondReach must not
+        // water down the (true, for loopback) claim this heading makes.
+        let services = vec![service(53, Binding::LoopbackOnly, None, None)];
+        let text = render_listening(&services);
+        assert!(text.contains("Loopback only — opening the firewall for these changes nothing:"));
+    }
+
+    #[test]
+    fn dual_stack_rows_sharing_a_port_read_as_two_sockets_not_one_listed_twice() {
+        // A dual-stack service (one socket on `0.0.0.0`, one on `::`) shares
+        // its port, protocol and process name -- both classify as
+        // `AllInterfaces` -- so without an address column the two rows were
+        // literally identical text, which reads as a duplicate rather than
+        // two real sockets. `service()` always derives its address from the
+        // binding, so this test builds both rows directly rather than
+        // through that helper.
+        use porthole_core::model::Protocol;
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        let v4 = Service {
+            port: 53,
+            protocol: Protocol::Tcp,
+            address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            binding: Binding::AllInterfaces,
+            process: Some("dnsmasq".to_string()),
+            pid: Some(100),
+        };
+        let v6 = Service {
+            port: 53,
+            protocol: Protocol::Tcp,
+            address: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            binding: Binding::AllInterfaces,
+            process: Some("dnsmasq".to_string()),
+            pid: Some(100),
+        };
+        let text = render_listening(&[v4, v6]);
+        let rows: Vec<&str> = text.lines().filter(|l| l.contains("53/tcp")).collect();
+        assert_eq!(rows.len(), 2, "expected both rows, got: {text}");
+        assert_ne!(
+            rows[0], rows[1],
+            "two distinct sockets must not render as identical lines: {text}"
+        );
+        assert!(rows[0].contains("0.0.0.0"), "got: {text}");
+        assert!(rows[1].contains("::"), "got: {text}");
     }
 }

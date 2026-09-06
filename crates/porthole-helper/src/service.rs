@@ -17,10 +17,10 @@
 
 use crate::authz::{caller_uid, Action, Authorizer, Details};
 use crate::error::HelperError;
-use porthole_core::backend;
+use porthole_core::backend::{self, BackendHealth, BackendId};
 use porthole_core::clock::SystemClock;
 use porthole_core::command::RealRunner;
-use porthole_core::engine::{is_open_any, resolve_scope, Engine};
+use porthole_core::engine::{is_open_any, resolve_scope, Engine, Status};
 use porthole_core::error::Error;
 use porthole_core::ipc::{WireError, WireRule, WireStatus};
 use porthole_core::model::Lifetime;
@@ -308,20 +308,47 @@ impl Porthole {
             .map_err(HelperError::from)?;
 
         let runner = RealRunner;
-        let backend = backend::detect(&runner).map_err(HelperError::from)?;
-        // Read-only open: `Engine::status` reconciles read-only (`SweepMode::
-        // ReadOnly`), so it never saves and never touches the firewall --
-        // see `reconcile.rs`. status must not block behind a writer either,
-        // which is the other reason this is the plain, non-exclusive open.
-        let state = StateStore::open(&self.state_path).map_err(HelperError::from)?;
-        let mut engine = Engine::new(
-            backend.as_ref(),
-            &runner,
-            &SYSTEM_CLOCK,
-            state,
-            self.executable.clone(),
-        );
-        let status = engine.status().map_err(HelperError::from)?;
+        // Mirrors `porthole-cli`'s own `run.rs::Commands::Status` handling,
+        // which a prior review already fixed this same collapse in: a
+        // backend that could not be *detected* at all (a machine with no
+        // firewall installed is the common case, but not the only one) is a
+        // different, confirmed fact from one that was detected but could not
+        // be *read* (`BackendHealth::active_unknown`'s own case) -- and it
+        // must reach the wire as that fact, not as a bare method error. Left
+        // as a `?` propagating through `HelperError`, this `detect` failure
+        // became indistinguishable, on every client, from "the helper itself
+        // could not be reached" -- exactly the collapse the GUI's own
+        // `StatusBar` was caught rendering: a confirmed "no firewall" status,
+        // wrapped in "could not reach the porthole helper". Synthesizing a
+        // `Status` here, the same shape `run.rs` already does locally, means
+        // every client -- this GUI and any future one -- renders the real
+        // fact instead of each rediscovering the trap.
+        let status = match backend::detect(&runner) {
+            Ok(backend) => {
+                // Read-only open: `Engine::status` reconciles read-only
+                // (`SweepMode::ReadOnly`), so it never saves and never
+                // touches the firewall -- see `reconcile.rs`. status must
+                // not block behind a writer either, which is the other
+                // reason this is the plain, non-exclusive open.
+                let state = StateStore::open(&self.state_path).map_err(HelperError::from)?;
+                let mut engine = Engine::new(
+                    backend.as_ref(),
+                    &runner,
+                    &SYSTEM_CLOCK,
+                    state,
+                    self.executable.clone(),
+                );
+                engine.status().map_err(HelperError::from)?
+            }
+            Err(e) => status_for_undetected_backend(
+                &e,
+                net::current_network(&runner).ok(),
+                StateStore::open(&self.state_path)
+                    .map_err(HelperError::from)?
+                    .rules()
+                    .to_vec(),
+            ),
+        };
         Ok(WireStatus::from_status(&status))
     }
 }
@@ -347,6 +374,44 @@ impl Porthole {
              forgotten by uid={}) -- no firewall was touched",
             rule.port, rule.protocol, rule.target, rule.backend, rule.uid, forgotten_by
         );
+    }
+}
+
+/// The `Status` a `detect` failure becomes on the wire -- split out from
+/// [`Porthole::status`] so this mapping is testable without a real bus, a
+/// real backend, or root (`tests/service.rs`'s own end-to-end suite runs
+/// against whatever firewall this machine actually has, which cannot be
+/// made to fail `detect` on demand). `error` is `detect`'s own error,
+/// verbatim, as `BackendHealth::detail` -- never reworded, and never
+/// silently reaching a client as "could not reach the helper": see
+/// [`Porthole::status`]'s own comment for the collapse this exists to
+/// avoid. `network` and `rules` are supplied by the caller rather than
+/// looked up here, since neither depends on whether a backend was
+/// detected -- the network probe and the state file are both independent
+/// of that.
+fn status_for_undetected_backend(
+    error: &Error,
+    network: Option<porthole_core::net::LocalNetwork>,
+    rules: Vec<porthole_core::state::ManagedRule>,
+) -> Status {
+    Status {
+        backend: BackendId::Firewalld,
+        health: BackendHealth {
+            available: false,
+            active: false,
+            // A backend that could not even be detected is not the same
+            // fact as one that was detected and could not be read -- see
+            // `active_unknown`'s own doc comment. `detect` failing this
+            // way means no backend was ever available to ask, so there is
+            // nothing left unresolved to call "unknown".
+            active_unknown: false,
+            version: None,
+            detail: error.to_string(),
+            caveat: None,
+        },
+        network,
+        location: None,
+        rules,
     }
 }
 
@@ -433,5 +498,45 @@ mod tests {
     fn a_human_initiated_close_carries_no_expired_marker() {
         let line = format_close_log(&rule(1000), 1000, false);
         assert!(!line.contains("expired"), "got: {line}");
+    }
+
+    #[test]
+    fn an_undetected_backend_reports_as_no_firewall_not_as_a_bare_error() {
+        // C1: `Porthole::status` used to `?`-propagate a `detect` failure
+        // straight through `HelperError`, indistinguishable, on the one
+        // client that exists today (the GUI), from "the helper itself
+        // could not be reached" -- a confirmed "no firewall" collapsed into
+        // an absence of information, the milestone-3 defect run backwards.
+        let error = Error::BackendUnavailable(
+            "no firewall found: none of firewalld, ufw or nftables is installed. \
+             Without a firewall this port is already reachable from your network."
+                .to_string(),
+        );
+        let status = status_for_undetected_backend(&error, None, Vec::new());
+        assert!(
+            !status.health.available,
+            "a detect failure must report available: false"
+        );
+        assert!(!status.health.active);
+        assert!(
+            !status.health.active_unknown,
+            "no backend was ever available to ask, so there is nothing left unresolved to \
+             call \"unknown\""
+        );
+        assert!(
+            status.health.detail.contains("already reachable"),
+            "detect's own message must survive verbatim, not be reworded: {}",
+            status.health.detail
+        );
+
+        // The fact this whole change exists to put on the wire correctly:
+        // `firewall_available: false`, not a bare method error a client
+        // could fold into "could not reach the helper at all".
+        let wire = WireStatus::from_status(&status);
+        assert!(!wire.firewall_available);
+        assert!(
+            wire.firewall_version.is_empty(),
+            "no version was ever read for a backend that was never detected"
+        );
     }
 }

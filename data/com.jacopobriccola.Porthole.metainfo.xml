@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.jacopobriccola.Porthole</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Porthole</name>
+  <summary>Open a port to your local network, temporarily and on purpose</summary>
+
+  <description>
+    <p>
+      On a laptop, exposing a dev server to the local network is usually an
+      all-or-nothing choice: either every high port is reachable by anyone on
+      the network, or reaching your own dev server from your phone means
+      remembering firewall syntax and undoing it again by hand.
+    </p>
+    <p>
+      Porthole opens a single port towards the network you are on right now,
+      for a bounded amount of time, and closes it again by itself. Opening
+      towards your own network authenticates once per session; opening
+      towards everyone your machine can reach asks every time, because it is
+      the more significant choice. Nothing Porthole opens survives a reboot,
+      and no timed opening can last longer than eight hours.
+    </p>
+    <p>
+      Porthole is not a firewall manager. It does not do zones, services,
+      NAT, port forwarding or permanent rules — for that, use
+      firewall-config, ufw or nft directly.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">com.jacopobriccola.Porthole.desktop</launchable>
+
+  <url type="homepage">https://github.com/jmbriccola/porthole</url>
+  <url type="bugtracker">https://github.com/jmbriccola/porthole/issues</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>What is open now, and what is listening on this machine</caption>
+      <image>https://raw.githubusercontent.com/jmbriccola/porthole/main/docs/screenshot.png</image>
+    </screenshot>
+  </screenshots>
+
+  <provides>
+    <binary>porthole-gui</binary>
+    <binary>porthole</binary>
+  </provides>
+
+  <developer id="io.github.jmbriccola">
+    <name>Jacopo Maria Briccola</name>
+  </developer>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.1.0" date="2026-09-06">
+      <description>
+        <p>Opening and closing a port from the GUI or the CLI, backed by
+        firewalld, ufw or nftables. Not yet packaged for any distribution;
+        see the project's own README for building from source.</p>
+      </description>
+    </release>
+  </releases>
+</component>
