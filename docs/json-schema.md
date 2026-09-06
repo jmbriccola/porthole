@@ -28,6 +28,9 @@ Used in `list`, `status`, `open` and `close`.
 - `protocol` — `"tcp"` or `"udp"`.
 - `scope` — `"network"` or `"anywhere"`. When it is `"anywhere"`, `target` is
   the string `"anywhere"`; otherwise `target` is a CIDR.
+- `backend` — `"firewalld"`, `"ufw"` or `"nftables"`: whichever backend
+  created this rule. See [docs/backends.md](backends.md) for what each one
+  can and cannot do.
 - `expires_at` and `expires_in_seconds` are `null` for an `--until-reboot` rule.
 
 ## `porthole list --json`
@@ -52,6 +55,21 @@ Used in `list`, `status`, `open` and `close`.
 ```
 
 `network` is `null` when the machine is not on a usable network.
+
+`backend` is one of `"firewalld"`, `"ufw"` or `"nftables"` — whichever
+porthole detected on this machine, in that priority order. `location` means
+something different for each, and a script that assumes it is always a
+firewalld zone will misread the other two:
+
+| `backend` | what `location` holds |
+|---|---|
+| `firewalld` | the zone porthole manages, e.g. `"FedoraWorkstation"` |
+| `ufw` | the literal string `"ufw"` — ufw has no zone concept |
+| `nftables` | the input-hook chain porthole found and would insert into, e.g. `"inet filter input"` |
+
+`location` is `null` when it could not be determined — on nftables this
+happens when there is no input-hook chain, or more than one, since porthole
+has not picked a single chain to name; see [docs/backends.md](backends.md).
 
 ## `porthole open --json`
 

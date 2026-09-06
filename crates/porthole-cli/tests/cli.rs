@@ -479,3 +479,40 @@ fn doctor_says_the_helper_is_missing_when_it_is() {
     );
     assert!(remedy.contains("dbus"), "got: {remedy}");
 }
+
+#[test]
+fn doctor_names_all_three_backends_when_none_is_found() {
+    // Milestone 3 made this message drift: the Firewall check used to say
+    // "porthole 0.1 manages firewalld only... wait for the ufw and nftables
+    // backends", which became false the moment those two backends shipped.
+    // Forcing the real "nothing found" path through the built binary --
+    // rather than only the library's own `backend::detect` unit test --
+    // catches drift in whatever doctor.rs wraps around that message, not
+    // just in the message itself. Hiding every firewall CLI by pointing PATH
+    // somewhere empty is the only way to reach this deterministically without
+    // uninstalling firewalld from the machine running the test suite.
+    let dir = TempDir::new().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_porthole"))
+        .args(["doctor", "--json"])
+        .env("PORTHOLE_STATE_FILE", state_path(&dir))
+        .env("PATH", "/nonexistent-porthole-test-path")
+        .output()
+        .expect("porthole binary runs");
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    let firewall = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "Firewall")
+        .expect("a Firewall check");
+    assert_eq!(firewall["ok"], false);
+    let detail = firewall["detail"].as_str().unwrap();
+    for name in ["firewalld", "ufw", "nftables"] {
+        assert!(detail.contains(name), "must name {name}: {detail}");
+    }
+    let remedy = firewall["remedy"].as_str().unwrap();
+    assert!(
+        !remedy.to_lowercase().contains("wait for"),
+        "must not tell someone to wait for a backend that already shipped: {remedy}"
+    );
+}

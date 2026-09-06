@@ -7,9 +7,9 @@
 //! a problem without a remedy has done half the job — and it is the half a
 //! stuck user cannot supply for themselves.
 
-use porthole_core::backend;
+use porthole_core::backend::{self, nftables, BackendId};
 use porthole_core::cli_path;
-use porthole_core::command::RealRunner;
+use porthole_core::command::{CommandRunner, RealRunner};
 use porthole_core::ipc::PortholeProxy;
 use porthole_core::net;
 use serde_json::{json, Value};
@@ -48,25 +48,12 @@ pub fn run(session: bool) -> Vec<Check> {
     let mut checks = Vec::new();
 
     checks.push(match backend::detect(&runner) {
-        Ok(backend) => match backend.health() {
-            Ok(h) if h.active => Check::good("Firewall", h.detail),
-            Ok(h) => Check::bad(
-                "Firewall",
-                h.detail,
-                "Start it — `sudo systemctl start firewalld`. While it is stopped, \
-                 nothing porthole does changes what is reachable.",
-            ),
-            Err(e) => Check::bad(
-                "Firewall",
-                e.to_string(),
-                "`systemctl status firewalld` to see whether it is running, and \
-                 `journalctl -u firewalld -n 50` for why it is not.",
-            ),
-        },
+        Ok(backend) => firewall_check(backend.as_ref(), &runner),
         Err(e) => {
             let remedy = format!(
-                "porthole {} manages firewalld. Install it, or wait for the ufw \
-                 and nftables backends. porthole will not install one for you.",
+                "porthole {} can drive firewalld, ufw or nftables — whichever this \
+                 machine already has — but none of the three was found. Install one \
+                 of them; porthole will not install or enable a firewall for you.",
                 env!("CARGO_PKG_VERSION")
             );
             Check::bad("Firewall", e.to_string(), &remedy)
@@ -116,6 +103,114 @@ pub fn run(session: bool) -> Vec<Check> {
     checks.push(check_ipv6(&runner));
 
     checks
+}
+
+/// The `Firewall` check: which backend was detected, whether it is enforcing
+/// anything, and the caveat specific to that backend that a user cannot see
+/// from `porthole status` alone — each backend's `health()` already names
+/// itself in its own detail text (`"firewalld 2.4.4 is running"`, `"ufw
+/// 0.36.2 is active"`, `"nftables v1.1.6: inet filter input is enforcing"`),
+/// so this function only adds what `health()` cannot: nftables' "more than
+/// one candidate chain" refusal, which `health()` reports as `active: true`
+/// because *something* is enforcing even though porthole cannot use it, and
+/// ufw's standing persistence caveat, which is true every time ufw is active,
+/// not only on failure.
+fn firewall_check(backend: &dyn backend::FirewallBackend, runner: &dyn CommandRunner) -> Check {
+    let health = match backend.health() {
+        Ok(h) => h,
+        Err(e) => return Check::bad("Firewall", e.to_string(), health_error_remedy(backend.id())),
+    };
+
+    if !health.active {
+        return Check::bad("Firewall", health.detail, not_active_remedy(backend.id()));
+    }
+
+    // nftables' `active: true` means "something is registered at the input
+    // hook", not "porthole can act". Two or more candidate chains is exactly
+    // that gap: health() already explains the ambiguity in its detail, but
+    // leaves `active` true because the hook genuinely is enforced by
+    // *something*. `open` and `close` refuse outright rather than guess which
+    // chain decides, so doctor must surface that as a failure here too,
+    // rather than let the ambiguity read as a plain "ok".
+    if backend.id() == BackendId::Nftables {
+        if let Ok(chains) = nftables::input_chains(runner) {
+            if chains.len() > 1 {
+                return Check::bad(
+                    "Firewall",
+                    health.detail,
+                    "porthole will refuse every `open` and `close` here until exactly \
+                     one base chain is registered at the input hook, because it cannot \
+                     prove which one decides a packet's fate. Remove or merge the extra \
+                     chain, or manage this port with whatever wrote it instead.",
+                );
+            }
+        }
+    }
+
+    // ufw has no runtime-only concept at all: `ufw allow` writes straight to
+    // /etc/ufw/user.rules, and ufw.service reloads it at every boot. If
+    // porthole is killed between opening and closing a port -- the process
+    // killed, the machine losing power, anything short of its own close
+    // running -- the rule is still there and still enforced after a reboot,
+    // until the next porthole command's reconciliation pass notices and
+    // removes it. That is not a failure of this check (reconciliation closes
+    // the gap in practice), but it is a property worth a user knowing on
+    // every single run, not only when something is wrong -- so it is said
+    // here rather than only in docs/backends.md.
+    if backend.id() == BackendId::Ufw {
+        return Check {
+            name: "Firewall",
+            ok: true,
+            detail: health.detail,
+            remedy: "ufw's rules are persistent: a reboot does not close them by \
+                     itself. If porthole is killed between opening and closing a \
+                     port, the rule survives until the next porthole command \
+                     reconciles it away."
+                .to_string(),
+        };
+    }
+
+    Check::good("Firewall", health.detail)
+}
+
+/// What to tell someone when the detected backend's own health check itself
+/// failed -- not "stopped", an actual error asking it.
+fn health_error_remedy(id: BackendId) -> &'static str {
+    match id {
+        BackendId::Firewalld => {
+            "`systemctl status firewalld` to see whether it is running, and \
+             `journalctl -u firewalld -n 50` for why it is not."
+        }
+        BackendId::Ufw => {
+            "`ufw status verbose` to see what ufw itself reports, and \
+             `journalctl -u ufw -n 50` for why the call failed."
+        }
+        BackendId::Nftables => {
+            "`nft -j list chains` by hand to see what it actually returns; \
+             porthole could not make sense of the output."
+        }
+    }
+}
+
+/// What to tell someone when the detected backend is installed but not
+/// enforcing anything.
+fn not_active_remedy(id: BackendId) -> &'static str {
+    match id {
+        BackendId::Firewalld => {
+            "Start it — `sudo systemctl start firewalld`. While it is stopped, \
+             nothing porthole does changes what is reachable."
+        }
+        BackendId::Ufw => {
+            "Enable it — `sudo ufw enable`. While it is disabled, nothing porthole \
+             does changes what is reachable."
+        }
+        BackendId::Nftables => {
+            "Nothing to start: no chain is registered at the input hook, so \
+             nothing is filtering incoming traffic and the port is already \
+             reachable. Set one up if that is not what you want — porthole will \
+             not do it for you."
+        }
+    }
 }
 
 /// What the bus said when we asked the helper for the rule list.
@@ -386,6 +481,136 @@ pub fn json(checks: &[Check]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use porthole_core::backend::{nftables::Nftables, ufw::Ufw};
+    use porthole_core::command::{Output, RecordingRunner};
+
+    /// Captured shape (see `nftables.rs`'s own tests for the same fixture):
+    /// one base chain at the input hook, policy `accept`.
+    const ONE_INPUT_CHAIN_ACCEPT: &str = r#"{"nftables":[
+        {"metainfo":{"version":"1.1.3","json_schema_version":1}},
+        {"chain":{"family":"inet","table":"filter","name":"input","handle":1,
+                  "type":"filter","hook":"input","prio":0,"policy":"accept"}}
+    ]}"#;
+
+    /// The same chain's rule list, empty: no rule to drop or reject with.
+    const NO_RULES: &str = r#"{"nftables":[
+        {"metainfo":{"version":"1.1.3","json_schema_version":1}}
+    ]}"#;
+
+    /// Two base chains at the input hook -- porthole cannot prove which one
+    /// decides a packet's fate.
+    const TWO_INPUT_CHAINS: &str = r#"{"nftables":[
+        {"metainfo":{"version":"1.1.3","json_schema_version":1}},
+        {"chain":{"family":"inet","table":"filter","name":"input","handle":1,
+                  "type":"filter","hook":"input","prio":0,"policy":"drop"}},
+        {"chain":{"family":"ip","table":"legacy","name":"INPUT","handle":1,
+                  "type":"filter","hook":"input","prio":0,"policy":"drop"}}
+    ]}"#;
+
+    /// No base chain at all at the input hook.
+    const NO_INPUT_CHAINS: &str = r#"{"nftables":[
+        {"metainfo":{"version":"1.1.3","json_schema_version":1}}
+    ]}"#;
+
+    #[test]
+    fn ufw_active_is_ok_and_names_the_persistence_caveat_every_time() {
+        // Not a failure: ufw being active is exactly what "ok" means. But the
+        // caveat is a standing property of the backend, not a symptom of
+        // something wrong, so it must show up on every green run, not only
+        // when doctor has bad news.
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout("ufw 0.36.2"),
+            Output::stdout("Status: active"),
+        ]);
+        let backend = Ufw::new(&runner);
+        let check = firewall_check(&backend, &runner);
+        assert!(check.ok, "detail={} remedy={}", check.detail, check.remedy);
+        assert!(check.detail.contains("active"), "got: {}", check.detail);
+        assert!(
+            check.remedy.contains("persistent") && check.remedy.contains("reboot"),
+            "the persistence caveat must be stated, got: {}",
+            check.remedy
+        );
+    }
+
+    #[test]
+    fn nftables_two_input_chains_is_a_failure_not_a_quiet_ok() {
+        // health() alone reports `active: true` here -- something at the
+        // hook genuinely is enforcing -- which would read as "ok" if doctor
+        // trusted `active` alone. `open`/`close` refuse outright on this
+        // ruleset, so doctor must fail here too.
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout("nftables v1.1.6"), // --version
+            Output::stdout(TWO_INPUT_CHAINS),  // health()'s own list_chains
+            Output::stdout(TWO_INPUT_CHAINS),  // firewall_check's own input_chains
+        ]);
+        let backend = Nftables::new(&runner);
+        let check = firewall_check(&backend, &runner);
+        assert!(!check.ok, "two candidate chains must not read as ok");
+        assert!(
+            check.remedy.contains("one base chain"),
+            "got: {}",
+            check.remedy
+        );
+    }
+
+    #[test]
+    fn nftables_no_input_chain_is_a_failure_that_says_the_port_is_reachable() {
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout("nftables v1.1.6"),
+            Output::stdout(NO_INPUT_CHAINS),
+        ]);
+        let backend = Nftables::new(&runner);
+        let check = firewall_check(&backend, &runner);
+        assert!(!check.ok);
+        assert!(
+            check.remedy.contains("already") && check.remedy.contains("reachable"),
+            "got: {}",
+            check.remedy
+        );
+    }
+
+    #[test]
+    fn nftables_accept_policy_with_no_drop_stays_ok_but_says_so_plainly() {
+        // The direction that misleads: everything is already allowed, so
+        // closing a port here does not make it unreachable. This must still
+        // read as "ok" (porthole did what it could prove), but the detail
+        // must say the dangerous part in words, not just imply it.
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout("nftables v1.1.6"),      // --version
+            Output::stdout(ONE_INPUT_CHAIN_ACCEPT), // health()'s list_chains
+            Output::stdout(NO_RULES),               // chain_itself_has_a_drop_or_reject
+            Output::stdout(ONE_INPUT_CHAIN_ACCEPT), // firewall_check's input_chains
+        ]);
+        let backend = Nftables::new(&runner);
+        let check = firewall_check(&backend, &runner);
+        assert!(check.ok);
+        assert!(
+            check.detail.contains("closing a port here"),
+            "the misleading direction must be spelled out, got: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn nftables_health_error_names_the_command_to_run_by_hand() {
+        // `nft --version` succeeds but `nft -j list chains` returns garbage --
+        // a version whose JSON shape porthole has never seen, say. health()
+        // propagates the parse failure as an `Err`, and the remedy must give
+        // someone something to actually run, not restate the failure.
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout("nftables v1.1.6"),
+            Output::stdout("not valid nft -j output"),
+        ]);
+        let backend = Nftables::new(&runner);
+        let check = firewall_check(&backend, &runner);
+        assert!(!check.ok);
+        assert!(
+            check.remedy.contains("nft -j list chains"),
+            "got: {}",
+            check.remedy
+        );
+    }
 
     #[test]
     fn answering_is_ok() {

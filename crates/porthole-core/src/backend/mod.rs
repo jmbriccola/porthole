@@ -228,10 +228,12 @@ mod tests {
         // family="ipv6" is the load-bearing part of this fixture, not the
         // source/port/protocol. `Firewalld::rich_rule` hardcodes
         // `family="ipv4"` in both of its match arms (porthole v1 does not
-        // manage IPv6 — see the module doc), so no `OpenRequest` porthole
-        // builds can ever produce an ipv6 rich rule. A rule that only varies
-        // the CIDR or port from `rich_rule`'s own template would not prove
-        // anything: porthole could have written that one too.
+        // manage IPv6 — `Target` in `model.rs`'s module doc is defined as
+        // always an already-resolved IPv4 network, and `net::current_network`
+        // in net.rs only ever resolves an IPv4 address), so no `OpenRequest`
+        // porthole builds can ever produce an ipv6 rich rule. A rule that only
+        // varies the CIDR or port from `rich_rule`'s own template would not
+        // prove anything: porthole could have written that one too.
         const USER_RULE: &str = r#"rule family="ipv6" source address="2001:db8::/32" port port="22" protocol="tcp" accept"#;
         let runner = RecordingRunner::with_responses(vec![
             Output::stdout(ROUTE_JSON),
