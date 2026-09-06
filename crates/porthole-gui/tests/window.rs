@@ -172,8 +172,19 @@ fn applications_own_activation_handler_also_realizes_a_window() -> Result<(), St
     }
 }
 
+/// One named check, run by `main` below. A type alias rather than spelling
+/// `(&str, fn() -> Result<(), String>)` out at the call site: clippy's
+/// `type_complexity` flagged the inline form (the actual finding from the
+/// milestone's first clippy pass over this crate -- `useless_vec` was a
+/// plausible guess at review time, but checked directly, it did not fire
+/// here even before this alias existed).
+type Case = (&'static str, fn() -> Result<(), String>);
+
 fn main() {
-    let cases: Vec<(&str, fn() -> Result<(), String>)> = vec![
+    // A plain array, not `vec![]`: the list is fixed at compile time and
+    // never grows, so there is nothing a `Vec` buys here, independently of
+    // what clippy does or does not flag.
+    let cases: [Case; 5] = [
         (
             "the_window_is_actually_realized_not_merely_constructed",
             the_window_is_actually_realized_not_merely_constructed,
