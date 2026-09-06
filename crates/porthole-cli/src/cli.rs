@@ -93,4 +93,24 @@ pub struct CloseArgs {
     /// Set when the expiry timer invokes the close. Not for humans.
     #[arg(long, hide = true)]
     pub from_timer: bool,
+
+    /// Drop the record of a rule without touching any firewall.
+    ///
+    /// Only for a rule recorded under a backend this machine no longer has
+    /// (`porthole list`/`--json` names it): reconciliation never removes
+    /// such an entry on its own, since it may still be sitting in whatever
+    /// firewall created it, and an ordinary `close` cannot reach it through
+    /// the backend now detected. Refused for anything else -- forgetting a
+    /// rule the current backend could actually close would leave it
+    /// enforced with no record left able to close it later.
+    ///
+    /// Not the same outcome on every backend: a forgotten ufw or nftables
+    /// rule is still closed automatically by the next `open` or `close` run
+    /// while that backend is current (reconciliation proves it is theirs and
+    /// sweeps it as an orphan) -- `status` and `list` will not, since they
+    /// never touch the firewall. A forgotten firewalld rule is never closed
+    /// at all: firewalld cannot prove a rich rule is its own, so no sweep
+    /// ever runs there.
+    #[arg(long, requires = "id")]
+    pub forget: bool,
 }

@@ -119,15 +119,32 @@ never renumbered.
 - **IPv6 is out of scope for version 1.** porthole only manages IPv4 rules. On a
   network with IPv6 enabled, opening or closing an IPv4 port tells you nothing
   about IPv6 reachability. Do not assume you are protected.
-- **Only firewalld is supported so far.** ufw and nftables are next.
+- **Three backends, chosen for you, never asked about.** porthole detects and
+  drives whichever firewall this machine already has installed — firewalld,
+  then ufw, then nftables, in that order — and each one has its own honest
+  limitation the others do not share, in a way you cannot see from the CLI
+  alone: firewalld can never prove which of its rich rules are porthole's, so
+  it will not remove one it did not create even after losing track of it;
+  ufw's rules survive a reboot until the next porthole command sweeps them;
+  and nftables refuses to guess when it cannot prove which chain decides a
+  packet's fate. See [docs/backends.md](docs/backends.md) for what each
+  backend can do, what it cannot, and why — `porthole doctor` also names the
+  one it found.
 - **Docker publishes ports below the firewall.** Docker writes its own iptables
   rules, evaluated before firewalld, so a container published on `0.0.0.0` is
   already reachable and closing that port with porthole will not close it.
   Detecting and explaining this is planned; right now porthole does not warn
   you. Publish container ports on `127.0.0.1` in your compose files.
-- **`firewall-cmd --reload` wipes porthole's rules without telling porthole.**
-  Until reconciliation lands, `porthole list` can show a rule that firewalld no
-  longer has. `porthole close --all` clears the stale entries.
+- **Reconciliation runs before every command, not continuously.** A
+  `firewall-cmd --reload`, a reboot, or a rule removed by hand between two
+  porthole commands is invisible until the next one runs — `porthole list`
+  can briefly claim a port is open that the firewall already dropped. That is
+  the safe direction: porthole over-reports exposure rather than
+  under-reporting it, and the next command corrects it on its own, with
+  nothing to run by hand. The one direction reconciliation deliberately does
+  not perform is removing a firewalld rich rule state does not know about —
+  firewalld rich rules carry no marker, so porthole can never prove such a
+  rule is its own to remove. See [docs/backends.md](docs/backends.md).
 - **No Flatpak, and there will not be one.** The privileged half of porthole is
   a polkit policy and a system D-Bus service; a Flatpak cannot install either.
 

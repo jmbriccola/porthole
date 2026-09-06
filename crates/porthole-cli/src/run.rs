@@ -39,18 +39,48 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
 
             let status = match backend::detect(runner.as_ref()) {
                 Ok(backend) => {
-                    // Never for_write: status only ever reads, regardless of
-                    // --dry-run.
-                    let engine = make_engine(backend.as_ref(), runner.as_ref(), false)?;
+                    // status only ever reads, regardless of --dry-run.
+                    // `Engine::status` reconciles read-only (`SweepMode::
+                    // ReadOnly`): it can update its own in-memory view of
+                    // what is actually open, but it never saves and never
+                    // touches the firewall -- see `reconcile.rs`.
+                    let mut engine = make_engine(backend.as_ref(), runner.as_ref())?;
                     engine.status()?
                 }
-                Err(Error::BackendUnavailable(detail)) => Status {
+                // Any failure to detect a backend at all -- not only the
+                // documented "no firewall installed" case -- must still
+                // answer in this shape. C1: `detect` used to also fail this
+                // way whenever the active backend's own privileged read
+                // errored (ufw and nftables both need root to say whether
+                // they are enforcing anything), and returning `Err` here made
+                // `status` exit non-zero with a raw error -- breaking the
+                // promise, two paragraphs up, that a script reading `--json`
+                // never has to handle two different top-level shapes. That
+                // specific case no longer reaches here (both backends now
+                // degrade `health()` instead of erroring), but folding every
+                // `detect` failure into this shape, not only
+                // `BackendUnavailable`, is what makes the promise hold
+                // regardless of what a future backend's `detect` path can
+                // fail with. That folding means `available: false` itself
+                // now covers two facts -- "no firewall is installed" and,
+                // more broadly, "detect could not tell" -- documented,
+                // deliberately without a field of its own, in
+                // `docs/json-schema.md`'s own paragraph on this collapse.
+                Err(e) => Status {
                     backend: BackendId::Firewalld,
                     health: BackendHealth {
                         available: false,
                         active: false,
+                        // A backend that could not even be detected is not
+                        // the same fact as one that was detected and could
+                        // not be read -- see `active_unknown`'s own doc
+                        // comment. `detect` failing this way means no
+                        // backend was ever available to ask, so there is
+                        // nothing left unresolved to call "unknown".
+                        active_unknown: false,
                         version: None,
-                        detail,
+                        detail: e.to_string(),
+                        caveat: None,
                     },
                     network: net::current_network(runner.as_ref()).ok(),
                     location: None,
@@ -58,7 +88,6 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
                         .rules()
                         .to_vec(),
                 },
-                Err(other) => return Err(other),
             };
 
             if cli.json {
@@ -113,7 +142,7 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
         // — first would defeat that.
         let runner = make_runner(cli);
         let backend = backend::detect(runner.as_ref())?;
-        let mut engine = make_engine(backend.as_ref(), runner.as_ref(), false)?;
+        let mut engine = make_engine(backend.as_ref(), runner.as_ref())?;
 
         let rule = engine.open(port, protocol, &scope, lifetime, requesting_uid())?;
         // Render against the rule's own opening instant rather than reading the
@@ -168,11 +197,26 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
         ));
     }
 
+    // Belt and braces: clap's own `requires = "id"` on `forget` does not
+    // reject `close <port> --forget` (verified by hand -- `id` also
+    // `conflicts_with_all(["port", ...])`, and clap does not treat that
+    // three-way combination as unsatisfiable the way a person reading the
+    // two declarations together would expect). Below this point, `forget`
+    // is read only inside the `args.id` branch, so without this check a
+    // port-based `close <port> --forget` would silently ignore `--forget`
+    // entirely and perform an ordinary close instead -- exactly the
+    // "implicit forgetting" the escape hatch must never be.
+    if args.forget && args.id.is_none() {
+        return Err(Error::InvalidArgument(
+            "--forget requires --id <ID> naming the exact rule to forget".to_string(),
+        ));
+    }
+
     if cli.dry_run {
         // Unchanged: local, unprivileged, no helper needed.
         let runner = make_runner(cli);
         let backend = backend::detect(runner.as_ref())?;
-        let mut engine = make_engine(backend.as_ref(), runner.as_ref(), false)?;
+        let mut engine = make_engine(backend.as_ref(), runner.as_ref())?;
 
         let mut failures: Vec<Error> = Vec::new();
         let closed = if args.all {
@@ -180,7 +224,7 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
             failures = errors;
             closed
         } else if let Some(id) = &args.id {
-            vec![engine.close_by_id(id, args.from_timer)?]
+            vec![engine.close_by_id(id, args.from_timer, args.forget)?]
         } else {
             vec![engine.close_by_port(
                 port.expect("a port, an id or --all was required above"),
@@ -193,14 +237,21 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
         if cli.json {
             println!(
                 "{}",
-                output::json_closed(&closed, &failures, now, true, &runner.recorded())
+                output::json_closed(
+                    &closed,
+                    &failures,
+                    now,
+                    true,
+                    args.forget,
+                    &runner.recorded()
+                )
             );
         } else {
             // "Nothing to close." would be a lie when there WAS something and
             // every attempt failed: the ports are still open. Say nothing on
             // stdout in that case and let the errors below speak.
             if !closed.is_empty() || failures.is_empty() {
-                output::print_closed(&closed, true);
+                output::print_closed(&closed, true, args.forget);
             }
             for error in &failures {
                 eprintln!("porthole: {error}");
@@ -227,7 +278,12 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
             // at the client, or the helper cannot tell a timer-triggered
             // close from an ordinary one — see
             // `porthole_helper::service::Porthole::close_by_id`.
-            vec![client::close_by_id(cli.session, id, args.from_timer)?]
+            vec![client::close_by_id(
+                cli.session,
+                id,
+                args.from_timer,
+                args.forget,
+            )?]
         } else {
             vec![client::close(
                 cli.session,
@@ -240,11 +296,11 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
             let now = SystemClock.now();
             println!(
                 "{}",
-                output::json_closed(&closed, &failures, now, false, &[])
+                output::json_closed(&closed, &failures, now, false, args.forget, &[])
             );
         } else {
             if !closed.is_empty() || failures.is_empty() {
-                output::print_closed(&closed, false);
+                output::print_closed(&closed, false, args.forget);
             }
             for error in &failures {
                 eprintln!("porthole: {error}");
@@ -274,22 +330,24 @@ fn make_runner(cli: &Cli) -> Box<dyn CommandRunner> {
     }
 }
 
-/// `for_write` is `true` only for the call sites that can actually save: `open`
-/// and `close`, and only when they are not `--dry-run`. `status` never saves —
-/// no matter what `--dry-run` says — so it always passes `false`: taking the
-/// lock would call `ensure_dir` on `/run/porthole`, which an unprivileged user
-/// cannot create, and `porthole status` is documented to need no privileges.
+/// Always opens the state store non-exclusively, on purpose: every real
+/// (non-dry-run) `open`/`close` crosses the bus via `client::*` instead of
+/// building an `Engine` here at all (see `open`/`close` below), so the only
+/// local `Engine`s this binary ever constructs are for `--dry-run` and for
+/// `status` -- and `status` never writes, regardless of `--dry-run`. Taking
+/// the exclusive lock would call `ensure_dir` on `/run/porthole`, which an
+/// unprivileged user cannot create, and neither of these callers is
+/// documented to need any privilege at all. There is deliberately no
+/// `for_write` parameter here any more: one existed, but every call site
+/// passed `false`, since `open_exclusive`'s branch had no caller that could
+/// ever reach it from this binary -- a doc comment describing the unreachable
+/// branch as real is exactly how that went unnoticed.
 fn make_engine<'a>(
     backend: &'a dyn FirewallBackend,
     runner: &'a dyn CommandRunner,
-    for_write: bool,
 ) -> Result<Engine<'a>> {
     let path = StateStore::default_path();
-    let state = if for_write {
-        StateStore::open_exclusive(path)?
-    } else {
-        StateStore::open(path)?
-    };
+    let state = StateStore::open(path)?;
     let executable = std::env::current_exe()
         .map_err(|e| Error::Unexpected(format!("could not determine porthole's own path: {e}")))?;
     Ok(Engine::new(

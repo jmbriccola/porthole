@@ -1,0 +1,24 @@
+# The nftables image: the reachability test runs here.
+#
+# `-Syu`, not a bare `-Sy` plus package names: installing new packages against
+# a stale local package database is an unsupported "partial upgrade" on Arch,
+# and it is not a theoretical warning -- it reproduced a real failure while
+# this image was being put together (`nft` refusing to run at all: "version
+# `LIBNFTNL_19' not found", because the base image's libnftnl predated the
+# nftables package pacman wanted to install). `-Syu` upgrades the base image's
+# packages together with the new ones in one transaction, which is what
+# avoids it.
+#
+# `socat` is the TCP listener/probe for the reachability check; `util-linux`
+# supplies `unshare` and `nsenter`, which build the peer network namespace
+# `ip netns` cannot -- rootless podman's `mount --make-shared /run/netns`
+# fails, verified in milestone-3-verified-facts.md.
+FROM docker.io/library/archlinux:latest
+
+RUN pacman -Syu --noconfirm --needed \
+      nftables \
+      iproute2 \
+      socat \
+      util-linux \
+      procps-ng \
+      dbus

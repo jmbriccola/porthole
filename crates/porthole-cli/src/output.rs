@@ -4,6 +4,7 @@
 //! The JSON shape is a public interface and is documented in
 //! `docs/json-schema.md`. Add fields; do not rename or remove them.
 
+use porthole_core::backend::BackendId;
 use porthole_core::command::Command;
 use porthole_core::engine::Status;
 use porthole_core::error::Error;
@@ -60,7 +61,19 @@ pub fn json_status(status: &Status, now: u64) -> Value {
         "backend": status.backend.to_string(),
         "firewall_available": status.health.available,
         "firewall_active": status.health.active,
+        // `false` in every case that exists before this field was added, and
+        // a script reading only `firewall_active` behaves exactly as it
+        // always has: this is `true` only in the one new case --
+        // `firewall_active: false` because ufw or nftables refused a
+        // permission-denied ruleset read, not because porthole confirmed
+        // nothing is enforcing. Without this, a script has strictly less
+        // information than a human running plain `status`, who at least
+        // sees `firewall_caveat`-adjacent detail prose explaining the
+        // difference -- see `BackendHealth::active_unknown`'s own doc
+        // comment for why the two facts cannot share one boolean.
+        "firewall_active_unknown": status.health.active_unknown,
         "firewall_version": status.health.version,
+        "firewall_caveat": status.health.caveat,
         "location": status.location,
         "network": status.network.as_ref().map(|n| json!({
             "interface": n.interface,
@@ -69,6 +82,18 @@ pub fn json_status(status: &Status, now: u64) -> Value {
         })),
         "rules": status.rules.iter().map(|r| rule_json(r, now)).collect::<Vec<_>>(),
     })
+}
+
+/// The label `print_status` puts in front of `location` -- the concept
+/// `location` names is different per backend (a firewalld zone is not a ufw
+/// chain), so the word in front of it has to change too, or the label lies
+/// for two out of three backends.
+fn location_label(backend: BackendId) -> &'static str {
+    match backend {
+        BackendId::Firewalld => "Zone",
+        BackendId::Ufw => "Location",
+        BackendId::Nftables => "Chain",
+    }
 }
 
 fn error_json(error: &Error) -> Value {
@@ -174,33 +199,93 @@ pub fn print_dry_run(commands: &[Command]) {
 /// `--all` can partly succeed, so failures belong inside this object rather
 /// than in a second one printed afterwards: two top-level objects on stdout
 /// are unparseable by any JSON reader.
+///
+/// `forgotten` is `--forget`: the eighth instance of this milestone's own
+/// pattern was this function itself, immediately below `print_closed`'s own
+/// guard against exactly this, putting a forgotten rule in `closed` --
+/// which `docs/json-schema.md` documents as "rules that closed" -- when
+/// nothing was closed in any firewall, only porthole's own record was
+/// dropped. A script (or a GUI reading `WireStatus`) that trusted `closed`
+/// here would record a port as shut that may still be open in a firewall
+/// porthole can no longer reach.
+///
+/// `rules` goes into `forgotten` instead of `closed` when `forgotten` is
+/// `true`, never both: `--forget` always resolves to at most one rule (see
+/// `Engine::close_by_id`'s own doc comment), so a single call is either an
+/// ordinary close/close-all or a forget, never a mix.
 pub fn json_closed(
     rules: &[ManagedRule],
     errors: &[Error],
     now: u64,
     dry_run: bool,
+    forgotten: bool,
     commands: &[Command],
 ) -> Value {
+    let rule_jsons: Vec<Value> = rules.iter().map(|r| rule_json(r, now)).collect();
+    let (closed, forgotten_rules) = if forgotten {
+        (Vec::new(), rule_jsons)
+    } else {
+        (rule_jsons, Vec::new())
+    };
     json!({
         "schema": JSON_SCHEMA,
         "dry_run": dry_run,
-        "closed": rules.iter().map(|r| rule_json(r, now)).collect::<Vec<_>>(),
+        "closed": closed,
+        "forgotten": forgotten_rules,
         "errors": errors.iter().map(error_json).collect::<Vec<_>>(),
         "commands": commands.iter().map(Command::display).collect::<Vec<_>>(),
     })
 }
 
-pub fn print_closed(rules: &[ManagedRule], dry_run: bool) {
+/// `forgotten` is `--forget`: nothing was closed in any firewall, only
+/// porthole's own record of the rule was dropped, so saying "Closed" would
+/// be exactly the overclaim the rest of this milestone spent so much effort
+/// removing elsewhere. `--forget` only ever resolves to a single rule (see
+/// `Engine::close_by_id`'s own doc comment), but `rules` still takes a slice
+/// so this stays one function for every shape `close` can report.
+pub fn print_closed(rules: &[ManagedRule], dry_run: bool, forgotten: bool) {
     if rules.is_empty() {
         println!("Nothing to close.");
         return;
     }
-    let verb = if dry_run { "Would close" } else { "Closed" };
+    let verb = match (dry_run, forgotten) {
+        (false, false) => "Closed",
+        (true, false) => "Would close",
+        (false, true) => "Forgot",
+        (true, true) => "Would forget",
+    };
     for rule in rules {
+        let suffix = if forgotten {
+            " (no firewall was touched)"
+        } else {
+            ""
+        };
         println!(
-            "{verb} {}/{} towards {}",
+            "{verb} {}/{} towards {}{suffix}",
             rule.port, rule.protocol, rule.target
         );
+    }
+}
+
+/// The word `print_status` puts in parentheses after the backend's name and
+/// version -- split out from `print_status` itself so this three-way choice
+/// is testable without capturing stdout.
+///
+/// Three states, not two: `active: false` alone does not mean "confirmed not
+/// running" -- ufw and nftables can also come back this way when porthole
+/// could not read enough of the ruleset to tell (see
+/// `BackendHealth::active_unknown`). Printing "NOT running" for that case
+/// would tell an unprivileged user their port is already reachable when the
+/// truth is porthole simply could not see the ruleset -- false in the
+/// dangerous direction, and the same claim `doctor`'s remedy selection
+/// exists to avoid making.
+fn firewall_state_word(health: &porthole_core::backend::BackendHealth) -> &'static str {
+    if health.active {
+        "running"
+    } else if health.active_unknown {
+        "unknown"
+    } else {
+        "NOT running"
     }
 }
 
@@ -209,16 +294,15 @@ pub fn print_status(status: &Status, now: u64) {
         // Not "firewalld (NOT running)" — there is no firewalld to run.
         "none installed".to_string()
     } else {
-        match (&status.health.version, status.health.active) {
-            (Some(v), true) => format!("{} {} (running)", status.backend, v),
-            (Some(v), false) => format!("{} {} (NOT running)", status.backend, v),
-            (None, true) => format!("{} (running)", status.backend),
-            (None, false) => format!("{} (NOT running)", status.backend),
+        let state = firewall_state_word(&status.health);
+        match &status.health.version {
+            Some(v) => format!("{} {} ({state})", status.backend, v),
+            None => format!("{} ({state})", status.backend),
         }
     };
     println!("Firewall  {firewall}");
     if let Some(location) = &status.location {
-        println!("Zone      {location}");
+        println!("{:<9} {location}", location_label(status.backend));
     }
     match &status.network {
         Some(n) => println!("Network   {} · {}", n.interface, n.cidr),
@@ -228,12 +312,33 @@ pub fn print_status(status: &Status, now: u64) {
 
     if status.health.available && !status.health.active {
         println!("{}", status.health.detail);
-        println!(
-            "While the firewall is not running, nothing porthole does changes what is reachable."
-        );
+        if status.health.active_unknown {
+            // Do not repeat the confirmed-inactive sentence below: it
+            // asserts the firewall is not running, which is exactly the
+            // claim this state cannot support either way.
+            println!(
+                "porthole could not confirm whether this firewall is enforcing anything -- \
+                 see the detail above for why."
+            );
+        } else {
+            println!(
+                "While the firewall is not running, nothing porthole does changes what is \
+                 reachable."
+            );
+        }
         println!();
     } else if !status.health.available {
         println!("{}", status.health.detail);
+        println!();
+    } else if let Some(caveat) = &status.health.caveat {
+        // A caveat is a standing property of an *active, available* backend
+        // (nftables' accepting-chain warning is the only one today) — the
+        // two branches above already cover "not active"/"not installed", so
+        // this is reached only when neither of those applies. `status` is
+        // where a user actually looks; leaving this out here just because
+        // `active` reads as healthy is exactly the safe-looking silence
+        // docs/backends.md promises does not happen.
+        println!("{caveat}");
         println!();
     }
 
@@ -332,8 +437,10 @@ mod tests {
             health: BackendHealth {
                 available: false,
                 active: false,
+                active_unknown: false,
                 version: None,
                 detail: "no supported firewall found".to_string(),
+                caveat: None,
             },
             network: None,
             location: None,
@@ -343,9 +450,153 @@ mod tests {
         let json = json_status(&status, 1_757_000_000);
         assert_eq!(json["firewall_available"], false);
         assert_eq!(json["firewall_active"], false);
+        // No firewall at all is not the permission-denied case: there is
+        // nothing porthole failed to read, only nothing to read at all.
+        assert_eq!(json["firewall_active_unknown"], false);
         assert!(json["firewall_version"].is_null());
+        assert!(json["firewall_caveat"].is_null());
         assert!(json["network"].is_null());
         assert!(json["location"].is_null());
+    }
+
+    #[test]
+    fn a_standing_caveat_reaches_json_status_even_while_active() {
+        // The bug this guards against: `print_status`/`json_status` used to
+        // gate all of `health.detail` on `!active`, so a caveat that only
+        // exists when the backend *is* active (nftables' accepting-chain
+        // warning) could never reach a script reading `--json`, or a person
+        // reading plain `status`. `caveat` must not depend on `active` to be
+        // seen.
+        use porthole_core::backend::{BackendHealth, BackendId};
+        use porthole_core::engine::Status;
+
+        let status = Status {
+            backend: BackendId::Nftables,
+            health: BackendHealth {
+                available: true,
+                active: true,
+                active_unknown: false,
+                version: Some("1.1.6".to_string()),
+                detail: "1.1.6: inet filter input is enforcing".to_string(),
+                caveat: Some(
+                    "its policy is accept and no rule in this chain drops or rejects".to_string(),
+                ),
+            },
+            network: None,
+            location: Some("inet filter input".to_string()),
+            rules: Vec::new(),
+        };
+
+        let json = json_status(&status, 1_757_000_000);
+        assert_eq!(json["firewall_active"], true);
+        assert_eq!(
+            json["firewall_caveat"],
+            "its policy is accept and no rule in this chain drops or rejects"
+        );
+    }
+
+    #[test]
+    fn a_healthy_backend_with_no_caveat_has_a_null_json_caveat() {
+        // The other half of the same guard: a backend with nothing special
+        // to say must not invent one, or every plain "it's fine" status
+        // would grow a phantom caveat.
+        use porthole_core::backend::{BackendHealth, BackendId};
+        use porthole_core::engine::Status;
+
+        let status = Status {
+            backend: BackendId::Firewalld,
+            health: BackendHealth {
+                available: true,
+                active: true,
+                active_unknown: false,
+                version: Some("2.4.4".to_string()),
+                detail: "firewalld 2.4.4 is running".to_string(),
+                caveat: None,
+            },
+            network: None,
+            location: Some("FedoraWorkstation".to_string()),
+            rules: Vec::new(),
+        };
+
+        let json = json_status(&status, 1_757_000_000);
+        assert!(json["firewall_caveat"].is_null());
+    }
+
+    #[test]
+    fn the_unknown_activity_state_never_reads_as_confirmed_not_running() {
+        // Follow-up to C1: `print_status` used to have only two states
+        // (running / NOT running), keyed on `active` alone. A
+        // permission-denied ufw or nftables read comes back `active: false`
+        // too, and printing "NOT running" for that would tell an
+        // unprivileged user their port is already reachable when porthole
+        // in fact could not see the ruleset at all -- false in the
+        // dangerous direction. Assert on the property (the confirmed-not-
+        // running word is absent), not the exact wording of the word this
+        // state does print, so a future rewording of either cannot quietly
+        // collapse the two states back together.
+        //
+        // Both renderers are checked against the *same* fixture here rather
+        // than in two separate tests, human (`firewall_state_word`, the
+        // piece `print_status` uses) and machine (`json_status`'s
+        // `firewall_active_unknown`) alike: a script reading `--json` has no
+        // sentence to fall back on the way a human reading `detail` does, so
+        // it needs this distinction at least as much, and the two output
+        // modes disagreeing about what exists is exactly the hazard this
+        // milestone has already had once.
+        use porthole_core::backend::{BackendHealth, BackendId};
+        use porthole_core::engine::Status;
+
+        let confirmed_inactive = BackendHealth {
+            available: true,
+            active: false,
+            active_unknown: false,
+            version: None,
+            detail: String::new(),
+            caveat: None,
+        };
+        assert_eq!(firewall_state_word(&confirmed_inactive), "NOT running");
+
+        let unknown = BackendHealth {
+            available: true,
+            active: false,
+            active_unknown: true,
+            version: None,
+            detail: String::new(),
+            caveat: None,
+        };
+        let word = firewall_state_word(&unknown);
+        assert_ne!(
+            word, "NOT running",
+            "an unread ruleset must not print the same word as a confirmed one"
+        );
+        assert_ne!(word, "running", "porthole did not confirm this either");
+
+        let status = Status {
+            backend: BackendId::Ufw,
+            health: unknown,
+            network: None,
+            location: None,
+            rules: Vec::new(),
+        };
+        let json = json_status(&status, 1_757_000_000);
+        assert_eq!(
+            json["firewall_active"], false,
+            "unchanged: a script reading only this field must behave exactly as before"
+        );
+        assert_eq!(
+            json["firewall_active_unknown"], true,
+            "a script that cares can now tell this apart from a confirmed-inactive backend"
+        );
+    }
+
+    #[test]
+    fn location_label_names_the_concept_each_backend_actually_uses() {
+        // "Zone" printed for a ufw or nftables location would be a label
+        // that means nothing there -- see docs/json-schema.md's own table of
+        // what `location` holds per backend.
+        assert_eq!(location_label(BackendId::Firewalld), "Zone");
+        assert_eq!(location_label(BackendId::Ufw), "Location");
+        assert_eq!(location_label(BackendId::Nftables), "Chain");
     }
 
     #[test]
@@ -366,6 +617,7 @@ mod tests {
             &[Error::RuleNotFound("9999/tcp".to_string())],
             1_757_000_000,
             false,
+            false,
             &[],
         );
         assert_eq!(json["schema"], 1);
@@ -373,5 +625,39 @@ mod tests {
         assert_eq!(json["errors"].as_array().unwrap().len(), 1);
         assert_eq!(json["errors"][0]["kind"], "rule_not_found");
         assert_eq!(json["errors"][0]["code"], 7);
+    }
+
+    #[test]
+    fn json_closed_never_reports_a_forgotten_rule_as_closed() {
+        // The eighth instance of this milestone's own pattern: `print_closed`
+        // was taught never to say "Closed" for a forget, in the same commit
+        // that left this function saying exactly that in `closed` -- which
+        // `docs/json-schema.md` documents as "rules that closed". A script
+        // (or a GUI reading `WireStatus`, widened one wave ago for precisely
+        // this reason) trusting `closed` here would record a port as shut
+        // that may still be open in a firewall porthole can no longer reach.
+        let json = json_closed(&[rule()], &[], 1_757_000_000, true, true, &[]);
+        assert_eq!(
+            json["closed"].as_array().unwrap().len(),
+            0,
+            "a forgotten rule must never appear in `closed`: {json}"
+        );
+        let forgotten = json["forgotten"].as_array().unwrap();
+        assert_eq!(
+            forgotten.len(),
+            1,
+            "it must appear in `forgotten` instead: {json}"
+        );
+        assert_eq!(forgotten[0]["id"], "1f0c8b6e-0000-4000-8000-000000000001");
+    }
+
+    #[test]
+    fn json_closed_puts_an_ordinary_close_in_closed_never_forgotten() {
+        // The other half of the same guard: an ordinary close (or close
+        // --all) must not grow a phantom `forgotten` entry just because the
+        // field exists now.
+        let json = json_closed(&[rule()], &[], 1_757_000_000, false, false, &[]);
+        assert_eq!(json["closed"].as_array().unwrap().len(), 1);
+        assert_eq!(json["forgotten"].as_array().unwrap().len(), 0);
     }
 }

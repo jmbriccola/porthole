@@ -80,6 +80,14 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    /// Also what `lock_exclusive` returns when the exclusive state lock could
+    /// not be acquired within its bounded wait -- see `state::lock_exclusive`
+    /// for why that wait is bounded rather than indefinite in the first
+    /// place. Not split into its own variant: nothing today gives a caller
+    /// anything useful to do with "the lock was busy" that "a state error
+    /// happened" does not already cover, and a dedicated exit code no
+    /// invocation could actually produce would be documented for a signal no
+    /// one could observe.
     #[error("state file {path}: {detail}")]
     State { path: String, detail: String },
 

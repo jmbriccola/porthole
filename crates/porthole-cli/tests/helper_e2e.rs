@@ -3,11 +3,46 @@
 //!
 //! A real `porthole-helper` runs as a child process on the session bus and the
 //! real `porthole` binary drives it. What this proves and what it cannot is
-//! written out in each test — the helper talks to the real firewalld, whose own
-//! polkit policy requires an admin password for config actions, so an ordinary
-//! user cannot change the firewall through it. That makes this safe to run, and
-//! it means the "firewalld agrees" half belongs to the human checklist.
+//! written out in each test.
+//!
+//! # Why this is safe to run, precisely
+//!
+//! An earlier version of this comment said the reason was that the helper
+//! talks to the real firewalld, whose own polkit policy requires an admin
+//! password for config actions. That is true of the ordinary `open`/`close`
+//! path, but it is backend-specific, and it stopped being the whole story the
+//! moment this milestone added reconciliation: starting the helper at all --
+//! for *every* test below, not only the ones that call `open` or `close` --
+//! runs its start-up sweep (`reconcile_at_startup` in `porthole-helper`'s
+//! `main.rs`) against whatever firewall backend this real machine actually
+//! has, before any client request exists to gate it.
+//!
+//! What actually makes that safe:
+//!
+//! - On firewalld, the sweep can never remove a rule it did not create --
+//!   rich rules carry no marker, so `Ownership::Unprovable` skips that half
+//!   of reconciliation outright, on every account, privileged or not.
+//! - On ufw or nftables, the sweep *can* prove ownership and does remove an
+//!   orphan it finds, straight through `ufw`/`nft` rather than through
+//!   firewalld's D-Bus/polkit path -- so this suite's `--session`
+//!   `AlwaysAllow` authorizer (which stands in for polkit here) has no
+//!   bearing on it at all. The only thing standing between that sweep and a
+//!   real rule on either of those backends is the OS's own root check on
+//!   `ufw`/`nft` themselves.
+//!
+//! So the condition this suite's safety actually depends on is: this process
+//! is not genuinely root, or the detected backend is one whose sweep cannot
+//! remove anything (firewalld). `start_helper` below checks exactly that and
+//! refuses to start the helper otherwise, rather than let a start-up sweep
+//! mutate a real firewall on the machine running the tests. Run as an
+//! ordinary user, nothing in this file can mutate the real firewall on any
+//! backend: reaching the ordinary `open`/`close` mutations still needs
+//! firewalld's own polkit (which refuses an unauthenticated request) or, on
+//! ufw/nftables, real root that an ordinary test process does not have
+//! either.
 
+use porthole_core::backend::{self, BackendId};
+use porthole_core::command::RealRunner;
 use std::process::{Child, Command, Stdio};
 use tempfile::TempDir;
 
@@ -21,7 +56,7 @@ impl Drop for Helper {
     }
 }
 
-/// All five tests below spawn a helper claiming the *same* well-known name on
+/// All six tests below spawn a helper claiming the *same* well-known name on
 /// the *same* session bus, and `cargo test` runs the `#[test]` functions in
 /// one process on separate threads by default. Two helpers racing for that
 /// one name — or one test's `Drop` killing its helper while another test's
@@ -43,6 +78,31 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// The backend whose start-up reconciliation sweep could remove a real rule
+/// from this machine's real firewall if the helper were started right now --
+/// see the module docs for why this is the condition this suite's safety
+/// actually depends on, not "the helper talks to firewalld".
+///
+/// Two things have to hold at once: this process is genuinely root (not
+/// merely authorized by this suite's own `--session` `AlwaysAllow`, which the
+/// sweep bypasses entirely -- it runs before the bus is even served), and the
+/// backend `backend::detect` finds on this real machine is one whose sweep
+/// can prove ownership (`Ufw` or `Nftables`; firewalld's rich rules cannot be
+/// marked, so its half of reconciliation that removes an orphan never runs at
+/// all, on any account). `detect` failing outright -- no firewall installed
+/// on this machine at all -- is the same as firewalld for this purpose:
+/// nothing for the sweep to touch either way, so that case returns `None`
+/// too.
+fn unsafe_startup_sweep_backend() -> Option<BackendId> {
+    if !is_root() {
+        return None;
+    }
+    match backend::detect(&RealRunner).map(|b| b.id()) {
+        Ok(id @ (BackendId::Ufw | BackendId::Nftables)) => Some(id),
+        _ => None,
+    }
+}
+
 /// `CARGO_BIN_EXE_<name>` only ever resolves for a binary target in the *same*
 /// package as the integration test — verified empirically, since it is easy
 /// to assume (as this test once did) that it reaches across the workspace to
@@ -60,7 +120,7 @@ fn helper_bin() -> std::path::PathBuf {
 
 /// Every reason [`start_helper`] can fail to hand back a running helper, each
 /// carrying enough to say *which* it was rather than one blanket "skipped"
-/// that hides all four behind the same sentence — which is exactly how a
+/// that hides all five behind the same sentence — which is exactly how a
 /// missing `porthole` at `/usr/bin` and `/usr/local/bin` made every test below
 /// silently skip while `cargo test` still reported the suite `ok`.
 enum StartFailure {
@@ -75,6 +135,13 @@ enum StartFailure {
     /// The process is still alive, but never showed up on the session bus
     /// within the timeout — a missing session bus, or `busctl` unavailable.
     NeverAppearedOnTheBus,
+    /// Starting the helper here, right now, would let its start-up
+    /// reconciliation sweep run as genuine root against a backend whose
+    /// orphan removal can actually prove ownership — see the module docs.
+    /// Refused rather than risk a real rule on the machine running the
+    /// suite: there is no way to let the sweep run without also letting it
+    /// act.
+    UnsafeStartupSweep(BackendId),
 }
 
 impl StartFailure {
@@ -100,6 +167,13 @@ impl StartFailure {
                  bus within 5s — no session bus reachable, or `busctl` unavailable"
                     .to_string()
             }
+            StartFailure::UnsafeStartupSweep(id) => format!(
+                "running as root with {id} detected — starting the helper would let its \
+                 start-up reconciliation sweep remove a real {id} rule this machine may \
+                 actually be enforcing, with no polkit and no authorization step in the \
+                 way. Skipped rather than risk it; run this suite as an ordinary user \
+                 instead"
+            ),
         }
     }
 }
@@ -108,6 +182,16 @@ fn start_helper(state: &std::path::Path) -> Result<Helper, StartFailure> {
     // --session is debug-only, so this test cannot run under --release.
     if !cfg!(debug_assertions) {
         return Err(StartFailure::ReleaseBuild);
+    }
+
+    // C2: refuse before ever spawning the helper -- see the module docs and
+    // `unsafe_startup_sweep_backend`'s own doc comment for exactly what this
+    // guards against. Checked here, once, rather than in each test: every
+    // single test below goes through this function, and the start-up sweep
+    // this guards against runs unconditionally the moment the helper starts,
+    // whether or not the test that started it ever calls `open` or `close`.
+    if let Some(id) = unsafe_startup_sweep_backend() {
+        return Err(StartFailure::UnsafeStartupSweep(id));
     }
 
     let bin = helper_bin();
@@ -333,7 +417,7 @@ fn an_open_reaches_the_firewall_and_changes_nothing_when_refused() {
 }
 
 #[test]
-fn closing_a_seeded_rule_reaches_the_real_backend_and_never_falsely_reports_success() {
+fn closing_a_seeded_phantom_rule_is_pruned_by_reconciliation_not_falsely_reported_open() {
     // I6: the previous version of this test claimed to prove the audit trail
     // names the requesting uid, but called `close 5173` (which fails
     // `RuleNotFound` before `log_close` is ever reached) and `list` (which
@@ -348,64 +432,41 @@ fn closing_a_seeded_rule_reaches_the_real_backend_and_never_falsely_reports_succ
     // this machine's own default zone but a rich rule that was never actually
     // added.
     //
-    // What I investigated and could not get past: `Porthole::close_by_id`
-    // only calls `log_close` *after* `backend.close` returns `Ok`, and on
-    // this machine (and, per the module doc comment above, deliberately on
-    // every machine this suite runs on) an unauthenticated `firewall-cmd
-    // --remove-rich-rule` never returns `Ok` — with no polkit agent
-    // registered to answer firewalld's own internal authorization check for a
-    // config-changing method call, the D-Bus call does not fail fast: it
-    // hangs for firewalld's own ~25s reply timeout and then fails with a
-    // generic "Did not receive a reply", regardless of whether the rule
-    // being removed exists, and regardless of the zone named. So this test
-    // cannot reach `log_close` for real, and does not claim to. What is
-    // proven instead, quickly and without touching any firewall, is the
-    // *format* of the audit line:
+    // Before reconciliation (milestone 3, task 5) existed, that made
+    // `close --id` reach a real, unauthorized `firewall-cmd
+    // --remove-rich-rule` call, which -- with no polkit agent registered to
+    // answer firewalld's own internal authorization check -- hung for
+    // firewalld's own ~25s reply timeout before failing. This test used to
+    // assert exactly that slow failure, and skip itself entirely when run as
+    // root (where the removal would have gone through for real instead).
+    //
+    // Reconciliation changes the outcome, and makes it strictly better:
+    // `Engine::close_by_id` now reconciles state against the firewall first
+    // (see `porthole_core::reconcile`), which lists this machine's real rich
+    // rules -- a read, needing no authorization at all -- and finds that the
+    // seeded rule's rich rule genuinely is not among them. It is dropped
+    // from state as stale *before* `close_by_id`'s own lookup ever runs, so
+    // the close fails fast with "no rule matches" instead of hanging for 25
+    // seconds attempting a removal that could only ever fail. There is no
+    // longer a privileged-vs-unprivileged split to guard against either: the
+    // removal this test used to worry about as root never happens for this
+    // rule now, on any account, because reconciliation prunes it first.
+    //
+    // What this test proves end to end: reconciliation reaches the real
+    // backend (a real `firewall-cmd --list-rich-rules` against this
+    // machine's own zone, not a fake one), correctly decides the seeded rule
+    // is not there, and prunes it -- quickly, and without ever attempting
+    // the doomed removal the old version of this test had to wait out.
+    //
+    // `log_close`'s audit-line format is proven separately and directly:
     // `porthole_helper::service::tests::the_close_line_names_both_uids_when_they_differ`
-    // calls `format_close_log` directly and checks both uids appear in it.
-    //
-    // That is not proof that `log_close` is ever called. `log_close`
-    // (`service.rs:323-325`) is a different function -- it just wraps
-    // `format_close_log`'s output in an `eprintln!` -- and nothing in this
-    // suite calls it. Deleting `log_close` and its three call sites
-    // (`service.rs:183,225,259`) would leave every test green; the only
-    // tripwire is indirect, `format_close_log` becoming dead code and
-    // failing the build under `-D warnings`, not a test asserting the call
-    // happens.
-    //
-    // No test closes that gap because `Porthole::close_by_id`,
-    // `Porthole::close_all` and `Porthole::status` all construct `RealRunner`
-    // and call `backend::detect` internally, with no seam through which a
-    // fake backend could be injected to make a close succeed
-    // deterministically and observe `log_close` actually firing. Adding that
-    // seam is a bigger change than this one.
-    //
-    // What this test does prove end to end: a close that reaches a real,
-    // unauthorized backend fails as a real failure — not a silent or false
-    // success — and the rule stays recorded as open rather than being
-    // dropped from state on a close that never really happened. Since the
-    // underlying D-Bus call is the ~25s timeout described above, this test is
-    // slow by the same amount `an_open_reaches_the_firewall_and_changes_nothing_when_refused`
-    // above already is, for the same underlying reason.
-    //
-    // That reasoning holds only when this test itself is unprivileged: as
-    // root, firewalld would not require an interactive polkit answer for a
-    // local root caller, so the close's `Some(0)` branch below would run for
-    // real — a real `firewall-cmd --remove-rich-rule` against this machine's
-    // default zone. Harmless here since the seeded rule (TEST-NET-3, port
-    // 25198) was never actually added, but it is the same class of test
-    // `an_open_reaches_the_firewall_and_changes_nothing_when_refused` already
-    // guards against, and the inconsistency is what would get copied next
-    // time. `cli.rs` guards its own real-firewall tests the same way.
-    if is_root() {
-        eprintln!("skipped: running as root, where firewalld would not refuse this close");
-        return;
-    }
+    // calls `format_close_log` and checks both uids appear in it. This test
+    // does not reach `log_close` -- reconciliation prunes the rule before
+    // `close_by_id` gets far enough to call it -- and does not claim to.
     let _guard = lock_helper();
     let dir = TempDir::new().unwrap();
     let state = dir.path().join("state.json");
 
-    const OPENER_UID: u32 = 999_999;
     const RULE_ID: &str = "i6-seeded-rule";
     const PORT: u16 = 25198;
     const CIDR: &str = "203.0.113.0/24"; // TEST-NET-3: never a real subnet.
@@ -423,7 +484,7 @@ fn closing_a_seeded_rule_reaches_the_real_backend_and_never_falsely_reports_succ
             "backend": "firewalld",
             "opened_at": 1_757_000_000_u64,
             "expires_at": null,
-            "uid": OPENER_UID,
+            "uid": 999_999,
             "handle": {"backend": "firewalld", "zone": zone, "rich_rule": rich_rule},
         }]
     });
@@ -431,45 +492,88 @@ fn closing_a_seeded_rule_reaches_the_real_backend_and_never_falsely_reports_succ
         .expect("seed the state file");
 
     let mut helper = start_or_skip!(&state);
-
+    let started = std::time::Instant::now();
     let out = cli(&state, &["close", "--id", RULE_ID]);
+    let elapsed = started.elapsed();
 
-    // Stop the helper so its stderr closes, then read what it wrote.
     let _ = helper.0.kill();
     let _ = helper.0.wait();
-    let mut text = String::new();
-    if let Some(mut err) = helper.0.stderr.take() {
-        use std::io::Read;
-        let _ = err.read_to_string(&mut text);
-    }
 
-    if out.status.code() == Some(0) {
-        // Not what this environment does (see above), but if some other
-        // environment's polkit configuration auto-grants this instead of
-        // hanging, the close really did succeed and really did reach
-        // `log_close` — so hold it to the full claim in that case.
-        let closer_uid = unsafe { libc::getuid() };
-        assert!(
-            text.contains(&format!("opened by uid={OPENER_UID}")),
-            "the opener's uid is missing from the close audit line, got: {text}"
-        );
-        assert!(
-            text.contains(&format!("closed by uid={closer_uid}")),
-            "the closer's uid is missing from the close audit line, got: {text}"
-        );
-    } else {
-        // The expected outcome here: a real failure, reported as one.
-        assert_ne!(
-            out.status.code(),
-            Some(7),
-            "the rule was seeded and must be found, not reported as missing; stderr: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let state_text = std::fs::read_to_string(&state).expect("the state file still exists");
-        assert!(
-            state_text.contains(RULE_ID),
-            "a close that failed at the backend must not drop the rule from \
-             state -- that would claim a port is shut when it is not: {state_text}"
-        );
-    }
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "reconciliation must prune the phantom rule before close_by_id's own \
+         lookup runs, so this must report RuleNotFound, not any other \
+         outcome; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "reconciliation only reads the real rich rules, which needs no \
+         authorization; taking anywhere near the old ~25s polkit timeout \
+         would mean it did not prune the rule first, got {elapsed:?}"
+    );
+
+    let state_text = std::fs::read_to_string(&state).expect("the state file still exists");
+    assert!(
+        !state_text.contains(RULE_ID),
+        "the phantom rule must be pruned from state, not left behind claiming \
+         a port is open that never really was: {state_text}"
+    );
+}
+
+#[test]
+fn the_helper_reconciles_at_startup_with_no_client_request_at_all() {
+    // Fix round 2, item 1: the spec's mandatory acceptance test is "open a
+    // port on ufw, reboot, verify it is closed". Nothing but a start-up
+    // sweep can make that true -- the helper is D-Bus activated, so nothing
+    // runs between a reboot and the first client request, and that request
+    // may never come before the machine reboots again. This seeds a phantom
+    // state entry (same shape as the one above) and starts the helper --
+    // and only the helper, no client call of any kind -- to prove the entry
+    // is pruned by start-up alone.
+    //
+    // No sleep needed to give the sweep time to run: `start_or_skip!` only
+    // returns once the helper's name appears on the bus, which happens in
+    // `main` strictly after the start-up sweep -- both run sequentially,
+    // before the bus connection is even opened. By the time this test can
+    // see the helper on the bus at all, the sweep has already finished.
+    let _guard = lock_helper();
+    let dir = TempDir::new().unwrap();
+    let state = dir.path().join("state.json");
+
+    const RULE_ID: &str = "startup-phantom";
+    const PORT: u16 = 25199;
+    const CIDR: &str = "203.0.113.0/24"; // TEST-NET-3: never a real subnet.
+    let zone = default_zone();
+    let rich_rule = format!(
+        r#"rule family="ipv4" source address="{CIDR}" port port="{PORT}" protocol="tcp" accept"#
+    );
+    let seeded = serde_json::json!({
+        "schema_version": 1,
+        "rules": [{
+            "id": RULE_ID,
+            "port": PORT,
+            "protocol": "tcp",
+            "target": {"kind": "network", "cidr": CIDR},
+            "backend": "firewalld",
+            "opened_at": 1_757_000_000_u64,
+            "expires_at": null,
+            "uid": 999_999,
+            "handle": {"backend": "firewalld", "zone": zone, "rich_rule": rich_rule},
+        }]
+    });
+    std::fs::write(&state, serde_json::to_string_pretty(&seeded).unwrap())
+        .expect("seed the state file");
+
+    let mut helper = start_or_skip!(&state);
+    let _ = helper.0.kill();
+    let _ = helper.0.wait();
+
+    let state_text = std::fs::read_to_string(&state).expect("the state file still exists");
+    assert!(
+        !state_text.contains(RULE_ID),
+        "start-up reconciliation must prune a phantom entry even with no \
+         client request ever made: {state_text}"
+    );
 }
