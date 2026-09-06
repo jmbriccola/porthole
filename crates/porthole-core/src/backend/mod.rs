@@ -193,11 +193,14 @@ pub trait FirewallBackend {
 /// the wire verbatim as `BackendHealth::detail` and then `WireStatus::detail`
 /// (`porthole-helper/src/service.rs`'s `status_for_undetected_backend`,
 /// `porthole-core/src/ipc.rs`'s `WireStatus::from_status`) -- which is what
-/// `porthole-gui`'s own `StatusBar` shows a user, and what
-/// `porthole-gui/tests/status_bar.rs`'s `NO_FIREWALL_DETAIL` fixture is for:
-/// an earlier version of that fixture retyped a shortened, non-verbatim copy
-/// of this string, which is exactly the drift this constant exists to rule
-/// out.
+/// `porthole-gui`'s own `StatusBar` shows a user.
+///
+/// It is a constant because a GUI test once retyped a shortened copy of this
+/// text and documented itself as holding the real thing, so nothing ever
+/// rendered the sentence a user would actually see. Tests import this; they do
+/// not restate it. That is the whole point of the constant, and it is why the
+/// sentence above names no test: this comment's own predecessor named a
+/// fixture that the commit introducing it had already deleted.
 pub const NO_FIREWALL_MESSAGE: &str = "no firewall found: none of firewalld, ufw or nftables is \
      installed. Without a firewall this port is already reachable from your network — \
      porthole cannot change that, and will not pretend it has. Setting up \
