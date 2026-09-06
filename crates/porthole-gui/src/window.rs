@@ -27,6 +27,7 @@ use std::ops::Deref;
 
 use adw::prelude::*;
 
+use crate::listening_section::ListeningSection;
 use crate::open_now::OpenNowSection;
 
 /// The width, in CSS pixels, at or below which the narrow layout applies.
@@ -43,6 +44,7 @@ pub struct PortholeWindow {
     breakpoint: adw::Breakpoint,
     toast_overlay: adw::ToastOverlay,
     open_now: OpenNowSection,
+    listening: ListeningSection,
 }
 
 impl Deref for PortholeWindow {
@@ -108,12 +110,20 @@ impl PortholeWindow {
         open_now.set_toast_overlay(&toast_overlay);
         content.append(open_now.widget());
 
+        // "Listening" -- services running on this machine that are not
+        // (yet) open to the network. Placed after "Open now" for the same
+        // ordering reason: what is already open comes first, what could be
+        // opened next.
+        let listening = ListeningSection::new();
+        content.append(listening.widget());
+
         Self {
             window,
             content,
             breakpoint,
             toast_overlay,
             open_now,
+            listening,
         }
     }
 
@@ -143,5 +153,11 @@ impl PortholeWindow {
     /// test) that needs to feed it a fresh rule list.
     pub fn open_now(&self) -> &OpenNowSection {
         &self.open_now
+    }
+
+    /// The "Listening" section this window owns, for a later task (or a
+    /// test) that needs to feed it a fresh service list.
+    pub fn listening(&self) -> &ListeningSection {
+        &self.listening
     }
 }

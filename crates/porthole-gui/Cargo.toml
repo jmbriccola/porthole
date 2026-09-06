@@ -39,6 +39,13 @@ name = "open_now"
 path = "tests/open_now.rs"
 harness = false
 
+# Same reasoning again: `tests/listening.rs` is task 4's own GTK-touching
+# suite for `ListeningSection`.
+[[test]]
+name = "listening"
+path = "tests/listening.rs"
+harness = false
+
 [dependencies]
 porthole-core = { path = "../porthole-core" }
 gtk = { package = "gtk4", version = "0.9" }
