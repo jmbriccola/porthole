@@ -172,6 +172,69 @@ never share an entry, and a script must not treat an entry in `forgotten` the
 way it would treat one in `closed`: the port it named may still be open in
 whatever firewall created it.
 
+## `porthole listen --json`
+
+```json
+{
+  "schema": 1,
+  "services": [
+    {
+      "port": 5173,
+      "protocol": "tcp",
+      "address": "0.0.0.0",
+      "binding": "all_interfaces",
+      "process": "node",
+      "pid": 12043
+    },
+    {
+      "port": 46715,
+      "protocol": "tcp",
+      "address": "127.0.0.1",
+      "binding": "loopback_only",
+      "process": "code",
+      "pid": 9816
+    }
+  ]
+}
+```
+
+Every TCP socket in `LISTEN` state on this machine, from `/proc/net/tcp` and
+`/proc/net/tcp6`. `protocol` is always `"tcp"` today — the underlying `udp`
+files are not read.
+
+`address` is the literal bound address: `"0.0.0.0"`, `"127.0.0.1"`, `"::"`,
+`"::1"`, or a specific interface address.
+
+`binding` is the derived fact that actually matters: whether opening
+porthole's firewall for this port could change anything.
+
+| `binding` | meaning |
+|---|---|
+| `"loopback_only"` | bound to `127.0.0.0/8` (or its IPv6 loopback/non-IPv4-reachable equivalent) — only this machine can reach it, and no firewall rule changes that. |
+| `"all_interfaces"` | bound to `0.0.0.0` or `::` — every interface, including whichever one the local network is reachable through. |
+| `"specific"` | bound to one interface's own address rather than the wildcard — still network-facing. |
+
+On an ordinary desktop `loopback_only` is typically the *majority* of the
+list, not an edge case: on the machine this was built and measured on, six of
+the seven listening TCP sockets were loopback-only. `porthole listen` (plain
+or `--json`) marks them so that opening the firewall for one is never mistaken
+for a fix.
+
+A `::` listener is included as `all_interfaces`, not filtered out for being
+IPv6: on most systems it also accepts IPv4-mapped connections, so it is
+reachable over IPv4 too. porthole itself only ever opens IPv4 rules — see
+`porthole doctor`'s `IPv6` check for that standing caveat.
+
+`process` and `pid` are `null` — never the string `"unknown"` — when the
+owning process could not be identified. Resolving a listening socket to a
+process needs read access to that process's own `/proc/<pid>/fd`, which an
+unprivileged `porthole listen` only has for its own user's processes; a
+socket owned by another user (or root) still appears, with `process` and
+`pid` both `null`, so the list is never quietly incomplete. A script that
+needs to tell "not resolved" from "a process actually named that" can rely on
+this: the field is `null` in the first case and always a real string in the
+second.
+
 ## `porthole doctor --json`
 
 ```json

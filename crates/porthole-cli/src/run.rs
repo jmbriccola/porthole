@@ -8,6 +8,7 @@ use porthole_core::clock::{Clock, SystemClock};
 use porthole_core::command::{CommandRunner, DryRunRunner, RealRunner};
 use porthole_core::engine::{Engine, Status};
 use porthole_core::error::{Error, ExitCode, Result};
+use porthole_core::listening::{self, RealProcFs};
 use porthole_core::model::{Lifetime, DEFAULT_DURATION};
 use porthole_core::net;
 use porthole_core::state::StateStore;
@@ -112,6 +113,18 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
             } else {
                 ExitCode::Failure
             })
+        }
+        // Unprivileged and read-only, like `list`: nothing here needs the
+        // helper or a firewall backend at all, so it works even when neither
+        // is installed.
+        Commands::Listen => {
+            let services = listening::scan(&RealProcFs)?;
+            if cli.json {
+                println!("{}", output::json_listening(&services));
+            } else {
+                output::print_listening(&services);
+            }
+            Ok(ExitCode::Success)
         }
     }
 }

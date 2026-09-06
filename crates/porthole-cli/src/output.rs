@@ -8,6 +8,7 @@ use porthole_core::backend::BackendId;
 use porthole_core::command::Command;
 use porthole_core::engine::Status;
 use porthole_core::error::Error;
+use porthole_core::listening::{Binding, Service};
 use porthole_core::model::Target;
 use porthole_core::state::ManagedRule;
 use serde_json::{json, Value};
@@ -345,6 +346,90 @@ pub fn print_status(status: &Status, now: u64) {
     print_rules(&status.rules, now);
 }
 
+/// The `binding` tag `porthole listen --json` reports. A plain string, not
+/// `Target`'s `{"kind": ...}` shape: `Binding::Specific`'s address is already
+/// carried in `address` above it, so there is nothing more for the tag to
+/// hold than which case this is.
+fn binding_tag(binding: &Binding) -> &'static str {
+    match binding {
+        Binding::LoopbackOnly => "loopback_only",
+        Binding::AllInterfaces => "all_interfaces",
+        Binding::Specific(_) => "specific",
+    }
+}
+
+fn service_json(service: &Service) -> Value {
+    json!({
+        "port": service.port,
+        "protocol": service.protocol.to_string(),
+        "address": service.address.to_string(),
+        "binding": binding_tag(&service.binding),
+        "process": service.process,
+        "pid": service.pid,
+    })
+}
+
+pub fn json_listening(services: &[Service]) -> Value {
+    json!({
+        "schema": JSON_SCHEMA,
+        "services": services.iter().map(service_json).collect::<Vec<_>>(),
+    })
+}
+
+/// `porthole listen` for a person. Loopback-only rows are pulled into their
+/// own labelled group rather than mixed in with an "open" affordance next to
+/// every row alike: on an ordinary desktop they are usually the majority of
+/// the list (see `milestone-4-verified-facts.md`), and opening the firewall
+/// for one of them changes nothing, since the process is not listening on a
+/// network interface at all.
+pub fn print_listening(services: &[Service]) {
+    println!("Listening on this machine");
+    println!();
+
+    if services.is_empty() {
+        println!("Nothing is listening.");
+        return;
+    }
+
+    // One set of column widths across both groups, so the two lists still
+    // read as one table rather than two differently-aligned ones.
+    let port_width = services
+        .iter()
+        .map(|s| format!("{}/{}", s.port, s.protocol).len())
+        .max()
+        .unwrap_or(0);
+    let name_width = services
+        .iter()
+        .map(|s| s.process.as_deref().unwrap_or("—").chars().count())
+        .max()
+        .unwrap_or(0);
+
+    let (loopback, network_facing): (Vec<&Service>, Vec<&Service>) = services
+        .iter()
+        .partition(|s| s.binding == Binding::LoopbackOnly);
+
+    print_listening_rows(&network_facing, port_width, name_width);
+    if !loopback.is_empty() {
+        if !network_facing.is_empty() {
+            println!();
+        }
+        println!("Loopback only — opening the firewall for these changes nothing:");
+        print_listening_rows(&loopback, port_width, name_width);
+    }
+}
+
+fn print_listening_rows(services: &[&Service], port_width: usize, name_width: usize) {
+    for service in services {
+        let port_proto = format!("{}/{}", service.port, service.protocol);
+        let process = service.process.as_deref().unwrap_or("—").to_string();
+        let pid = service
+            .pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        println!("  {port_proto:port_width$}  {process:name_width$}  pid {pid}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,5 +744,73 @@ mod tests {
         let json = json_closed(&[rule()], &[], 1_757_000_000, false, false, &[]);
         assert_eq!(json["closed"].as_array().unwrap().len(), 1);
         assert_eq!(json["forgotten"].as_array().unwrap().len(), 0);
+    }
+
+    fn service(port: u16, binding: Binding, process: Option<&str>, pid: Option<u32>) -> Service {
+        use porthole_core::model::Protocol;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let address = match binding {
+            Binding::LoopbackOnly => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Binding::AllInterfaces => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            Binding::Specific(a) => IpAddr::V4(a),
+        };
+        Service {
+            port,
+            protocol: Protocol::Tcp,
+            address,
+            binding,
+            process: process.map(str::to_string),
+            pid,
+        }
+    }
+
+    #[test]
+    fn json_listening_has_the_documented_shape() {
+        let services = vec![service(
+            5173,
+            Binding::AllInterfaces,
+            Some("node"),
+            Some(12043),
+        )];
+        let json = json_listening(&services);
+        assert_eq!(json["schema"], 1);
+        let svc = &json["services"][0];
+        assert_eq!(svc["port"], 5173);
+        assert_eq!(svc["protocol"], "tcp");
+        assert_eq!(svc["address"], "0.0.0.0");
+        assert_eq!(svc["binding"], "all_interfaces");
+        assert_eq!(svc["process"], "node");
+        assert_eq!(svc["pid"], 12043);
+    }
+
+    #[test]
+    fn an_unresolved_process_is_null_in_json_never_a_placeholder_string() {
+        // A script must be able to tell "porthole could not resolve this" from
+        // "the process is actually named that" -- a literal "unknown" string
+        // would erase exactly that distinction.
+        let services = vec![service(53, Binding::LoopbackOnly, None, None)];
+        let json = json_listening(&services);
+        assert!(json["services"][0]["process"].is_null());
+        assert!(json["services"][0]["pid"].is_null());
+    }
+
+    #[test]
+    fn a_specific_binding_reports_the_specific_tag() {
+        let services = vec![service(
+            8080,
+            Binding::Specific("10.10.10.5".parse().unwrap()),
+            None,
+            None,
+        )];
+        let json = json_listening(&services);
+        assert_eq!(json["services"][0]["binding"], "specific");
+        assert_eq!(json["services"][0]["address"], "10.10.10.5");
+    }
+
+    #[test]
+    fn the_empty_listening_list_is_an_empty_array_not_a_missing_key() {
+        let json = json_listening(&[]);
+        assert_eq!(json["services"].as_array().unwrap().len(), 0);
     }
 }
