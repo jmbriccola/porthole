@@ -309,6 +309,7 @@ impl FirewallBackend for Ufw<'_> {
                 return Ok(BackendHealth {
                     available: false,
                     active: false,
+                    active_unknown: false,
                     version: None,
                     detail: "ufw is not installed".to_string(),
                     caveat: None,
@@ -329,7 +330,7 @@ impl FirewallBackend for Ufw<'_> {
         // problem from reading as "no firewall at all" once it reaches
         // `detect` -- see C1 in the milestone 3 merge-wave review.
         let status_cmd = Command::read("ufw", ["status"]);
-        let (active, detail) = match self.runner.run(&status_cmd) {
+        let (active, active_unknown, detail) = match self.runner.run(&status_cmd) {
             Ok(out) if out.success() => {
                 let active = out.stdout.contains("Status: active");
                 let detail = if active {
@@ -341,10 +342,11 @@ impl FirewallBackend for Ufw<'_> {
                     "ufw is installed but not active, so no rule it holds is being enforced"
                         .to_string()
                 };
-                (active, detail)
+                (active, false, detail)
             }
             Ok(out) => (
                 false,
+                true,
                 format!(
                     "ufw is installed, but reading its status needs more privilege than this \
                      process has ({}) -- that is not the same as ufw being inactive, it may \
@@ -354,6 +356,7 @@ impl FirewallBackend for Ufw<'_> {
             ),
             Err(e) => (
                 false,
+                true,
                 format!(
                     "ufw is installed, but reading its status failed: {e} -- that is not the \
                      same as ufw being inactive, it may already be enforcing rules porthole \
@@ -365,6 +368,7 @@ impl FirewallBackend for Ufw<'_> {
         Ok(BackendHealth {
             available: true,
             active,
+            active_unknown,
             version,
             detail,
             // ufw's standing persistence caveat ("a rule survives a reboot
@@ -628,6 +632,11 @@ mod tests {
         let health = Ufw::new(&runner).health().unwrap();
         assert!(health.available);
         assert!(!health.active, "inactive ufw enforces nothing");
+        assert!(
+            !health.active_unknown,
+            "this is a confirmed answer, not an unreadable one -- porthole did read \
+             ufw's status successfully here, it just says inactive"
+        );
     }
 
     #[test]
@@ -659,6 +668,11 @@ mod tests {
         assert!(
             !health.active,
             "porthole cannot claim it is enforcing anything it could not read"
+        );
+        assert!(
+            health.active_unknown,
+            "this is the unknown case, not a confirmed-inactive one -- doctor's remedy \
+             selection depends on telling the two apart"
         );
         assert!(
             health.detail.contains("root") || health.detail.contains("privilege"),

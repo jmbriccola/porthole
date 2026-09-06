@@ -222,6 +222,7 @@ impl FirewallBackend for Firewalld<'_> {
                 return Ok(BackendHealth {
                     available: false,
                     active: false,
+                    active_unknown: false,
                     version: None,
                     detail: "firewalld is not installed".to_string(),
                     caveat: None,
@@ -231,7 +232,11 @@ impl FirewallBackend for Firewalld<'_> {
         };
 
         // `firewall-cmd --state` exits non-zero when the daemon is stopped, so
-        // the status is the answer, not an error.
+        // the status is the answer, not an error. Unlike ufw's `status` or
+        // nft's `-j list chains`, this never needs more privilege than any
+        // user has -- firewalld's info actions are `yes` in its own policy
+        // for everyone -- so `active_unknown` is always `false` here; there
+        // is no permission-denied case for this backend to degrade.
         let state_cmd = Command::read("firewall-cmd", ["--state"]);
         let state = self.runner.run(&state_cmd)?;
         let active = state.success() && state.stdout.trim() == "running";
@@ -249,6 +254,7 @@ impl FirewallBackend for Firewalld<'_> {
         Ok(BackendHealth {
             available: true,
             active,
+            active_unknown: false,
             version,
             detail,
             caveat: None,

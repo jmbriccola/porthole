@@ -40,19 +40,37 @@ impl FakeBackend {
         FakeBackend::with_health(BackendHealth {
             available: true,
             active: true,
+            active_unknown: false,
             version: Some("0.0.0-fake".into()),
             detail: "fake backend, running".into(),
             caveat: None,
         })
     }
 
-    /// A firewall that is installed but stopped.
+    /// A firewall that is installed but confirmed stopped.
     pub fn inactive() -> Self {
         FakeBackend::with_health(BackendHealth {
             available: true,
             active: false,
+            active_unknown: false,
             version: Some("0.0.0-fake".into()),
             detail: "fake backend, not running".into(),
+            caveat: None,
+        })
+    }
+
+    /// A firewall that is installed, but whose ruleset porthole could not
+    /// read -- ufw and nftables' shape for a permission-denied caller. Not
+    /// the same fact as [`FakeBackend::inactive`]: distinguishing the two is
+    /// the whole point of `active_unknown`, so a caller that treats them the
+    /// same defeats the fake meant to catch that.
+    pub fn active_unknown() -> Self {
+        FakeBackend::with_health(BackendHealth {
+            available: true,
+            active: false,
+            active_unknown: true,
+            version: Some("0.0.0-fake".into()),
+            detail: "fake backend, needs more privilege to read".into(),
             caveat: None,
         })
     }
@@ -62,6 +80,7 @@ impl FakeBackend {
         FakeBackend::with_health(BackendHealth {
             available: false,
             active: false,
+            active_unknown: false,
             version: None,
             detail: "fake backend, not installed".into(),
             caveat: None,
@@ -302,14 +321,17 @@ mod tests {
     }
 
     #[test]
-    fn health_variants_describe_the_three_states() {
+    fn health_variants_describe_the_four_states() {
         let healthy = FakeBackend::new().health().unwrap();
-        assert!(healthy.available && healthy.active);
+        assert!(healthy.available && healthy.active && !healthy.active_unknown);
 
         let stopped = FakeBackend::inactive().health().unwrap();
-        assert!(stopped.available && !stopped.active);
+        assert!(stopped.available && !stopped.active && !stopped.active_unknown);
+
+        let unknown = FakeBackend::active_unknown().health().unwrap();
+        assert!(unknown.available && !unknown.active && unknown.active_unknown);
 
         let missing = FakeBackend::absent().health().unwrap();
-        assert!(!missing.available && !missing.active);
+        assert!(!missing.available && !missing.active && !missing.active_unknown);
     }
 }

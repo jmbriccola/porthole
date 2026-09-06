@@ -571,6 +571,7 @@ impl FirewallBackend for Nftables<'_> {
                 return Ok(BackendHealth {
                     available: false,
                     active: false,
+                    active_unknown: false,
                     version: None,
                     detail: "nft is not installed".to_string(),
                     caveat: None,
@@ -664,6 +665,7 @@ impl FirewallBackend for Nftables<'_> {
                 Ok(BackendHealth {
                     available: true,
                     active,
+                    active_unknown: false,
                     version,
                     detail,
                     caveat,
@@ -672,6 +674,7 @@ impl FirewallBackend for Nftables<'_> {
             Err(e @ Error::CommandFailed { .. }) => Ok(BackendHealth {
                 available: true,
                 active: false,
+                active_unknown: true,
                 version,
                 detail: format!(
                     "nft is installed, but listing its chains needs more privilege than this \
@@ -1365,6 +1368,11 @@ mod tests {
         assert!(
             !health.active,
             "porthole cannot claim it is enforcing anything it could not read"
+        );
+        assert!(
+            health.active_unknown,
+            "this is the unknown case, not a confirmed-empty-input-hook one -- doctor's \
+             remedy selection depends on telling the two apart"
         );
         assert!(
             health.detail.contains("root") || health.detail.contains("privilege"),

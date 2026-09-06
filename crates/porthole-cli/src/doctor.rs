@@ -122,7 +122,21 @@ fn firewall_check(backend: &dyn backend::FirewallBackend, runner: &dyn CommandRu
     };
 
     if !health.active {
-        return Check::bad("Firewall", health.detail, not_active_remedy(backend.id()));
+        // `active: false` is two different facts porthole cannot read apart
+        // from that one bit alone -- see `BackendHealth::active_unknown`'s
+        // own doc comment. `not_active_remedy` is written for the confirmed
+        // case ("no chain is registered... the port is already reachable");
+        // saying that when the truth is "porthole could not read the
+        // ruleset at all" is a false claim in the dangerous direction, which
+        // is exactly the "feeling safe when you are not" failure this
+        // milestone spent a whole task guarding against elsewhere. Ask
+        // `health` which case this is rather than assume the confirmed one.
+        let remedy = if health.active_unknown {
+            privilege_needed_remedy(backend.id())
+        } else {
+            not_active_remedy(backend.id())
+        };
+        return Check::bad("Firewall", health.detail, remedy);
     }
 
     // nftables' `active: true` means "something is registered at the input
@@ -220,8 +234,12 @@ fn health_error_remedy(id: BackendId) -> &'static str {
     }
 }
 
-/// What to tell someone when the detected backend is installed but not
-/// enforcing anything.
+/// What to tell someone when the detected backend is installed and
+/// *confirmed* not enforcing anything -- `health()` actually read its state
+/// and got a definite answer. Never call this for the other reason `active`
+/// can be `false`: see [`privilege_needed_remedy`] and
+/// `BackendHealth::active_unknown`'s own doc comment for why the two need
+/// different, non-interchangeable wording.
 fn not_active_remedy(id: BackendId) -> &'static str {
     match id {
         BackendId::Firewalld => {
@@ -237,6 +255,41 @@ fn not_active_remedy(id: BackendId) -> &'static str {
              nothing is filtering incoming traffic and the port is already \
              reachable. Set one up if that is not what you want — porthole will \
              not do it for you."
+        }
+    }
+}
+
+/// What to tell someone when the detected backend is installed, but
+/// `porthole doctor` — which runs unprivileged, by design — could not read
+/// enough of its ruleset to say whether anything is enforcing traffic.
+///
+/// Deliberately silent on which way the answer would actually go: naming a
+/// direction here would just be `not_active_remedy`'s mistake with the
+/// wording softened, not fixed. The one true thing porthole can say is that
+/// it does not know, and how to find out.
+fn privilege_needed_remedy(id: BackendId) -> &'static str {
+    match id {
+        // Unreachable today: firewalld's reads (`firewall-cmd --version`,
+        // `--state`) are `yes` in its own policy for every user, so
+        // `active_unknown` never comes back `true` for this backend. Kept
+        // exhaustive, not a wildcard, so a change to that assumption breaks
+        // the build here instead of silently falling through to the wrong
+        // message.
+        BackendId::Firewalld => {
+            "porthole could not tell whether firewalld is enforcing anything, though this \
+             should never need more privilege than any user has. Run `porthole doctor` as \
+             root to rule that out, or check `firewall-cmd --state` by hand."
+        }
+        BackendId::Ufw => {
+            "porthole could not read ufw's status without more privilege than this process \
+             has, so it cannot say whether anything is enforced here — one way or the \
+             other. Run `porthole doctor` as root, or check `sudo ufw status` yourself."
+        }
+        BackendId::Nftables => {
+            "porthole could not read nftables' ruleset without more privilege than this \
+             process has, so it cannot say whether anything is filtering incoming traffic \
+             — one way or the other. Run `porthole doctor` as root, or check \
+             `sudo nft -j list chains` yourself."
         }
     }
 }
@@ -665,6 +718,77 @@ mod tests {
         assert!(
             check.remedy.contains("nft -j list chains"),
             "got: {}",
+            check.remedy
+        );
+    }
+
+    #[test]
+    fn nftables_active_unknown_does_not_claim_reachability_either_way() {
+        // Follow-up to C1: `active: false` on nftables now has two different
+        // causes -- a confirmed-empty input hook (`not_active_remedy`'s "the
+        // port is already reachable"), and a permission-denied read that
+        // tells porthole nothing at all. That sentence is true of the first
+        // and false, in the dangerous direction, of the second. Assert on
+        // the property -- no claim about reachability in either direction --
+        // rather than the literal sentence, so a future rewording of either
+        // remedy cannot quietly reintroduce it.
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout("nftables v1.1.6"),
+            Output {
+                status: 1,
+                stdout: String::new(),
+                stderr: "Error: Operation not permitted (you must be root)".to_string(),
+            },
+        ]);
+        let backend = Nftables::new(&runner);
+        let check = firewall_check(&backend, &runner);
+        assert!(
+            !check.ok,
+            "porthole genuinely does not know here -- must not read as ok"
+        );
+        assert!(
+            !check.remedy.to_lowercase().contains("reachable"),
+            "must not claim the port is reachable, or that it is not, when porthole \
+             could not read the ruleset at all: {}",
+            check.remedy
+        );
+        assert!(
+            check.remedy.contains("root") || check.remedy.contains("privilege"),
+            "must say the actual reason -- needs privilege -- got: {}",
+            check.remedy
+        );
+    }
+
+    #[test]
+    fn ufw_active_unknown_does_not_claim_reachability_either_way() {
+        // Same follow-up, ufw's shape: `not_active_remedy`'s "Enable it --
+        // `sudo ufw enable`. While it is disabled, ..." is a claim that ufw
+        // is confirmed disabled, which is false when the truth is porthole
+        // could not read its status at all.
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout("ufw 0.36.2"),
+            Output {
+                status: 1,
+                stdout: String::new(),
+                stderr: "ERROR: You need to be root to run this script".to_string(),
+            },
+        ]);
+        let backend = Ufw::new(&runner);
+        let check = firewall_check(&backend, &runner);
+        assert!(
+            !check.ok,
+            "porthole genuinely does not know here -- must not read as ok"
+        );
+        assert!(
+            !check.remedy.to_lowercase().contains("disabled")
+                && !check.remedy.to_lowercase().contains("reachable"),
+            "must not claim ufw is confirmed disabled, or say anything about \
+             reachability, when porthole could not read its status at all: {}",
+            check.remedy
+        );
+        assert!(
+            check.remedy.contains("root") || check.remedy.contains("privilege"),
+            "must say the actual reason -- needs privilege -- got: {}",
             check.remedy
         );
     }

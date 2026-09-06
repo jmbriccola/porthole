@@ -96,7 +96,29 @@ pub struct BackendHealth {
     /// The backend's tooling is installed.
     pub available: bool,
     /// The firewall is actually running and enforcing rules.
+    ///
+    /// `false` means one of two different things, and `active` alone cannot
+    /// tell a caller which: either porthole read the ruleset and confirmed
+    /// nothing is enforcing, or it could not read the ruleset at all (see
+    /// [`BackendHealth::active_unknown`]). Collapsing those two into one bit
+    /// is exactly what let a permission-denied read on ufw or nftables come
+    /// out the other end as "porthole confirmed this port is already
+    /// reachable" — false in the dangerous direction. A caller that needs to
+    /// tell them apart must check `active_unknown` too, not read `!active`
+    /// as a confirmed absence on its own.
     pub active: bool,
+    /// `true` when `active` is `false` only because porthole could not read
+    /// enough of the ruleset to tell -- a permission-denied `ufw status` or
+    /// `nft -j list chains`, not a confirmed absence of enforcement. Always
+    /// `false` when `active` is `true`: there is nothing left unknown once
+    /// enforcement has actually been confirmed. `porthole doctor` reads this
+    /// to choose between "here is how to enable it" (genuinely inactive) and
+    /// "porthole cannot tell, one way or the other" (unknown) -- the two
+    /// need different remedies, and conflating them risks the same "feeling
+    /// safe when you are not" failure reconciliation's own ownership rules
+    /// exist to prevent, just one layer up in diagnostics instead of in the
+    /// firewall itself.
+    pub active_unknown: bool,
     pub version: Option<String>,
     /// A sentence fit to show the user.
     pub detail: String,

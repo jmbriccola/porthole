@@ -224,10 +224,24 @@ impl<'a> Engine<'a> {
 
         let health = self.backend.health()?;
         if !health.active {
-            return Err(Error::BackendUnavailable(format!(
-                "{}. porthole will not open anything while the firewall is not enforcing \
+            // `active: false` is two different facts (see
+            // `BackendHealth::active_unknown`'s own doc comment), and only
+            // one of them supports "the firewall is not enforcing rules" as
+            // a stated premise. Saying that outright when porthole could not
+            // read the ruleset at all would assert something it does not
+            // know, right where a hedge already exists for the other half
+            // of the same claim (reachable vs. blocked) -- so the unknown
+            // case gets its own honest lead-in instead of reusing this one.
+            let why = if health.active_unknown {
+                "porthole cannot open anything here until it can confirm the firewall is \
+                 actually enforcing rules -- it could not read enough of the ruleset to tell"
+            } else {
+                "porthole will not open anything while the firewall is not enforcing \
                  rules: the port is either already reachable or blocked by something \
-                 porthole does not manage",
+                 porthole does not manage"
+            };
+            return Err(Error::BackendUnavailable(format!(
+                "{}. {why}",
                 health.detail
             )));
         }
@@ -625,6 +639,43 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.exit_code(), crate::error::ExitCode::BackendUnavailable);
         assert!(backend.opened().is_empty());
+    }
+
+    #[test]
+    fn open_refuses_without_claiming_reachability_when_activity_is_unknown() {
+        // Follow-up to C1: refusing to open is correct in both cases `!
+        // health.active` covers, but the *reason* given must not overclaim.
+        // "the firewall is not enforcing rules" is a fact only the confirmed
+        // case (`FakeBackend::inactive`, covered above) can support; a
+        // permission-denied read supports only "porthole could not tell."
+        let harness = Harness::new();
+        let backend = FakeBackend::active_unknown();
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let err = engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::For(Duration::from_secs(3600)),
+                1000,
+            )
+            .unwrap_err();
+        assert_eq!(err.exit_code(), crate::error::ExitCode::BackendUnavailable);
+        assert!(backend.opened().is_empty());
+        let text = err.to_string();
+        assert!(
+            !text.to_lowercase().contains("reachable"),
+            "must not claim the port is reachable, or that it is not, when porthole \
+             could not read the ruleset at all: {text}"
+        );
+        assert!(
+            text.contains("could not") || text.contains("privilege"),
+            "must say porthole could not tell, not that the firewall is confirmed \
+             inactive: {text}"
+        );
     }
 
     #[test]

@@ -67,6 +67,13 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
                     health: BackendHealth {
                         available: false,
                         active: false,
+                        // A backend that could not even be detected is not
+                        // the same fact as one that was detected and could
+                        // not be read -- see `active_unknown`'s own doc
+                        // comment. `detect` failing this way means no
+                        // backend was ever available to ask, so there is
+                        // nothing left unresolved to call "unknown".
+                        active_unknown: false,
                         version: None,
                         detail: e.to_string(),
                         caveat: None,

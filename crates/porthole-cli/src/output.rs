@@ -218,16 +218,37 @@ pub fn print_closed(rules: &[ManagedRule], dry_run: bool) {
     }
 }
 
+/// The word `print_status` puts in parentheses after the backend's name and
+/// version -- split out from `print_status` itself so this three-way choice
+/// is testable without capturing stdout.
+///
+/// Three states, not two: `active: false` alone does not mean "confirmed not
+/// running" -- ufw and nftables can also come back this way when porthole
+/// could not read enough of the ruleset to tell (see
+/// `BackendHealth::active_unknown`). Printing "NOT running" for that case
+/// would tell an unprivileged user their port is already reachable when the
+/// truth is porthole simply could not see the ruleset -- false in the
+/// dangerous direction, and the same claim `doctor`'s remedy selection
+/// exists to avoid making.
+fn firewall_state_word(health: &porthole_core::backend::BackendHealth) -> &'static str {
+    if health.active {
+        "running"
+    } else if health.active_unknown {
+        "unknown"
+    } else {
+        "NOT running"
+    }
+}
+
 pub fn print_status(status: &Status, now: u64) {
     let firewall = if !status.health.available {
         // Not "firewalld (NOT running)" — there is no firewalld to run.
         "none installed".to_string()
     } else {
-        match (&status.health.version, status.health.active) {
-            (Some(v), true) => format!("{} {} (running)", status.backend, v),
-            (Some(v), false) => format!("{} {} (NOT running)", status.backend, v),
-            (None, true) => format!("{} (running)", status.backend),
-            (None, false) => format!("{} (NOT running)", status.backend),
+        let state = firewall_state_word(&status.health);
+        match &status.health.version {
+            Some(v) => format!("{} {} ({state})", status.backend, v),
+            None => format!("{} ({state})", status.backend),
         }
     };
     println!("Firewall  {firewall}");
@@ -242,9 +263,20 @@ pub fn print_status(status: &Status, now: u64) {
 
     if status.health.available && !status.health.active {
         println!("{}", status.health.detail);
-        println!(
-            "While the firewall is not running, nothing porthole does changes what is reachable."
-        );
+        if status.health.active_unknown {
+            // Do not repeat the confirmed-inactive sentence below: it
+            // asserts the firewall is not running, which is exactly the
+            // claim this state cannot support either way.
+            println!(
+                "porthole could not confirm whether this firewall is enforcing anything -- \
+                 see the detail above for why."
+            );
+        } else {
+            println!(
+                "While the firewall is not running, nothing porthole does changes what is \
+                 reachable."
+            );
+        }
         println!();
     } else if !status.health.available {
         println!("{}", status.health.detail);
@@ -356,6 +388,7 @@ mod tests {
             health: BackendHealth {
                 available: false,
                 active: false,
+                active_unknown: false,
                 version: None,
                 detail: "no supported firewall found".to_string(),
                 caveat: None,
@@ -390,6 +423,7 @@ mod tests {
             health: BackendHealth {
                 available: true,
                 active: true,
+                active_unknown: false,
                 version: Some("1.1.6".to_string()),
                 detail: "1.1.6: inet filter input is enforcing".to_string(),
                 caveat: Some(
@@ -422,6 +456,7 @@ mod tests {
             health: BackendHealth {
                 available: true,
                 active: true,
+                active_unknown: false,
                 version: Some("2.4.4".to_string()),
                 detail: "firewalld 2.4.4 is running".to_string(),
                 caveat: None,
@@ -433,6 +468,46 @@ mod tests {
 
         let json = json_status(&status, 1_757_000_000);
         assert!(json["firewall_caveat"].is_null());
+    }
+
+    #[test]
+    fn the_unknown_activity_state_never_reads_as_confirmed_not_running() {
+        // Follow-up to C1: `print_status` used to have only two states
+        // (running / NOT running), keyed on `active` alone. A
+        // permission-denied ufw or nftables read comes back `active: false`
+        // too, and printing "NOT running" for that would tell an
+        // unprivileged user their port is already reachable when porthole
+        // in fact could not see the ruleset at all -- false in the
+        // dangerous direction. Assert on the property (the confirmed-not-
+        // running word is absent), not the exact wording of the word this
+        // state does print, so a future rewording of either cannot quietly
+        // collapse the two states back together.
+        use porthole_core::backend::BackendHealth;
+
+        let confirmed_inactive = BackendHealth {
+            available: true,
+            active: false,
+            active_unknown: false,
+            version: None,
+            detail: String::new(),
+            caveat: None,
+        };
+        assert_eq!(firewall_state_word(&confirmed_inactive), "NOT running");
+
+        let unknown = BackendHealth {
+            available: true,
+            active: false,
+            active_unknown: true,
+            version: None,
+            detail: String::new(),
+            caveat: None,
+        };
+        let word = firewall_state_word(&unknown);
+        assert_ne!(
+            word, "NOT running",
+            "an unread ruleset must not print the same word as a confirmed one"
+        );
+        assert_ne!(word, "running", "porthole did not confirm this either");
     }
 
     #[test]

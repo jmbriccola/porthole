@@ -246,6 +246,7 @@ mod tests {
             health: BackendHealth {
                 available: true,
                 active: true,
+                active_unknown: false,
                 version: Some("1.3.2".to_string()),
                 detail: "running".to_string(),
                 caveat: None,
