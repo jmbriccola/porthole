@@ -958,6 +958,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "porthole-agent"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "libc",
+ "porthole-core",
+ "tempfile",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "porthole-cli"
 version = "0.1.0"
 dependencies = [

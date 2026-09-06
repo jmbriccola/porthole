@@ -19,7 +19,7 @@ the helper and CLI. This project's own development host has no GTK4 installed
 and builds/tests the GUI only inside the container described in the top-level
 README, but that is a statement about this host, not a requirement — any
 machine with those headers builds it the same way `cargo build --release`
-already builds the other two. Eight more pieces are checked into `data/` and
+already builds the other two. Ten more pieces are checked into `data/` and
 are not installed by anything automatically — you copy them into place
 yourself.
 
@@ -35,6 +35,9 @@ yourself.
 | `data/com.jacopobriccola.Porthole.desktop` | `/usr/share/applications/` | The desktop entry: what `Name=`, icon and `Exec=` line a launcher (GNOME's Activities overview, an app grid, `gtk-launch`) uses to show and start the GUI. Unrelated to the D-Bus files above — this is what makes the app *appear*, not what lets it *talk to the helper*, which it still does exactly as the CLI does, over the system bus. |
 | `data/icons/hicolor/scalable/apps/com.jacopobriccola.Porthole.svg` | `/usr/share/icons/hicolor/scalable/apps/` | The full-colour app icon the desktop file's `Icon=com.jacopobriccola.Porthole` resolves to via the freedesktop icon theme spec — the basename is what has to match, not the path. |
 | `data/icons/hicolor/symbolic/apps/com.jacopobriccola.Porthole-symbolic.svg` | `/usr/share/icons/hicolor/symbolic/apps/` | The single-colour variant the same spec expects alongside the full-colour icon, used in menus, lists and high-contrast themes rather than shown standalone. |
+| `target/release/porthole-agent` (built, not in `data/`) | `/usr/local/bin/porthole-agent` (a packaged install may instead use `/usr/bin/porthole-agent`) | The session agent: it listens on the system bus for the helper's `RuleClosed` signal and turns each one into a desktop notification. Nothing reads this path back the way the helper reads the CLI's, but the systemd unit below names it absolutely: install it here, or change that unit's `ExecStart=` to wherever you put it. The autostart entry needs no such edit — a desktop entry's `Exec=` is looked up on `$PATH`. |
+| `data/porthole-agent.service` | `/usr/lib/systemd/user/` | The systemd **user** unit for the agent — user, not system: one agent per logged-in session, running as that user, because a notification goes to a session and not to a machine. `WantedBy=graphical-session.target` is what starts it, so it needs enabling once per user (`systemctl --user enable porthole-agent.service`), unlike the helper, which nothing has to enable. |
+| `data/porthole-agent.desktop` | `/etc/xdg/autostart/` | The same job for desktops that start session services from XDG autostart rather than through systemd. Both are shipped on purpose: desktops differ in which they honour, and one that honours both starts two agents — the second finds the agent's session bus name already taken and exits, so installing both never doubles a notification. |
 | `data/com.jacopobriccola.Porthole.metainfo.xml` | `/usr/share/metainfo/` | AppStream metadata: what a software centre (GNOME Software, KDE Discover) reads for the name, summary, description and screenshot it shows *before* anyone has installed anything. Without this file the desktop entry above still makes the app launchable once installed, but a software centre listing it has nothing to show beside a bare name. |
 
 These paths mirror where `firewalld` — one of the three firewalls porthole

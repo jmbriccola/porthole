@@ -1,0 +1,494 @@
+//! The agent as a process, on a private session bus.
+//!
+//! Every test here starts `dbus-run-session`, points both
+//! `DBUS_SESSION_BUS_ADDRESS` and `DBUS_SYSTEM_BUS_ADDRESS` at it, and runs
+//! the real `porthole-agent` binary against stand-ins for the two services it
+//! talks to. Nothing reaches this machine's own buses, and the agent has no
+//! way to touch a firewall in any case: it opens no ports itself, it asks a
+//! helper to, and the helper here is forty lines of test code that records
+//! the request and answers it.
+//!
+//! What this proves is the wiring: a `RuleClosed` becomes a `Notify` with the
+//! right words on it, one for another uid becomes nothing, an `ActionInvoked`
+//! becomes an `Open` carrying the original request, and a bus where nothing
+//! answers `Notify` leaves the process running. What it does not prove is
+//! anything about a real notification daemon -- the stand-in below answers
+//! the method and emits the signal, it does not draw a bubble or wait for a
+//! human to click it -- nor anything about the real helper or polkit.
+
+use porthole_core::ipc::{CloseReason, WireRule, INTERFACE, PATH, SERVICE};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use zbus::zvariant::OwnedValue;
+
+const NOTIFICATIONS_SERVICE: &str = "org.freedesktop.Notifications";
+const NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
+const NOTIFICATIONS_INTERFACE: &str = "org.freedesktop.Notifications";
+
+/// How long any of these will wait for something to arrive over the bus
+/// before calling it a failure. Generous on purpose: a slow machine under a
+/// parallel `cargo test` is not the thing under test.
+const DEADLINE: Duration = Duration::from_secs(15);
+
+const OPENED_AT: u64 = 1_757_000_000;
+const EXPIRES_AT: u64 = 1_757_003_600;
+const OUR_UID: u32 = 4242;
+
+/// A private bus, alive for as long as this value is.
+///
+/// The inner shell prints the address and then blocks reading its own stdin,
+/// so dropping this closes that pipe, the shell exits, and `dbus-run-session`
+/// takes the daemon down with it on its own -- no signals, no orphaned
+/// `dbus-daemon` left behind for the next test to find.
+struct Bus {
+    child: Child,
+    address: String,
+}
+
+impl Bus {
+    fn start() -> Bus {
+        let mut child = Command::new("dbus-run-session")
+            .args([
+                "--",
+                "sh",
+                "-c",
+                r#"echo "$DBUS_SESSION_BUS_ADDRESS"; exec cat >/dev/null"#,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("dbus-run-session is installed");
+
+        let mut address = String::new();
+        BufReader::new(child.stdout.take().expect("piped"))
+            .read_line(&mut address)
+            .expect("the session address");
+        let address = address.trim().to_string();
+        assert!(!address.is_empty(), "dbus-run-session printed no address");
+        Bus { child, address }
+    }
+}
+
+impl Drop for Bus {
+    fn drop(&mut self) {
+        drop(self.child.stdin.take());
+        let _ = self.child.wait();
+    }
+}
+
+/// The agent under test, killed however the test ends.
+struct Agent {
+    child: Child,
+    stderr: tempfile::NamedTempFile,
+}
+
+impl Agent {
+    fn start(bus: &Bus) -> Agent {
+        let stderr = tempfile::NamedTempFile::new().expect("a temp file for the agent's stderr");
+        let child = Command::new(env!("CARGO_BIN_EXE_porthole-agent"))
+            // Both buses are this one private bus. The agent asks for the
+            // system bus by name and gets it here, which is the only reason
+            // a test can stand in front of it at all.
+            .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
+            .env("DBUS_SYSTEM_BUS_ADDRESS", &bus.address)
+            .env_remove("DBUS_STARTER_ADDRESS")
+            .env_remove("DBUS_STARTER_BUS_TYPE")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr.reopen().expect("a second handle on the temp file"))
+            .spawn()
+            .expect("the agent binary was built");
+        Agent { child, stderr }
+    }
+
+    fn journal(&self) -> String {
+        let mut text = String::new();
+        self.stderr
+            .reopen()
+            .expect("a read handle")
+            .read_to_string(&mut text)
+            .expect("readable");
+        text
+    }
+
+    fn is_running(&mut self) -> bool {
+        self.child.try_wait().expect("waitable").is_none()
+    }
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn wire_rule(port: u16, uid: u32) -> WireRule {
+    WireRule {
+        id: "abc".to_string(),
+        port,
+        protocol: "tcp".to_string(),
+        target: "10.10.10.0/24".to_string(),
+        scope: "network".to_string(),
+        backend: "firewalld".to_string(),
+        opened_at: OPENED_AT,
+        expires_at: EXPIRES_AT,
+        uid,
+    }
+}
+
+/// One `Notify` call, as the stand-in server received it.
+#[derive(Debug, Clone)]
+struct Shown {
+    summary: String,
+    body: String,
+    actions: Vec<String>,
+}
+
+struct FakeNotifications {
+    shown: Arc<Mutex<Vec<Shown>>>,
+    /// Handed back as the notification id, and what the test then sends
+    /// `ActionInvoked` for.
+    id: u32,
+}
+
+#[zbus::interface(name = "org.freedesktop.Notifications")]
+impl FakeNotifications {
+    #[allow(clippy::too_many_arguments)]
+    async fn notify(
+        &self,
+        _app_name: String,
+        _replaces_id: u32,
+        _app_icon: String,
+        summary: String,
+        body: String,
+        actions: Vec<String>,
+        _hints: HashMap<String, OwnedValue>,
+        _expire_timeout: i32,
+    ) -> u32 {
+        self.shown.lock().expect("not poisoned").push(Shown {
+            summary,
+            body,
+            actions,
+        });
+        self.id
+    }
+}
+
+/// One `Open` call, as the stand-in helper received it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Opened {
+    port: u16,
+    protocol: String,
+    scope: String,
+    seconds: u32,
+}
+
+struct FakeHelper {
+    opens: Arc<Mutex<Vec<Opened>>>,
+}
+
+#[zbus::interface(name = "com.jacopobriccola.Porthole1")]
+impl FakeHelper {
+    /// The agent calls this once at start-up, for the call itself rather
+    /// than the answer.
+    async fn list(&self) -> Vec<WireRule> {
+        Vec::new()
+    }
+
+    async fn open(&self, port: u16, protocol: String, scope: String, seconds: u32) -> WireRule {
+        self.opens.lock().expect("not poisoned").push(Opened {
+            port,
+            protocol: protocol.clone(),
+            scope,
+            seconds,
+        });
+        let mut rule = wire_rule(port, OUR_UID);
+        rule.protocol = protocol;
+        rule
+    }
+}
+
+/// Poll until `f` answers, or give up after [`DEADLINE`].
+async fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+    let deadline = std::time::Instant::now() + DEADLINE;
+    loop {
+        if let Some(value) = f() {
+            return value;
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The agent's own uid, which is the test process's uid: a signal has to
+/// carry that uid for the agent to act on it, and any other for it not to.
+fn our_uid() -> u32 {
+    // SAFETY: getuid takes no arguments and cannot fail.
+    unsafe { libc::getuid() }
+}
+
+#[tokio::test]
+async fn a_close_notifies_its_own_user_only_and_a_reopen_re_sends_the_original_open() {
+    let bus = Bus::start();
+    let uid = our_uid();
+
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let opens = Arc::new(Mutex::new(Vec::new()));
+    let notification_id = 42;
+
+    let notifications = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(NOTIFICATIONS_SERVICE)
+        .unwrap()
+        .serve_at(
+            NOTIFICATIONS_PATH,
+            FakeNotifications {
+                shown: shown.clone(),
+                id: notification_id,
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let helper = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(SERVICE)
+        .unwrap()
+        .serve_at(
+            PATH,
+            FakeHelper {
+                opens: opens.clone(),
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let mut agent = Agent::start(&bus);
+    // Both services are up before the agent starts, so its own start-up
+    // `list` is what tells us its subscription is in place: nothing is
+    // emitted until that call has landed.
+    until("the agent to call the helper", || {
+        agent.journal().contains("listening for uid").then_some(())
+    })
+    .await;
+
+    // A close belonging to somebody else, then one belonging to us. Both come
+    // from the same sender, so the bus delivers them in this order: if the
+    // foreign one produced a notification, it would be the first one shown.
+    for rule in [wire_rule(6000, uid.wrapping_add(1)), wire_rule(5173, uid)] {
+        helper
+            .emit_signal(
+                None::<()>,
+                PATH,
+                INTERFACE,
+                "RuleClosed",
+                &(rule, CloseReason::Expired),
+            )
+            .await
+            .unwrap();
+    }
+
+    let first = until("a notification", || shown.lock().unwrap().first().cloned()).await;
+    assert!(
+        first.body.contains("5173/tcp"),
+        "the notification shown was for somebody else's port: {first:?}"
+    );
+    assert!(first.body.contains("expired"), "{first:?}");
+    assert!(first.summary.contains("5173/tcp"), "{first:?}");
+    assert_eq!(
+        first.actions,
+        vec!["reopen".to_string(), "Reopen".to_string()],
+        "an expiry offers exactly one action, as a key/label pair"
+    );
+
+    // The click.
+    notifications
+        .emit_signal(
+            None::<()>,
+            NOTIFICATIONS_PATH,
+            NOTIFICATIONS_INTERFACE,
+            "ActionInvoked",
+            &(notification_id, "reopen"),
+        )
+        .await
+        .unwrap();
+
+    let opened = until("the reopen to reach the helper", || {
+        opens.lock().unwrap().first().cloned()
+    })
+    .await;
+    assert_eq!(
+        opened,
+        Opened {
+            port: 5173,
+            protocol: "tcp".to_string(),
+            // The rule's own CIDR, not the word `subnet`: reopening asks for
+            // the network the rule was actually towards.
+            scope: "10.10.10.0/24".to_string(),
+            // The length it was open for, not the instant it would have
+            // ended -- that instant is in the past by now.
+            seconds: (EXPIRES_AT - OPENED_AT) as u32,
+        }
+    );
+
+    assert_eq!(
+        shown.lock().unwrap().len(),
+        1,
+        "the foreign uid's close must still have produced nothing"
+    );
+    assert!(agent.is_running());
+}
+
+#[tokio::test]
+async fn a_missing_notification_service_does_not_kill_the_agent() {
+    // A headless login or a session without a notification daemon must not
+    // leave a crash-looping user unit behind. Nothing owns
+    // `org.freedesktop.Notifications` on this bus, so every `Notify` comes
+    // back as an error, and the agent has to keep listening through it.
+    let bus = Bus::start();
+    let uid = our_uid();
+    let opens = Arc::new(Mutex::new(Vec::new()));
+
+    let helper = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(SERVICE)
+        .unwrap()
+        .serve_at(
+            PATH,
+            FakeHelper {
+                opens: opens.clone(),
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let mut agent = Agent::start(&bus);
+    until("the agent to start listening", || {
+        agent.journal().contains("listening for uid").then_some(())
+    })
+    .await;
+
+    for port in [5173, 8080] {
+        helper
+            .emit_signal(
+                None::<()>,
+                PATH,
+                INTERFACE,
+                "RuleClosed",
+                &(wire_rule(port, uid), CloseReason::Expired),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Twice: a single survived failure could be one the agent never reached.
+    // The second line proves it was still reading the bus afterwards.
+    until("both failures to be recorded", || {
+        let journal = agent.journal();
+        (journal.matches("could not be shown").count() == 2).then_some(())
+    })
+    .await;
+    let journal = agent.journal();
+    assert!(journal.contains("5173/tcp"), "{journal}");
+    assert!(journal.contains("8080/tcp"), "{journal}");
+    assert!(
+        agent.is_running(),
+        "the agent exited instead of carrying on: {journal}"
+    );
+
+    // And it is still the same process a moment later, not one on its way
+    // out with an exit status not yet collected.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(agent.is_running(), "{}", agent.journal());
+}
+
+#[tokio::test]
+async fn a_second_agent_in_one_session_stops_instead_of_doubling_every_notice() {
+    // porthole ships both a systemd user unit and an XDG autostart entry --
+    // desktops differ in which they honour, and one that honours both would
+    // start two agents. The second must stop, and the first must be left
+    // alone doing its job.
+    let bus = Bus::start();
+    let uid = our_uid();
+
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let opens = Arc::new(Mutex::new(Vec::new()));
+
+    let _notifications = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(NOTIFICATIONS_SERVICE)
+        .unwrap()
+        .serve_at(
+            NOTIFICATIONS_PATH,
+            FakeNotifications {
+                shown: shown.clone(),
+                id: 7,
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let helper = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(SERVICE)
+        .unwrap()
+        .serve_at(
+            PATH,
+            FakeHelper {
+                opens: opens.clone(),
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let mut first = Agent::start(&bus);
+    until("the first agent to start listening", || {
+        first.journal().contains("listening for uid").then_some(())
+    })
+    .await;
+
+    let mut second = Agent::start(&bus);
+    let status = until("the second agent to exit", || {
+        second.child.try_wait().expect("waitable")
+    })
+    .await;
+    assert!(
+        status.success(),
+        "a second agent is an ordinary thing to be, not a failure: {status:?}"
+    );
+    assert!(
+        second.journal().contains("already has an agent"),
+        "it must say why it stopped: {}",
+        second.journal()
+    );
+
+    // One close, one notification -- not two.
+    helper
+        .emit_signal(
+            None::<()>,
+            PATH,
+            INTERFACE,
+            "RuleClosed",
+            &(wire_rule(5173, uid), CloseReason::Expired),
+        )
+        .await
+        .unwrap();
+    until("a notification", || shown.lock().unwrap().first().cloned()).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(shown.lock().unwrap().len(), 1);
+    assert!(first.is_running());
+}

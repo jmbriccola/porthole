@@ -4,6 +4,7 @@ members = [
     "crates/porthole-core",
     "crates/porthole-cli",
     "crates/porthole-helper",
+    "crates/porthole-agent",
     "crates/porthole-gui",
 ]
 # porthole-gui links gtk4/libadwaita, which need GTK4 development headers
@@ -26,6 +27,7 @@ default-members = [
     "crates/porthole-core",
     "crates/porthole-cli",
     "crates/porthole-helper",
+    "crates/porthole-agent",
 ]
 
 [workspace.package]

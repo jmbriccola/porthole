@@ -1,0 +1,16 @@
+# XDG autostart entry, installed in /etc/xdg/autostart. The systemd user unit
+# data/porthole-agent.service does the same job for desktops that start
+# session services through systemd; the spec asks for both, because desktops
+# differ in which they honour. A desktop that honours both starts two agents,
+# and the second exits on finding com.jacopobriccola.PortholeAgent already
+# taken -- see that unit's own comment.
+[Desktop Entry]
+Type=Application
+Name=Porthole notifications
+Comment=Say when porthole closes a port
+Exec=porthole-agent
+Icon=com.jacopobriccola.Porthole
+Terminal=false
+# Nothing to launch by hand: it has no window and no interface of its own.
+NoDisplay=true
+Categories=Network;

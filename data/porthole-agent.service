@@ -1,0 +1,35 @@
+[Unit]
+Description=porthole desktop notifications
+Documentation=man:porthole(1)
+# Ends with the graphical session rather than outliving it: this exists to
+# put a notification on a screen, and after the session there is no screen.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+# The path docs/installing.md installs it to by hand. A packaged install
+# that puts it in /usr/bin must change this line; the XDG autostart entry
+# beside this file needs no such edit, because a desktop entry's Exec= is
+# looked up on $PATH and this is not.
+ExecStart=/usr/local/bin/porthole-agent
+# No Restart=. The one failure this binary must survive -- a session with no
+# notification service -- it survives by carrying on rather than by exiting,
+# so a restart could only ever repeat a start-up that stopped for a reason
+# restarting cannot change: no session bus, no system bus, or a second agent
+# already holding com.jacopobriccola.PortholeAgent. Each of those says why
+# and exits 0, so the unit stays stopped and is never marked failed. Adding
+# Restart=on-failure here would turn a headless login into a loop against
+# systemd's start limit.
+#
+# porthole also ships data/porthole-agent.desktop, because desktops differ in
+# which of the two they honour. A desktop that honours both starts two
+# agents; the second finds the bus name taken, says so, and exits, so this
+# unit and that file can both be installed without every close being
+# announced twice.
+#
+# No hardening directives: the agent reads two buses and writes nothing. The
+# privileged half is porthole-helper.service, which carries its own.
+
+[Install]
+WantedBy=graphical-session.target

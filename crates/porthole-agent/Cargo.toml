@@ -1,0 +1,23 @@
+[package]
+name = "porthole-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Session agent that turns porthole's bus signals into desktop notifications."
+
+[[bin]]
+name = "porthole-agent"
+path = "src/main.rs"
+
+[dependencies]
+porthole-core = { path = "../porthole-core" }
+futures-util.workspace = true
+libc.workspace = true
+tokio.workspace = true
+zbus.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
