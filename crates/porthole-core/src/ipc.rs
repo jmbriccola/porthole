@@ -160,6 +160,33 @@ impl WireStatus {
     }
 }
 
+/// One port Docker has published, as [`crate::docker::Published`] crosses
+/// the bus. D-Bus has no optional types (the same reason [`WireRule`]'s
+/// `expires_at` uses `0` as a sentinel): `host_addr` is empty for "no `-d`",
+/// i.e. published on every interface, and otherwise the address itself,
+/// which can never be the empty string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct WireDockerPort {
+    /// Empty means every interface (no `-d` on the rule).
+    pub host_addr: String,
+    pub host_port: u16,
+    pub protocol: String,
+    pub container_addr: String,
+    pub container_port: u16,
+}
+
+impl WireDockerPort {
+    pub fn from_published(p: &crate::docker::Published) -> Self {
+        WireDockerPort {
+            host_addr: p.host_addr.map(|a| a.to_string()).unwrap_or_default(),
+            host_port: p.host_port,
+            protocol: p.protocol.to_string(),
+            container_addr: p.container_addr.to_string(),
+            container_port: p.container_port,
+        }
+    }
+}
+
 /// The client side of the helper's interface.
 ///
 /// `scope` is passed as the user typed it — `subnet`, `any`, a CIDR, an IP —
@@ -204,6 +231,13 @@ pub trait Porthole {
     async fn list(&self) -> zbus::Result<Vec<WireRule>>;
 
     async fn status(&self) -> zbus::Result<WireStatus>;
+
+    /// Every port Docker currently has published, read from the `DOCKER`
+    /// chain in the `nat` table — see `crate::docker`'s own module doc for
+    /// why this needs root, and never asks Docker itself anything. Gated on
+    /// the same `list` polkit action as `list`/`status`: it is exactly as
+    /// unprivileged a read as either.
+    async fn docker_ports(&self) -> zbus::Result<Vec<WireDockerPort>>;
 }
 
 #[cfg(test)]
@@ -384,5 +418,39 @@ mod tests {
         assert_eq!(json["kind"], "command_failed");
         assert_eq!(json["code"], 1);
         assert!(json["message"].as_str().unwrap().contains("firewall-cmd"));
+    }
+
+    #[test]
+    fn a_docker_port_published_everywhere_crosses_the_wire_with_an_empty_host_addr() {
+        // No `-d` on the rule means every interface -- see this module's own
+        // `WireDockerPort::from_published`. Empty, not the address `"0.0.0.0"`
+        // itself, since porthole never actually parses that literal out of
+        // the rule -- it only ever infers "no restriction" from `-d`'s
+        // absence.
+        let p = crate::docker::Published {
+            host_addr: None,
+            host_port: 8080,
+            protocol: Protocol::Tcp,
+            container_addr: "172.17.0.2".parse().unwrap(),
+            container_port: 80,
+        };
+        let wire = WireDockerPort::from_published(&p);
+        assert_eq!(wire.host_addr, "");
+        assert_eq!(wire.host_port, 8080);
+        assert_eq!(wire.container_addr, "172.17.0.2");
+        assert_eq!(wire.container_port, 80);
+    }
+
+    #[test]
+    fn a_docker_port_published_on_loopback_carries_that_address_on_the_wire() {
+        let p = crate::docker::Published {
+            host_addr: Some("127.0.0.1".parse().unwrap()),
+            host_port: 5432,
+            protocol: Protocol::Tcp,
+            container_addr: "172.17.0.3".parse().unwrap(),
+            container_port: 80,
+        };
+        let wire = WireDockerPort::from_published(&p);
+        assert_eq!(wire.host_addr, "127.0.0.1");
     }
 }

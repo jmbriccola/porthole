@@ -99,7 +99,7 @@ pub fn run(session: bool) -> Vec<Check> {
         ),
     });
 
-    checks.push(check_docker());
+    checks.push(check_docker(session));
     checks.push(check_ipv6(&runner));
 
     checks
@@ -451,13 +451,15 @@ fn check_expiry_timer(session: bool) -> Check {
     }
 }
 
-fn check_docker() -> Check {
-    if !std::path::Path::new("/sys/class/net/docker0").exists() {
-        return Check::good("Docker", "not present".to_string());
-    }
-    // Not a failure — a warning. Docker writes its own iptables rules, which
-    // are evaluated before firewalld, so porthole neither sees nor controls
-    // ports a container published.
+/// The generic, presence-only wording this check used before it could read
+/// the `DOCKER` chain itself -- kept as the fallback for whenever the
+/// privileged helper cannot be reached, or errors, since `doctor` runs
+/// unprivileged and has no other way to read that chain (see
+/// `porthole_core::docker`'s own module doc). No longer says "detecting
+/// which ports are affected arrives in a later release": this is that
+/// release, when the helper answers -- `check_docker`'s own `Err` arm below
+/// is what keeps this fallback's wording honest for when it does not.
+fn generic_docker_check() -> Check {
     Check {
         name: "Docker",
         ok: true,
@@ -465,9 +467,68 @@ fn check_docker() -> Check {
                  reachable, and porthole cannot close it: Docker's rules are \
                  evaluated before firewalld's."
             .to_string(),
-        remedy: "Publish container ports on 127.0.0.1 in your compose files. \
-                 Detecting which ports are affected arrives in a later release."
+        remedy: "porthole could not read which ports Docker has actually published -- the \
+                 helper could not be reached, or answered with an error (see the Helper \
+                 check above). Publish container ports on 127.0.0.1 in your compose files \
+                 if you do not want them reachable from the network."
             .to_string(),
+    }
+}
+
+/// One `port/protocol on <where>` fragment per published port, for the
+/// `Docker` check's own detail text -- e.g. `8080/tcp on every interface
+/// (0.0.0.0), 5432/tcp on 127.0.0.1`.
+fn describe_published(published: &[porthole_core::docker::Published]) -> String {
+    published
+        .iter()
+        .map(|p| {
+            let where_ = match p.host_addr {
+                Some(addr) => addr.to_string(),
+                None => "every interface (0.0.0.0)".to_string(),
+            };
+            format!("{}/{} on {where_}", p.host_port, p.protocol)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Not a failure either way — a warning. Docker writes its own iptables
+/// rules, evaluated before firewalld's, so porthole neither sees nor
+/// controls a port a container published; what changes below is only
+/// whether `doctor` can name exactly which ports that is true for, which
+/// needs the privileged helper (`porthole_core::docker`'s own module doc
+/// says why) and so is a best-effort extra, not something this check's own
+/// `ok: true` depends on either way.
+fn check_docker(session: bool) -> Check {
+    if !std::path::Path::new("/sys/class/net/docker0").exists() {
+        return Check::good("Docker", "not present".to_string());
+    }
+
+    match crate::client::docker_ports(session) {
+        Ok(published) if published.is_empty() => Check::good(
+            "Docker",
+            "present, but nothing is currently published".to_string(),
+        ),
+        Ok(published) => Check {
+            name: "Docker",
+            ok: true,
+            detail: format!(
+                "present, publishing {}. Each of these is already reachable exactly as \
+                 published, and porthole neither opened nor can close it: Docker's rules \
+                 are evaluated before firewalld's.",
+                describe_published(&published)
+            ),
+            // Not "publish on 127.0.0.1 if you don't want it reachable" --
+            // that advice would be backwards for any row already published
+            // there, and this list can hold both kinds at once. Docker's own
+            // rule is what to change either way, in either direction.
+            remedy: "Docker, not porthole, decides whether each of these is reachable from \
+                     the network: publish on 0.0.0.0 in your compose file to make one \
+                     reachable, or on 127.0.0.1 to keep it off the network -- porthole \
+                     cannot open or close what Docker's own rules already decide."
+                .to_string(),
+        },
+        Err(_) => generic_docker_check(),
     }
 }
 
@@ -585,6 +646,44 @@ mod tests {
     use super::*;
     use porthole_core::backend::{nftables::Nftables, ufw::Ufw, FirewallBackend};
     use porthole_core::command::{Output, RecordingRunner};
+    use porthole_core::docker::Published;
+    use porthole_core::model::Protocol;
+
+    #[test]
+    fn describe_published_names_every_port_and_where_it_is_published() {
+        let published = vec![
+            Published {
+                host_addr: None,
+                host_port: 8080,
+                protocol: Protocol::Tcp,
+                container_addr: "172.17.0.2".parse().unwrap(),
+                container_port: 80,
+            },
+            Published {
+                host_addr: Some("127.0.0.1".parse().unwrap()),
+                host_port: 5432,
+                protocol: Protocol::Tcp,
+                container_addr: "172.17.0.3".parse().unwrap(),
+                container_port: 80,
+            },
+        ];
+        let text = describe_published(&published);
+        assert!(
+            text.contains("8080/tcp on every interface (0.0.0.0)"),
+            "got: {text}"
+        );
+        assert!(text.contains("5432/tcp on 127.0.0.1"), "got: {text}");
+    }
+
+    #[test]
+    fn the_generic_docker_fallback_names_the_helper_as_the_reason_it_is_generic() {
+        // This is what a doctor run reports when the helper cannot be
+        // reached to ask -- it must not claim to know exactly which ports
+        // are published, since it does not.
+        let check = generic_docker_check();
+        assert!(check.ok);
+        assert!(check.remedy.contains("helper"), "got: {}", check.remedy);
+    }
 
     /// Captured shape (see `nftables.rs`'s own tests for the same fixture):
     /// one base chain at the input hook, policy `accept`.

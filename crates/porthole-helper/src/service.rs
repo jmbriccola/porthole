@@ -22,7 +22,7 @@ use porthole_core::clock::SystemClock;
 use porthole_core::command::RealRunner;
 use porthole_core::engine::{is_open_any, resolve_scope, Engine, Status};
 use porthole_core::error::Error;
-use porthole_core::ipc::{WireError, WireRule, WireStatus};
+use porthole_core::ipc::{WireDockerPort, WireError, WireRule, WireStatus};
 use porthole_core::model::Lifetime;
 use porthole_core::net;
 use porthole_core::state::StateStore;
@@ -350,6 +350,30 @@ impl Porthole {
             ),
         };
         Ok(WireStatus::from_status(&status))
+    }
+
+    /// Every port Docker currently has published, read from the `DOCKER`
+    /// chain in the `nat` table -- see `porthole_core::docker`'s own module
+    /// doc for why this needs to live behind the helper at all: reading the
+    /// `nat` table needs root, which an unprivileged CLI process does not
+    /// have. Gated on `Action::List`, exactly as unprivileged a read as
+    /// `list`/`status` already are -- there is nothing here a caller could
+    /// use to change anything.
+    async fn docker_ports(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<Vec<WireDockerPort>, HelperError> {
+        self.authorizer
+            .check(Action::List, &Details::new(), &header)
+            .await
+            .map_err(HelperError::from)?;
+
+        let runner = RealRunner;
+        let published = porthole_core::docker::published(&runner).map_err(HelperError::from)?;
+        Ok(published
+            .iter()
+            .map(WireDockerPort::from_published)
+            .collect())
     }
 }
 

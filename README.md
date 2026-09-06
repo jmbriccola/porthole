@@ -164,11 +164,19 @@ never renumbered.
   packet's fate. See [docs/backends.md](docs/backends.md) for what each
   backend can do, what it cannot, and why — `porthole doctor` also names the
   one it found.
-- **Docker publishes ports below the firewall.** Docker writes its own iptables
-  rules, evaluated before firewalld, so a container published on `0.0.0.0` is
-  already reachable and closing that port with porthole will not close it.
-  Detecting and explaining this is planned; right now porthole does not warn
-  you. Publish container ports on `127.0.0.1` in your compose files.
+- **Docker publishes ports below the firewall, in both directions.** Docker
+  writes its own iptables rules, evaluated before firewalld, ufw or nftables,
+  so a container published on `0.0.0.0` is already reachable — closing that
+  port with porthole will not close it — and a container published on
+  `127.0.0.1` is *not* made reachable by opening it with porthole, because
+  the firewall was never what was stopping it. `porthole listen`,
+  `porthole open` and `porthole doctor` all name which of your listening
+  ports Docker has already published, and to which address, by reading the
+  `DOCKER` chain directly (never by asking `docker` itself, and never by
+  checking `docker` group membership — porthole works the same whether or
+  not you can query Docker at all). Publish container ports on `127.0.0.1`
+  in your compose files if you do not want them reachable from the network;
+  porthole cannot do that for you.
 - **Reconciliation runs before every command, not continuously.** A
   `firewall-cmd --reload`, a reboot, or a rule removed by hand between two
   porthole commands is invisible until the next one runs — `porthole list`

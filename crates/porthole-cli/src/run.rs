@@ -116,14 +116,21 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
             })
         }
         // Unprivileged and read-only, like `list`: nothing here needs the
-        // helper or a firewall backend at all, so it works even when neither
-        // is installed.
+        // helper or a firewall backend at all, so it still completes with no
+        // firewall installed. Docker information is the one exception: it is
+        // privileged (`porthole_core::docker`'s own module doc says why),
+        // and asking for it is a best-effort extra, never a reason to fail
+        // `listen` outright -- a helper that is absent, or that answers with
+        // an error, is reported to the renderers as "not checked"
+        // (`docker: None`), not silently folded into "Docker touches
+        // nothing here".
         Commands::Listen => {
             let services = listening::scan(&RealProcFs)?;
+            let docker = client::docker_ports(cli.session).ok();
             if cli.json {
-                println!("{}", output::json_listening(&services));
+                println!("{}", output::json_listening(&services, docker.as_deref()));
             } else {
-                output::print_listening(&services);
+                output::print_listening(&services, docker.as_deref());
             }
             Ok(ExitCode::Success)
         }
@@ -166,11 +173,26 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
         }
     };
 
+    // A best-effort, read-only look at whether Docker already has an
+    // opinion about this exact port/protocol -- see `porthole_core::docker`'s
+    // own module doc for the two ways a user is misled if this stays silent.
+    // Unlike every value resolved above, this never changes what `open`
+    // itself does: a helper that cannot be reached, or that errors, leaves
+    // `docker_note` at `None` rather than failing `open` outright -- `open`
+    // has never needed the helper for anything but the real work, and a
+    // missing bonus warning is not a reason to stop doing that work.
+    let docker_note = client::docker_ports(cli.session)
+        .ok()
+        .and_then(|published| porthole_core::docker::advise(port, protocol, &published));
+
     if cli.dry_run {
-        // Unchanged: local, unprivileged, no helper needed. Seeing what
-        // porthole would do is what earns a user's trust, and asking for a
-        // password — or reaching for a helper that may not even be installed
-        // — first would defeat that.
+        // The engine path below is unchanged: local, unprivileged, no helper
+        // needed. Seeing what porthole would do is what earns a user's
+        // trust, and asking for a password — or reaching for a helper that
+        // may not even be installed — first would defeat that. `docker_note`
+        // above is the one exception: it does attempt the helper, even under
+        // `--dry-run`, since it only ever reads and is swallowed on failure
+        // exactly as it is for a real open.
         let runner = make_runner(cli);
         let backend = backend::detect(runner.as_ref())?;
         let mut engine = make_engine(backend.as_ref(), runner.as_ref())?;
@@ -185,7 +207,7 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
         if cli.json {
             println!(
                 "{}",
-                output::json_opened(&rule, now, true, &runner.recorded())
+                output::json_opened(&rule, now, true, &runner.recorded(), docker_note.as_deref())
             );
         } else {
             println!(
@@ -196,6 +218,10 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
                 output::format_remaining(rule.expires_in(now))
             );
             output::print_dry_run(&runner.recorded());
+            if let Some(note) = &docker_note {
+                println!();
+                println!("{note}");
+            }
         }
         Ok(ExitCode::Success)
     } else {
@@ -210,9 +236,12 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
         let now = rule.opened_at;
 
         if cli.json {
-            println!("{}", output::json_opened(&rule, now, false, &[]));
+            println!(
+                "{}",
+                output::json_opened(&rule, now, false, &[], docker_note.as_deref())
+            );
         } else {
-            output::print_opened(&rule, now);
+            output::print_opened(&rule, now, docker_note.as_deref());
         }
         Ok(ExitCode::Success)
     }

@@ -16,6 +16,7 @@ pub mod cli_path;
 pub mod clock;
 pub mod command;
 pub mod devices;
+pub mod docker;
 pub mod engine;
 pub mod error;
 pub mod expiry;

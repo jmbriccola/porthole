@@ -116,6 +116,43 @@ async fn opening_towards_everyone_asks_for_the_stronger_action() {
     );
 }
 
+/// `docker_ports` reaches the real `Porthole::docker_ports` method over a
+/// real bus, exactly the way `list` does above -- what this actually proves
+/// is that the method is wired onto the interface and authorized the same
+/// way `list`/`status` are. It is authorized first: `authz.asked()` records
+/// the check regardless of what the read itself does next. This helper runs
+/// unprivileged, so `iptables -t nat -S DOCKER` itself fails with permission
+/// denied here (exit 4, `iptables(8)`'s own resource-problem code) whether
+/// or not Docker is installed, and `porthole_core::docker::published`
+/// propagates that as a real error rather than reading it as "no ports" --
+/// see its own doc comment -- so this call is expected to fail, the same
+/// reasoning `opening_towards_everyone_asks_for_the_stronger_action`,
+/// above, already applies to firewalld refusing an unprivileged caller. The
+/// production helper always runs as root, where this permission error never
+/// happens.
+#[tokio::test]
+async fn docker_ports_is_reachable_and_authorized_like_list() {
+    let dir = TempDir::new().unwrap();
+    let (_server, authz, name) = serve("Docker", &dir.path().join("state.json")).await;
+
+    let client = zbus::Connection::session().await.unwrap();
+    let proxy = PortholeProxy::builder(&client)
+        .destination(name)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let err = proxy.docker_ports().await.unwrap_err();
+    assert!(
+        format!("{err:?}").contains("CommandFailed"),
+        "expected a typed CommandFailed (this helper cannot read iptables unprivileged), \
+         got: {err:?}"
+    );
+    let asked: Vec<String> = authz.asked().into_iter().map(|(a, _)| a).collect();
+    assert_eq!(asked, vec![Action::List.id().to_string()]);
+}
+
 #[tokio::test]
 async fn an_invalid_protocol_is_refused_before_anything_is_authorized() {
     // The helper validates for itself. A client cannot make it act on a value

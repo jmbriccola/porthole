@@ -138,12 +138,37 @@ same sentence, without a label, directly under the `Firewall`/location/
   "schema": 1,
   "dry_run": false,
   "rule": { /* rule object */ },
-  "commands": [ "firewall-cmd --zone=... '--add-rich-rule=...'" ]
+  "commands": [ "firewall-cmd --zone=... '--add-rich-rule=...'" ],
+  "docker_note": null
 }
 ```
 
 `commands` lists the withheld commands under `--dry-run`, and is empty
 otherwise.
+
+`docker_note` is `null` on almost every open — Docker has an opinion about
+the exact port/protocol just opened only rarely. When it is not `null`, it
+says one of two things, and porthole still went ahead and opened the rule
+either way (diagnosing Docker's own rules is all porthole ever does; it
+never touches them):
+
+- the port is already published by a container on every interface, or on one
+  specific address other than `127.0.0.1`: opening it here changed nothing,
+  because it was already reachable, and closing it later will not close it
+  either — Docker's own iptables rules are evaluated before firewalld's,
+  ufw's or nftables'.
+- the port is published by a container on `127.0.0.1` only: the firewall was
+  never what was stopping it from being reachable, so opening it here does
+  not make it reachable — the fix is in the container's own port binding, not
+  in porthole.
+
+Getting a container port reachable, or closed, when Docker itself has
+published or restricted it is outside what porthole can do — see
+`porthole doctor`'s own `Docker` check for the same two facts, named for
+whichever ports it could actually read. This is a plain string, not a
+structured object: a script that needs the underlying fact reads it from
+`porthole listen --json`'s own `docker` field instead, which names the exact
+address rather than a rendered sentence.
 
 ## `porthole close --json`
 
@@ -177,6 +202,7 @@ whatever firewall created it.
 ```json
 {
   "schema": 1,
+  "docker_checked": true,
   "services": [
     {
       "port": 5173,
@@ -184,7 +210,8 @@ whatever firewall created it.
       "address": "0.0.0.0",
       "binding": "all_interfaces",
       "process": "node",
-      "pid": 12043
+      "pid": 12043,
+      "docker": null
     },
     {
       "port": 46715,
@@ -192,7 +219,8 @@ whatever firewall created it.
       "address": "127.0.0.1",
       "binding": "loopback_only",
       "process": "code",
-      "pid": 9816
+      "pid": 9816,
+      "docker": null
     },
     {
       "port": 8443,
@@ -200,7 +228,17 @@ whatever firewall created it.
       "address": "2001:db8::1",
       "binding": "beyond_reach",
       "process": null,
-      "pid": null
+      "pid": null,
+      "docker": null
+    },
+    {
+      "port": 8080,
+      "protocol": "tcp",
+      "address": "0.0.0.0",
+      "binding": "all_interfaces",
+      "process": null,
+      "pid": null,
+      "docker": { "published_on": null }
     }
   ]
 }
@@ -259,6 +297,25 @@ socket owned by another user (or root) still appears, with `process` and
 needs to tell "not resolved" from "a process actually named that" can rely on
 this: the field is `null` in the first case and always a real string in the
 second.
+
+`docker_checked` says whether porthole could actually ask about Docker at
+all — reading Docker's own DNAT rules needs root, which `porthole listen`
+does not have, so it goes through the privileged helper, and `listen` still
+completes without one (exactly as it already does with no firewall backend
+installed). `false` means the helper could not be reached or errored, and
+every row's own `docker` field is `null` regardless of whether any of them
+are actually Docker-published — a script must check `docker_checked` before
+reading anything into a row's `docker: null`, or it cannot tell "checked,
+and Docker does not touch this port" from "not checked at all". When
+`docker_checked` is `true`, a row's `docker` is `{ "published_on": <addr or
+null> }` for a port a container has published, and `null` for one Docker
+does not touch. `published_on` is the address Docker's own rule restricts
+the port to — `null` means every interface (no `-d` on the rule, i.e.
+published on `0.0.0.0`), a string like `"127.0.0.1"` means only that address.
+See `porthole open --json`'s own `docker_note` for the two-sentence version
+of what this means for a person opening that exact port, and
+`porthole_core::docker`'s own module doc for why both directions — already
+reachable, and not made reachable by opening it — matter.
 
 ## `porthole devices list --json`
 
