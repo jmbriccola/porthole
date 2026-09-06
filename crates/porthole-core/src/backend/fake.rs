@@ -26,6 +26,12 @@ pub struct FakeBackend {
     /// `fail_close_for`, for tests exercising "one stuck rule must not abort
     /// the rest of a sweep or a `close --all`".
     fail_close: Mutex<HashSet<String>>,
+    /// Set by `fail_list_rules`. For tests proving a sweep failure must not
+    /// fail the operation the caller actually asked for.
+    fail_list_rules: Mutex<bool>,
+    /// Set by `fail_owned_rules`. For tests proving the safe direction's
+    /// write does not depend on the unsafe direction succeeding.
+    fail_owned_rules: Mutex<bool>,
 }
 
 impl FakeBackend {
@@ -67,6 +73,8 @@ impl FakeBackend {
             markers: Mutex::new(Vec::new()),
             live: Mutex::new(Vec::new()),
             fail_close: Mutex::new(HashSet::new()),
+            fail_list_rules: Mutex::new(false),
+            fail_owned_rules: Mutex::new(false),
         }
     }
 
@@ -96,6 +104,16 @@ impl FakeBackend {
             .lock()
             .expect("not poisoned")
             .insert(marker.to_string());
+    }
+
+    /// Make every subsequent `list_rules` call return an error.
+    pub fn fail_list_rules(&self) {
+        *self.fail_list_rules.lock().expect("not poisoned") = true;
+    }
+
+    /// Make every subsequent `owned_rules` call return an error.
+    pub fn fail_owned_rules(&self) {
+        *self.fail_owned_rules.lock().expect("not poisoned") = true;
     }
 }
 
@@ -163,10 +181,20 @@ impl FirewallBackend for FakeBackend {
     }
 
     fn list_rules(&self) -> Result<Vec<RuleHandle>> {
+        if *self.fail_list_rules.lock().expect("not poisoned") {
+            return Err(Error::Unexpected(
+                "fake backend: list_rules forced to fail".to_string(),
+            ));
+        }
         Ok(self.handles())
     }
 
     fn owned_rules(&self) -> Result<Option<Vec<RuleHandle>>> {
+        if *self.fail_owned_rules.lock().expect("not poisoned") {
+            return Err(Error::Unexpected(
+                "fake backend: owned_rules forced to fail".to_string(),
+            ));
+        }
         Ok(Some(self.handles()))
     }
 

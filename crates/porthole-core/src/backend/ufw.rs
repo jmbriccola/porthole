@@ -58,6 +58,17 @@ impl<'a> Ufw<'a> {
         let cmd = Command::mutate("ufw", args);
         let out = self.runner.run(&cmd)?.into_ok(&cmd)?;
 
+        if self.runner.is_dry_run() {
+            // The add was withheld, so there is no stdout to read a
+            // confirmation from -- ufw's success signal is its words, not its
+            // exit code (see the module docs), and a withheld mutation's
+            // `Output` is empty. Report the rule dry-run would have added.
+            return Ok(RuleHandle::Ufw {
+                spec,
+                marker: marker.to_string(),
+            });
+        }
+
         // ufw's exit code says nothing; its words do.
         if out.stdout.contains("Skipping adding existing rule") {
             return Err(Error::AlreadyOpen {
@@ -93,6 +104,17 @@ impl<'a> Ufw<'a> {
         let cmd = Command::mutate("ufw", args);
         let out = self.runner.run(&cmd)?.into_ok(&cmd)?;
 
+        if self.runner.is_dry_run() {
+            // Same reasoning as `open_impl`: the delete was withheld, so
+            // there is nothing on stdout to confirm it against. This matters
+            // beyond an explicit `close --dry-run`: reconciliation's own
+            // sweep calls this for every orphan it finds, including under a
+            // dry-run `open` or `close`, and without this a withheld orphan
+            // close would land in `Report::failures` instead of the
+            // withheld-command list a dry run is supposed to show.
+            return Ok(());
+        }
+
         if out.stdout.contains("Could not delete non-existent rule") {
             return Err(Error::RuleNotFound(format!("ufw has no rule {spec}")));
         }
@@ -103,6 +125,34 @@ impl<'a> Ufw<'a> {
             )));
         }
         Ok(())
+    }
+
+    /// Normalise a source address the way `spec` already writes one, so a
+    /// stored handle and one reconstructed from ufw's own output compare
+    /// equal.
+    ///
+    /// `ufw status numbered` renders a `/32` source with the prefix
+    /// dropped -- `10.10.10.42`, not `10.10.10.42/32` -- while `spec` always
+    /// writes the network form via `Ipv4Net::to_string`, which never omits
+    /// it. Left alone, a host-scoped `open`'s stored handle and the one this
+    /// function's caller reconstructs are never equal, and reconciliation
+    /// -- which compares handles structurally -- treats a rule ufw still
+    /// enforces as stale, drops it from state, and (see `owned_rules`) could
+    /// not even have recognised it as porthole's own to protect it, because
+    /// a bare address fails to parse as `Ipv4Net` at all.
+    fn canonical_source(text: &str) -> String {
+        if let Ok(net) = text.parse::<Ipv4Net>() {
+            return net.to_string();
+        }
+        if let Ok(addr) = text.parse::<std::net::Ipv4Addr>() {
+            if let Ok(net) = Ipv4Net::new(addr, 32) {
+                return net.to_string();
+            }
+        }
+        // Not a recognisable IPv4 address at all (shouldn't happen -- v6 rows
+        // are filtered out before this runs) -- pass it through unchanged
+        // rather than inventing a shape for it.
+        text.to_string()
     }
 
     fn status_numbered(&self) -> Result<String> {
@@ -182,7 +232,7 @@ impl<'a> Ufw<'a> {
             let source = if from_base == "Anywhere" {
                 "0.0.0.0/0".to_string()
             } else {
-                from_base.to_string()
+                Self::canonical_source(from_base)
             };
 
             let spec = format!("from {source} to any port {port_text} proto {proto_text}");
@@ -304,7 +354,10 @@ mod tests {
 
     /// Captured verbatim from ufw 0.36.2 in a container, with real user rules
     /// alongside porthole's. Do not tidy the spacing, and do not drop a row:
-    /// each of the last four is a shape a naive parser gets wrong.
+    /// each of the last five is a shape a naive parser gets wrong. Row 7 is a
+    /// `/32` host source rendered bare (no prefix) -- exactly the shape that
+    /// made a host-scoped `open` compare unequal to itself after a round trip
+    /// through `list_rules`, before `canonical_source` existed.
     const STATUS_NUMBERED: &str = "Status: active
 
      To                         Action      From
@@ -315,6 +368,7 @@ mod tests {
 [ 4] 80                         DENY IN     192.168.5.0/24
 [ 5] 8000:8010/tcp              ALLOW IN    Anywhere
 [ 6] 22/tcp (v6)                LIMIT IN    Anywhere (v6)
+[ 7] 5174/tcp                   ALLOW IN    10.10.10.42                # porthole:c3
 ";
 
     fn request(port: u16, target: Target) -> OpenRequest {
@@ -428,7 +482,7 @@ mod tests {
         // action as part of the address. All four are real ufw output.
         let runner = RecordingRunner::with_responses(vec![Output::stdout(STATUS_NUMBERED)]);
         let all = Ufw::new(&runner).list_rules().unwrap();
-        assert_eq!(all.len(), 6, "every row is reported, none silently dropped");
+        assert_eq!(all.len(), 7, "every row is reported, none silently dropped");
     }
 
     #[test]
@@ -453,9 +507,12 @@ mod tests {
     fn owned_rules_finds_only_the_marked_ones() {
         // Entries 3 to 6 are the user's own rules. None may come back from
         // owned_rules, and reconciliation must therefore never remove one.
+        // Entry 7 is porthole's own host-scoped rule, rendered bare -- it
+        // must be recognised despite that, or a leftover host-scoped ufw
+        // rule could never be cleaned up by reconciliation at all.
         let runner = RecordingRunner::with_responses(vec![Output::stdout(STATUS_NUMBERED)]);
         let owned = Ufw::new(&runner).owned_rules().unwrap().unwrap();
-        assert_eq!(owned.len(), 2);
+        assert_eq!(owned.len(), 3);
         let markers: Vec<_> = owned
             .iter()
             .map(|h| match h {
@@ -463,14 +520,16 @@ mod tests {
                 other => panic!("unexpected handle: {other:?}"),
             })
             .collect();
-        assert_eq!(markers, vec!["porthole:a1", "porthole:b2"]);
+        assert_eq!(markers, vec!["porthole:a1", "porthole:b2", "porthole:c3"]);
     }
 
     #[test]
     fn a_listed_rule_yields_a_spec_that_would_delete_it() {
         // Reconciliation removes an orphan by feeding this spec straight back
         // to `ufw delete`. If the reconstruction is wrong, the sweep silently
-        // does nothing and the port stays open forever.
+        // does nothing and the port stays open forever. Entry 7's `/32` must
+        // come back with an explicit prefix -- the bare form `ufw delete`
+        // would be fed is not what `spec` ever writes, and would not match.
         let runner = RecordingRunner::with_responses(vec![Output::stdout(STATUS_NUMBERED)]);
         let owned = Ufw::new(&runner).owned_rules().unwrap().unwrap();
         let specs: Vec<_> = owned
@@ -485,7 +544,44 @@ mod tests {
             vec![
                 "from 0.0.0.0/0 to any port 5173 proto tcp",
                 "from 10.10.10.0/24 to any port 6000 proto udp",
+                "from 10.10.10.42/32 to any port 5174 proto tcp",
             ]
+        );
+    }
+
+    #[test]
+    fn a_host_scoped_open_round_trips_through_list_rules_despite_ufws_bare_slash_32() {
+        // C1: ufw renders a `/32` source without its prefix in `status
+        // numbered` (`10.10.10.42`, not `10.10.10.42/32`), while `spec`
+        // always writes the network form with an explicit one. Without
+        // normalising both sides, the handle `open` returns and the one
+        // `list_rules` reconstructs from ufw's own output are never equal --
+        // and reconciliation, which compares handles structurally, would
+        // drop a rule ufw still enforces as stale on the very next sweep,
+        // then close it as an unrecognised orphan: porthole silently closing
+        // a port it just opened.
+        let open_runner = RecordingRunner::with_responses(vec![Output::stdout("Rule added")]);
+        let host = Target::Network {
+            cidr: "10.10.10.42/32".parse().unwrap(),
+        };
+        let opened = Ufw::new(&open_runner)
+            .open(&request(5173, host), "porthole:host")
+            .unwrap();
+
+        const RENDERED: &str = "Status: active
+
+     To                         Action      From
+     --                         ------      ----
+[ 1] 5173/tcp                   ALLOW IN    10.10.10.42                # porthole:host
+";
+        let list_runner = RecordingRunner::with_responses(vec![Output::stdout(RENDERED)]);
+        let listed = Ufw::new(&list_runner).list_rules().unwrap();
+
+        assert_eq!(
+            listed,
+            vec![opened],
+            "a host-scoped rule must round-trip through list_rules identically \
+             to what open returned, or reconciliation treats a live rule as stale"
         );
     }
 
@@ -514,5 +610,37 @@ mod tests {
         for cmd in runner.recorded() {
             assert!(!cmd.display().contains("--permanent"));
         }
+    }
+
+    #[test]
+    fn open_and_close_succeed_under_dry_run_with_nothing_to_confirm() {
+        // Unlike firewalld and nftables, ufw decides success by reading
+        // stdout, never the exit code -- and a withheld mutation's `Output`
+        // is empty. Without a dry-run check of its own, `open_impl` reads
+        // that emptiness as "did not confirm the rule was added" and
+        // `close_impl` reads it as "did not confirm the rule was deleted",
+        // turning every withheld ufw mutation into a hard error under
+        // `--dry-run` -- including reconciliation's own orphan closes, which
+        // now run inside every dry-run `open` and `close` too.
+        use crate::command::DryRunRunner;
+
+        let open_runner = DryRunRunner::new(Box::new(RecordingRunner::new()));
+        let handle = Ufw::new(&open_runner)
+            .open(&request(5173, subnet()), "porthole:abc")
+            .unwrap();
+        assert_eq!(
+            handle,
+            RuleHandle::Ufw {
+                spec: "from 10.10.10.0/24 to any port 5173 proto tcp".to_string(),
+                marker: "porthole:abc".to_string(),
+            }
+        );
+        assert_eq!(open_runner.recorded().len(), 1, "one withheld mutation");
+
+        let close_runner = DryRunRunner::new(Box::new(RecordingRunner::new()));
+        Ufw::new(&close_runner)
+            .close(&handle)
+            .expect("a withheld close must not be reported as a failure");
+        assert_eq!(close_runner.recorded().len(), 1, "one withheld mutation");
     }
 }

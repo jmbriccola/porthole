@@ -77,6 +77,10 @@ pub struct StateStore {
     /// read-modify-write is atomic against other porthole processes. `None`
     /// for a read-only view.
     _lock: Option<File>,
+    /// See [`StateStore::saved_generation`]. Interior mutability because
+    /// `save` takes `&self`, not `&mut self`.
+    #[cfg(test)]
+    save_count: std::cell::Cell<u64>,
 }
 
 impl StateStore {
@@ -94,6 +98,8 @@ impl StateStore {
             path,
             state,
             _lock: None,
+            #[cfg(test)]
+            save_count: std::cell::Cell::new(0),
         })
     }
 
@@ -116,6 +122,8 @@ impl StateStore {
             path,
             state,
             _lock: Some(lock),
+            #[cfg(test)]
+            save_count: std::cell::Cell::new(0),
         })
     }
 
@@ -205,20 +213,22 @@ impl StateStore {
             path: self.path.display().to_string(),
             detail: e.to_string(),
         })?;
+        #[cfg(test)]
+        self.save_count.set(self.save_count.get() + 1);
         Ok(())
     }
 
-    /// A value that changes if and only if [`StateStore::save`] has actually
-    /// written the file since the last time this was read.
+    /// How many times [`StateStore::save`] has actually written the file
+    /// through this handle.
     ///
-    /// Built from the file's own mtime rather than an added counter: `save`
-    /// already renames a freshly-written file into place, so its mtime is a
-    /// free signal that needs no change to `save` itself. `None` before the
-    /// file has ever been written. Test-only: reconciliation's "nothing
-    /// changed, nothing written" test is the reason this exists.
+    /// A real counter (`save_count`), not the file's mtime: mtime resolution
+    /// is not guaranteed finer than a second on every filesystem this could
+    /// run on, so two saves landing in the same tick would compare equal and
+    /// falsely read as "nothing was written". Test-only: reconciliation's
+    /// "nothing changed, nothing written" test is the reason this exists.
     #[cfg(test)]
-    pub fn saved_generation(&self) -> Option<std::time::SystemTime> {
-        fs::metadata(&self.path).and_then(|m| m.modified()).ok()
+    pub fn saved_generation(&self) -> u64 {
+        self.save_count.get()
     }
 }
 
@@ -237,7 +247,7 @@ fn ensure_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// How long [`lock_exclusive`] retries before giving up with [`Error::Busy`].
+/// How long [`lock_exclusive`] retries before giving up with [`Error::State`].
 ///
 /// Bounded on purpose, not merely as a tuning knob: the D-Bus helper serves
 /// every method call from one internal driver thread (zbus runs with default
@@ -248,6 +258,29 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// codebase's own critical sections take (a handful of backend commands and
 /// a `systemd-run`), which is on the order of tens of milliseconds, not
 /// hundreds.
+///
+/// **Why not the real fix.** The actual hazard is that every handler shares
+/// one driver thread at all. The complete fix is enabling zbus's `tokio`
+/// feature and running each handler's blocking work inside
+/// `tokio::task::spawn_blocking`, so a stalled handler occupies one of
+/// tokio's dedicated blocking threads rather than the one thread that also
+/// has to keep dispatching every other incoming call. That is a cross-cutting
+/// change to the `zbus` dependency shared by all three crates in this
+/// workspace (not just the helper) and to `porthole-helper`'s own runtime,
+/// with real feature-unification and client-connection risk (does `zbus`'s
+/// `tokio` feature coexist with the `async-io` feature `porthole-core`'s own
+/// `#[zbus::proxy]` client still pulls in by default? does `porthole-cli`'s
+/// `block_on`-over-a-current-thread-runtime pattern still connect once
+/// zbus's I/O type changes?) that this task could not retire without
+/// actually running it end to end -- work belonging to its own reviewed
+/// change, not a side effect of adding reconciliation.
+///
+/// This bound is accepted as a genuine fix for the specific hazard, not a
+/// half-measure that merely shortens it: when the lock's holder is the very
+/// thread that is stuck waiting for it, nothing will ever release it, so an
+/// infinite wedge is exactly what a blocking `flock` would produce here, and
+/// turning that into a bounded, terminating, recoverable error removes the
+/// hazard rather than delaying it.
 const LOCK_TIMEOUT: Duration = Duration::from_millis(500);
 /// How often [`lock_exclusive`] retries within [`LOCK_TIMEOUT`].
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -259,10 +292,19 @@ const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 ///
 /// Non-blocking and bounded, not a single blocking `flock(LOCK_EX)`: see
 /// [`LOCK_TIMEOUT`]. Contention is rare enough in practice — today's only
-/// other taker is the expiry timer's own `close`, and reconciliation's sweep
-/// runs inside a lock a caller already holds rather than acquiring its own —
-/// that this is expected to never actually retry; it exists so a helper that
-/// somehow does meet contention degrades to "try again" instead of hanging.
+/// other taker is the expiry timer's own `close`, arriving as a fresh D-Bus
+/// call into the same already-serialised helper — that this is expected to
+/// never actually retry; it exists so a helper that somehow does meet
+/// contention degrades to "try again" instead of hanging.
+///
+/// Reconciliation's own sweep never calls this directly. Its only write --
+/// `reconcile::SweepMode::Apply`'s save, itself gated on the caller not being
+/// a dry run -- always runs inside a lock a caller already holds: every
+/// production path that can reach a real (non-dry-run) `Apply` sweep does so
+/// from behind the helper's own `open_exclusive`, because the CLI's own
+/// non-dry-run `open`/`close` never construct a local `Engine` at all -- they
+/// go over the bus. `reconcile::SweepMode::ReadOnly` (`status`,
+/// `Engine::rules`) never saves at all, lock or no lock. See `reconcile.rs`.
 fn lock_exclusive(path: &Path) -> Result<File> {
     let lock_path = path.with_extension("lock");
     let file = std::fs::OpenOptions::new()
@@ -291,10 +333,10 @@ fn lock_exclusive(path: &Path) -> Result<File> {
             });
         }
         if Instant::now() >= deadline {
-            return Err(Error::Busy(format!(
-                "{} is held by another porthole process; try again",
-                lock_path.display()
-            )));
+            return Err(Error::State {
+                path: lock_path.display().to_string(),
+                detail: "is held by another porthole process; try again".to_string(),
+            });
         }
         std::thread::sleep(LOCK_POLL_INTERVAL);
     }
@@ -542,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn open_exclusive_gives_up_with_busy_rather_than_blocking_forever() {
+    fn open_exclusive_gives_up_rather_than_blocking_forever() {
         // The whole reason `lock_exclusive` polls instead of taking a single
         // blocking `flock`: on the D-Bus helper's one driver thread, an
         // indefinite wait there wedges the entire service, including the
@@ -568,7 +610,15 @@ mod tests {
             "must give up well before the holder releases the lock, got {:?}",
             started.elapsed()
         );
-        assert_eq!(err.exit_code(), crate::error::ExitCode::Busy, "got: {err}");
+        assert_eq!(
+            err.exit_code(),
+            crate::error::ExitCode::Failure,
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains("held by another porthole process"),
+            "got: {err}"
+        );
 
         holder.join().unwrap();
     }

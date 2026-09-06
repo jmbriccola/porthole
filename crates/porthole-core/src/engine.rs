@@ -109,10 +109,14 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Reconciles state against the firewall, then returns the (now
-    /// reconciled) rules.
+    /// Reconciles state against the firewall, read-only, then returns the
+    /// (now accurate) rules.
+    ///
+    /// Read-only and not [`Engine::reconcile`]'s full sweep, deliberately:
+    /// this is a read accessor, and the orphan direction mutates the
+    /// firewall. See [`crate::reconcile::SweepMode::ReadOnly`].
     pub fn rules(&mut self) -> &[ManagedRule] {
-        self.reconcile();
+        self.reconcile_read_only();
         self.state.rules()
     }
 
@@ -122,16 +126,48 @@ impl<'a> Engine<'a> {
     }
 
     /// Bring the firewall and the state file back into agreement before
-    /// doing anything else.
+    /// doing anything else that reads or writes state.
     ///
     /// Runs before every operation, not only once at helper start-up: see
-    /// `reconcile`'s module docs for why. A sweep failure is logged and
-    /// otherwise ignored -- the caller asked to open a port, close one, or
-    /// read the truth about what is open, not to tidy up, and refusing that
-    /// because an unrelated stale rule would not delete is a worse outcome
-    /// than a rule left behind.
+    /// `reconcile`'s module docs for why. Full [`crate::reconcile::SweepMode::Apply`]:
+    /// both directions, persisted (unless the caller itself is a dry run, in
+    /// which case the safe direction is computed and reflected in memory but
+    /// never written -- see `SweepMode::Apply`'s own doc comment). Used by
+    /// every operation that can mutate the firewall or the state file:
+    /// `open`, `close_by_id`, `close_by_port`, `close_all`. `status` and
+    /// `rules` use [`Engine::reconcile_read_only`] instead -- see there for
+    /// why the split exists at all.
+    ///
+    /// A sweep failure is logged and otherwise ignored -- the caller asked to
+    /// open a port or close one, not to tidy up, and refusing that because an
+    /// unrelated stale rule would not delete is a worse outcome than a rule
+    /// left behind.
     fn reconcile(&mut self) {
-        if let Err(e) = reconcile::sweep(self.backend, &mut self.state) {
+        let mode = reconcile::SweepMode::Apply {
+            dry_run: self.runner.is_dry_run(),
+        };
+        if let Err(e) = reconcile::sweep(self.backend, &mut self.state, mode) {
+            eprintln!("porthole: reconciliation failed, continuing anyway: {e}");
+        }
+    }
+
+    /// [`Engine::reconcile`], but for a read path.
+    ///
+    /// `status` is gated by the `List` polkit action, not `Close`, so a
+    /// caller authorised only to look must never be able to cause a close --
+    /// and the orphan direction is the only direction that mutates the
+    /// firewall. [`crate::reconcile::SweepMode::ReadOnly`] never reaches it:
+    /// it computes the safe (state-firewall) direction only, reflects it in
+    /// `self.state`'s in-memory view so the caller's answer is accurate, and
+    /// never saves -- a read path must not write either, and both `status`
+    /// and `rules` are commonly reached without the exclusive state lock
+    /// held at all.
+    fn reconcile_read_only(&mut self) {
+        if let Err(e) = reconcile::sweep(
+            self.backend,
+            &mut self.state,
+            reconcile::SweepMode::ReadOnly,
+        ) {
             eprintln!("porthole: reconciliation failed, continuing anyway: {e}");
         }
     }
@@ -309,7 +345,7 @@ impl<'a> Engine<'a> {
     }
 
     pub fn status(&mut self) -> Result<Status> {
-        self.reconcile();
+        self.reconcile_read_only();
         Ok(Status {
             backend: self.backend.id(),
             health: self.backend.health()?,
@@ -940,6 +976,11 @@ mod tests {
 
     #[test]
     fn dry_run_changes_nothing_and_writes_no_state() {
+        // C3: a store starting empty can never catch "dry-run's own
+        // reconciliation sweep writes anyway" -- there is nothing for sweep
+        // to find stale, so its `store.save()` (gated on `!dry_run`) never
+        // even becomes reachable. A pre-existing ghost entry the backend does
+        // not have is what makes this test able to fail.
         let harness = Harness::new();
         let backend = FakeBackend::new();
         let inner = RecordingRunner::with_responses(vec![
@@ -948,7 +989,25 @@ mod tests {
         ]);
         let runner = DryRunRunner::new(Box::new(inner));
         let clock = FixedClock(NOW);
-        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let mut store = harness.store();
+        store.insert(ManagedRule {
+            id: "ghost".to_string(),
+            port: 9999,
+            protocol: Protocol::Tcp,
+            target: Target::Anywhere,
+            backend: BackendId::Firewalld,
+            opened_at: NOW,
+            expires_at: None,
+            uid: 1000,
+            handle: RuleHandle::Firewalld {
+                zone: "TestZone".to_string(),
+                rich_rule: "a rule nothing in this test actually has".to_string(),
+            },
+        });
+        store.save().unwrap();
+
+        let mut engine = make_engine(&backend, &runner, &clock, store);
 
         let rule = engine
             .open(
@@ -967,15 +1026,50 @@ mod tests {
                 cidr: "10.10.10.0/24".parse().unwrap()
             }
         );
-        assert!(
-            !harness.path.exists(),
-            "dry-run must not write the state file"
+        let reloaded = StateStore::open(&harness.path).unwrap();
+        assert_eq!(
+            reloaded.rules().len(),
+            1,
+            "dry-run must not write the state file, including via its own \
+             reconciliation sweep: got {:?}",
+            reloaded.rules()
+        );
+        assert_eq!(
+            reloaded.rules()[0].id,
+            "ghost",
+            "the file on disk must be exactly what it was before this dry run"
         );
         assert_eq!(
             runner.recorded().len(),
             1,
             "one withheld mutation: the systemd-run"
         );
+    }
+
+    #[test]
+    fn open_succeeds_even_when_reconciliations_own_sweep_fails() {
+        // I2: named explicitly by the brief, and previously untested --
+        // FakeBackend could not fail list_rules or owned_rules, so changing
+        // Engine::reconcile to propagate a sweep failure with `?` instead of
+        // logging and continuing would have left every existing test green.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        backend.fail_list_rules();
+        let runner = RecordingRunner::with_responses(subnet_open_script());
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let rule = engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::For(Duration::from_secs(3600)),
+                1000,
+            )
+            .expect("a sweep failure must not fail the operation the caller asked for");
+
+        assert_eq!(rule.port, 5173);
     }
 
     #[test]
@@ -1114,6 +1208,43 @@ mod tests {
         assert_eq!(
             status.network.unwrap().cidr,
             "10.10.10.0/24".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn status_cannot_close_a_rule_even_though_it_looks_like_an_orphan() {
+        // C2: `status` is gated by the List polkit action, not Close -- a
+        // caller authorised only to look must never be able to cause a
+        // close. A rule the backend holds but state does not know about
+        // looks exactly like an orphan reconciliation's Apply mode would
+        // remove; `status` must leave it alone regardless.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let orphan = backend
+            .open(
+                &OpenRequest {
+                    port: 9999,
+                    protocol: Protocol::Tcp,
+                    target: Target::Anywhere,
+                    lifetime: Lifetime::UntilReboot,
+                },
+                "porthole:orphan",
+            )
+            .unwrap();
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ADDR_JSON),
+        ]);
+        let clock = FixedClock(NOW);
+        // Nothing in state claims this rule -- harness.store() starts empty.
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        engine.status().unwrap();
+
+        assert_eq!(
+            backend.handles(),
+            vec![orphan],
+            "a read command must never close a rule the firewall holds"
         );
     }
 }

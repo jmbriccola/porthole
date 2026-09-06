@@ -915,6 +915,52 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_open_writes_round_trips_through_list_rules_with_an_identical_handle() {
+        // C1: reconciliation compares handles structurally, so whatever
+        // `open` returns must be exactly what `list_rules` reconstructs for
+        // the same rule, or a live rule looks stale the moment the next
+        // sweep runs. ufw needed this fixed for real -- its own version of
+        // this test is `ufw::tests::
+        // a_host_scoped_open_round_trips_through_list_rules_despite_ufws_bare_slash_32`.
+        // nftables' `RuleHandle` carries no address at all, only
+        // family/table/chain/marker, so nothing here depends on how an
+        // address is spelled; this is a belt-and-braces proof, not a
+        // regression this backend was found to have.
+        let open_runner = RecordingRunner::with_responses(vec![
+            Output::stdout(CHAINS_ONE_INPUT),
+            Output::empty(),
+        ]);
+        let host = Target::Network {
+            cidr: "10.10.10.42/32".parse().unwrap(),
+        };
+        let opened = Nftables::new(&open_runner)
+            .open(&request(5173, host), "porthole:host")
+            .unwrap();
+
+        const RULES_AFTER: &str = r#"{"nftables":[
+            {"metainfo":{"version":"1.1.3","json_schema_version":1}},
+            {"rule":{"family":"inet","table":"filter","chain":"input","handle":9,
+                     "comment":"porthole:host",
+                     "expr":[
+                       {"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":5173}},
+                       {"match":{"op":"==","left":{"payload":{"protocol":"ip","field":"saddr"}},"right":"10.10.10.42"}},
+                       {"accept":null}
+                     ]}}
+        ]}"#;
+        let list_runner = RecordingRunner::with_responses(vec![
+            Output::stdout(CHAINS_ONE_INPUT),
+            Output::stdout(RULES_AFTER),
+        ]);
+        let listed = Nftables::new(&list_runner).list_rules().unwrap();
+
+        assert_eq!(
+            listed,
+            vec![opened],
+            "list_rules must reconstruct the identical handle open returned"
+        );
+    }
+
+    #[test]
     fn no_input_chain_means_nothing_is_filtering_and_porthole_says_so() {
         // With no base chain at the input hook the port is already reachable.
         // Adding a rule would be theatre, and reporting success would tell the
