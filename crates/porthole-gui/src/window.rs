@@ -28,6 +28,7 @@ use std::ops::Deref;
 use adw::prelude::*;
 
 use crate::listening_section::ListeningSection;
+use crate::open_dialog::OpenDialog;
 use crate::open_now::OpenNowSection;
 
 /// The width, in CSS pixels, at or below which the narrow layout applies.
@@ -45,6 +46,7 @@ pub struct PortholeWindow {
     toast_overlay: adw::ToastOverlay,
     open_now: OpenNowSection,
     listening: ListeningSection,
+    open_button: gtk::Button,
 }
 
 impl Deref for PortholeWindow {
@@ -78,8 +80,22 @@ impl PortholeWindow {
         let toast_overlay = adw::ToastOverlay::new();
         toast_overlay.set_child(Some(&scroller));
 
+        // Task 5's own affordance: opens a fresh `OpenDialog` -- never a
+        // reused one, so a previous attempt's typed port or chosen chip
+        // never leaks into the next. `ListeningSection`'s own per-row Open
+        // buttons are a second, pre-filled way to reach the same dialog;
+        // wiring those up is left to whichever task first calls
+        // `ListeningSection::set_services` with real data, since there is
+        // nothing to click on an empty list.
+        let open_button = gtk::Button::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text("Open a port")
+            .build();
+        let header_bar = adw::HeaderBar::new();
+        header_bar.pack_start(&open_button);
+
         let toolbar_view = adw::ToolbarView::new();
-        toolbar_view.add_top_bar(&adw::HeaderBar::new());
+        toolbar_view.add_top_bar(&header_bar);
         toolbar_view.set_content(Some(&toast_overlay));
 
         let window = adw::ApplicationWindow::builder()
@@ -89,6 +105,12 @@ impl PortholeWindow {
             .default_height(560)
             .content(&toolbar_view)
             .build();
+
+        let window_for_open = window.clone();
+        open_button.connect_clicked(move |_| {
+            let dialog = OpenDialog::new();
+            dialog.present(Some(&window_for_open));
+        });
 
         let condition = adw::BreakpointCondition::new_length(
             adw::BreakpointConditionLengthType::MaxWidth,
@@ -124,6 +146,7 @@ impl PortholeWindow {
             toast_overlay,
             open_now,
             listening,
+            open_button,
         }
     }
 
@@ -159,5 +182,14 @@ impl PortholeWindow {
     /// test) that needs to feed it a fresh service list.
     pub fn listening(&self) -> &ListeningSection {
         &self.listening
+    }
+
+    /// The header bar's "Open a port" button, for a test that wants to
+    /// check its own state (tooltip, focusability) rather than simulate a
+    /// click -- see this constructor's own comment on why the click handler
+    /// builds a fresh `OpenDialog` each time instead of one this window
+    /// keeps around.
+    pub fn open_button(&self) -> &gtk::Button {
+        &self.open_button
     }
 }

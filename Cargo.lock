@@ -989,6 +989,7 @@ name = "porthole-gui"
 version = "0.1.0"
 dependencies = [
  "gtk4",
+ "ipnet",
  "libadwaita",
  "porthole-core",
  "tokio",

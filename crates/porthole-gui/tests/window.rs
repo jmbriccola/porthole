@@ -172,6 +172,34 @@ fn applications_own_activation_handler_also_realizes_a_window() -> Result<(), St
     }
 }
 
+/// Task 5's header-bar affordance: structural presence and the right
+/// tooltip, plus keyboard reachability -- not a simulated click. A click's
+/// own behaviour (a fresh `OpenDialog` presented over the window) is real
+/// code, exercised by `tests/open_dialog.rs` for what it builds and sends,
+/// but not proven end-to-end from this button press; see `window.rs`'s own
+/// comment on the click handler for why.
+fn the_window_has_an_open_button_that_is_reachable_from_the_keyboard() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate("com.jacopobriccola.Porthole.Test.OpenButton", move |app| {
+        let win = PortholeWindow::new(app);
+        win.present();
+        let button = win.open_button();
+        seen.replace(Some((
+            button.tooltip_text().map(|s| s.to_string()),
+            button.is_focusable(),
+        )));
+    });
+    let (tooltip, focusable) = result.borrow_mut().take().ok_or("activation never ran")?;
+    if tooltip.as_deref() != Some("Open a port") {
+        return Err(format!("expected tooltip \"Open a port\", got {tooltip:?}"));
+    }
+    if !focusable {
+        return Err("the open button must be reachable by keyboard".to_string());
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below. A type alias rather than spelling
 /// `(&str, fn() -> Result<(), String>)` out at the call site: clippy's
 /// `type_complexity` flagged the inline form (the actual finding from the
@@ -184,7 +212,7 @@ fn main() {
     // A plain array, not `vec![]`: the list is fixed at compile time and
     // never grows, so there is nothing a `Vec` buys here, independently of
     // what clippy does or does not flag.
-    let cases: [Case; 5] = [
+    let cases: [Case; 6] = [
         (
             "the_window_is_actually_realized_not_merely_constructed",
             the_window_is_actually_realized_not_merely_constructed,
@@ -204,6 +232,10 @@ fn main() {
         (
             "applications_own_activation_handler_also_realizes_a_window",
             applications_own_activation_handler_also_realizes_a_window,
+        ),
+        (
+            "the_window_has_an_open_button_that_is_reachable_from_the_keyboard",
+            the_window_has_an_open_button_that_is_reachable_from_the_keyboard,
         ),
     ];
 
