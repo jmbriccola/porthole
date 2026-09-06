@@ -98,6 +98,39 @@ impl Deref for PortholeWindow {
 
 impl PortholeWindow {
     pub fn new(app: &adw::Application) -> Self {
+        let window = Self::build(app);
+        // The initial load this constructor owes -- see this module's own
+        // doc comment on the planning defect this task repairs. Both
+        // sections start out showing their own *indeterminate* "not
+        // answered yet" state (built into `OpenNowSection`/
+        // `ListeningSection` themselves, not the calm "nothing open"/
+        // "nothing listening" one -- a zbus proxy carries no default
+        // per-call timeout, so nothing bounds how long that would
+        // otherwise have to stand in for a confirmed fact it has not
+        // earned) until `refresh` resolves; `refresh` runs the same path a
+        // later explicit refresh does, there is no separate "first load"
+        // code.
+        refresh(
+            &window.window,
+            &window.open_now,
+            &window.listening,
+            &window.status_bar,
+        );
+        window
+    }
+
+    /// Builds the same window [`PortholeWindow::new`] does, but never
+    /// starts the initial helper/`/proc` load -- for `main.rs`'s
+    /// debug-only `--screenshot` flag (`crate::screenshot::run`), which
+    /// populates the window with fixture data instead of real data, and
+    /// needs nothing in this crate racing that fixture for which one lands
+    /// on screen last. Every other caller wants [`PortholeWindow::new`],
+    /// not this.
+    pub fn new_without_initial_load(app: &adw::Application) -> Self {
+        Self::build(app)
+    }
+
+    fn build(app: &adw::Application) -> Self {
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(18)
@@ -207,19 +240,10 @@ impl PortholeWindow {
             );
         });
 
-        // The initial load this constructor owes -- see this module's own
-        // doc comment on the planning defect this task repairs. Both
-        // sections start out showing their own *indeterminate* "not
-        // answered yet" state (built into `OpenNowSection`/
-        // `ListeningSection` themselves, not the calm "nothing open"/
-        // "nothing listening" one -- a zbus proxy carries no default
-        // per-call timeout, so nothing bounds how long that would
-        // otherwise have to stand in for a confirmed fact it has not
-        // earned) until `refresh` resolves; `refresh` runs the same path a
-        // later explicit refresh does, there is no separate "first load"
-        // code.
-        refresh(&window, &open_now, &listening, &status_bar);
-
+        // No initial `refresh` here -- see `PortholeWindow::new` (the only
+        // caller that wants one) and `PortholeWindow::new_without_initial_load`
+        // (the one that deliberately does not) for where that call now
+        // lives and why.
         Self {
             window,
             content,
