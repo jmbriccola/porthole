@@ -10,16 +10,27 @@
 //! Every widget property here is read back *without* pumping the main
 //! loop, unlike `tests/window.rs`'s breakpoint checks: these tests assert
 //! on properties this section sets directly (title, subtitle, widget
-//! presence, computed countdown text), none of which need a GTK layout
-//! pass to become true -- only construction, which does need to happen
-//! inside a real activation (GTK widgets cannot be built before
-//! `gtk_init`, which activation performs).
+//! presence, the countdown label's actual displayed text), none of which
+//! need a GTK layout pass to become true -- only construction, which does
+//! need to happen inside a real activation (GTK widgets cannot be built
+//! before `gtk_init`, which activation performs).
+//!
+//! None of these tests read the real clock. `BASE_TIME` is an arbitrary,
+//! fixed anchor, and `OpenNowSection::with_clock` is what lets a test
+//! supply it directly -- `SharedClock` below is a `Clock` backed by a
+//! `Cell` the test keeps its own handle to, so "moving time forward" is
+//! just mutating that cell and calling `OpenNowSection::refresh()`, never a
+//! method on `OpenNowSection` itself that accepts a raw time value (see
+//! `open_now.rs`'s module doc for why that distinction matters: such a
+//! method would be reachable from production too, and freezing a live
+//! section's clock permanently is the exact failure this section's
+//! countdown exists to avoid).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
-use porthole_core::clock::{Clock, SystemClock};
+use porthole_core::clock::Clock;
 use porthole_core::ipc::WireRule;
 use porthole_gui::open_now::OpenNowSection;
 
@@ -38,23 +49,44 @@ fn activate<F: FnOnce(&adw::Application) + 'static>(app_id: &str, f: F) {
     app.run_with_args::<&str>(&[]);
 }
 
-/// This fixture's own "now": the same real clock `OpenNowSection` reads by
-/// default, before any `tick_at` call ever freezes it. A fixed constant
-/// would not agree with that default -- `OpenNowSection` cannot know at
-/// construction time what a fixed test constant is going to be -- so the
-/// fixture has to read the real clock too.
-fn now() -> u64 {
-    SystemClock.now()
+/// A fixed constant, never read from the real clock. Every test that cares
+/// about a specific countdown value builds its fixture and its
+/// `SharedClock` from this same constant, so there is exactly one source of
+/// "now" per test and no possibility of two independent clock reads landing
+/// on either side of a second boundary.
+const BASE_TIME: u64 = 1_757_100_000;
+
+/// A `Clock` a test can move forward directly, by mutating the `Cell` it
+/// shares with whichever `OpenNowSection` was built with a clone of it via
+/// `OpenNowSection::with_clock`. The test keeps the only other handle to
+/// that `Cell`; nothing about `OpenNowSection`'s own public API can reach
+/// or move it.
+#[derive(Clone)]
+struct SharedClock(Rc<Cell<u64>>);
+
+impl SharedClock {
+    fn at(seconds: u64) -> Self {
+        Self(Rc::new(Cell::new(seconds)))
+    }
+
+    fn advance_to(&self, seconds: u64) {
+        self.0.set(seconds);
+    }
 }
 
-/// A rule as the wire reports it, opened one minute before `now()` with a
+impl Clock for SharedClock {
+    fn now(&self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// A rule as the wire reports it, opened one minute before `base` with a
 /// total lifetime of `lifetime_secs` -- so a 3600s (one hour) rule already
-/// has 59 minutes left by the time a test's very first `countdown_text`
-/// call reads it, rather than the full hour a rule just opened would show.
-/// `lifetime_secs == 0` is the wire's own until-reboot sentinel and is
-/// passed straight through as `expires_at == 0`, never offset.
-fn wire_rule(port: u16, protocol: &str, target: &str, lifetime_secs: u64) -> WireRule {
-    let opened_at = now() - 60;
+/// has 59 minutes left as of `base`, not the full hour a rule just opened
+/// would show. `lifetime_secs == 0` is the wire's own until-reboot sentinel
+/// and is passed straight through as `expires_at == 0`, never offset.
+fn wire_rule(base: u64, port: u16, protocol: &str, target: &str, lifetime_secs: u64) -> WireRule {
+    let opened_at = base - 60;
     WireRule {
         id: format!("{port}/{protocol}"),
         port,
@@ -75,24 +107,47 @@ fn wire_rule(port: u16, protocol: &str, target: &str, lifetime_secs: u64) -> Wir
 /// "No ports open" is this machine's normal state, not an error. Presenting
 /// it as a problem -- a warning icon, an error style, a red anything --
 /// teaches the user to ignore the one part of this window that should mean
-/// something.
+/// something. Checked structurally (the icon name, the CSS classes), not
+/// only the title -- a title alone would still pass if a later change added
+/// `.add_css_class("error")` or swapped in a warning glyph.
 fn an_empty_list_is_a_calm_status_page_not_an_error() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
     activate(
         "com.jacopobriccola.Porthole.Test.OpenNowEmpty",
         move |_app| {
-            let section = OpenNowSection::new();
+            let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
             section.set_rules(&[]);
-            let status_title = section.status_page().map(|p| p.title().to_string());
+            let status = section.status_page();
+            let title = status.as_ref().map(|p| p.title().to_string());
+            let icon_name = status
+                .as_ref()
+                .and_then(|p| p.icon_name())
+                .map(|s| s.to_string());
+            let css_classes: Vec<String> = status
+                .as_ref()
+                .map(|p| p.css_classes().iter().map(|c| c.to_string()).collect())
+                .unwrap_or_default();
             let rows_empty = section.rows().is_empty();
-            *seen.borrow_mut() = Some((status_title, rows_empty));
+            *seen.borrow_mut() = Some((title, icon_name, css_classes, rows_empty));
         },
     );
-    let (status_title, rows_empty) = result.borrow_mut().take().ok_or("activation never ran")?;
-    if status_title.as_deref() != Some("No ports open") {
+    let (title, icon_name, css_classes, rows_empty) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if title.as_deref() != Some("No ports open") {
         return Err(format!(
-            "expected a status page titled \"No ports open\", got {status_title:?}"
+            "expected a status page titled \"No ports open\", got {title:?}"
+        ));
+    }
+    let icon = icon_name.unwrap_or_default();
+    if icon.contains("warning") || icon.contains("error") {
+        return Err(format!(
+            "the empty state's icon reads as a problem, not the ordinary state it is: {icon:?}"
+        ));
+    }
+    if css_classes.iter().any(|c| c == "error" || c == "warning") {
+        return Err(format!(
+            "the empty state carries an error/warning CSS class: {css_classes:?}"
         ));
     }
     if !rows_empty {
@@ -105,8 +160,8 @@ fn each_rule_shows_port_protocol_target_and_a_close_button() -> Result<(), Strin
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
     activate("com.jacopobriccola.Porthole.Test.OpenNowRow", move |_app| {
-        let section = OpenNowSection::new();
-        section.set_rules(&[wire_rule(5173, "tcp", "10.10.10.0/24", 3600)]);
+        let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
+        section.set_rules(&[wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 3600)]);
         let rows = section.rows();
         let row_count = rows.len();
         let title = rows.first().map(|r| r.title().to_string());
@@ -136,18 +191,23 @@ fn each_rule_shows_port_protocol_target_and_a_close_button() -> Result<(), Strin
 }
 
 /// A countdown that renders once and freezes is worse than no countdown: it
-/// states a specific remaining time, confidently, and is wrong. `tick_at`
-/// is what lets this test observe a genuine second tick with no sleep.
+/// states a specific remaining time, confidently, and is wrong. This reads
+/// `countdown_text`, which is the real `gtk::Label`'s actual displayed text
+/// (not a value recomputed independently of the widget) -- so what this
+/// test observes changing is the same thing a person looking at the window
+/// would see change.
 fn the_countdown_is_live_and_counts_down() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
     activate(
         "com.jacopobriccola.Porthole.Test.OpenNowCountdown",
         move |_app| {
-            let section = OpenNowSection::new();
-            section.set_rules(&[wire_rule(5173, "tcp", "10.10.10.0/24", 3600)]);
+            let clock = SharedClock::at(BASE_TIME);
+            let section = OpenNowSection::with_clock(Box::new(clock.clone()));
+            section.set_rules(&[wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 3600)]);
             let first = section.countdown_text(0);
-            section.tick_at(now() + 61);
+            clock.advance_to(BASE_TIME + 61);
+            section.refresh();
             let later = section.countdown_text(0);
             *seen.borrow_mut() = Some((first, later));
         },
@@ -179,8 +239,8 @@ fn until_reboot_says_so_instead_of_showing_a_countdown() -> Result<(), String> {
     activate(
         "com.jacopobriccola.Porthole.Test.OpenNowReboot",
         move |_app| {
-            let section = OpenNowSection::new();
-            section.set_rules(&[wire_rule(5173, "tcp", "10.10.10.0/24", 0)]);
+            let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
+            section.set_rules(&[wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 0)]);
             *seen.borrow_mut() = Some(section.countdown_text(0));
         },
     );
@@ -191,15 +251,23 @@ fn until_reboot_says_so_instead_of_showing_a_countdown() -> Result<(), String> {
     Ok(())
 }
 
+/// The other half of the live-countdown property: a rule that still has a
+/// few seconds left when the section first renders it must flip to
+/// "closing" -- on the real widget, via `refresh()` -- once that time has
+/// genuinely passed, rather than ever showing a negative duration.
 fn an_expired_rule_reads_as_closing_not_as_a_negative_time() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
     activate(
         "com.jacopobriccola.Porthole.Test.OpenNowExpired",
         move |_app| {
-            let section = OpenNowSection::new();
-            section.set_rules(&[wire_rule(5173, "tcp", "10.10.10.0/24", 10)]);
-            section.tick_at(now() + 60);
+            let clock = SharedClock::at(BASE_TIME);
+            let section = OpenNowSection::with_clock(Box::new(clock.clone()));
+            // 65s lifetime, opened 60s before BASE_TIME: 5 seconds left as
+            // of BASE_TIME, still a normal countdown at construction.
+            section.set_rules(&[wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 65)]);
+            clock.advance_to(BASE_TIME + 65);
+            section.refresh();
             *seen.borrow_mut() = Some(section.countdown_text(0));
         },
     );

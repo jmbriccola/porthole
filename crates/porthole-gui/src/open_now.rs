@@ -23,16 +23,28 @@
 //! strings, and a GUI toast must not reintroduce that.
 //!
 //! The countdown's rendering never calls the real clock itself; it always
-//! goes through `current_time`, which reads a frozen value if
-//! [`OpenNowSection::tick_at`] has ever set one, and only falls back to
-//! `porthole_core::clock::SystemClock` otherwise -- so a
-//! test can move time forward by calling `tick_at` and reading
-//! `countdown_text` again, with no sleep and no dependency on how fast the
-//! test happens to run. In the real application, nothing ever calls
-//! `tick_at`: a `glib::timeout_add_seconds_local` fired once a second is
-//! what keeps the on-screen countdown live there.
+//! goes through `current_time`, which asks whatever
+//! `porthole_core::clock::Clock` was injected at construction --
+//! [`OpenNowSection::new`] injects the real `SystemClock`, and
+//! [`OpenNowSection::with_clock`] lets a caller supply a different one. A
+//! test builds a `Clock` it can advance itself (e.g. one backed by a shared
+//! `Cell`), injects it via `with_clock`, moves it forward directly, and
+//! calls [`OpenNowSection::refresh`] to make the display catch up -- no
+//! sleep needed, and no method on this section ever accepts a raw time
+//! value that could freeze it. That is deliberate: a `pub fn` taking a
+//! `u64` and overriding this section's idea of "now" from then on is
+//! reachable from any caller, test or not, and freezing the clock
+//! permanently is the exact failure the countdown exists to avoid. Only
+//! `new()` is what the real application ever calls; nothing in this crate
+//! calls `with_clock` outside of tests.
+//!
+//! `refresh()` itself carries no time value and cannot freeze anything --
+//! it only recomputes every row's countdown against whatever the injected
+//! clock currently reports, the same thing a `glib::timeout_add_seconds_local`
+//! fired once a second already does unprompted in the real application.
+//! Calling it extra times in production is inert.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -64,15 +76,17 @@ struct Inner {
     /// drop exactly the one rule that closed and re-render from the rest,
     /// without a second `list` call.
     rules: RefCell<Vec<WireRule>>,
-    /// `None` reads the real clock; `Some(t)` is what `tick_at` freezes it
-    /// to, so a test can observe a second tick without sleeping.
-    frozen_at: Cell<Option<u64>>,
+    /// Injected at construction -- `OpenNowSection::new()` supplies the real
+    /// `SystemClock`; `with_clock` lets a caller (a test) supply another.
+    /// Never swapped after construction, which is what makes it safe: there
+    /// is no method that changes which clock a live section reads.
+    clock: Box<dyn Clock>,
     toast_overlay: RefCell<Option<adw::ToastOverlay>>,
 }
 
 impl Inner {
     fn current_time(&self) -> u64 {
-        self.frozen_at.get().unwrap_or_else(|| SystemClock.now())
+        self.clock.now()
     }
 
     fn refresh_countdown_labels(&self) {
@@ -241,6 +255,23 @@ impl Default for OpenNowSection {
 
 impl OpenNowSection {
     pub fn new() -> Self {
+        Self::with_clock(Box::new(SystemClock))
+    }
+
+    /// Same construction as [`OpenNowSection::new`], but reads time through
+    /// `clock` instead of the real one.
+    ///
+    /// Not `#[cfg(test)]`: `tests/open_now.rs` is a separate integration-test
+    /// crate that links this library as built for the `test` *binary*, not
+    /// with `cfg(test)` set on the *library* -- an attribute here would just
+    /// compile this constructor out from under it, silently, the moment
+    /// anyone tried to use it from there. A constructor parameter is the
+    /// actual seam -- the same pattern `porthole_core::engine::Engine::new`
+    /// already uses for its own `Clock` (there as a borrowed `&'a dyn
+    /// Clock`; owned here as `Box<dyn Clock>`, since `Inner` has to outlive
+    /// the borrow that constructed it -- it is kept alive by `'static`
+    /// GTK/glib closures for as long as this section's widgets exist).
+    pub fn with_clock(clock: Box<dyn Clock>) -> Self {
         let group = adw::PreferencesGroup::builder().title("Open now").build();
 
         // "No ports open" is this machine's normal state, not a problem --
@@ -264,17 +295,17 @@ impl OpenNowSection {
             status_page,
             rows: RefCell::new(Vec::new()),
             rules: RefCell::new(Vec::new()),
-            frozen_at: Cell::new(None),
+            clock,
             toast_overlay: RefCell::new(None),
         });
 
         // Keeps the on-screen countdown live on its own, without anything
         // else asking: once a second, recompute every row's countdown text
-        // against whatever `current_time` reports (live, unless a test has
-        // frozen it via `tick_at`). `tests/open_now.rs`'s activations are
-        // brief enough that this is unlikely to fire during a test at all,
-        // and harmless if it does -- it only recomputes text from state a
-        // test already controls, it does not change that state itself.
+        // against whatever `current_time` reports. `tests/open_now.rs`'s
+        // activations are brief enough that this is unlikely to fire during
+        // a test at all, and harmless if it does -- `refresh_countdown_labels`
+        // only recomputes text from state a test already controls, it does
+        // not change that state itself.
         let tick_inner = inner.clone();
         glib::timeout_add_seconds_local(1, move || {
             tick_inner.refresh_countdown_labels();
@@ -329,16 +360,27 @@ impl OpenNowSection {
             .map(|r| r.close_button.clone())
     }
 
+    /// The countdown text as it actually reads on screen right now --
+    /// `row.countdown_label`'s real, currently-displayed `gtk::Label` text,
+    /// not a value recomputed independently of it. A countdown that is
+    /// correct in an accessor but stale on the widget the user is actually
+    /// looking at is exactly the failure this section exists to avoid, so
+    /// this reads the same property a person would see.
     pub fn countdown_text(&self, index: usize) -> String {
-        let rows = self.inner.rows.borrow();
-        format_countdown(rows[index].expires_at, self.inner.current_time())
+        self.inner.rows.borrow()[index]
+            .countdown_label
+            .label()
+            .to_string()
     }
 
-    /// Freezes this section's clock at `seconds` and immediately re-renders
-    /// every countdown against it. The only way a test moves this section's
-    /// idea of "now" -- no sleep needed to observe a later tick.
-    pub fn tick_at(&self, seconds: u64) {
-        self.inner.frozen_at.set(Some(seconds));
+    /// Recomputes every row's countdown label against whatever the injected
+    /// clock currently reports, and writes the result to the real widget.
+    /// Takes no time value and cannot freeze anything -- it is exactly what
+    /// the once-a-second `glib::timeout_add_seconds_local` in `new()` already
+    /// calls unprompted. A test that moves an injected clock forward (see
+    /// `with_clock`) calls this afterward to make the display catch up,
+    /// without waiting a real second for the timer to do it.
+    pub fn refresh(&self) {
         self.inner.refresh_countdown_labels();
     }
 }
@@ -371,5 +413,55 @@ mod tests {
     #[test]
     fn the_exact_expiry_second_reads_as_closing_not_zero_left() {
         assert_eq!(format_countdown(100, 100), "closing");
+    }
+
+    // `helper_message` is the one piece of the close path with no GTK, no
+    // D-Bus connection and no async runtime in it -- and it is the property
+    // the brief calls most important ("do not re-word the helper's
+    // message"), so it is unit-tested directly rather than left to the
+    // untestable-without-a-live-helper rest of the close path. Same shape as
+    // `porthole-cli/src/client.rs`'s own `method_error` helper, used there
+    // to unit-test `from_dbus`'s identical verbatim pass-through.
+    fn method_error(name: &str, detail: Option<&str>) -> zbus::Error {
+        zbus::Error::MethodError(
+            zbus::names::OwnedErrorName::try_from(name.to_string()).unwrap(),
+            detail.map(str::to_string),
+            zbus::message::Message::method_call("/", "Noop")
+                .unwrap()
+                .build(&())
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn helper_message_is_the_helpers_detail_verbatim_not_reworded() {
+        let e = method_error(
+            "com.jacopobriccola.Porthole.AlreadyOpen",
+            Some("5173/tcp is already open (open towards 10.10.10.0/24)"),
+        );
+        assert_eq!(
+            helper_message(&e),
+            "5173/tcp is already open (open towards 10.10.10.0/24)"
+        );
+    }
+
+    #[test]
+    fn helper_message_falls_back_to_the_error_name_when_there_is_no_detail() {
+        let e = method_error("com.jacopobriccola.Porthole.RuleNotFound", None);
+        assert_eq!(
+            helper_message(&e),
+            "com.jacopobriccola.Porthole.RuleNotFound"
+        );
+    }
+
+    #[test]
+    fn helper_message_is_not_empty_or_panicking_for_a_non_method_error() {
+        // Not every failure to close is a `MethodError` -- losing the bus
+        // connection entirely is a different `zbus::Error` variant, and
+        // `helper_message` has to produce *something* readable for it too,
+        // even though there is no helper-authored text to preserve verbatim
+        // in this case.
+        let e = zbus::Error::Failure("the connection was lost".to_string());
+        assert_eq!(helper_message(&e), e.to_string());
     }
 }
