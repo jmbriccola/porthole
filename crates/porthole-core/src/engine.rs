@@ -461,21 +461,27 @@ impl<'a> Engine<'a> {
     }
 
     /// Close every rule whose stored CIDR is inside `lost` -- the subnet the
-    /// machine was on and no longer is.
+    /// caller last observed, now that it is observing a different one.
     ///
     /// `ManagedRule` records only the resolved `Target`, never the
     /// `ScopeSpec` that produced it, so there is no stored fact anywhere
     /// distinguishing "opened towards whatever subnet I'm on" from "opened
     /// towards this exact CIDR, deliberately, wherever I am". The predicate
-    /// below is chosen so it does not need that distinction: a rule whose
-    /// CIDR sits inside `lost` was reachable only by virtue of the machine
-    /// being on `lost`, and cannot be reachable now that it is not -- true
-    /// regardless of which `ScopeSpec` produced it. A rule whose CIDR is
-    /// disjoint from `lost`, or broader than it (a deliberate `--to
-    /// 10.0.0.0/8` on a `10.10.10.0/24` machine, say), was never a claim
-    /// about `lost` specifically and survives -- closing it would be
-    /// answering a question the machine leaving `lost` never raised.
-    /// [`Target::Anywhere`] is checked against nothing and always survives.
+    /// below is chosen so it does not need that distinction: a rule closes
+    /// when its own CIDR sits inside `lost`, whichever `ScopeSpec` produced
+    /// it. A rule whose CIDR is disjoint from `lost`, or broader than it (a
+    /// deliberate `--to 10.0.0.0/8` on a `10.10.10.0/24` machine, say), was
+    /// never a claim about `lost` specifically and survives -- closing it
+    /// would be answering a question the machine leaving `lost` never
+    /// raised. [`Target::Anywhere`] is checked against nothing and always
+    /// survives.
+    ///
+    /// `lost` is a subnet that stopped being the observed one, not a subnet
+    /// proven unreachable. One subnet is observed at a time, resolved from a
+    /// single default route, so a machine with two networks up at once has
+    /// one of them described here and the other not: when the two swap
+    /// places -- a laptop on wifi docking into ethernet -- the wifi subnet
+    /// arrives here as `lost` and its rules close while wifi is still up.
     ///
     /// Reconciles first, exactly as [`Engine::close_all`] does: the same
     /// batch of rules is about to be inspected and possibly closed, so this

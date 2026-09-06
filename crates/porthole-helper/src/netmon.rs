@@ -20,9 +20,16 @@
 //! "opened towards whatever subnet I'm on" from "opened towards this exact
 //! CIDR, deliberately". [`porthole_core::engine::Engine::close_rules_outside`]
 //! is built around that limit rather than against it: it closes a rule when
-//! the rule's own CIDR sits inside the subnet that was just lost, not when
-//! the rule's CIDR merely differs from the new one -- see its own doc
-//! comment for the case that distinction protects.
+//! the rule's own CIDR sits inside the subnet this module last saw, once
+//! that subnet stops matching the one resolving now, not when the rule's
+//! CIDR merely differs from the new one -- see its own doc comment for the
+//! case that distinction protects.
+//!
+//! One subnet is resolved per wake-up, from a single default route. A
+//! machine with two networks up at once is described here by whichever one
+//! that route names, and the other one is not described at all: bringing up
+//! a second interface that wins the route makes the first subnet stop
+//! matching, and rules inside it close while it is still up.
 //!
 //! A consequence of the same limit: this module cannot tell "a rule scoped
 //! to 10.10.10.0/24, tied to the machine being on 10.10.10.0/24" apart from
@@ -34,6 +41,15 @@
 //! records whatever it finds and closes nothing: there is no way to prove a
 //! rule already in the state file is tied to a subnet nothing here has ever
 //! seen.
+//!
+//! That costs more than the one tick it sounds like. The only subnet a
+//! change can close rules inside is one this module observed itself, and
+//! the first observation after a restart is the subnet the machine is on
+//! now -- so a rule towards a subnet the machine had already left before
+//! the helper started is never closed by a subnet change at all, no matter
+//! how many wake-ups follow. Such a rule still ends at its own expiry, at a
+//! `close`, or on a confirmed loss of every network, none of which need a
+//! prior observation.
 //!
 //! # This module's own lifetime
 //!
@@ -114,14 +130,15 @@ fn decide(session: bool, opted_in: bool, debug_build: bool) -> bool {
 
 static SYSTEM_CLOCK: SystemClock = SystemClock;
 
-/// The subnet [`wake_up_blocking`] last resolved successfully. `None` before
-/// the first successful resolution, and again after a resolution finds no
-/// network at all -- both share the same status: nothing to prove a rule in
-/// the state file is tied to. Read and written only from [`wake_up_blocking`]
-/// (always inside `spawn_blocking`, never concurrently with a unit test):
-/// [`check_network`] takes and returns this value as a plain parameter
-/// instead of touching the static directly, precisely so it stays testable
-/// without one test's run colliding with another's through shared state.
+/// The subnet the last wake-up resolved successfully. `None` before the
+/// first successful resolution, again after a resolution finds no network at
+/// all, and again after a wake-up that skipped resolving because no rule was
+/// recorded -- all three share the same status: nothing to prove a rule in
+/// the state file is tied to. Touched only by [`wake_up_blocking`], which
+/// passes it to [`wake_up_tracking`]; every decision below takes the value
+/// as a plain parameter instead of reading the static, so a test drives the
+/// same code over a mutex of its own without colliding with another test's
+/// run through shared state.
 static LAST_KNOWN_SUBNET: Mutex<Option<Ipv4Net>> = Mutex::new(None);
 
 #[zbus::proxy(
@@ -224,7 +241,29 @@ fn check_network(
 /// that must never run on an async worker thread
 /// (`porthole_core::state`'s own `LOCK_TIMEOUT` doc comment).
 fn wake_up_blocking(state_path: &Path, executable: &Path) -> CheckOutcome {
-    let previous = *LAST_KNOWN_SUBNET.lock().expect("not poisoned");
+    wake_up_tracking(state_path, executable, &LAST_KNOWN_SUBNET)
+}
+
+/// [`wake_up_blocking`] with the tracked subnet as a parameter, so a test can
+/// drive it over a mutex of its own.
+fn wake_up_tracking(
+    state_path: &Path,
+    executable: &Path,
+    tracked: &Mutex<Option<Ipv4Net>>,
+) -> CheckOutcome {
+    // One guard for the whole wake-up rather than one to read and another to
+    // write. The two wake-up sources can fire at once; with a gap between the
+    // read and the write, both would see the same previous subnet, both would
+    // decide the same transition, and both would announce it. Held across a
+    // state lock, a `backend::detect` and a close, which is only safe because
+    // this whole function is synchronous and runs on a blocking thread --
+    // there is no await here to hold it across. Poisoning is taken rather
+    // than panicked on: what is behind the lock is one `Option<Ipv4Net>` with
+    // no invariant of its own to be left half-updated, and a panic in one
+    // wake-up must not stop every later one -- `wake_up` already treats a
+    // panicking check as survivable.
+    let mut tracked = tracked.lock().unwrap_or_else(|e| e.into_inner());
+    let previous = *tracked;
     let unchanged = CheckOutcome {
         reconciled: Vec::new(),
         closed: Vec::new(),
@@ -234,12 +273,24 @@ fn wake_up_blocking(state_path: &Path, executable: &Path) -> CheckOutcome {
 
     // Nothing recorded means nothing a network change could invalidate --
     // skip the two `ip` reads on every idle tick, not only the close itself.
+    // This wake-up therefore observes no subnet, and says so by clearing the
+    // tracked one instead of leaving the last observation standing. Keeping
+    // it would let a subnet observed before the state file emptied be
+    // compared against one resolved after it: a rule opened in between, on a
+    // different network, towards a CIDR that stale value contains, would be
+    // closed as if the machine had left a subnet it was never on while the
+    // rule existed. Clearing it makes the next wake-up that does resolve a
+    // subnet baseline on it instead, closing nothing.
     // An unreadable state file is a different fact from an empty one, so it
     // does not take this shortcut; the detect/lock attempts below fail
     // loudly (and harmlessly) on their own in that case instead.
     if let Ok(state) = StateStore::open(state_path) {
         if state.rules().is_empty() {
-            return unchanged;
+            *tracked = None;
+            return CheckOutcome {
+                last_known: None,
+                ..unchanged
+            };
         }
     }
 
@@ -259,7 +310,7 @@ fn wake_up_blocking(state_path: &Path, executable: &Path) -> CheckOutcome {
         executable.to_path_buf(),
     );
     let outcome = check_network(&mut engine, &runner, previous);
-    *LAST_KNOWN_SUBNET.lock().expect("not poisoned") = outcome.last_known;
+    *tracked = outcome.last_known;
     outcome
 }
 
@@ -372,6 +423,18 @@ mod tests {
     const ROUTE_JSON: &str = r#"[{"dst":"default","dev":"wlo1","metric":600}]"#;
     const ADDR_JSON: &str = r#"[{"ifindex":2,"ifname":"wlo1","addr_info":[{"family":"inet","local":"10.10.10.119","prefixlen":24,"scope":"global"}]}]"#;
     const ADDR_JSON_OTHER_SUBNET: &str = r#"[{"ifindex":2,"ifname":"wlo1","addr_info":[{"family":"inet","local":"192.168.1.50","prefixlen":24,"scope":"global"}]}]"#;
+
+    /// Two default routes at once, the multi-homed case the fixtures above
+    /// cannot express. The `wlo1` entry is verbatim `ip -j route show
+    /// default` from a real machine (Fedora 44, iproute2); the second entry
+    /// is that same entry with its own values -- an ethernet interface at a
+    /// lower metric, as docking produces -- and not one key more or fewer.
+    const ROUTE_JSON_TWO_DEFAULT_ROUTES: &str = r#"[{"dst":"default","gateway":"10.10.10.1","dev":"wlo1","protocol":"dhcp","prefsrc":"10.10.10.119","metric":600,"flags":[]},{"dst":"default","gateway":"192.168.1.1","dev":"enp0s31f6","protocol":"dhcp","prefsrc":"192.168.1.50","metric":100,"flags":[]}]"#;
+
+    /// `ip -j -4 addr show dev enp0s31f6`, which is what the resolution runs
+    /// once the route above has named that interface. Same provenance: the
+    /// real `wlo1` reply from that machine, carrying its own values.
+    const ADDR_JSON_DOCKED_ETHERNET: &str = r#"[{"ifindex":3,"ifname":"enp0s31f6","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],"mtu":1500,"qdisc":"noqueue","operstate":"UP","group":"default","txqlen":1000,"altnames":["enxe8bfb85d9153"],"addr_info":[{"family":"inet","local":"192.168.1.50","prefixlen":24,"broadcast":"192.168.1.255","scope":"global","dynamic":true,"noprefixroute":true,"label":"enp0s31f6","valid_life_time":42300,"preferred_life_time":42300}]}]"#;
 
     #[test]
     fn the_monitor_runs_on_the_system_bus_and_only_opts_in_on_a_session_one() {
@@ -635,5 +698,176 @@ mod tests {
             assert!(outcome.closed.is_empty());
             assert_eq!(engine.rules().len(), 1);
         }
+    }
+
+    #[test]
+    fn a_rule_opened_after_the_state_file_emptied_survives_the_move_that_emptied_it() {
+        // The sequence, in order:
+        //   1. the machine is on 10.10.10.0/24, and a wake-up records it;
+        //   2. `close --all` empties the state file, and a wake-up runs with
+        //      nothing recorded;
+        //   3. the machine is now on 192.168.1.0/24, and the user opens a
+        //      rule towards 10.10.10.0/24 -- a subnet it is not on, which is
+        //      the stronger polkit prompt, answered on purpose;
+        //   4. the next wake-up must leave that rule alone.
+        // Step 2 is where this went wrong: skipping the resolve left
+        // 10.10.10.0/24 tracked, so step 4 compared it against the subnet
+        // resolving now, called the difference a move off 10.10.10.0/24, and
+        // closed a rule that had never been open while the machine was there.
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join("state.json");
+        let executable = PathBuf::from("/usr/bin/porthole");
+        let tracked: Mutex<Option<Ipv4Net>> = Mutex::new(None);
+        let clock = FixedClock(NOW);
+
+        // 1. On the office network, with a rule towards it.
+        let backend = FakeBackend::new();
+        let open_runner = RecordingRunner::new();
+        let mut engine = engine_with_rule(
+            &backend,
+            &open_runner,
+            &clock,
+            StateStore::open(&state_path).unwrap(),
+            ScopeSpec::Network("10.10.10.0/24".parse().unwrap()),
+        );
+        let probe = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ADDR_JSON),
+        ]);
+        let outcome = check_network(&mut engine, &probe, *tracked.lock().unwrap());
+        *tracked.lock().unwrap() = outcome.last_known;
+        assert_eq!(
+            *tracked.lock().unwrap(),
+            Some("10.10.10.0/24".parse().unwrap())
+        );
+
+        // 2. `close --all`, then a wake-up over the emptied state file. It
+        //    returns before detecting a backend or running a single `ip`, so
+        //    no firewall is touched -- and it must not leave the office
+        //    subnet standing as though it were still an observation.
+        let (closed, errors) = engine.close_all(false);
+        assert_eq!(closed.len(), 1);
+        assert!(errors.is_empty(), "{errors:?}");
+        drop(engine);
+        assert!(StateStore::open(&state_path).unwrap().rules().is_empty());
+
+        let outcome = wake_up_tracking(&state_path, &executable, &tracked);
+        assert!(outcome.closed.is_empty());
+        assert!(outcome.transition.is_none());
+        assert_eq!(outcome.last_known, None);
+        assert_eq!(
+            *tracked.lock().unwrap(),
+            None,
+            "a wake-up that resolved no subnet must leave none tracked"
+        );
+
+        // 3. Home now, and a deliberate rule towards the office subnet.
+        let backend = FakeBackend::new();
+        let open_runner = RecordingRunner::new();
+        let mut engine = engine_with_rule(
+            &backend,
+            &open_runner,
+            &clock,
+            StateStore::open(&state_path).unwrap(),
+            ScopeSpec::Network("10.10.10.0/24".parse().unwrap()),
+        );
+
+        // 4. The next wake-up baselines instead of comparing.
+        let probe = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ADDR_JSON_OTHER_SUBNET),
+        ]);
+        let outcome = check_network(&mut engine, &probe, *tracked.lock().unwrap());
+        assert!(
+            outcome.closed.is_empty(),
+            "the rule the user just authorised must survive: {:?}",
+            outcome.closed
+        );
+        assert!(
+            outcome.transition.is_none(),
+            "nothing was observed before this, so there is no move to announce"
+        );
+        assert_eq!(outcome.last_known, Some("192.168.1.0/24".parse().unwrap()));
+        assert_eq!(engine.rules().len(), 1);
+
+        // The contrast that makes step 2 load-bearing: the very same step 4,
+        // with the office subnet still tracked, destroys that rule.
+        let stale_dir = TempDir::new().unwrap();
+        let backend = FakeBackend::new();
+        let open_runner = RecordingRunner::new();
+        let mut engine = engine_with_rule(
+            &backend,
+            &open_runner,
+            &clock,
+            StateStore::open(stale_dir.path().join("state.json")).unwrap(),
+            ScopeSpec::Network("10.10.10.0/24".parse().unwrap()),
+        );
+        let probe = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ADDR_JSON_OTHER_SUBNET),
+        ]);
+        let outcome = check_network(&mut engine, &probe, Some("10.10.10.0/24".parse().unwrap()));
+        assert_eq!(outcome.closed.len(), 1);
+    }
+
+    #[test]
+    fn a_wake_up_with_nothing_recorded_clears_the_tracked_subnet() {
+        // The narrow half of the sequence above, on its own: an empty state
+        // file resolves nothing, and "nothing resolved" is recorded as
+        // nothing rather than as the last thing that was.
+        let dir = TempDir::new().unwrap();
+        let tracked = Mutex::new(Some("10.10.10.0/24".parse::<Ipv4Net>().unwrap()));
+
+        let outcome = wake_up_tracking(
+            &dir.path().join("state.json"),
+            &PathBuf::from("/usr/bin/porthole"),
+            &tracked,
+        );
+
+        assert!(outcome.closed.is_empty());
+        assert!(outcome.transition.is_none());
+        assert_eq!(outcome.last_known, None);
+        assert_eq!(*tracked.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn docking_closes_a_rule_for_the_wifi_subnet_that_is_still_up_a_known_limitation() {
+        // Not a blessing: this pins today's behaviour so the interface change
+        // that fixes it has to break a test. One subnet is resolved per
+        // wake-up, from a single default route, so a laptop with wifi
+        // (10.10.10.0/24, metric 600) and ethernet (192.168.1.0/24, metric
+        // 100) both up reports only the ethernet one. The wifi subnet stops
+        // matching, and a rule inside it closes while wifi is still up and
+        // still carrying that rule's traffic.
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(dir.path().join("state.json")).unwrap();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let open_runner = RecordingRunner::new();
+        let mut engine = engine_with_rule(
+            &backend,
+            &open_runner,
+            &clock,
+            store,
+            ScopeSpec::Network("10.10.10.0/24".parse().unwrap()),
+        );
+
+        let probe = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON_TWO_DEFAULT_ROUTES),
+            Output::stdout(ADDR_JSON_DOCKED_ETHERNET),
+        ]);
+        let outcome = check_network(&mut engine, &probe, Some("10.10.10.0/24".parse().unwrap()));
+
+        assert_eq!(
+            outcome.closed.len(),
+            1,
+            "today's behaviour: the still-reachable wifi rule is closed"
+        );
+        assert_eq!(
+            outcome.transition,
+            Some(("10.10.10.0/24".to_string(), "192.168.1.0/24".to_string())),
+            "and the move is announced as though wifi were gone"
+        );
+        assert!(engine.rules().is_empty());
     }
 }
