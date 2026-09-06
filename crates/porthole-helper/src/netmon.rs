@@ -246,6 +246,15 @@ fn wake_up_blocking(state_path: &Path, executable: &Path) -> CheckOutcome {
 
 /// [`wake_up_blocking`] with the tracked subnet as a parameter, so a test can
 /// drive it over a mutex of its own.
+///
+/// One path through here is driven by a test and one is not. The
+/// "nothing recorded" return below happens before a backend is detected and
+/// before any `ip` runs, so a test can enter it with a temporary directory
+/// and reach nothing outside it. Everything after that point builds a
+/// `RealRunner`: it detects whichever firewall this machine actually has and
+/// can close rules in it, so no test in this workspace goes past the return
+/// below, and the only coverage that half has is [`check_network`]'s, which
+/// takes its runner as a parameter.
 fn wake_up_tracking(
     state_path: &Path,
     executable: &Path,
@@ -714,6 +723,13 @@ mod tests {
         // 10.10.10.0/24 tracked, so step 4 compared it against the subnet
         // resolving now, called the difference a move off 10.10.10.0/24, and
         // closed a rule that had never been open while the machine was there.
+        //
+        // Only step 2 runs `wake_up_tracking`, which is the code the fix is
+        // in. Steps 1 and 4 call `check_network` and move the tracked value
+        // by hand, the way `wake_up_tracking` would: the rest of that
+        // function reaches a real firewall and no test enters it. So what
+        // this pins is the decision the four steps make in sequence, not
+        // that one function performs all four.
         let dir = TempDir::new().unwrap();
         let state_path = dir.path().join("state.json");
         let executable = PathBuf::from("/usr/bin/porthole");

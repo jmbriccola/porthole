@@ -44,9 +44,25 @@ fn both_files_start_the_same_binary() {
     let unit = data("porthole-agent.service");
     let desktop = data("porthole-agent.desktop");
 
+    // Read, not merely named: the same coupling `data_files.rs` keeps
+    // between the helper's CLI path and this file. An `ExecStart=` pointing
+    // somewhere the install instructions never put the binary is a unit that
+    // fails to start on a by-hand install, and nothing else in this
+    // workspace compiles either file.
+    const EXEC_START: &str = "/usr/local/bin/porthole-agent";
+    let installing = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/installing.md"
+    ))
+    .unwrap_or_else(|e| panic!("docs/installing.md: {e}"));
     assert!(
-        directives(&unit).contains(&"ExecStart=/usr/local/bin/porthole-agent"),
-        "the unit must name the path docs/installing.md installs to: {unit}"
+        directives(&unit).contains(&format!("ExecStart={EXEC_START}").as_str()),
+        "{unit}"
+    );
+    assert!(
+        installing.contains(EXEC_START),
+        "docs/installing.md never names {EXEC_START}, so a by-hand install \
+         puts the binary somewhere ExecStart= does not look"
     );
     // A desktop entry's `Exec=` is looked up on `$PATH`, so this one is a
     // bare name on purpose rather than the absolute path above.

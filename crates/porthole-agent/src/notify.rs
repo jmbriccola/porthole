@@ -54,8 +54,13 @@ impl Notification {
 ///
 /// Every signal on the system bus reaches every agent on the machine. A rule
 /// carries the uid that opened it, and that is the only thing that decides
-/// this: telling a second user which ports the first one had open is both
-/// noise and a leak.
+/// this: a notification about a port somebody else opened is not addressed
+/// to the person reading it, and the `Reopen` on it would not be theirs to
+/// answer.
+///
+/// It is not a confidentiality boundary. `list` is authorized for every
+/// user, so which ports porthole has open is already readable by anyone on
+/// the machine, and this filter neither adds to that nor takes from it.
 pub fn should_notify(rule: &WireRule, uid: u32) -> bool {
     rule.uid == uid
 }
@@ -228,8 +233,10 @@ mod tests {
     #[test]
     fn a_signal_for_another_user_is_ignored() {
         // The system bus broadcasts to every agent on the machine. Notifying
-        // a second user about the first user's ports is both noise and a
-        // leak.
+        // a second user about the first user's ports is noise, and hands
+        // them a `Reopen` for a rule that is not theirs. The brief called it
+        // a leak as well; `list` is authorized for every user, so it is not
+        // one.
         assert!(should_notify(&signal_from_uid(1000), 1000));
         assert!(!should_notify(&signal_from_uid(1001), 1000));
     }
@@ -268,9 +275,19 @@ mod tests {
             let n = notification_for(&closed_rule(8080, "udp"), reason);
             assert!(n.body.contains("8080/udp"), "{reason}: {}", n.body);
             assert!(!n.summary.is_empty(), "{reason}");
-            // `Notify` takes actions as a flat key/label list; an odd number
-            // of entries silently misaligns every label after it.
-            assert_eq!(n.action_pairs().len(), n.actions.len() * 2, "{reason}");
+            // `Notify` takes actions as one flat list, key before label.
+            // Flattened the other way round it is still the right length and
+            // still even, and every server would show `reopen` as the button
+            // text and send `Reopen` back as the key -- which no branch here
+            // acts on.
+            for pair in n.action_pairs().chunks(2) {
+                assert_eq!(pair.len(), 2, "{reason}: a key with no label");
+                assert_eq!(
+                    pair[0], REOPEN,
+                    "{reason}: the key comes first, and it is what `ActionInvoked` sends back"
+                );
+                assert_ne!(pair[1], REOPEN, "{reason}: the label is not the key");
+            }
         }
     }
 }

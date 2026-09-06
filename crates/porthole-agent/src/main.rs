@@ -40,6 +40,11 @@
 //! `ActionInvoked`, it does not draw anything), the real helper, or polkit --
 //! so "the prompt appears and the port comes back" is not covered by any test
 //! in this repository.
+//!
+//! The start-up ordering above is not covered either. All three tests bring
+//! their stand-in helper up before the agent, so none of them exercises an
+//! agent whose subscription is what the helper is started into, and nothing
+//! here would fail if that ordering were reversed.
 
 mod notify;
 
@@ -63,11 +68,22 @@ const AGENT_SERVICE: &str = "com.jacopobriccola.PortholeAgent";
 /// is refused with a line in the journal rather than acted on with a guess.
 const MAX_PENDING: usize = 32;
 
-/// The rules whose notifications are still on screen, oldest first.
+/// The rules whose notifications are still on screen, oldest last.
 ///
 /// A `Vec` rather than a map: it holds at most [`MAX_PENDING`] entries, a
-/// click scans it once, and this way "oldest" is a position rather than an
+/// click scans it once, and this way "newest" is a position rather than an
 /// assumption about how a notification server numbers things.
+///
+/// A notification id identifies a notification within one run of one
+/// notification server. It says nothing across a restart of that server, and
+/// nothing about a different server: the next run starts numbering again, so
+/// an entry left here from before a restart can carry the same id as one
+/// added after it. Two things keep a click off the wrong entry. The list is
+/// emptied whenever the notification service changes owner, so entries from
+/// a previous run do not survive into the next one; and a click is matched
+/// against the newest entry with that id, not the oldest. Only the first
+/// removes the possibility -- the second is what happens if the first ever
+/// fails to fire.
 type Pending = Vec<(u32, WireRule)>;
 
 #[tokio::main(flavor = "current_thread")]
@@ -130,6 +146,16 @@ async fn main() {
         }
     };
 
+    // The cue to forget every id in `pending`: they are only meaningful
+    // within one run of one notification server. See [`Pending`].
+    let mut owners = match notifications.inner().receive_owner_changed().await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("porthole-agent: could not watch the notification service's owner: {e}");
+            return;
+        }
+    };
+
     // Not for its answer. Calling the helper is what starts it, and the
     // subscription above already exists, so whatever its start-up sweep
     // announces arrives here instead of being sent to nobody. A failure is
@@ -141,29 +167,85 @@ async fn main() {
 
     eprintln!("porthole-agent: listening for uid {uid}");
 
+    // A stream here ends when the connection under it does, and neither
+    // connection can be rebuilt from inside this loop, so the end of any of
+    // the three signal streams ends the process rather than leaving it
+    // running with one half of its job -- an agent that has lost the system
+    // bus is a process nothing will ever wake again. Nothing restarts it:
+    // `data/porthole-agent.service` sets no `Restart=`, so this is a stop
+    // and not a bounce, and the line it prints is the only record of why.
     let mut pending: Pending = Vec::new();
     loop {
         tokio::select! {
-            Some(signal) = closes.next() => {
+            biased;
+            // First on purpose. An owner change and a close can be ready in
+            // the same breath, and the order they are taken in decides
+            // whether the close's notification is recorded and then thrown
+            // away, or thrown away and then recorded. Polled first, an owner
+            // change already on the wire empties the list before the close
+            // fills it.
+            //
+            // It does not cover an owner change that becomes ready while a
+            // `Notify` is still in flight: that one is applied after the
+            // notification it did not invalidate has been recorded, so a
+            // click on that notification is refused. Refusing is the
+            // direction that cannot open the wrong port.
+            //
+            // A refutable pattern, unlike the three below: this is the one
+            // branch allowed to end without ending the loop, and matching it
+            // unconditionally would make a terminated stream return
+            // immediately forever.
+            Some(_) = owners.next() => {
+                eprintln!(
+                    "porthole-agent: the notification service changed; forgetting {} \
+                     notification id(s), so a later click cannot be matched to one of them",
+                    pending.len()
+                );
+                pending.clear();
+            }
+            close = closes.next() => {
+                let Some(signal) = close else {
+                    eprintln!("porthole-agent: the system bus connection ended; stopping");
+                    break;
+                };
                 let Ok(args) = signal.args() else { continue };
                 on_close(&notifications, &mut pending, args.rule(), *args.reason(), uid).await;
             }
-            Some(signal) = actions.next() => {
+            action = actions.next() => {
+                let Some(signal) = action else {
+                    eprintln!("porthole-agent: the session bus connection ended; stopping");
+                    break;
+                };
                 let Ok(args) = signal.args() else { continue };
                 on_action(&porthole, &notifications, &pending, args.id, args.action_key);
             }
-            Some(signal) = dismissals.next() => {
+            dismissal = dismissals.next() => {
+                let Some(signal) = dismissal else {
+                    eprintln!("porthole-agent: the session bus connection ended; stopping");
+                    break;
+                };
                 let Ok(args) = signal.args() else { continue };
                 pending.retain(|(id, _)| *id != args.id);
             }
-            else => break,
         }
     }
+}
 
-    // Every stream ended at once, which means the connections behind them
-    // are gone. There is nothing left to listen to, and nothing here can put
-    // them back.
-    eprintln!("porthole-agent: the bus connections ended; stopping");
+/// The rule behind the notification with this id, newest first.
+///
+/// Newest rather than first-found, and the reason is the whole of
+/// [`Pending`]'s own doc: an id is unique within one run of one notification
+/// server, and an entry outliving that run can collide with a fresh one. The
+/// newest entry with an id is the notification on the screen; an older one
+/// is a notification the user cannot see and did not click. Backwards, this
+/// opens a port the user never looked at while they believe they authorized
+/// the one they did.
+fn newest_with_id(pending: &Pending, id: u32) -> Option<&WireRule> {
+    pending
+        .iter()
+        .rev()
+        .find(|(pending_id, _)| *pending_id == id)
+        .map(|(_, rule)| rule)
 }
 
 /// One `RuleClosed`.
@@ -220,7 +302,7 @@ fn on_action(
     if key != REOPEN {
         return;
     }
-    let Some((_, rule)) = pending.iter().find(|(pending_id, _)| *pending_id == id) else {
+    let Some(rule) = newest_with_id(pending, id) else {
         eprintln!("porthole-agent: a reopen arrived for a notification this no longer holds");
         return;
     };
@@ -351,6 +433,30 @@ mod tests {
             expires_at,
             uid: 1000,
         }
+    }
+
+    #[test]
+    fn a_click_reopens_the_notification_on_the_screen_not_one_that_outlived_a_restart() {
+        // A notification id is unique within one run of one notification
+        // server. Restart the server and it starts numbering again, so an
+        // entry that outlived the restart can carry the id of one added
+        // after it. Matching the first entry found would reopen 5173 while
+        // the user is looking at a notification about 8080 and believes that
+        // is what they authorized.
+        let stale = rule("network", "10.10.10.0/24", 0, 0);
+        let live = WireRule {
+            port: 8080,
+            ..rule("network", "192.168.1.0/24", 0, 0)
+        };
+        let pending: Pending = vec![(7, stale), (7, live)];
+
+        assert_eq!(
+            newest_with_id(&pending, 7).map(|r| r.port),
+            Some(8080),
+            "the newest entry with the id is the notification on the screen"
+        );
+        assert_eq!(newest_with_id(&pending, 8), None);
+        assert_eq!(newest_with_id(&Pending::new(), 7), None);
     }
 
     #[test]

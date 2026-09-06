@@ -492,3 +492,163 @@ async fn a_second_agent_in_one_session_stops_instead_of_doubling_every_notice() 
     assert_eq!(shown.lock().unwrap().len(), 1);
     assert!(first.is_running());
 }
+
+#[tokio::test]
+async fn a_click_after_the_notification_service_restarted_never_reopens_a_stale_port() {
+    // A notification id means something only within one run of one
+    // notification server. Restart the server and it numbers from the start
+    // again, so an id the agent is still holding can name a notification
+    // nobody can see any more -- and a click carrying that id would reopen
+    // the port that notification was about, while the user is looking at a
+    // different one and believes that is what they authorized.
+    let bus = Bus::start();
+    let uid = our_uid();
+    let opens = Arc::new(Mutex::new(Vec::new()));
+    let before = Arc::new(Mutex::new(Vec::new()));
+    let after = Arc::new(Mutex::new(Vec::new()));
+    // The same id from both runs, which is the whole point: a server that
+    // numbered differently after a restart would hide this by accident.
+    let reused_id = 7;
+
+    let helper = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(SERVICE)
+        .unwrap()
+        .serve_at(
+            PATH,
+            FakeHelper {
+                opens: opens.clone(),
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let first_run = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(NOTIFICATIONS_SERVICE)
+        .unwrap()
+        .serve_at(
+            NOTIFICATIONS_PATH,
+            FakeNotifications {
+                shown: before.clone(),
+                id: reused_id,
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let mut agent = Agent::start(&bus);
+    until("the agent to start listening", || {
+        agent.journal().contains("listening for uid").then_some(())
+    })
+    .await;
+
+    // One notification under the first run: the agent is now holding id 7
+    // against port 5173.
+    helper
+        .emit_signal(
+            None::<()>,
+            PATH,
+            INTERFACE,
+            "RuleClosed",
+            &(wire_rule(5173, uid), CloseReason::Expired),
+        )
+        .await
+        .unwrap();
+    until("the first notification", || {
+        before.lock().unwrap().first().cloned()
+    })
+    .await;
+
+    // The restart. Waiting for the agent to say it forgot is also what makes
+    // the rest of this deterministic: the line cannot appear before the bus
+    // has broadcast the name's release, so the name is free to take again.
+    drop(first_run);
+    until("the agent to forget the first run's ids", || {
+        agent
+            .journal()
+            .contains("forgetting 1 notification id(s)")
+            .then_some(())
+    })
+    .await;
+
+    let second_run = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(NOTIFICATIONS_SERVICE)
+        .unwrap()
+        .serve_at(
+            NOTIFICATIONS_PATH,
+            FakeNotifications {
+                shown: after.clone(),
+                id: reused_id,
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    // A click carrying the reused id, with nothing yet shown under the new
+    // run. Nothing may be reopened: the only rule that id ever named belongs
+    // to a notification that no longer exists.
+    second_run
+        .emit_signal(
+            None::<()>,
+            NOTIFICATIONS_PATH,
+            NOTIFICATIONS_INTERFACE,
+            "ActionInvoked",
+            &(reused_id, "reopen"),
+        )
+        .await
+        .unwrap();
+    until("the agent to refuse the stale click", || {
+        agent.journal().contains("no longer holds").then_some(())
+    })
+    .await;
+    assert!(
+        opens.lock().unwrap().is_empty(),
+        "a click on a notification from before the restart reopened something: {:?}",
+        opens.lock().unwrap()
+    );
+
+    // Now a real notification under the new run, taking the same id back.
+    helper
+        .emit_signal(
+            None::<()>,
+            PATH,
+            INTERFACE,
+            "RuleClosed",
+            &(wire_rule(8080, uid), CloseReason::Expired),
+        )
+        .await
+        .unwrap();
+    let shown = until("the second run's notification", || {
+        after.lock().unwrap().first().cloned()
+    })
+    .await;
+    assert!(shown.body.contains("8080/tcp"), "{shown:?}");
+
+    second_run
+        .emit_signal(
+            None::<()>,
+            NOTIFICATIONS_PATH,
+            NOTIFICATIONS_INTERFACE,
+            "ActionInvoked",
+            &(reused_id, "reopen"),
+        )
+        .await
+        .unwrap();
+    let opened = until("the reopen to reach the helper", || {
+        opens.lock().unwrap().first().cloned()
+    })
+    .await;
+    assert_eq!(
+        opened.port, 8080,
+        "the click reopened the port from before the restart, not the one on the screen"
+    );
+    assert!(agent.is_running());
+}
