@@ -215,15 +215,31 @@ pub fn json_closed(
     })
 }
 
-pub fn print_closed(rules: &[ManagedRule], dry_run: bool) {
+/// `forgotten` is `--forget`: nothing was closed in any firewall, only
+/// porthole's own record of the rule was dropped, so saying "Closed" would
+/// be exactly the overclaim the rest of this milestone spent so much effort
+/// removing elsewhere. `--forget` only ever resolves to a single rule (see
+/// `Engine::close_by_id`'s own doc comment), but `rules` still takes a slice
+/// so this stays one function for every shape `close` can report.
+pub fn print_closed(rules: &[ManagedRule], dry_run: bool, forgotten: bool) {
     if rules.is_empty() {
         println!("Nothing to close.");
         return;
     }
-    let verb = if dry_run { "Would close" } else { "Closed" };
+    let verb = match (dry_run, forgotten) {
+        (false, false) => "Closed",
+        (true, false) => "Would close",
+        (false, true) => "Forgot",
+        (true, true) => "Would forget",
+    };
     for rule in rules {
+        let suffix = if forgotten {
+            " (no firewall was touched)"
+        } else {
+            ""
+        };
         println!(
-            "{verb} {}/{} towards {}",
+            "{verb} {}/{} towards {}{suffix}",
             rule.port, rule.protocol, rule.target
         );
     }

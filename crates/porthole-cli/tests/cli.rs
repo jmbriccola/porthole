@@ -229,6 +229,28 @@ fn close_rejects_conflicting_targets() {
 }
 
 #[test]
+fn forget_without_an_id_is_rejected_even_alongside_a_port() {
+    // clap's own `#[arg(requires = "id")]` on `--forget` does not catch
+    // `close <port> --forget` by itself -- verified by hand: `--id` also
+    // `conflicts_with_all(["port", ...])`, and clap does not treat that
+    // three-way combination as unsatisfiable. Without `run.rs`'s own
+    // explicit check, `close <port> --forget` would silently perform an
+    // ordinary close and ignore `--forget` entirely, which is exactly the
+    // implicit forgetting the flag must never allow.
+    let dir = TempDir::new().unwrap();
+    let out = porthole(&["close", "5173", "--forget"], &state_path(&dir));
+    assert_eq!(code(&out), 2, "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("--id"), "got: {}", stderr(&out));
+}
+
+#[test]
+fn forget_without_an_id_at_all_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let out = porthole(&["close", "--forget"], &state_path(&dir));
+    assert_eq!(code(&out), 2, "stderr: {}", stderr(&out));
+}
+
+#[test]
 fn closing_without_a_helper_says_the_helper_is_missing() {
     // Same change as `open`, and for the same reason: without a helper on the
     // bus there is no one to authorize or deny the request, so this is

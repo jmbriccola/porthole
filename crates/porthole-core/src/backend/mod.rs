@@ -107,17 +107,27 @@ pub struct BackendHealth {
     /// tell them apart must check `active_unknown` too, not read `!active`
     /// as a confirmed absence on its own.
     pub active: bool,
-    /// `true` when `active` is `false` only because porthole could not read
-    /// enough of the ruleset to tell -- a permission-denied `ufw status` or
-    /// `nft -j list chains`, not a confirmed absence of enforcement. Always
-    /// `false` when `active` is `true`: there is nothing left unknown once
-    /// enforcement has actually been confirmed. `porthole doctor` reads this
-    /// to choose between "here is how to enable it" (genuinely inactive) and
-    /// "porthole cannot tell, one way or the other" (unknown) -- the two
-    /// need different remedies, and conflating them risks the same "feeling
-    /// safe when you are not" failure reconciliation's own ownership rules
-    /// exist to prevent, just one layer up in diagnostics instead of in the
-    /// firewall itself.
+    /// `true` when `active` is `false` only because porthole could not
+    /// confirm activity, never because it confirmed an absence of it.
+    ///
+    /// The most common cause is a permission-denied `ufw status` or `nft -j
+    /// list chains` -- both need root to read at all, and `porthole status`/
+    /// `doctor` run without it -- but it is not the *only* one: an `nft -j
+    /// list chains` that returns something porthole cannot parse sets it
+    /// too, since an installed `nft` porthole cannot make sense of is still
+    /// installed, not absent, and porthole did not confirm anything either
+    /// way. Read this as "could not confirm," not as a synonym for
+    /// "permission denied" specifically -- a caller that needs to say *why*
+    /// reads `detail`, which always names the actual reason.
+    ///
+    /// Always `false` when `active` is `true`: there is nothing left unknown
+    /// once enforcement has actually been confirmed. `porthole doctor` reads
+    /// this to choose between "here is how to enable it" (genuinely
+    /// inactive) and "porthole cannot tell, one way or the other" (unknown)
+    /// -- the two need different remedies, and conflating them risks the
+    /// same "feeling safe when you are not" failure reconciliation's own
+    /// ownership rules exist to prevent, just one layer up in diagnostics
+    /// instead of in the firewall itself.
     pub active_unknown: bool,
     pub version: Option<String>,
     /// A sentence fit to show the user.
@@ -448,6 +458,31 @@ mod tests {
             ],
         );
         assert_eq!(detect(&runner).unwrap().id(), BackendId::Nftables);
+    }
+
+    #[test]
+    fn detect_does_not_report_no_firewall_when_nftables_output_is_unparseable() {
+        // The seventh instance of one class on this branch, and the first
+        // time it was in a comment written to fix that very class:
+        // `Nftables::health` used to let a JSON parse failure propagate as
+        // `Err` on the theory that `porthole doctor` needed it to, to tell
+        // the failure apart from "needs root". Doctor cannot -- it gets its
+        // backend from `detect`, which propagates any `health()` error with
+        // `?` (below), so the parse failure never reached `firewall_check`
+        // at all. A unit test constructing `Nftables` directly (as
+        // `doctor.rs`'s own test does) cannot catch that, because it never
+        // goes through `detect` -- this one does, on purpose, to prove the
+        // path production actually takes.
+        let runner = AbsentPrograms::new(
+            &["firewall-cmd", "ufw"],
+            vec![
+                Output::stdout("nftables v1.1.6"),
+                Output::stdout("not valid nft -j output"),
+            ],
+        );
+        let backend = detect(&runner)
+            .expect("an installed nft with unparseable output must still be detected");
+        assert_eq!(backend.id(), BackendId::Nftables);
     }
 
     #[test]

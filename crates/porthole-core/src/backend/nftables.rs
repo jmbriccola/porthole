@@ -593,16 +593,22 @@ impl FirewallBackend for Nftables<'_> {
         // propagating, is what keeps that from reading as "no firewall at
         // all".
         //
-        // Only `Error::CommandFailed` degrades this way: that is the shape a
-        // non-zero exit takes (`input_chains`'s own `into_ok()?`), which is
-        // exactly what a permission refusal looks like and the only failure
-        // this measured fact is actually about. A malformed-JSON parse
-        // failure (`Error::Unexpected`, from a genuinely successful exit
-        // whose stdout `porthole` cannot make sense of) is a different
-        // problem `porthole doctor` needs to tell apart from "needs root" --
-        // see `nftables_health_error_names_the_command_to_run_by_hand` in
-        // `doctor.rs` -- so that, and anything else unexpected, still
-        // propagates exactly as before.
+        // Every failure from here degrades, not only `Error::CommandFailed`
+        // (the permission-denied shape). An earlier version of this comment
+        // said a malformed-JSON parse failure (`Error::Unexpected`, from a
+        // genuinely successful exit whose stdout porthole cannot parse)
+        // needed to propagate so `porthole doctor` could tell it apart from
+        // "needs root" -- but doctor never gets the chance: it gets its
+        // backend from `backend::detect`, which propagates any `health()`
+        // error with `?` before `firewall_check` is ever called (see
+        // `detect_does_not_report_no_firewall_when_nftables_output_is_unparseable`
+        // in `backend/mod.rs`, which exercises exactly that path). An
+        // installed `nft` whose output porthole cannot parse is still an
+        // installed `nft` -- propagating turned it into "no firewall found",
+        // the last remaining way this backend could report a running
+        // firewall as absent. The two failure shapes still get different
+        // `detail` wording below, for whoever reads it by hand; only the
+        // wording differs, not whether this degrades.
         match self.list_chains() {
             Ok(chains) => {
                 let (active, detail) = match chains.as_slice() {
@@ -684,7 +690,19 @@ impl FirewallBackend for Nftables<'_> {
                 ),
                 caveat: None,
             }),
-            Err(other) => Err(other),
+            Err(e) => Ok(BackendHealth {
+                available: true,
+                active: false,
+                active_unknown: true,
+                version,
+                detail: format!(
+                    "nft is installed, but porthole could not make sense of its ruleset ({e}) \
+                     -- that is not the same as nothing being registered at the input hook, \
+                     it may already be enforcing traffic porthole cannot see from here; run \
+                     `nft -j list chains` by hand to see what it actually returned"
+                ),
+                caveat: None,
+            }),
         }
     }
 

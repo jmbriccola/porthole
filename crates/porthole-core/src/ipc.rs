@@ -84,6 +84,17 @@ pub struct WireStatus {
     pub backend: String,
     pub firewall_available: bool,
     pub firewall_active: bool,
+    /// `true` when `firewall_active: false` means "porthole could not
+    /// confirm activity," never "porthole confirmed there is none" — the
+    /// same distinction `status --json`'s own `firewall_active_unknown`
+    /// carries (see `docs/json-schema.md`), reproduced here so a client on
+    /// this surface is not left with the one undistinguished bit the local
+    /// `--json` path already stopped carrying. The production helper always
+    /// runs as root, where this is effectively always `false`, but a
+    /// `--session` helper run by an ordinary user -- which this milestone's
+    /// own e2e suite does -- can still hit the permission-denied case a
+    /// system helper never would.
+    pub firewall_active_unknown: bool,
     /// Empty when unknown.
     pub firewall_version: String,
     /// The firewalld zone, or empty.
@@ -104,6 +115,7 @@ impl WireStatus {
             backend: status.backend.to_string(),
             firewall_available: status.health.available,
             firewall_active: status.health.active,
+            firewall_active_unknown: status.health.active_unknown,
             firewall_version: status.health.version.clone().unwrap_or_default(),
             location: status.location.clone().unwrap_or_default(),
             interface: status
@@ -153,7 +165,15 @@ pub trait Porthole {
     /// from `--from-timer` — see `porthole_helper::service::Porthole::close_by_id`
     /// for why the helper accepts it from the client rather than verifying it
     /// independently.
-    async fn close_by_id(&self, id: &str, from_timer: bool) -> zbus::Result<WireRule>;
+    ///
+    /// `forget` is `--forget`: drop the state record without touching any
+    /// firewall, the only way out of the trap a state entry recorded under a
+    /// backend this machine no longer has would otherwise be — see
+    /// `porthole_core::engine::Engine::forget_rule`. The helper re-checks
+    /// that the entry is actually such an orphan before honouring it; a
+    /// client claiming `forget: true` for anything else is refused.
+    async fn close_by_id(&self, id: &str, from_timer: bool, forget: bool)
+        -> zbus::Result<WireRule>;
 
     /// Returns what closed and, separately, the failures — so one stuck rule
     /// cannot hide the others, exactly as `close --all` behaves locally.
@@ -264,6 +284,36 @@ mod tests {
         assert_eq!(wire.interface, "wlo1");
         assert_eq!(wire.address, "10.10.10.119");
         assert_eq!(wire.cidr, "10.10.10.0/24");
+    }
+
+    #[test]
+    fn wire_status_does_not_collapse_the_activity_distinction_status_json_already_carries() {
+        // `--json` stopped carrying only `firewall_active` once a
+        // permission-denied read stopped being distinguishable from a
+        // confirmed absence of enforcement; this D-Bus surface must not be
+        // the one place that regresses back to it. `firewall_active_unknown`
+        // is `false` in every case that existed before this field, so a
+        // client reading only `firewall_active` is unaffected either way.
+        let status = Status {
+            backend: BackendId::Ufw,
+            health: BackendHealth {
+                available: true,
+                active: false,
+                active_unknown: true,
+                version: Some("0.36.2".to_string()),
+                detail: "ufw is installed, but reading its status needs more privilege than \
+                         this process has"
+                    .to_string(),
+                caveat: None,
+            },
+            network: None,
+            location: Some("ufw".to_string()),
+            rules: vec![],
+        };
+
+        let wire = WireStatus::from_status(&status);
+        assert!(!wire.firewall_active);
+        assert!(wire.firewall_active_unknown);
     }
 
     #[test]

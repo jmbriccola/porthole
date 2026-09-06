@@ -60,26 +60,48 @@ Used in `list`, `status`, `open` and `close`.
 
 `backend` is one of `"firewalld"`, `"ufw"` or `"nftables"` — whichever
 porthole detected on this machine, in that priority order, **when
-`firewall_available` is `true`**. When it is `false` — no supported firewall
-was found at all — `backend` still holds `"firewalld"`, but that value is
-arbitrary and carries no information: nothing was actually detected, and a
-script must not read anything into it in that case.
+`firewall_available` is `true`**. When it is `false`, `backend` still holds
+`"firewalld"`, but that value is arbitrary and carries no information:
+nothing was actually detected, and a script must not read anything into it
+in that case.
+
+`firewall_available: false` itself folds two facts into one bit, for the
+same reason `porthole status` always exits `0` and answers in this one
+shape rather than failing outright: **no supported firewall is installed**
+(the ordinary case a script will actually meet) and, more broadly, **porthole
+could not detect a backend at all**, for whatever reason — today those are
+the same thing in practice, since every backend's own detection step
+degrades rather than errors (see `firewall_active_unknown` below), but nothing
+guarantees a future backend's detection can only ever fail that one way.
+Neither case has a field of its own here to tell them apart: plain `porthole
+status` prints the distinguishing sentence (porthole's own `detail`) as
+prose; `--json` does not carry it, on the judgment that this collapse is not
+live today and a script gains nothing from a field for a case that cannot
+currently happen — `firewall_available: false` is reason enough on its own
+to stop reading the rest of this object as meaningful.
 
 `firewall_active: false` is two different facts, and `firewall_active_unknown`
 is what tells them apart. `firewall_active_unknown: false` — every case that
 existed before this field was added, `firewall_active` either `true` or
 `false` — means porthole actually read the firewall's state and got a
 definite answer, whichever way it came out. `firewall_active_unknown: true`
-means it could not: ufw's and nftables' own reads both need more privilege
-than `porthole status` runs with, so a permission-denied read reports
-`firewall_active: false` too, but that is not a confirmed absence, only an
-unanswered question. `firewall_active_unknown` is always `false` for
-firewalld (its reads never need more privilege than any user has) and always
-`false` when `firewall_available` is itself `false` (there is nothing to
-have failed to read). A script that only reads `firewall_active` behaves
-exactly as it always has; one that reads `firewall_active_unknown` too can
-avoid treating "porthole could not tell" as "porthole confirmed this is
-off."
+means it could not **confirm** activity, one way or the other — not
+specifically "permission denied," though that is the most common reason:
+ufw's and nftables' own reads both need more privilege than `porthole
+status` runs with, so a permission-denied read sets it. So does an `nft -j
+list chains` that returns something porthole cannot parse — an installed
+`nft` porthole cannot make sense of is still installed, not absent, and
+porthole did not confirm anything either way about it. Neither cause has a
+field of its own here; `porthole doctor` (plain or `--json`) names the
+actual reason in its `Firewall` check's `detail` when that matters. Treat
+`firewall_active_unknown` as "could not confirm," not as a synonym for one
+specific cause. It is always `false` for firewalld (its reads never need
+more privilege than any user has, and it has no unparseable-output case) and
+always `false` when `firewall_available` is itself `false` (there is
+nothing to have failed to confirm). A script that only reads
+`firewall_active` behaves exactly as it always has; one that reads
+`firewall_active_unknown` too can avoid treating "porthole could not tell"
+as "porthole confirmed this is off."
 
 `location` means something different for each, and a script that assumes it
 is always a firewalld zone will misread the other two:

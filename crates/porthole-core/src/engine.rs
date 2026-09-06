@@ -247,13 +247,31 @@ impl<'a> Engine<'a> {
         }
 
         if let Some(existing) = self.state.find_by_port(port, protocol) {
+            // A foreign-backend entry (see `close_rule`'s own doc comment)
+            // cannot be closed through this backend, so "close it first"
+            // would send someone in a circle: an ordinary `close` on this
+            // port hits the same guard `close_rule` does. Name the actual
+            // way out.
+            let detail = if existing.backend != self.backend.id() {
+                format!(
+                    "open towards {} (recorded under the {} backend, but this machine now \
+                     has {}); an ordinary close cannot remove that record -- \
+                     `porthole close --id {} --forget` does, if you want this port back",
+                    existing.target,
+                    existing.backend,
+                    self.backend.id(),
+                    existing.id
+                )
+            } else {
+                format!(
+                    "open towards {}; close it first if you want a different scope",
+                    existing.target
+                )
+            };
             return Err(Error::AlreadyOpen {
                 port,
                 protocol,
-                detail: format!(
-                    "open towards {}; close it first if you want a different scope",
-                    existing.target
-                ),
+                detail,
             });
         }
 
@@ -325,22 +343,35 @@ impl<'a> Engine<'a> {
         }
     }
 
-    pub fn close_by_id(&mut self, id: &str, from_timer: bool) -> Result<ManagedRule> {
+    /// `forget`: see [`Engine::forget_rule`]. Only ever `true` from the CLI's
+    /// `close --id <id> --forget` — `close_by_port` and `close_all` never
+    /// pass it, so a foreign-backend entry is never forgotten by anything
+    /// less specific than a human naming its id on purpose.
+    pub fn close_by_id(&mut self, id: &str, from_timer: bool, forget: bool) -> Result<ManagedRule> {
         self.reconcile();
-        self.close_by_id_unreconciled(id, from_timer)
+        self.close_by_id_unreconciled(id, from_timer, forget)
     }
 
     /// [`Engine::close_by_id`] without its own reconciliation pass. Used by
     /// [`Engine::close_all`], which already reconciled once for the whole
     /// batch: reconciling again per rule would run the same listing command
     /// once per rule instead of once per operation.
-    fn close_by_id_unreconciled(&mut self, id: &str, from_timer: bool) -> Result<ManagedRule> {
+    fn close_by_id_unreconciled(
+        &mut self,
+        id: &str,
+        from_timer: bool,
+        forget: bool,
+    ) -> Result<ManagedRule> {
         let rule = self
             .state
             .find_by_id(id)
             .cloned()
             .ok_or_else(|| Error::RuleNotFound(id.to_string()))?;
-        self.close_rule(rule, from_timer)
+        if forget {
+            self.forget_rule(rule)
+        } else {
+            self.close_rule(rule, from_timer)
+        }
     }
 
     pub fn close_by_port(
@@ -360,13 +391,18 @@ impl<'a> Engine<'a> {
 
     /// Close everything. Keeps going after a failure: one rule that will not
     /// close must not leave the others open.
+    ///
+    /// Never forgets: a foreign-backend entry among the rest still surfaces
+    /// [`Engine::close_rule`]'s guard as one of the returned failures, rather
+    /// than being silently dropped by a batch operation nobody named it to.
+    /// Forgetting one is `close_by_id`'s job, on purpose, by id, alone.
     pub fn close_all(&mut self, from_timer: bool) -> (Vec<ManagedRule>, Vec<Error>) {
         self.reconcile();
         let ids: Vec<String> = self.state.rules().iter().map(|r| r.id.clone()).collect();
         let mut closed = Vec::new();
         let mut errors = Vec::new();
         for id in ids {
-            match self.close_by_id_unreconciled(&id, from_timer) {
+            match self.close_by_id_unreconciled(&id, from_timer, false) {
                 Ok(rule) => closed.push(rule),
                 Err(e) => errors.push(e),
             }
@@ -374,7 +410,41 @@ impl<'a> Engine<'a> {
         (closed, errors)
     }
 
+    /// Close a rule the currently detected backend actually created.
+    ///
+    /// I1 (a previous wave): a state entry recorded under a backend that is
+    /// no longer the one `detect` finds survives reconciliation rather than
+    /// being silently dropped -- correctly, since dropping it would lose the
+    /// only record of a rule that may still be sitting in the old firewall.
+    /// But that leaves this function needing a guard of its own: `rule.handle`
+    /// is a `RuleHandle` variant belonging to a *different* backend than
+    /// `self.backend`, and every backend's own `close` refuses a handle from
+    /// another one (see e.g. `Firewalld::close`'s `other @ (RuleHandle::Ufw
+    /// {..} | ...)` arm) -- correctly, but with a message meant for a
+    /// programmer, not a user: `"the nftables backend was handed a Ufw
+    /// {..}"`. Refuse here instead, before ever calling `close`, with a
+    /// message that says what actually happened and what to do about it --
+    /// including [`Engine::forget_rule`], the only way out of this specific
+    /// trap.
     fn close_rule(&mut self, rule: ManagedRule, from_timer: bool) -> Result<ManagedRule> {
+        if rule.backend != self.backend.id() {
+            return Err(Error::Unexpected(format!(
+                "{}/{} towards {} was recorded under the {} backend, but this machine now has \
+                 {} -- porthole cannot remove a rule through a different backend than the one \
+                 that created it. Close it by hand with {}'s own tools, switch back to {} and \
+                 let the next porthole command reconcile it, or run `porthole close --id {} \
+                 --forget` to drop the record without touching any firewall",
+                rule.port,
+                rule.protocol,
+                rule.target,
+                rule.backend,
+                self.backend.id(),
+                rule.backend,
+                rule.backend,
+                rule.id
+            )));
+        }
+
         self.backend.close(&rule.handle)?;
 
         // The rule is gone from the firewall, so the state must stop claiming it
@@ -392,6 +462,49 @@ impl<'a> Engine<'a> {
         // fails, the timer simply fires later, finds no such rule and exits —
         // harmless, and not a reason to report a successful close as an error.
         if !from_timer && rule.expires_at.is_some() {
+            let _ = expiry::cancel_close(self.runner, &rule.id);
+        }
+
+        Ok(rule)
+    }
+
+    /// Drop a state entry without touching any firewall.
+    ///
+    /// The only way out of the trap [`Engine::close_rule`]'s own doc comment
+    /// describes: a foreign-backend entry cannot be closed through the
+    /// currently detected backend, and reconciliation deliberately never
+    /// removes it either (`reconcile.rs`'s `Report::foreign_backend`), since
+    /// the entry may still name a real rule sitting in whatever firewall
+    /// created it. Without this, such an entry is permanent: `open` on the
+    /// same port refuses forever (`AlreadyOpen`), and `close` refuses too.
+    ///
+    /// Refuses for anything else: forgetting a rule the current backend
+    /// could actually close would silently leave it enforced with no record
+    /// left to close it by, later -- a strictly worse outcome than the trap
+    /// this exists to escape, and not what `--forget` is for. Reachable only
+    /// through `close_by_id` (see its own doc comment): forgetting always
+    /// names one rule, by id, on purpose -- never a side effect of `--all`
+    /// or a port lookup that might resolve to the wrong rule.
+    fn forget_rule(&mut self, rule: ManagedRule) -> Result<ManagedRule> {
+        if rule.backend == self.backend.id() {
+            return Err(Error::InvalidArgument(format!(
+                "{}/{} towards {} was recorded under {}, the backend this machine still has -- \
+                 porthole can close it normally. --forget exists only for a rule recorded \
+                 under a backend this machine no longer has; refusing to drop the record of \
+                 one it could actually still close",
+                rule.port, rule.protocol, rule.target, rule.backend
+            )));
+        }
+
+        if !self.runner.is_dry_run() {
+            self.state.remove(&rule.id);
+            self.state.save()?;
+        }
+
+        // Same reasoning as `close_rule`'s own cancel: secondary, and must
+        // not turn a successful forget into a reported failure. A stray
+        // timer that fires later finds no such rule and exits, harmlessly.
+        if rule.expires_at.is_some() {
             let _ = expiry::cancel_close(self.runner, &rule.id);
         }
 
@@ -417,7 +530,7 @@ mod tests {
     use crate::backend::fake::FakeBackend;
     use crate::backend::RuleHandle;
     use crate::clock::FixedClock;
-    use crate::command::{Command, DryRunRunner, Output, RecordingRunner};
+    use crate::command::{Command, DryRunRunner, Effect, Output, RecordingRunner};
     use crate::model::Protocol;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -827,7 +940,7 @@ mod tests {
                 1000,
             )
             .unwrap();
-        engine.close_by_id(&rule.id, true).unwrap();
+        engine.close_by_id(&rule.id, true, false).unwrap();
 
         assert!(
             !runner.recorded().iter().any(|c| c.program == "systemctl"),
@@ -848,6 +961,190 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.exit_code(), crate::error::ExitCode::RuleNotFound);
         assert!(err.to_string().contains("5173/tcp"), "got: {err}");
+    }
+
+    /// A state entry recorded under a different backend than the one an
+    /// engine in these tests detects (always `Ufw`, below) -- I1's
+    /// surviving-but-permanent entry, exactly the shape `close_rule` and
+    /// `forget_rule` exist to handle.
+    fn foreign_backend_rule(id: &str, port: u16) -> ManagedRule {
+        ManagedRule {
+            id: id.to_string(),
+            port,
+            protocol: Protocol::Tcp,
+            target: Target::Network {
+                cidr: "10.10.10.0/24".parse().unwrap(),
+            },
+            backend: BackendId::Nftables,
+            opened_at: NOW,
+            expires_at: None,
+            uid: 1000,
+            handle: RuleHandle::Nftables {
+                family: "inet".to_string(),
+                table: "filter".to_string(),
+                chain: "input".to_string(),
+                marker: "porthole:foreign".to_string(),
+            },
+        }
+    }
+
+    /// `Ufw::list_rules`/`owned_rules` both read `ufw status numbered` once
+    /// each -- `Engine::reconcile`'s Apply sweep calls both -- and neither
+    /// finds a `[`-prefixed row in this text, so both come back empty
+    /// without needing anything scripted beyond it.
+    const UFW_STATUS_NO_ROWS: &str = "Status: active\n";
+
+    #[test]
+    fn closing_a_foreign_backend_entry_refuses_with_a_plain_message_naming_forget() {
+        // I1 created this trap: a state entry recorded under a backend that
+        // is no longer the one `detect` finds survives reconciliation,
+        // correctly -- but every backend's own `close` refuses a handle from
+        // another one with wording meant for a programmer, not a user (e.g.
+        // `Ufw::close`'s "the ufw backend was handed a Nftables { .. }").
+        // `close_rule` must catch this *before* ever calling `backend.close`,
+        // name what actually happened in plain language, and point at the
+        // only way out.
+        use crate::backend::ufw::Ufw;
+
+        let harness = Harness::new();
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(UFW_STATUS_NO_ROWS),
+            Output::stdout(UFW_STATUS_NO_ROWS),
+        ]);
+        let backend = Ufw::new(&runner);
+        let clock = FixedClock(NOW);
+        let mut store = harness.store();
+        store.insert(foreign_backend_rule("foreign-1", 9999));
+        let mut engine = make_engine(&backend, &runner, &clock, store);
+
+        let err = engine.close_by_id("foreign-1", false, false).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            !text.contains("was handed a"),
+            "must not leak the internal RuleHandle-mismatch wording: {text}"
+        );
+        assert!(
+            text.contains("nftables"),
+            "must name the backend that actually created it: {text}"
+        );
+        assert!(
+            text.contains("ufw"),
+            "must name the backend this machine has now: {text}"
+        );
+        assert!(
+            text.contains("--forget"),
+            "must point at the only way out: {text}"
+        );
+        assert_eq!(
+            engine.rules().len(),
+            1,
+            "refusing to close it must not lose the only record of it either"
+        );
+    }
+
+    #[test]
+    fn forgetting_a_foreign_backend_entry_drops_it_without_touching_any_firewall() {
+        use crate::backend::ufw::Ufw;
+
+        let harness = Harness::new();
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(UFW_STATUS_NO_ROWS),
+            Output::stdout(UFW_STATUS_NO_ROWS),
+        ]);
+        let backend = Ufw::new(&runner);
+        let clock = FixedClock(NOW);
+        let mut store = harness.store();
+        store.insert(foreign_backend_rule("foreign-1", 9999));
+        let mut engine = make_engine(&backend, &runner, &clock, store);
+
+        let forgotten = engine.close_by_id("foreign-1", false, true).unwrap();
+        assert_eq!(forgotten.id, "foreign-1");
+        assert!(engine.rules().is_empty(), "the record must be gone");
+        assert!(
+            runner.recorded().iter().all(|c| c.effect == Effect::Read),
+            "forgetting must never mutate anything, only porthole's own state: {:?}",
+            runner.recorded()
+        );
+
+        let reloaded = StateStore::open(&harness.path).unwrap();
+        assert!(
+            reloaded.rules().is_empty(),
+            "the drop must reach disk too, not just the in-memory view"
+        );
+    }
+
+    #[test]
+    fn forget_refuses_a_rule_the_current_backend_could_actually_close() {
+        // --forget exists only for the trap a foreign-backend entry is.
+        // Honouring it for an ordinary rule the current backend still owns
+        // would silently leave that rule enforced with no record left able
+        // to close it later -- a strictly worse outcome than the trap it
+        // exists to escape, so this must refuse rather than guess the user
+        // meant it.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::with_responses(subnet_open_script());
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let rule = engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::For(Duration::from_secs(3600)),
+                1000,
+            )
+            .unwrap();
+
+        let err = engine.close_by_id(&rule.id, false, true).unwrap_err();
+        assert_eq!(err.exit_code(), crate::error::ExitCode::InvalidArguments);
+        assert_eq!(
+            engine.rules().len(),
+            1,
+            "a refused forget must not lose the record either"
+        );
+        assert_eq!(
+            backend.handles().len(),
+            1,
+            "and the firewall was genuinely never touched"
+        );
+    }
+
+    #[test]
+    fn open_on_a_port_with_a_foreign_backend_entry_names_forget_as_the_way_out() {
+        // Without `--forget`, `AlreadyOpen`'s original "close it first" advice
+        // sends someone in a circle: an ordinary close on this port hits the
+        // exact same guard `close_rule` has. Name the way that actually works.
+        let harness = Harness::new();
+        let backend = FakeBackend::new(); // id() is Firewalld -- foreign_backend_rule is Nftables.
+                                          // `AlreadyOpen` fires before scope is ever resolved, so nothing here
+                                          // should read anything at all; an empty script makes that explicit
+                                          // rather than leaving unused responses that could mask a regression.
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+        let mut store = harness.store();
+        store.insert(foreign_backend_rule("foreign-1", 9999));
+        let mut engine = make_engine(&backend, &runner, &clock, store);
+
+        let err = engine
+            .open(
+                9999,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::For(Duration::from_secs(3600)),
+                1000,
+            )
+            .unwrap_err();
+        assert_eq!(err.exit_code(), crate::error::ExitCode::AlreadyOpen);
+        assert!(
+            runner.recorded().is_empty(),
+            "AlreadyOpen must be decided before anything is read"
+        );
+        assert!(
+            err.to_string().contains("--forget"),
+            "an ordinary close cannot free this port; the message must say what does: {err}"
+        );
     }
 
     #[test]

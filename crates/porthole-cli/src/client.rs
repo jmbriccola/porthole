@@ -155,10 +155,13 @@ pub fn close(session: bool, port: u16, protocol: &str) -> Result<ManagedRule> {
     })
 }
 
-pub fn close_by_id(session: bool, id: &str, from_timer: bool) -> Result<ManagedRule> {
+pub fn close_by_id(session: bool, id: &str, from_timer: bool, forget: bool) -> Result<ManagedRule> {
     block_on(async {
         let p = proxy(session).await?;
-        let wire = p.close_by_id(id, from_timer).await.map_err(from_dbus)?;
+        let wire = p
+            .close_by_id(id, from_timer, forget)
+            .await
+            .map_err(from_dbus)?;
         to_local(&wire)
     })
 }

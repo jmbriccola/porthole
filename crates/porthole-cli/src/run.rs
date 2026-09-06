@@ -61,7 +61,11 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
                 // `detect` failure into this shape, not only
                 // `BackendUnavailable`, is what makes the promise hold
                 // regardless of what a future backend's `detect` path can
-                // fail with.
+                // fail with. That folding means `available: false` itself
+                // now covers two facts -- "no firewall is installed" and,
+                // more broadly, "detect could not tell" -- documented,
+                // deliberately without a field of its own, in
+                // `docs/json-schema.md`'s own paragraph on this collapse.
                 Err(e) => Status {
                     backend: BackendId::Firewalld,
                     health: BackendHealth {
@@ -193,6 +197,21 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
         ));
     }
 
+    // Belt and braces: clap's own `requires = "id"` on `forget` does not
+    // reject `close <port> --forget` (verified by hand -- `id` also
+    // `conflicts_with_all(["port", ...])`, and clap does not treat that
+    // three-way combination as unsatisfiable the way a person reading the
+    // two declarations together would expect). Below this point, `forget`
+    // is read only inside the `args.id` branch, so without this check a
+    // port-based `close <port> --forget` would silently ignore `--forget`
+    // entirely and perform an ordinary close instead -- exactly the
+    // "implicit forgetting" the escape hatch must never be.
+    if args.forget && args.id.is_none() {
+        return Err(Error::InvalidArgument(
+            "--forget requires --id <ID> naming the exact rule to forget".to_string(),
+        ));
+    }
+
     if cli.dry_run {
         // Unchanged: local, unprivileged, no helper needed.
         let runner = make_runner(cli);
@@ -205,7 +224,7 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
             failures = errors;
             closed
         } else if let Some(id) = &args.id {
-            vec![engine.close_by_id(id, args.from_timer)?]
+            vec![engine.close_by_id(id, args.from_timer, args.forget)?]
         } else {
             vec![engine.close_by_port(
                 port.expect("a port, an id or --all was required above"),
@@ -225,7 +244,7 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
             // every attempt failed: the ports are still open. Say nothing on
             // stdout in that case and let the errors below speak.
             if !closed.is_empty() || failures.is_empty() {
-                output::print_closed(&closed, true);
+                output::print_closed(&closed, true, args.forget);
             }
             for error in &failures {
                 eprintln!("porthole: {error}");
@@ -252,7 +271,12 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
             // at the client, or the helper cannot tell a timer-triggered
             // close from an ordinary one — see
             // `porthole_helper::service::Porthole::close_by_id`.
-            vec![client::close_by_id(cli.session, id, args.from_timer)?]
+            vec![client::close_by_id(
+                cli.session,
+                id,
+                args.from_timer,
+                args.forget,
+            )?]
         } else {
             vec![client::close(
                 cli.session,
@@ -269,7 +293,7 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
             );
         } else {
             if !closed.is_empty() || failures.is_empty() {
-                output::print_closed(&closed, false);
+                output::print_closed(&closed, false, args.forget);
             }
             for error in &failures {
                 eprintln!("porthole: {error}");

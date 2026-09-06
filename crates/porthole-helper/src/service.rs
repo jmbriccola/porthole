@@ -198,6 +198,7 @@ impl Porthole {
         &self,
         id: &str,
         from_timer: bool,
+        forget: bool,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<WireRule, HelperError> {
         self.authorizer
@@ -220,9 +221,17 @@ impl Porthole {
             self.executable.clone(),
         );
         let rule = engine
-            .close_by_id(id, from_timer)
+            .close_by_id(id, from_timer, forget)
             .map_err(HelperError::from)?;
-        Self::log_close(&rule, closed_by, from_timer);
+        // `forget` never touched any firewall -- `Engine::forget_rule`
+        // refuses it for anything a real close could still reach -- so the
+        // journal must not say "closed", which `format_close_log` always
+        // does. A different, explicit line for a different, explicit action.
+        if forget {
+            Self::log_forget(&rule, closed_by);
+        } else {
+            Self::log_close(&rule, closed_by, from_timer);
+        }
         Ok(WireRule::from_rule(&rule))
     }
 
@@ -326,6 +335,18 @@ impl Porthole {
     /// rather than being handled in-process.
     fn log_close(rule: &porthole_core::state::ManagedRule, closed_by: u32, from_timer: bool) {
         eprintln!("{}", format_close_log(rule, closed_by, from_timer));
+    }
+
+    /// The `--forget` audit line: distinct from [`Porthole::log_close`]
+    /// because nothing was closed -- `Engine::forget_rule` only ever runs
+    /// for a rule recorded under a backend this machine no longer has, and
+    /// removes porthole's own record of it without touching any firewall.
+    fn log_forget(rule: &porthole_core::state::ManagedRule, forgotten_by: u32) {
+        eprintln!(
+            "porthole: forgot {}/{} towards {} (recorded under backend {}, opened by uid={}, \
+             forgotten by uid={}) -- no firewall was touched",
+            rule.port, rule.protocol, rule.target, rule.backend, rule.uid, forgotten_by
+        );
     }
 }
 

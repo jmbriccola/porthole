@@ -562,7 +562,7 @@ pub fn json(checks: &[Check]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use porthole_core::backend::{nftables::Nftables, ufw::Ufw};
+    use porthole_core::backend::{nftables::Nftables, ufw::Ufw, FirewallBackend};
     use porthole_core::command::{Output, RecordingRunner};
 
     /// Captured shape (see `nftables.rs`'s own tests for the same fixture):
@@ -703,15 +703,44 @@ mod tests {
     }
 
     #[test]
-    fn nftables_health_error_names_the_command_to_run_by_hand() {
+    fn nftables_unparseable_ruleset_is_available_not_absent_and_names_the_command() {
         // `nft --version` succeeds but `nft -j list chains` returns garbage --
-        // a version whose JSON shape porthole has never seen, say. health()
-        // propagates the parse failure as an `Err`, and the remedy must give
-        // someone something to actually run, not restate the failure.
-        let runner = RecordingRunner::with_responses(vec![
-            Output::stdout("nftables v1.1.6"),
-            Output::stdout("not valid nft -j output"),
-        ]);
+        // a version whose JSON shape porthole has never seen, say. This test
+        // used to assert that `health()` propagated the parse failure as an
+        // `Err`; it no longer does (a fix in a later wave than the one that
+        // wrote that assumption: an installed `nft` porthole cannot parse is
+        // still an installed `nft`, not "no firewall found", and `detect`
+        // propagates any `health()` error with `?` before `firewall_check`
+        // is ever reached in production -- see
+        // `detect_does_not_report_no_firewall_when_nftables_output_is_unparseable`
+        // in `backend/mod.rs` for the production-path proof this test,
+        // constructing `Nftables` directly, cannot give). `firewall_check`
+        // must still read this as a failure -- porthole genuinely could not
+        // confirm anything -- and the remedy must still give someone
+        // something to run by hand.
+        let unparseable = || {
+            vec![
+                Output::stdout("nftables v1.1.6"),
+                Output::stdout("not valid nft -j output"),
+            ]
+        };
+
+        // Two independent runners, same script: `firewall_check` below calls
+        // `health()` again itself, and a single runner's script would run
+        // out after this direct call, feeding the second call empty output
+        // instead of the fixture -- a different, accidental scenario rather
+        // than the one this test is actually about.
+        let health_runner = RecordingRunner::with_responses(unparseable());
+        let health = Nftables::new(&health_runner).health().expect(
+            "a parse failure must degrade to Ok(active_unknown: true), never propagate as Err",
+        );
+        assert!(
+            health.available,
+            "the binary is there; that must stand alone"
+        );
+        assert!(health.active_unknown);
+
+        let runner = RecordingRunner::with_responses(unparseable());
         let backend = Nftables::new(&runner);
         let check = firewall_check(&backend, &runner);
         assert!(!check.ok);
