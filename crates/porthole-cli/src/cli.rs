@@ -105,10 +105,12 @@ pub struct CloseArgs {
     /// enforced with no record left able to close it later.
     ///
     /// Not the same outcome on every backend: a forgotten ufw or nftables
-    /// rule is still closed automatically once that backend is current
-    /// again (reconciliation proves it is theirs and sweeps it as an
-    /// orphan); a forgotten firewalld rule is not -- firewalld can never
-    /// prove a rule is its own, so nothing ever closes it, permanently.
+    /// rule is still closed automatically by the next `open` or `close` run
+    /// while that backend is current (reconciliation proves it is theirs and
+    /// sweeps it as an orphan) -- `status` and `list` will not, since they
+    /// never touch the firewall. A forgotten firewalld rule is never closed
+    /// at all: firewalld cannot prove a rich rule is its own, so no sweep
+    /// ever runs there.
     #[arg(long, requires = "id")]
     pub forget: bool,
 }

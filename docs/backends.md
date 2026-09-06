@@ -58,9 +58,11 @@ port and protocol. Two things follow from that directly:
 That same asymmetry reaches `porthole close --id <id> --forget` (the escape
 hatch for a rule recorded under a backend this machine no longer has — see
 `porthole close --help`). Forgetting a **ufw or nftables** rule is not
-permanent: both can prove a rule is their own, so the next time that backend
-is current again, reconciliation's orphan sweep finds the still-marked rule
-and closes it on its own. Forgetting a **firewalld** rule is permanent:
+permanent: both can prove a rule is their own, so the next `porthole open` or
+`porthole close` run while that backend is current finds the still-marked rule
+and sweeps it away. Note which commands those are: `status` and `list`
+deliberately never touch the firewall, so running them will not clean it up --
+the rule waits for something that opens or closes. Forgetting a **firewalld** rule is permanent:
 firewalld can never prove a rich rule is its own, so that sweep never runs
 for it, on any account — nothing ever closes it automatically, even after
 firewalld is current again.

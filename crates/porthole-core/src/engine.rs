@@ -448,7 +448,8 @@ impl<'a> Engine<'a> {
                 BackendId::Ufw | BackendId::Nftables => {
                     "ufw and nftables can prove a rule is their own, so forgetting this one \
                      is not permanent: once that backend is current again, the next \
-                     command's reconciliation closes it as an orphan on its own"
+                     `open` or `close` sweeps it away as an orphan. `status` and `list` \
+                     will not -- they never touch the firewall"
                 }
             };
             return Err(Error::Unexpected(format!(
