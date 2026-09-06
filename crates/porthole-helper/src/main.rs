@@ -100,15 +100,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // what is open, and these rules are exactly the ones that are not in it.
     announce_reconciled(&conn, &reconciled).await;
 
+    // Not spawned under `--session`: `crates/porthole-cli/tests/helper_e2e.rs`
+    // spawns a real `--session` helper directly on this development host, and
+    // its safety argument for the real backend it talks to rested partly on
+    // no helper process living long enough for a poll tick to fire -- timing,
+    // not anything enforced. NetworkManager only answers on the system bus
+    // regardless, so `--session` buys the monitor nothing there in
+    // production either.
+    //
+    // Known conflict, not silently papered over: `crates/porthole-cli/tests/
+    // container.rs`'s own network-change test starts `porthole-helper
+    // --session` *inside an isolated podman container*, specifically so
+    // netmon runs against a real, disposable firewall with no system
+    // bus/polkit stack required -- that test cannot pass with this gate in
+    // place. Left for the next review to resolve; this round's ask was the
+    // development-host risk.
+    //
     // Its own connection, not the one just moved into `service`: that one is
     // already spoken for (`Porthole` uses it to ask the bus daemon who a
-    // caller is), and NetworkManager only ever answers on the **system**
-    // bus, so under `--session` (tests only) there is nothing there to
-    // subscribe to -- `netmon::run` tolerates that on its own and falls back
-    // to its plain interval poll. See `netmon`'s own module docs for why this
-    // task, once spawned, keeps the helper alive for exactly as long as it
-    // needs to be.
-    tokio::spawn(netmon::run(conn.clone(), state_path, cli));
+    // caller is).
+    if !session {
+        tokio::spawn(netmon::run(conn.clone(), state_path, cli));
+    }
 
     tokio::signal::ctrl_c().await?;
     Ok(())

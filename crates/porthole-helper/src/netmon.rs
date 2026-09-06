@@ -7,58 +7,84 @@
 //! different subnet on the same interface -- a new access point, or a fresh
 //! DHCP lease -- which is exactly the case porthole's CIDR-scoped rules are
 //! exposed to. So the signal here is only ever a prompt to look again: every
-//! wake-up re-resolves the current subnet and compares it against each
-//! rule's own stored CIDR (see
-//! [`porthole_core::engine::Engine::close_rules_outside`]), and it is that
-//! comparison, not the signal's own payload, that decides anything.
+//! wake-up re-resolves the current subnet and compares it against the subnet
+//! this module last saw. Two wake-up sources feed the same check, so a
+//! machine with no NetworkManager is still covered: `StateChanged` when
+//! NetworkManager answers on the bus, and a fixed-interval poll that does not
+//! depend on NetworkManager at all.
 //!
-//! Two wake-up sources feed the same check, so a machine with no
-//! NetworkManager is still covered: `StateChanged` when NetworkManager
-//! answers on the bus, and a plain fixed-interval poll regardless of whether
-//! it does. The poll is not a netlink subscription -- it is the same two
-//! read-only `ip` commands `porthole status` already runs, cheap enough to
-//! repeat every few seconds -- and it is what keeps a machine with no
-//! NetworkManager covered at all, and what catches anything the signal alone
-//! missed.
+//! # What "the subnet this module last saw" means, and what it does not
 //!
-//! # Why this keeps the helper alive while a rule is open
+//! `ManagedRule` records the resolved `Target` a rule was opened towards, not
+//! the `ScopeSpec` that produced it -- there is no stored fact distinguishing
+//! "opened towards whatever subnet I'm on" from "opened towards this exact
+//! CIDR, deliberately". [`porthole_core::engine::Engine::close_rules_outside`]
+//! is built around that limit rather than against it: it closes a rule when
+//! the rule's own CIDR sits inside the subnet that was just lost, not when
+//! the rule's CIDR merely differs from the new one -- see its own doc
+//! comment for the case that distinction protects.
+//!
+//! A consequence of the same limit: this module cannot tell "a rule scoped
+//! to 10.10.10.0/24, tied to the machine being on 10.10.10.0/24" apart from
+//! "a rule scoped to 10.10.10.0/24, deliberately, wherever the machine is"
+//! until the machine actually leaves 10.10.10.0/24 -- at which point both
+//! close, because from this module's own vantage point they are the same
+//! fact. Before that point, on the very first wake-up after the helper
+//! starts, this module has not yet observed any subnet at all, so it
+//! records whatever it finds and closes nothing: there is no way to prove a
+//! rule already in the state file is tied to a subnet nothing here has ever
+//! seen.
+//!
+//! # This module's own lifetime
 //!
 //! `main` spawns [`run`] onto the same runtime that serves the D-Bus
-//! interface and never awaits it there -- the process's own lifetime is not
-//! this task's problem to manage. Nothing in the helper today exits it
-//! early on its own: there is no idle timeout and no "last rule closed"
-//! shutdown, so once started it keeps running until something outside it
-//! stops it, whether or not any rule is open. The requirement this module
-//! exists to satisfy -- the helper must stay alive for as long as any rule
-//! is open, since it is the only thing left watching for the network
-//! changing under it -- therefore already holds, unconditionally, before
-//! this module adds anything; [`run`]'s own loop then simply lives exactly
-//! as long as the process that spawned it.
+//! interface and never awaits it there. Nothing in the helper exits the
+//! process early on its own -- there is no idle timeout and no
+//! "last-rule-closed" shutdown -- so [`run`] lives exactly as long as the
+//! process does, no more and no less. That is not the same as covering
+//! every open rule continuously: a crash, an OOM kill, a plain `systemctl
+//! stop`, or a package `try-restart` ends the process (and this module with
+//! it) while `RuntimeDirectoryPreserve=yes` keeps the state file and the
+//! firewall keeps every rule, and nothing restarts the helper until a
+//! client next addresses the bus name -- see `data/porthole-helper.service`'s
+//! own comment on why `Restart=` is not set there. Automatic close
+//! (`porthole_core::expiry`) does not share this gap: it is a systemd
+//! transient timer that lives outside this process, so a helper restart
+//! cannot lose it. A network change this module would have caught can be
+//! lost that way.
 
 use crate::service::Porthole;
+use ipnet::Ipv4Net;
 use porthole_core::backend;
 use porthole_core::clock::SystemClock;
 use porthole_core::command::{CommandRunner, RealRunner};
 use porthole_core::engine::Engine;
+use porthole_core::error::Error;
 use porthole_core::ipc::{CloseReason, PATH};
 use porthole_core::net;
 use porthole_core::state::{ManagedRule, StateStore};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 use zbus::object_server::SignalEmitter;
 
 /// How often the fallback poll re-checks the subnet. Two read-only `ip`
-/// commands, cheap enough to repeat this often; chosen with a comfortable
-/// margin over this workspace's own slowest end-to-end test that spawns a
-/// real helper process (`porthole-cli/tests/helper_e2e.rs`'s
-/// `an_open_reaches_the_firewall_and_changes_nothing_when_refused`, measured
-/// at ~28s -- firewalld's own polkit timeout, not this module's doing), so
-/// that test suite never has a real helper process alive long enough for
-/// this poll to fire even once.
+/// commands, cheap enough to repeat this often; long enough that it is rare,
+/// short enough that a roam NetworkManager itself misses (or a machine with
+/// no NetworkManager at all) is still noticed within about a minute.
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 static SYSTEM_CLOCK: SystemClock = SystemClock;
+
+/// The subnet [`wake_up_blocking`] last resolved successfully. `None` before
+/// the first successful resolution, and again after a resolution finds no
+/// network at all -- both share the same status: nothing to prove a rule in
+/// the state file is tied to. Read and written only from [`wake_up_blocking`]
+/// (always inside `spawn_blocking`, never concurrently with a unit test):
+/// [`check_network`] takes and returns this value as a plain parameter
+/// instead of touching the static directly, precisely so it stays testable
+/// without one test's run colliding with another's through shared state.
+static LAST_KNOWN_SUBNET: Mutex<Option<Ipv4Net>> = Mutex::new(None);
 
 #[zbus::proxy(
     interface = "org.freedesktop.NetworkManager",
@@ -73,80 +99,102 @@ trait NetworkManager {
     fn state_changed(&self, state: u32) -> zbus::Result<()>;
 }
 
-/// What one look at the network found.
-#[derive(Debug)]
-pub struct Check {
-    /// The subnet the machine is on right now, rendered exactly as it
-    /// crosses the bus: a CIDR, or **empty for "no usable network"**. D-Bus
-    /// has no optional types, the same reason `WireRule::expires_at` uses
-    /// `0`, and the empty string can never be a CIDR.
-    pub cidr: String,
-    /// The rules this look closed, all of them for the same reason:
-    /// [`CloseReason::NetworkChanged`].
-    pub closed: Vec<ManagedRule>,
+/// What one wake-up decided.
+struct CheckOutcome {
+    /// Rules closed because they no longer belong to the network the machine
+    /// is on.
+    closed: Vec<ManagedRule>,
+    /// `(old_cidr, new_cidr)` for the `NetworkChanged` signal, in the wire
+    /// format's own convention -- empty string for "no usable network" --
+    /// or `None` when nothing changed enough to report (including the
+    /// "first observation" and "still on the same subnet" cases).
+    transition: Option<(String, String)>,
+    /// What [`LAST_KNOWN_SUBNET`] should hold after this wake-up.
+    last_known: Option<Ipv4Net>,
 }
 
-/// Re-resolve the current subnet and close whatever no longer belongs to it.
+/// Re-resolve the current subnet, decide what changed relative to `previous`,
+/// and close whatever no longer belongs to what was there before.
 ///
-/// Split out from [`wake_up`] so the decision is testable without a bus, a
-/// timer, or root: everything below this point is exactly the seam
-/// `porthole_core::engine`'s own tests already use. A resolution failure
-/// (no default route, no global address -- see `porthole_core::net`) is
-/// treated the same as "no usable network", regardless of which specific
-/// reason it failed for: either way there is no current subnet left to
-/// honestly compare a rule's CIDR against.
-pub fn check_network(engine: &mut Engine<'_>, runner: &dyn CommandRunner) -> Check {
+/// Split out from [`wake_up_blocking`] so the decision is testable without a
+/// bus, a timer, or root: everything here is exactly the seam
+/// `porthole_core::engine`'s own tests already use, plus `previous` as a
+/// plain value rather than the module's own tracked state.
+///
+/// A resolution failure other than [`Error::NoNetwork`] (a spawned `ip` that
+/// could not run, a non-zero exit, a malformed JSON body) leaves `previous`
+/// and every rule untouched: the current subnet is simply unknown for this
+/// one wake-up, not confirmed absent, and treating every such failure as
+/// "no network" would close every subnet-scoped rule on a parse error alone.
+/// Only [`Error::NoNetwork`] -- porthole's own confirmed "no default route"
+/// or "no global address" -- means there is genuinely no network right now,
+/// and that closes every subnet-scoped rule regardless of `previous`: unlike
+/// "the subnet changed", "there is no network" needs no prior observation to
+/// be true.
+fn check_network(
+    engine: &mut Engine<'_>,
+    runner: &dyn CommandRunner,
+    previous: Option<Ipv4Net>,
+) -> CheckOutcome {
     match net::current_network(runner) {
-        Ok(network) => Check {
-            cidr: network.cidr.to_string(),
-            closed: engine.close_rules_outside(network.cidr),
+        Ok(network) => match previous {
+            Some(lost) if lost != network.cidr => CheckOutcome {
+                closed: engine.close_rules_outside(lost),
+                transition: Some((lost.to_string(), network.cidr.to_string())),
+                last_known: Some(network.cidr),
+            },
+            _ => CheckOutcome {
+                closed: Vec::new(),
+                transition: None,
+                last_known: Some(network.cidr),
+            },
         },
-        Err(_) => Check {
-            cidr: String::new(),
+        Err(Error::NoNetwork(_)) => CheckOutcome {
             closed: engine.close_rules_on_network_loss(),
+            transition: previous.map(|lost| (lost.to_string(), String::new())),
+            last_known: None,
+        },
+        Err(_) => CheckOutcome {
+            closed: Vec::new(),
+            transition: None,
+            last_known: previous,
         },
     }
 }
 
-/// The subnet porthole saw the last time it looked, as [`Check::cidr`]
-/// renders it. `None` means it has not looked yet, which is a different fact
-/// from having looked and found nothing: there is no "old" network to name
-/// in a `NetworkChanged` on the very first look, so the first look never
-/// emits one.
-type LastSeen = Mutex<Option<String>>;
-
-/// Detect the backend, take the state lock, run the check. `None` when
-/// there was nothing to check or nothing to check it with. Best-effort
-/// throughout, the same policy `Engine::reconcile` already applies to its own
-/// sweep -- a backend that cannot be detected, or a lock that is momentarily
-/// busy, is a reason to wait for the next wake-up, not to bring down the
-/// helper that is the only thing left watching for it.
-///
-/// Synchronous, and separate from [`wake_up`]'s announcements, because the
-/// `Engine` it builds borrows `&dyn CommandRunner` and `&dyn Clock`, neither
-/// of them `Sync`: it must be gone before anything is awaited, or [`run`]'s
-/// future stops being `Send` and `tokio::spawn` will not take it.
-fn look(state_path: &Path, executable: &Path) -> Option<Check> {
-    let runner = RealRunner;
+/// One wake-up's synchronous half: detect the backend, take the state lock,
+/// run [`check_network`]. Runs only inside `tokio::task::spawn_blocking` (see
+/// [`wake_up`]) -- `backend::detect`'s subprocesses, the state lock's own
+/// bounded retry loop, and a `close` that can sit on firewalld's polkit
+/// timeout are all real blocking work, and this crate already documents why
+/// that must never run on an async worker thread
+/// (`porthole_core::state`'s own `LOCK_TIMEOUT` doc comment).
+fn wake_up_blocking(state_path: &Path, executable: &Path) -> CheckOutcome {
+    let previous = *LAST_KNOWN_SUBNET.lock().expect("not poisoned");
+    let unchanged = CheckOutcome {
+        closed: Vec::new(),
+        transition: None,
+        last_known: previous,
+    };
 
     // Nothing recorded means nothing a network change could invalidate --
     // skip the two `ip` reads on every idle tick, not only the close itself.
     // An unreadable state file is a different fact from an empty one, so it
-    // does not take this shortcut; the detect/lock attempts below will fail
+    // does not take this shortcut; the detect/lock attempts below fail
     // loudly (and harmlessly) on their own in that case instead.
-    //
-    // It also means porthole does not look at the network at all while
-    // nothing is open, which is what makes `NetworkChanged`'s `old_cidr` the
-    // previous *look* rather than the previous *state of the world*: see
-    // [`wake_up`].
     if let Ok(state) = StateStore::open(state_path) {
         if state.rules().is_empty() {
-            return None;
+            return unchanged;
         }
     }
 
-    let backend = backend::detect(&runner).ok()?; // No firewall to close anything in.
-    let state = StateStore::open_exclusive(state_path).ok()?; // Lock busy elsewhere.
+    let runner = RealRunner;
+    let Ok(backend) = backend::detect(&runner) else {
+        return unchanged; // No firewall to close anything in; try the next wake-up.
+    };
+    let Ok(state) = StateStore::open_exclusive(state_path) else {
+        return unchanged; // Lock momentarily held elsewhere; try the next wake-up.
+    };
 
     let mut engine = Engine::new(
         backend.as_ref(),
@@ -155,107 +203,100 @@ fn look(state_path: &Path, executable: &Path) -> Option<Check> {
         state,
         executable.to_path_buf(),
     );
-    Some(check_network(&mut engine, &runner))
+    let outcome = check_network(&mut engine, &runner, previous);
+    *LAST_KNOWN_SUBNET.lock().expect("not poisoned") = outcome.last_known;
+    outcome
 }
 
-/// One wake-up: [`look`], then say what happened -- to the journal and, when
-/// there is a bus to say it on, to whoever is subscribed.
-///
-/// `NetworkChanged` compares this look against the previous one, not against
-/// what was true an instant ago: porthole only looks when something is
-/// recorded (see [`look`]), so `old_cidr` is the subnet as of porthole's last
-/// look and may be older than the change itself. The signal's own
-/// documentation in `porthole_core::ipc` says the same thing to the client
-/// that reads it.
-///
-/// It is emitted before the closes it explains, so a subscriber that shows
-/// both has them in the order they make sense in.
-async fn wake_up(
-    state_path: &Path,
-    executable: &Path,
-    emitter: Option<&SignalEmitter<'_>>,
-    last_seen: &LastSeen,
-) {
-    let Some(check) = look(state_path, executable) else {
-        return;
+/// One full wake-up: the blocking half on a dedicated thread, then the
+/// journal line and bus signals for whatever it decided, on the async
+/// runtime that called this. `emitter` is `None` when this process could not
+/// build one at all (see [`make_emitter`]); the journal still records
+/// everything either way.
+async fn wake_up(state_path: &Path, executable: &Path, emitter: Option<&SignalEmitter<'_>>) {
+    let owned_state = state_path.to_path_buf();
+    let owned_executable = executable.to_path_buf();
+    let outcome = match tokio::task::spawn_blocking(move || {
+        wake_up_blocking(&owned_state, &owned_executable)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!("porthole-helper: network-change check panicked, continuing: {e}");
+            return;
+        }
     };
 
-    // Held only long enough to swap; nothing is awaited under it.
-    let previous = last_seen
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .replace(check.cidr.clone());
-
-    if let (Some(emitter), Some(previous)) = (emitter, previous.as_ref()) {
-        if previous != &check.cidr {
-            Porthole::announce_network_change(emitter, previous, &check.cidr).await;
+    if let Some((old, new)) = &outcome.transition {
+        match emitter {
+            Some(emitter) => Porthole::announce_network_change(emitter, old, new).await,
+            None => eprintln!(
+                "porthole-helper: subnet changed (from \"{old}\" to \"{new}\"), but no signal \
+                 emitter is available to announce it"
+            ),
         }
     }
-
-    for rule in &check.closed {
+    for rule in &outcome.closed {
         Porthole::announce_autoclose(emitter, rule, CloseReason::NetworkChanged).await;
     }
 }
 
-/// Runs for as long as the process does -- see the module docs for why that
-/// is exactly long enough. Subscribes to NetworkManager's `StateChanged` on
-/// `bus` when NetworkManager answers there at all (it does not on the
-/// session bus `--session` serves for tests, which is fine: the poll below
-/// does not depend on it either way) and always runs the fallback poll
-/// alongside it.
-pub async fn run(bus: zbus::Connection, state_path: PathBuf, executable: PathBuf) {
-    // One emitter for both wake-up sources, and one record of what the last
-    // look saw, shared between them: the poll and the NetworkManager signal
-    // are two prompts to do the same thing, so a change noticed by one must
-    // not be re-announced by the other.
-    let emitter = match SignalEmitter::new(&bus, PATH) {
-        Ok(emitter) => Some(emitter.into_owned()),
+/// A signal emitter for this helper's own object, or `None` (logged once)
+/// when `bus` cannot produce one. Matches `main.rs`'s own
+/// `announce_reconciled` -- the other caller with no client request, and no
+/// requesting uid, behind it.
+fn make_emitter(bus: &zbus::Connection) -> Option<SignalEmitter<'_>> {
+    match SignalEmitter::new(bus, PATH) {
+        Ok(emitter) => Some(emitter),
         Err(e) => {
             eprintln!(
-                "porthole-helper: no signal emitter, network changes will go unannounced \
-                 (they are still acted on): {e}"
+                "porthole-helper: no signal emitter for the network monitor -- its closes and \
+                 subnet changes will not reach the bus, though the journal still records each \
+                 one: {e}"
             );
             None
         }
-    };
-    let last_seen: Arc<LastSeen> = Arc::new(Mutex::new(None));
+    }
+}
 
+/// Runs for as long as the process does -- see the module docs for what that
+/// does and does not cover. Two wake-up sources: NetworkManager's
+/// `StateChanged` on `bus`, subscribed to on `bus` directly since it lives
+/// for this whole call, and a fixed interval poll on its own clone of `bus`,
+/// spawned as an independent task so it keeps running for as long as the
+/// process does regardless of whether the subscription above ever yields
+/// anything.
+pub async fn run(bus: zbus::Connection, state_path: PathBuf, executable: PathBuf) {
+    let poll_bus = bus.clone();
     let poll_state = state_path.clone();
     let poll_executable = executable.clone();
-    let poll_emitter = emitter.clone();
-    let poll_last_seen = Arc::clone(&last_seen);
     let poll = tokio::spawn(async move {
+        let emitter = make_emitter(&poll_bus);
         let mut ticker = tokio::time::interval(POLL_INTERVAL);
         // The first tick fires immediately; the helper's own start-up sweep
         // already covered this instant, so skip it rather than repeat it.
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            wake_up(
-                &poll_state,
-                &poll_executable,
-                poll_emitter.as_ref(),
-                &poll_last_seen,
-            )
-            .await;
+            wake_up(&poll_state, &poll_executable, emitter.as_ref()).await;
         }
     });
 
     if let Ok(nm) = NetworkManagerProxy::new(&bus).await {
         if let Ok(mut signals) = nm.receive_state_changed().await {
             use futures_util::StreamExt;
+            let emitter = make_emitter(&bus);
             while signals.next().await.is_some() {
-                wake_up(&state_path, &executable, emitter.as_ref(), &last_seen).await;
+                wake_up(&state_path, &executable, emitter.as_ref()).await;
             }
             // The stream ended -- NetworkManager left the bus, or the
-            // connection dropped. The poll task above does not depend on it
-            // in any way and keeps covering every future wake-up by itself.
+            // connection dropped. Both are routine (a package upgrade
+            // restarts NetworkManager); the poll task above does not depend
+            // on either and keeps covering every future wake-up by itself.
         }
     }
 
-    // Reached only once there is no signal subscription left to drive (in
-    // production, where NetworkManager is present, never). The poll keeps
-    // the process doing useful work regardless.
     let _ = poll.await;
 }
 
@@ -271,144 +312,241 @@ mod tests {
     const NOW: u64 = 1_757_000_000;
     const ROUTE_JSON: &str = r#"[{"dst":"default","dev":"wlo1","metric":600}]"#;
     const ADDR_JSON: &str = r#"[{"ifindex":2,"ifname":"wlo1","addr_info":[{"family":"inet","local":"10.10.10.119","prefixlen":24,"scope":"global"}]}]"#;
+    const ADDR_JSON_OTHER_SUBNET: &str = r#"[{"ifindex":2,"ifname":"wlo1","addr_info":[{"family":"inet","local":"192.168.1.50","prefixlen":24,"scope":"global"}]}]"#;
+
+    fn engine_with_rule<'a>(
+        backend: &'a FakeBackend,
+        open_runner: &'a RecordingRunner,
+        clock: &'a FixedClock,
+        store: porthole_core::state::StateStore,
+        scope: ScopeSpec,
+    ) -> Engine<'a> {
+        let mut engine = Engine::new(
+            backend,
+            open_runner,
+            clock,
+            store,
+            PathBuf::from("/usr/bin/porthole"),
+        );
+        engine
+            .open(5173, Protocol::Tcp, &scope, Lifetime::UntilReboot, 1000)
+            .unwrap();
+        engine
+    }
 
     #[test]
-    fn check_network_closes_a_rule_for_a_subnet_the_resolution_says_we_left() {
+    fn check_network_closes_nothing_on_the_first_observation() {
+        // Nothing here has ever seen a subnet before, so nothing can be
+        // proven tied to one -- even a rule scoped to exactly the subnet
+        // that resolves now must survive this first look.
         let dir = TempDir::new().unwrap();
         let store = StateStore::open(dir.path().join("state.json")).unwrap();
         let backend = FakeBackend::new();
         let clock = FixedClock(NOW);
         let open_runner = RecordingRunner::new();
-        let mut engine = Engine::new(
+        let mut engine = engine_with_rule(
             &backend,
             &open_runner,
             &clock,
             store,
-            PathBuf::from("/usr/bin/porthole"),
+            ScopeSpec::Network("10.10.10.0/24".parse().unwrap()),
         );
-        engine
-            .open(
-                5173,
-                Protocol::Tcp,
-                &ScopeSpec::Network("192.168.1.0/24".parse().unwrap()),
-                Lifetime::UntilReboot,
-                1000,
-            )
-            .unwrap();
 
-        // The machine is actually on 10.10.10.0/24, not the rule's own
-        // 192.168.1.0/24.
-        let probe_runner = RecordingRunner::with_responses(vec![
+        let probe = RecordingRunner::with_responses(vec![
             Output::stdout(ROUTE_JSON),
             Output::stdout(ADDR_JSON),
         ]);
-        let check = check_network(&mut engine, &probe_runner);
+        let outcome = check_network(&mut engine, &probe, None);
 
-        assert_eq!(check.closed.len(), 1);
-        assert!(engine.rules().is_empty());
+        assert!(outcome.closed.is_empty());
+        assert!(outcome.transition.is_none());
+        assert_eq!(outcome.last_known, Some("10.10.10.0/24".parse().unwrap()));
+        assert_eq!(engine.rules().len(), 1);
     }
 
     #[test]
-    fn check_network_closes_every_subnet_rule_when_resolution_finds_no_network() {
+    fn check_network_closes_nothing_when_the_subnet_is_unchanged() {
         let dir = TempDir::new().unwrap();
         let store = StateStore::open(dir.path().join("state.json")).unwrap();
         let backend = FakeBackend::new();
         let clock = FixedClock(NOW);
         let open_runner = RecordingRunner::new();
-        let mut engine = Engine::new(
+        let mut engine = engine_with_rule(
             &backend,
             &open_runner,
             &clock,
             store,
-            PathBuf::from("/usr/bin/porthole"),
+            ScopeSpec::Network("10.10.10.0/24".parse().unwrap()),
         );
-        engine
-            .open(
-                5173,
-                Protocol::Tcp,
-                &ScopeSpec::Network("10.10.10.0/24".parse().unwrap()),
-                Lifetime::UntilReboot,
-                1000,
-            )
-            .unwrap();
 
-        // No default route at all: a real "no default route" response, the
-        // same shape `porthole_core::net`'s own tests capture.
-        let probe_runner = RecordingRunner::with_responses(vec![Output::stdout("[]")]);
-        let check = check_network(&mut engine, &probe_runner);
+        let probe = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ADDR_JSON),
+        ]);
+        let outcome = check_network(&mut engine, &probe, Some("10.10.10.0/24".parse().unwrap()));
 
-        assert_eq!(check.closed.len(), 1);
+        assert!(outcome.closed.is_empty());
+        assert!(outcome.transition.is_none());
+        assert_eq!(engine.rules().len(), 1);
+    }
+
+    #[test]
+    fn check_network_closes_a_rule_for_the_subnet_it_just_left_and_announces_the_move() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(dir.path().join("state.json")).unwrap();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let open_runner = RecordingRunner::new();
+        let mut engine = engine_with_rule(
+            &backend,
+            &open_runner,
+            &clock,
+            store,
+            ScopeSpec::Network("10.10.10.0/24".parse().unwrap()),
+        );
+
+        let probe = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ADDR_JSON_OTHER_SUBNET),
+        ]);
+        let outcome = check_network(&mut engine, &probe, Some("10.10.10.0/24".parse().unwrap()));
+
+        assert_eq!(outcome.closed.len(), 1);
+        assert_eq!(
+            outcome.transition,
+            Some(("10.10.10.0/24".to_string(), "192.168.1.0/24".to_string()))
+        );
+        assert_eq!(outcome.last_known, Some("192.168.1.0/24".parse().unwrap()));
         assert!(engine.rules().is_empty());
     }
 
     #[test]
-    fn a_look_reports_the_subnet_it_found_or_the_empty_sentinel() {
-        // `Check::cidr` is what `NetworkChanged` puts on the wire, so the
-        // "no usable network" case has to be the empty string and not, say,
-        // `0.0.0.0/0` -- which is a real CIDR meaning the opposite of
-        // "nowhere".
-        for (probe, expected) in [
+    fn check_network_leaves_a_rule_broader_than_the_lost_subnet_alone() {
+        // The same C1 case as `porthole_core::engine`'s own test, exercised
+        // through this module's own entry point.
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(dir.path().join("state.json")).unwrap();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let open_runner = RecordingRunner::new();
+        let mut engine = engine_with_rule(
+            &backend,
+            &open_runner,
+            &clock,
+            store,
+            ScopeSpec::Network("10.0.0.0/8".parse().unwrap()),
+        );
+
+        let probe = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ADDR_JSON_OTHER_SUBNET),
+        ]);
+        let outcome = check_network(&mut engine, &probe, Some("10.10.10.0/24".parse().unwrap()));
+
+        assert!(
+            outcome.closed.is_empty(),
+            "must survive: {:?}",
+            outcome.closed
+        );
+        assert_eq!(engine.rules().len(), 1);
+    }
+
+    #[test]
+    fn check_network_closes_every_subnet_rule_and_announces_no_network_on_confirmed_loss() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(dir.path().join("state.json")).unwrap();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let open_runner = RecordingRunner::new();
+        let mut engine = engine_with_rule(
+            &backend,
+            &open_runner,
+            &clock,
+            store,
+            ScopeSpec::Network("10.10.10.0/24".parse().unwrap()),
+        );
+
+        // No default route at all: a real "no default route" response, the
+        // same shape `porthole_core::net`'s own tests capture.
+        let probe = RecordingRunner::with_responses(vec![Output::stdout("[]")]);
+        let outcome = check_network(&mut engine, &probe, Some("10.10.10.0/24".parse().unwrap()));
+
+        assert_eq!(outcome.closed.len(), 1);
+        assert_eq!(
+            outcome.transition,
+            Some(("10.10.10.0/24".to_string(), String::new()))
+        );
+        assert_eq!(outcome.last_known, None);
+        assert!(engine.rules().is_empty());
+    }
+
+    #[test]
+    fn check_network_leaves_rules_alone_when_resolution_fails_for_a_reason_other_than_no_network() {
+        // I1: a spawn failure, a non-zero exit, or a malformed `ip` body are
+        // not "no network" -- they are "porthole could not tell this time".
+        // Only `Error::NoNetwork` may close anything.
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(dir.path().join("state.json")).unwrap();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let open_runner = RecordingRunner::new();
+        let mut engine = engine_with_rule(
+            &backend,
+            &open_runner,
+            &clock,
+            store,
+            ScopeSpec::Network("10.10.10.0/24".parse().unwrap()),
+        );
+
+        let probe = RecordingRunner::with_responses(vec![Output {
+            status: 1,
+            stdout: String::new(),
+            stderr: "ip: command not found".to_string(),
+        }]);
+        let previous = Some("10.10.10.0/24".parse().unwrap());
+        let outcome = check_network(&mut engine, &probe, previous);
+
+        assert!(outcome.closed.is_empty());
+        assert!(outcome.transition.is_none());
+        assert_eq!(
+            outcome.last_known, previous,
+            "the tracked subnet must not be disturbed by an unrelated failure"
+        );
+        assert_eq!(engine.rules().len(), 1);
+    }
+
+    #[test]
+    fn check_network_leaves_an_anywhere_rule_alone_on_every_path() {
+        for (probe, previous) in [
+            (
+                RecordingRunner::with_responses(vec![
+                    Output::stdout(ROUTE_JSON),
+                    Output::stdout(ADDR_JSON_OTHER_SUBNET),
+                ]),
+                Some("10.10.10.0/24".parse().unwrap()),
+            ),
+            (
+                RecordingRunner::with_responses(vec![Output::stdout("[]")]),
+                Some("10.10.10.0/24".parse().unwrap()),
+            ),
             (
                 RecordingRunner::with_responses(vec![
                     Output::stdout(ROUTE_JSON),
                     Output::stdout(ADDR_JSON),
                 ]),
-                "10.10.10.0/24",
+                None,
             ),
-            (
-                RecordingRunner::with_responses(vec![Output::stdout("[]")]),
-                "",
-            ),
-        ] {
-            let dir = TempDir::new().unwrap();
-            let store = StateStore::open(dir.path().join("state.json")).unwrap();
-            let backend = FakeBackend::new();
-            let clock = FixedClock(NOW);
-            let mut engine = Engine::new(
-                &backend,
-                &probe,
-                &clock,
-                store,
-                PathBuf::from("/usr/bin/porthole"),
-            );
-
-            assert_eq!(check_network(&mut engine, &probe).cidr, expected);
-        }
-    }
-
-    #[test]
-    fn check_network_leaves_an_anywhere_rule_alone_on_either_path() {
-        for probe in [
-            RecordingRunner::with_responses(vec![
-                Output::stdout(ROUTE_JSON),
-                Output::stdout(ADDR_JSON),
-            ]),
-            RecordingRunner::with_responses(vec![Output::stdout("[]")]),
         ] {
             let dir = TempDir::new().unwrap();
             let store = StateStore::open(dir.path().join("state.json")).unwrap();
             let backend = FakeBackend::new();
             let clock = FixedClock(NOW);
             let open_runner = RecordingRunner::new();
-            let mut engine = Engine::new(
-                &backend,
-                &open_runner,
-                &clock,
-                store,
-                PathBuf::from("/usr/bin/porthole"),
-            );
-            engine
-                .open(
-                    5173,
-                    Protocol::Tcp,
-                    &ScopeSpec::Anywhere,
-                    Lifetime::UntilReboot,
-                    1000,
-                )
-                .unwrap();
+            let mut engine =
+                engine_with_rule(&backend, &open_runner, &clock, store, ScopeSpec::Anywhere);
 
-            let check = check_network(&mut engine, &probe);
-            assert!(check.closed.is_empty());
+            let outcome = check_network(&mut engine, &probe, previous);
+            assert!(outcome.closed.is_empty());
             assert_eq!(engine.rules().len(), 1);
         }
     }

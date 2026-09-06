@@ -411,17 +411,22 @@ impl<'a> Engine<'a> {
         (closed, errors)
     }
 
-    /// Close every subnet-scoped rule that no longer belongs to `current`,
-    /// the subnet the machine is actually on right now.
+    /// Close every rule whose stored CIDR is inside `lost` -- the subnet the
+    /// machine was on and no longer is.
     ///
-    /// Whatever prompted this call is only ever a reason to look again, never
-    /// a description of what changed -- the comparison below is what
-    /// decides, nothing else: a rule's own stored CIDR is checked against
-    /// `current`, and if `current` does not contain it, the intent it was
-    /// opened for ("let this reach me, on this network") no longer holds, so
-    /// it is closed rather than left open, re-aimed, or reported as valid.
-    /// [`Target::Anywhere`] was never tied to any subnet, so nothing about it
-    /// became false when the network did -- it survives untouched.
+    /// `ManagedRule` records only the resolved `Target`, never the
+    /// `ScopeSpec` that produced it, so there is no stored fact anywhere
+    /// distinguishing "opened towards whatever subnet I'm on" from "opened
+    /// towards this exact CIDR, deliberately, wherever I am". The predicate
+    /// below is chosen so it does not need that distinction: a rule whose
+    /// CIDR sits inside `lost` was reachable only by virtue of the machine
+    /// being on `lost`, and cannot be reachable now that it is not -- true
+    /// regardless of which `ScopeSpec` produced it. A rule whose CIDR is
+    /// disjoint from `lost`, or broader than it (a deliberate `--to
+    /// 10.0.0.0/8` on a `10.10.10.0/24` machine, say), was never a claim
+    /// about `lost` specifically and survives -- closing it would be
+    /// answering a question the machine leaving `lost` never raised.
+    /// [`Target::Anywhere`] is checked against nothing and always survives.
     ///
     /// Reconciles first, exactly as [`Engine::close_all`] does: the same
     /// batch of rules is about to be inspected and possibly closed, so this
@@ -429,7 +434,7 @@ impl<'a> Engine<'a> {
     /// [`Engine::close_by_id`] naively would. Keeps going after a failure for
     /// the same reason `close_all` does -- one rule that will not close must
     /// not leave the others open on a network they no longer belong to.
-    pub fn close_rules_outside(&mut self, current: Ipv4Net) -> Vec<ManagedRule> {
+    pub fn close_rules_outside(&mut self, lost: Ipv4Net) -> Vec<ManagedRule> {
         self.reconcile();
         let ids: Vec<String> = self
             .state
@@ -437,7 +442,7 @@ impl<'a> Engine<'a> {
             .iter()
             .filter(|r| match r.target {
                 Target::Anywhere => false,
-                Target::Network { cidr } => !current.contains(&cidr),
+                Target::Network { cidr } => lost.contains(&cidr),
             })
             .map(|r| r.id.clone())
             .collect();
@@ -1520,7 +1525,7 @@ mod tests {
     }
 
     #[test]
-    fn close_rules_outside_closes_a_rule_for_a_subnet_we_have_left() {
+    fn close_rules_outside_closes_a_rule_for_exactly_the_subnet_that_was_lost() {
         // The intent was "let my phone reach this, on this network". The
         // network changed, so the intent no longer holds: closed, not
         // re-aimed at the new network, not left listed as if still valid.
@@ -1540,13 +1545,38 @@ mod tests {
             )
             .unwrap();
 
-        let closed = engine.close_rules_outside("192.168.1.0/24".parse().unwrap());
+        let closed = engine.close_rules_outside("10.10.10.0/24".parse().unwrap());
         assert_eq!(closed.len(), 1);
         assert!(engine.rules().is_empty());
         assert!(
             backend.handles().is_empty(),
             "the firewall rule must really be gone, not just the state entry"
         );
+    }
+
+    #[test]
+    fn close_rules_outside_closes_a_narrower_rule_still_inside_the_lost_subnet() {
+        // A single device on the subnet that was lost is exactly as
+        // unreachable as the subnet itself.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::Host("10.10.10.42".parse().unwrap()),
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        let closed = engine.close_rules_outside("10.10.10.0/24".parse().unwrap());
+        assert_eq!(closed.len(), 1);
+        assert!(engine.rules().is_empty());
     }
 
     #[test]
@@ -1569,13 +1599,15 @@ mod tests {
             )
             .unwrap();
 
-        let closed = engine.close_rules_outside("192.168.1.0/24".parse().unwrap());
+        let closed = engine.close_rules_outside("10.10.10.0/24".parse().unwrap());
         assert!(closed.is_empty());
         assert_eq!(engine.rules().len(), 1);
     }
 
     #[test]
-    fn close_rules_outside_leaves_a_rule_for_the_network_we_are_still_on_alone() {
+    fn close_rules_outside_leaves_a_rule_for_a_disjoint_subnet_alone() {
+        // A rule deliberately aimed at a different subnet than the one lost
+        // never made any claim about the one that was lost.
         let harness = Harness::new();
         let backend = FakeBackend::new();
         let runner = RecordingRunner::new();
@@ -1586,7 +1618,7 @@ mod tests {
             .open(
                 5173,
                 Protocol::Tcp,
-                &ScopeSpec::Network("10.10.10.0/24".parse().unwrap()),
+                &ScopeSpec::Network("192.168.5.0/24".parse().unwrap()),
                 Lifetime::UntilReboot,
                 1000,
             )
@@ -1595,6 +1627,36 @@ mod tests {
         assert!(engine
             .close_rules_outside("10.10.10.0/24".parse().unwrap())
             .is_empty());
+        assert_eq!(engine.rules().len(), 1);
+    }
+
+    #[test]
+    fn close_rules_outside_leaves_a_rule_broader_than_the_lost_subnet_alone() {
+        // C1: `porthole open 5173 --to 10.0.0.0/8` on a 10.10.10.0/24 machine
+        // is a deliberate, wider peer-subnet rule, not a claim about
+        // 10.10.10.0/24 specifically. `10.0.0.0/8` is not a subset of the
+        // 10.10.10.0/24 that was lost -- `lost.contains(&cidr)` is false --
+        // so it must survive. The predicate this replaced (`!current.
+        // contains(&cidr)`, checked against the *new* subnet) closed this
+        // rule on every poll tick even though nothing about it had changed.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::Network("10.0.0.0/8".parse().unwrap()),
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        let closed = engine.close_rules_outside("10.10.10.0/24".parse().unwrap());
+        assert!(closed.is_empty(), "must survive, got closed: {closed:?}");
         assert_eq!(engine.rules().len(), 1);
     }
 
