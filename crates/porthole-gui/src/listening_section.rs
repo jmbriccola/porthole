@@ -54,15 +54,25 @@
 //! port still read as two distinct sockets rather than one service listed
 //! twice by mistake.
 //!
-//! ## What this section does not do yet
+//! ## Docker-published ports
 //!
-//! Docker-published ports belong in this list too (a container publishing a
-//! port on `0.0.0.0` is a service running on this machine, in every sense a
-//! user cares about), but detection arrives in milestone 5.
-//! `porthole_core::listening::Binding` is left exactly as task 1 shaped it,
-//! ready for a future variant or flag -- this section does not stub a fake
-//! "not a container" marking now. A marking that is always absent would look
-//! like it works when it does not, which is worse than no marking at all.
+//! A row whose port and protocol match one of the ports Docker has
+//! published carries a marker icon and, in its subtitle, the address Docker
+//! published it on -- the same two facts `porthole listen`'s own trailing
+//! `docker:` column prints, worded the same way. Nothing enforces that: the
+//! two are separate strings in separate crates. porthole never touches
+//! Docker's rules; the
+//! marker says what is there, and `porthole_core::docker`'s own module doc
+//! is where the consequences are spelled out.
+//!
+//! **"Not published" and "not checked" are two different facts**, and only
+//! one of them may render as an unmarked row. Reading the `DOCKER` chain
+//! needs root, so this section learns about it from the helper, over a call
+//! that can fail like any other; [`ListeningSection::set_docker_unknown`] is
+//! that failure's own state and puts [`DOCKER_UNKNOWN_NOTE`] under the
+//! group's title. Said once for the whole list, not per row -- every row
+//! would otherwise repeat the identical caveat -- which mirrors what
+//! `porthole-cli`'s own `render_listening` does with the same fact.
 //!
 //! ## A scan failure is not "nothing is listening"
 //!
@@ -102,6 +112,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
+use porthole_core::docker::Published;
 use porthole_core::listening::{Binding, Service};
 
 /// One rendered service: the widgets `Inner::rows` needs to update or
@@ -116,6 +127,9 @@ struct Row {
     /// `BeyondReach`) or one that is already open -- see this module's own
     /// doc comment for why each of those has no button.
     open_button: Option<gtk::Button>,
+    /// The marker on a row whose port Docker publishes. `None` on every
+    /// other row, and on every row at all while Docker could not be checked.
+    docker_icon: Option<gtk::Image>,
 }
 
 struct Inner {
@@ -152,6 +166,11 @@ struct Inner {
     services: RefCell<Vec<Service>>,
     /// Ports `set_open_ports` was last given, as a set for cheap lookup.
     open_ports: RefCell<HashSet<u16>>,
+    /// Every port Docker currently publishes, or `None` for "porthole could
+    /// not check". `None` is not an empty list: an empty list is a checked
+    /// answer, and only a checked answer lets an unmarked row mean "Docker
+    /// does not publish this". See this module's own doc comment.
+    docker: RefCell<Option<Vec<Published>>>,
     /// Whether `services` is a confirmed scan result right now -- `true`
     /// only between a `set_services` call and the next `set_scan_failed`
     /// (which clears it again). `apply` reads this, not
@@ -188,12 +207,63 @@ const LOOPBACK_SUBTITLE: &str = "listening only on this machine — the firewall
 const BEYOND_REACH_SUBTITLE: &str = "reachable over IPv6 — porthole manages IPv4 rules only and \
      cannot open or close it. Run `porthole doctor` to check your IPv6 exposure.";
 
+/// What this section says when it was never told which ports Docker
+/// publishes. Under the group's title, once, rather than on every row --
+/// see this module's own doc comment. Makes the same claim
+/// `porthole-cli`'s own `render_listening` prints for the identical fact.
+pub const DOCKER_UNKNOWN_NOTE: &str = "Docker information unavailable — the porthole helper \
+     could not be reached, or answered with an error, so porthole cannot say whether any of \
+     these ports are already published by a container.";
+
+/// The port Docker publishes at `port`/`protocol`, if it publishes one at
+/// all. `published` is the whole checked list; a caller with no list at all
+/// has nothing to ask.
+fn docker_for(
+    port: u16,
+    protocol: porthole_core::model::Protocol,
+    published: &[Published],
+) -> Option<Published> {
+    published
+        .iter()
+        .find(|p| p.host_port == port && p.protocol == protocol)
+        .copied()
+}
+
+/// The `docker:` fragment a published row's subtitle ends with, worded the
+/// same way `porthole listen`'s own trailing column words it.
+fn docker_fragment(published: &Published) -> String {
+    match published.host_addr {
+        Some(addr) => format!("docker: published on {addr}"),
+        None => "docker: published on every interface".to_string(),
+    }
+}
+
 /// Every row's subtitle. Always `Some` in this section's own design: even a
 /// service with no Docker/loopback/reach caveat and no already-open
 /// suppression still gets a subtitle -- the literal bind address, which is
 /// what lets two dual-stack rows sharing a title (see this module's doc
 /// comment) read as two sockets rather than one listed twice.
-fn subtitle_for(service: &Service, open_ports: &HashSet<u16>) -> String {
+///
+/// `docker` is the whole checked list, or `None` for "porthole could not
+/// check". An unchecked row's subtitle is identical to an unpublished
+/// row's -- neither mentions Docker -- which is why the difference between
+/// them is said once under the group's title instead, in
+/// [`DOCKER_UNKNOWN_NOTE`]. A subtitle cannot carry it.
+fn subtitle_for(
+    service: &Service,
+    open_ports: &HashSet<u16>,
+    docker: Option<&[Published]>,
+) -> String {
+    let base = subtitle_without_docker(service, open_ports);
+    match docker.and_then(|list| docker_for(service.port, service.protocol, list)) {
+        Some(published) => format!("{base} · {}", docker_fragment(&published)),
+        None => base,
+    }
+}
+
+/// [`subtitle_for`] without its Docker fragment: everything this section
+/// says about a socket from the scan alone.
+fn subtitle_without_docker(service: &Service, open_ports: &HashSet<u16>) -> String {
     match service.binding {
         Binding::LoopbackOnly => LOOPBACK_SUBTITLE.to_string(),
         Binding::BeyondReach(_) => BEYOND_REACH_SUBTITLE.to_string(),
@@ -266,6 +336,7 @@ fn apply(inner: &Rc<Inner>) {
 
     let services = inner.services.borrow().clone();
     let open_ports = inner.open_ports.borrow().clone();
+    let docker = inner.docker.borrow().clone();
 
     for row in inner.rows.replace(Vec::new()) {
         inner.group.remove(&row.row);
@@ -300,15 +371,41 @@ fn apply(inner: &Rc<Inner>) {
         inner.container.append(&inner.group);
     }
 
+    // Present exactly while Docker is unchecked: an unmarked row is only
+    // allowed to read as "Docker does not publish this" once there is a
+    // list that says so. See this module's own doc comment.
+    match docker {
+        Some(_) => inner.group.set_description(None),
+        None => inner.group.set_description(Some(DOCKER_UNKNOWN_NOTE)),
+    }
+
     let mut ordered: Vec<&Service> = services.iter().collect();
     ordered.sort_by_key(|s| group_rank(&s.binding));
 
     let mut rows = Vec::with_capacity(ordered.len());
     for service in ordered {
+        // `use_markup(false)`: the title carries a process name read out of
+        // `/proc`, which is whatever the running binary happens to be
+        // called, and an `AdwPreferencesRow` parses its title and subtitle
+        // as Pango markup by default.
         let action_row = adw::ActionRow::builder()
             .title(title_for(service))
-            .subtitle(subtitle_for(service, &open_ports))
+            .subtitle(subtitle_for(service, &open_ports, docker.as_deref()))
+            .use_markup(false)
             .build();
+
+        // The marker the module doc describes: an icon, not colour, and
+        // only ever on a row a checked list actually names.
+        let docker_icon = docker
+            .as_deref()
+            .and_then(|list| docker_for(service.port, service.protocol, list))
+            .map(|published| {
+                let icon = gtk::Image::from_icon_name("package-x-generic-symbolic");
+                icon.set_valign(gtk::Align::Center);
+                icon.set_tooltip_text(Some(&docker_fragment(&published)));
+                action_row.add_prefix(&icon);
+                icon
+            });
 
         let open_button = if is_actionable(service, &open_ports) {
             let button = gtk::Button::builder()
@@ -343,6 +440,7 @@ fn apply(inner: &Rc<Inner>) {
             port: service.port,
             row: action_row,
             open_button,
+            docker_icon,
         });
     }
     inner.rows.replace(rows);
@@ -447,6 +545,7 @@ impl ListeningSection {
             rows: RefCell::new(Vec::new()),
             services: RefCell::new(Vec::new()),
             open_ports: RefCell::new(HashSet::new()),
+            docker: RefCell::new(None),
             scanned: Cell::new(false),
         });
 
@@ -490,6 +589,26 @@ impl ListeningSection {
     /// rows.
     pub fn set_open_ports_unknown(&self) {
         self.inner.open_ports.replace(HashSet::new());
+        apply(&self.inner);
+    }
+
+    /// The whole way this section learns which ports Docker publishes.
+    /// Re-renders immediately against whatever the other setters last
+    /// stored, in any call order.
+    pub fn set_docker_ports(&self, published: &[Published]) {
+        self.inner.docker.replace(Some(published.to_vec()));
+        apply(&self.inner);
+    }
+
+    /// The failure counterpart to [`ListeningSection::set_docker_ports`]:
+    /// the helper could not say which ports Docker publishes, which is not
+    /// the same fact as it saying none. Drops whatever list was last known
+    /// -- a marker left standing would keep claiming something porthole can
+    /// no longer stand behind -- and puts [`DOCKER_UNKNOWN_NOTE`] under the
+    /// group's title instead. The state a freshly constructed section is
+    /// already in.
+    pub fn set_docker_unknown(&self) {
+        self.inner.docker.replace(None);
         apply(&self.inner);
     }
 
@@ -546,6 +665,29 @@ impl ListeningSection {
             .iter()
             .map(|r| r.row.clone())
             .collect()
+    }
+
+    /// The group's own description line -- [`DOCKER_UNKNOWN_NOTE`] while
+    /// Docker could not be checked, `None` once it could.
+    pub fn group_description(&self) -> Option<String> {
+        self.inner
+            .group
+            .description()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Whether row `index` carries the Docker marker, checked against the
+    /// live widget tree -- the icon's own `parent()` -- rather than only
+    /// whether the field is `Some`, the same way
+    /// `OpenDialog::is_marked_significant` checks its own. `Some` alone
+    /// would prove an icon was constructed, not that it was ever attached.
+    pub fn is_marked_docker(&self, index: usize) -> bool {
+        self.inner.rows.borrow().get(index).is_some_and(|r| {
+            r.docker_icon
+                .as_ref()
+                .is_some_and(|icon| icon.parent().is_some())
+        })
     }
 
     /// `None` for a row the firewall cannot affect (`LoopbackOnly`,
@@ -619,7 +761,7 @@ mod tests {
     fn loopback_subtitle_is_the_exact_reassuring_sentence() {
         let open = HashSet::new();
         assert_eq!(
-            subtitle_for(&svc(53, None, Binding::LoopbackOnly), &open),
+            subtitle_for(&svc(53, None, Binding::LoopbackOnly), &open, None),
             LOOPBACK_SUBTITLE,
         );
     }
@@ -631,7 +773,7 @@ mod tests {
         // to this section's subtitles, this fails.
         let addr: Ipv6Addr = "2001:db8::1".parse().unwrap();
         let open = HashSet::new();
-        let subtitle = subtitle_for(&svc(22, None, Binding::BeyondReach(addr)), &open);
+        let subtitle = subtitle_for(&svc(22, None, Binding::BeyondReach(addr)), &open, None);
         assert!(
             !subtitle.contains("only on this machine"),
             "a BeyondReach subtitle must not claim the reassurance LoopbackOnly earns: {subtitle}"
@@ -651,7 +793,11 @@ mod tests {
         let mut open = HashSet::new();
         open.insert(5173);
         assert_eq!(
-            subtitle_for(&svc(5173, Some("node"), Binding::AllInterfaces), &open),
+            subtitle_for(
+                &svc(5173, Some("node"), Binding::AllInterfaces),
+                &open,
+                None
+            ),
             "already open · 0.0.0.0"
         );
     }
@@ -672,8 +818,8 @@ mod tests {
         open.insert(53);
         let wildcard = svc(53, None, Binding::AllInterfaces);
         let specific = svc(53, None, Binding::Specific("10.0.0.5".parse().unwrap()));
-        let wildcard_subtitle = subtitle_for(&wildcard, &open);
-        let specific_subtitle = subtitle_for(&specific, &open);
+        let wildcard_subtitle = subtitle_for(&wildcard, &open, None);
+        let specific_subtitle = subtitle_for(&specific, &open, None);
         assert_ne!(
             wildcard_subtitle, specific_subtitle,
             "two already-open sockets sharing a port must not render identically"
@@ -694,12 +840,20 @@ mod tests {
         // title because they share a port still carry different addresses.
         let open = HashSet::new();
         assert_eq!(
-            subtitle_for(&svc(5173, Some("node"), Binding::AllInterfaces), &open),
+            subtitle_for(
+                &svc(5173, Some("node"), Binding::AllInterfaces),
+                &open,
+                None
+            ),
             "0.0.0.0"
         );
         let specific: Ipv4Addr = "10.0.0.5".parse().unwrap();
         assert_eq!(
-            subtitle_for(&svc(5173, Some("node"), Binding::Specific(specific)), &open),
+            subtitle_for(
+                &svc(5173, Some("node"), Binding::Specific(specific)),
+                &open,
+                None
+            ),
             "10.0.0.5"
         );
     }
@@ -744,5 +898,76 @@ mod tests {
         let global: Ipv6Addr = "2001:db8::1".parse().unwrap();
         assert!(group_rank(&Binding::AllInterfaces) < group_rank(&Binding::BeyondReach(global)));
         assert!(group_rank(&Binding::BeyondReach(global)) < group_rank(&Binding::LoopbackOnly));
+    }
+
+    fn published(port: u16, host_addr: Option<&str>) -> Published {
+        Published {
+            host_addr: host_addr.map(|a| a.parse().unwrap()),
+            host_port: port,
+            protocol: Protocol::Tcp,
+            container_addr: "172.17.0.2".parse().unwrap(),
+            container_port: 80,
+        }
+    }
+
+    #[test]
+    fn a_published_row_names_the_address_docker_published_it_on() {
+        let open = HashSet::new();
+        let list = [published(8080, None)];
+        assert_eq!(
+            subtitle_for(
+                &svc(8080, Some("node"), Binding::AllInterfaces),
+                &open,
+                Some(&list)
+            ),
+            "0.0.0.0 · docker: published on every interface"
+        );
+
+        let list = [published(5432, Some("127.0.0.1"))];
+        assert_eq!(
+            subtitle_for(&svc(5432, None, Binding::LoopbackOnly), &open, Some(&list)),
+            format!("{LOOPBACK_SUBTITLE} · docker: published on 127.0.0.1")
+        );
+    }
+
+    #[test]
+    fn a_row_docker_does_not_publish_says_nothing_about_docker() {
+        let open = HashSet::new();
+        let list = [published(8080, None)];
+        assert_eq!(
+            subtitle_for(&svc(4000, None, Binding::AllInterfaces), &open, Some(&list)),
+            "0.0.0.0"
+        );
+    }
+
+    #[test]
+    fn an_unchecked_docker_list_leaves_every_row_exactly_as_it_was() {
+        // The distinction the module doc calls out: "not published" and
+        // "not checked" must not render the same way *per row*. They do
+        // render the same way per row -- both unmarked -- which is why the
+        // group-level note exists, and why this test pins that the row text
+        // itself is untouched rather than pretending the row can carry the
+        // difference.
+        let open = HashSet::new();
+        let service = svc(8080, Some("node"), Binding::AllInterfaces);
+        assert_eq!(
+            subtitle_for(&service, &open, None),
+            subtitle_without_docker(&service, &open)
+        );
+    }
+
+    #[test]
+    fn a_published_port_on_the_other_protocol_is_not_this_rows_docker_port() {
+        let mut udp = published(8080, None);
+        udp.protocol = Protocol::Udp;
+        assert!(docker_for(8080, Protocol::Tcp, &[udp]).is_none());
+        assert!(docker_for(8080, Protocol::Udp, &[udp]).is_some());
+    }
+
+    #[test]
+    fn the_unknown_note_says_porthole_could_not_check_not_that_there_is_nothing() {
+        let note = DOCKER_UNKNOWN_NOTE.to_lowercase();
+        assert!(note.contains("unavailable"), "{DOCKER_UNKNOWN_NOTE}");
+        assert!(note.contains("cannot say"), "{DOCKER_UNKNOWN_NOTE}");
     }
 }

@@ -48,19 +48,69 @@
 //! different things -- see `refresh`'s own doc comment, `open_now.rs`'s and
 //! `status_bar.rs`'s module docs for why conflating any pair of them is
 //! this project's characteristic defect.
+//!
+//! ## The saved devices and Docker's own ports
+//!
+//! Two more things `refresh` reads, and neither belongs to a section that
+//! is on screen when it lands: the saved devices (the address book, plus
+//! one resolution attempt per device -- subprocesses, so on the same I/O
+//! thread pool the `/proc` scan uses) and the ports Docker publishes (the
+//! helper's own `docker_ports`, the only one of the three helper calls that
+//! needs root to answer at all). Both go into [`Sections`]'s own caches, and
+//! [`present_open_dialog`] hands them to each [`OpenDialog`] it opens: the
+//! devices become target rows, and the Docker list is what lets pressing
+//! Open explain a Docker-managed port before sending anything.
+//!
+//! The Docker list additionally reaches the "Listening" section, which
+//! marks the rows it names. That is the one of the two that has a "could
+//! not check" state visible on screen -- `listening_section.rs`'s own group
+//! note -- because an unmarked row is otherwise indistinguishable from a
+//! checked, unpublished one. porthole never touches Docker's rules; every
+//! one of these surfaces only ever reads and explains.
 
+use std::cell::RefCell;
 use std::ops::Deref;
+use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::glib;
 
-use porthole_core::ipc::{PortholeProxy, WireRule, WireStatus};
+use porthole_core::command::RealRunner;
+use porthole_core::devices;
+use porthole_core::docker::Published;
+use porthole_core::ipc::{PortholeProxy, WireDockerPort, WireRule, WireStatus};
 use porthole_core::listening::RealProcFs;
 
 use crate::listening_section::ListeningSection;
-use crate::open_dialog::OpenDialog;
+use crate::open_dialog::{DeviceEntry, OpenDialog};
 use crate::open_now::OpenNowSection;
 use crate::status_bar::StatusBar;
+
+/// The saved devices as [`load_devices`] last resolved them, or the reason
+/// the address book itself could not be read -- two facts an empty `Vec`
+/// alone cannot tell apart, and the second of which must not render as "no
+/// devices are saved".
+type DeviceSnapshot = Result<Vec<DeviceEntry>, String>;
+
+/// What [`refresh`] fills in, and what it keeps for an [`OpenDialog`]
+/// opened later. One value rather than six parameters threaded through four
+/// functions; every field is a refcounted handle, so a clone is another
+/// handle on the same thing, not a copy of it.
+#[derive(Clone)]
+struct Sections {
+    window: adw::ApplicationWindow,
+    open_now: OpenNowSection,
+    listening: ListeningSection,
+    status_bar: StatusBar,
+    /// Read on a worker thread by [`refresh`], and read back by
+    /// [`present_open_dialog`] when a dialog is actually opened -- the
+    /// dialog never resolves a device itself, and never blocks on one.
+    devices: Rc<RefCell<DeviceSnapshot>>,
+    /// Every port Docker publishes, or `None` for "the helper could not
+    /// say". Not an empty `Vec`: only a list that arrived can tell a port
+    /// Docker does not publish from one nobody checked.
+    docker: Rc<RefCell<Option<Vec<Published>>>>,
+}
 
 /// The width, in CSS pixels, at or below which the narrow layout applies.
 /// The `Breakpoint` object itself is reachable via
@@ -86,6 +136,8 @@ pub struct PortholeWindow {
     listening: ListeningSection,
     status_bar: StatusBar,
     open_button: gtk::Button,
+    devices: Rc<RefCell<DeviceSnapshot>>,
+    docker: Rc<RefCell<Option<Vec<Published>>>>,
 }
 
 impl Deref for PortholeWindow {
@@ -110,12 +162,7 @@ impl PortholeWindow {
         // earned) until `refresh` resolves; `refresh` runs the same path a
         // later explicit refresh does, there is no separate "first load"
         // code.
-        refresh(
-            &window.window,
-            &window.open_now,
-            &window.listening,
-            &window.status_bar,
-        );
+        refresh(&window.sections());
         window
     }
 
@@ -226,18 +273,23 @@ impl PortholeWindow {
         let listening = ListeningSection::new();
         content.append(listening.widget());
 
-        let window_for_open = window.clone();
-        let open_now_for_open = open_now.clone();
-        let listening_for_open = listening.clone();
-        let status_bar_for_open = status_bar.clone();
+        // Both start out saying "porthole has not looked yet", which is
+        // what they in fact mean until `refresh` resolves -- neither is an
+        // empty answer. See `DeviceSnapshot` and `Sections::docker`.
+        let devices: Rc<RefCell<DeviceSnapshot>> =
+            Rc::new(RefCell::new(Err(DEVICES_NOT_READ_YET.to_string())));
+        let docker: Rc<RefCell<Option<Vec<Published>>>> = Rc::new(RefCell::new(None));
+
+        let sections_for_open = Sections {
+            window: window.clone(),
+            open_now: open_now.clone(),
+            listening: listening.clone(),
+            status_bar: status_bar.clone(),
+            devices: devices.clone(),
+            docker: docker.clone(),
+        };
         open_button.connect_clicked(move |_| {
-            present_open_dialog(
-                &window_for_open,
-                &OpenDialog::new(),
-                &open_now_for_open,
-                &listening_for_open,
-                &status_bar_for_open,
-            );
+            present_open_dialog(&sections_for_open, &OpenDialog::new());
         });
 
         // No initial `refresh` here -- see `PortholeWindow::new` (the only
@@ -253,6 +305,23 @@ impl PortholeWindow {
             listening,
             status_bar,
             open_button,
+            devices,
+            docker,
+        }
+    }
+
+    /// This window's own sections and caches as the one bundle `refresh`
+    /// and `present_open_dialog` take. Every field is a refcounted handle:
+    /// what comes back shares state with this window rather than copying
+    /// it.
+    fn sections(&self) -> Sections {
+        Sections {
+            window: self.window.clone(),
+            open_now: self.open_now.clone(),
+            listening: self.listening.clone(),
+            status_bar: self.status_bar.clone(),
+            devices: self.devices.clone(),
+            docker: self.docker.clone(),
         }
     }
 
@@ -339,12 +408,7 @@ impl PortholeWindow {
     /// function of the same name, below, for what it actually does and why
     /// neither read blocks the UI thread.
     pub fn refresh(&self) {
-        refresh(
-            &self.window,
-            &self.open_now,
-            &self.listening,
-            &self.status_bar,
-        );
+        refresh(&self.sections());
     }
 }
 
@@ -425,6 +489,38 @@ fn apply_failure_to_status_bar(status_bar: &StatusBar, failure: &HelperFailure) 
 struct HelperSnapshot {
     rules: Result<Vec<WireRule>, HelperFailure>,
     status: Result<WireStatus, HelperFailure>,
+    docker: Result<Vec<Published>, HelperFailure>,
+}
+
+/// One [`WireDockerPort`] as the local type. `host_addr` empty means "no
+/// `-d`", i.e. every interface -- see [`WireDockerPort`]'s own doc comment.
+/// The same conversion `porthole-cli`'s own client makes off the same wire,
+/// down to treating a malformed address as the helper's own encoding being
+/// wrong rather than as anything about Docker.
+fn published_from_wire(wire: &WireDockerPort) -> Result<Published, String> {
+    let host_addr = if wire.host_addr.is_empty() {
+        None
+    } else {
+        Some(wire.host_addr.parse().map_err(|_| {
+            format!(
+                "the helper sent `{}` as a Docker host address",
+                wire.host_addr
+            )
+        })?)
+    };
+    Ok(Published {
+        host_addr,
+        host_port: wire.host_port,
+        protocol: porthole_core::validate::parse_protocol(&wire.protocol)
+            .map_err(|e| e.to_string())?,
+        container_addr: wire.container_addr.parse().map_err(|_| {
+            format!(
+                "the helper sent `{}` as a Docker container address",
+                wire.container_addr
+            )
+        })?,
+        container_port: wire.container_port,
+    })
 }
 
 async fn fetch_helper_snapshot() -> Result<HelperSnapshot, HelperFailure> {
@@ -436,7 +532,49 @@ async fn fetch_helper_snapshot() -> Result<HelperSnapshot, HelperFailure> {
     })?;
     let rules = proxy.list().await.map_err(classify_failure);
     let status = proxy.status().await.map_err(classify_failure);
-    Ok(HelperSnapshot { rules, status })
+    // A third independent result, for the same reason `rules` and `status`
+    // are two: a `docker_ports` failure must not throw away a `list` that
+    // already succeeded.
+    let docker = match proxy.docker_ports().await {
+        Ok(wire) => wire
+            .iter()
+            .map(published_from_wire)
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(HelperFailure::Errored),
+        Err(e) => Err(classify_failure(e)),
+    };
+    Ok(HelperSnapshot {
+        rules,
+        status,
+        docker,
+    })
+}
+
+/// What the saved-device cache says before anything has read the address
+/// book -- neither a device list nor a failure to read one, and rendered as
+/// itself rather than as an empty list of devices.
+const DEVICES_NOT_READ_YET: &str = "porthole has not read the saved devices yet.";
+
+/// Reads the address book and resolves every device in it, exactly as
+/// `porthole devices list` does. Blocking -- `porthole_core::devices::
+/// resolve` runs a subprocess per device -- so [`refresh`] runs it on
+/// GLib's I/O thread pool, never on the UI thread.
+///
+/// Each device's own resolution failure stays that device's own -- an
+/// absent phone does not hide the laptop that is here. Only the address
+/// book itself failing to load produces the outer `Err`, since then there
+/// are no devices to report at all.
+fn load_devices() -> DeviceSnapshot {
+    let book = devices::Book::load(&devices::default_path()).map_err(|e| e.to_string())?;
+    let runner = RealRunner;
+    Ok(book
+        .devices()
+        .iter()
+        .map(|d| DeviceEntry {
+            name: d.name.clone(),
+            resolved: devices::resolve(&book, &d.name, &runner).map_err(|e| e.to_string()),
+        })
+        .collect())
 }
 
 /// How long [`refresh`] waits for [`fetch_helper_snapshot`] before treating
@@ -478,21 +616,28 @@ async fn with_timeout<F: std::future::Future>(
 /// successful open. Shared by the header bar's own "Open a port" button
 /// and every "Listening" row's pre-filled one (wired by
 /// `wire_listening_open_buttons`), so both paths refresh the same way.
-fn present_open_dialog(
-    window: &adw::ApplicationWindow,
-    dialog: &OpenDialog,
-    open_now: &OpenNowSection,
-    listening: &ListeningSection,
-    status_bar: &StatusBar,
-) {
-    let window_for_refresh = window.clone();
-    let open_now = open_now.clone();
-    let listening = listening.clone();
-    let status_bar = status_bar.clone();
+fn present_open_dialog(sections: &Sections, dialog: &OpenDialog) {
+    // Whatever the last `refresh` learned, handed over before the dialog is
+    // ever on screen: the saved devices it offers as targets, and the ports
+    // Docker publishes, which is what lets pressing Open explain a
+    // Docker-managed port before sending anything. Both are read here, from
+    // a cache, rather than fetched by the dialog -- resolving a device runs
+    // a subprocess, and the dialog must not block on one at the moment it
+    // opens.
+    match sections.devices.borrow().as_ref() {
+        Ok(entries) => dialog.set_devices(entries),
+        Err(reason) => dialog.set_devices_unreadable(reason),
+    }
+    match sections.docker.borrow().as_ref() {
+        Some(published) => dialog.set_docker_ports(published),
+        None => dialog.set_docker_unknown(),
+    }
+
+    let sections_for_refresh = sections.clone();
     dialog.on_opened(move |_rule| {
-        refresh(&window_for_refresh, &open_now, &listening, &status_bar);
+        refresh(&sections_for_refresh);
     });
-    dialog.present(Some(window));
+    dialog.present(Some(&sections.window));
 }
 
 /// Connects each "Listening" row's own Open button (if it has one -- see
@@ -514,12 +659,8 @@ fn present_open_dialog(
 /// rather than inside `listening_section.rs` itself because that module
 /// renders what it is given and knows nothing about `OpenDialog` or this
 /// window.
-fn wire_listening_open_buttons(
-    window: &adw::ApplicationWindow,
-    open_now: &OpenNowSection,
-    listening: &ListeningSection,
-    status_bar: &StatusBar,
-) {
+fn wire_listening_open_buttons(sections: &Sections) {
+    let listening = &sections.listening;
     for index in 0..listening.rows().len() {
         let (Some(button), Some(port)) = (
             listening.open_button_for(index),
@@ -527,18 +668,9 @@ fn wire_listening_open_buttons(
         ) else {
             continue;
         };
-        let window = window.clone();
-        let open_now = open_now.clone();
-        let listening = listening.clone();
-        let status_bar = status_bar.clone();
+        let sections = sections.clone();
         button.connect_clicked(move |_| {
-            present_open_dialog(
-                &window,
-                &OpenDialog::for_port(port),
-                &open_now,
-                &listening,
-                &status_bar,
-            );
+            present_open_dialog(&sections, &OpenDialog::for_port(port));
         });
     }
 }
@@ -579,40 +711,53 @@ fn wire_listening_open_buttons(
 /// told a confirmed scan exists at all before it may render that calm page,
 /// not merely infer it from an empty list (see its own module doc for the
 /// bug that produced).
-fn refresh(
-    window: &adw::ApplicationWindow,
-    open_now: &OpenNowSection,
-    listening: &ListeningSection,
-    status_bar: &StatusBar,
-) {
+fn refresh(sections: &Sections) {
     {
-        let window = window.clone();
-        let open_now = open_now.clone();
-        let listening = listening.clone();
-        let status_bar = status_bar.clone();
+        let sections = sections.clone();
         glib::spawn_future_local(async move {
             let scanned =
                 gtk::gio::spawn_blocking(|| porthole_core::listening::scan(&RealProcFs)).await;
             match scanned {
                 Ok(Ok(services)) => {
-                    listening.set_services(&services);
-                    wire_listening_open_buttons(&window, &open_now, &listening, &status_bar);
+                    sections.listening.set_services(&services);
+                    wire_listening_open_buttons(&sections);
                 }
                 Ok(Err(e)) => {
-                    listening.set_scan_failed(&format!("could not check what is listening: {e}"));
+                    sections
+                        .listening
+                        .set_scan_failed(&format!("could not check what is listening: {e}"));
                 }
                 Err(_) => {
-                    listening.set_scan_failed("the listening scan panicked");
+                    sections
+                        .listening
+                        .set_scan_failed("the listening scan panicked");
                 }
             }
         });
     }
 
     {
-        let window = window.clone();
-        let open_now = open_now.clone();
-        let listening = listening.clone();
-        let status_bar = status_bar.clone();
+        // A third independent read, alongside the `/proc` scan and the
+        // helper round trip: reading the address book and resolving every
+        // device in it runs subprocesses, so it goes to the same I/O thread
+        // pool the scan does and never touches the UI thread. Nothing on
+        // screen changes when it lands -- it fills the cache
+        // `present_open_dialog` reads when a dialog is actually opened.
+        let sections = sections.clone();
+        glib::spawn_future_local(async move {
+            let loaded = gtk::gio::spawn_blocking(load_devices).await;
+            *sections.devices.borrow_mut() = match loaded {
+                Ok(snapshot) => snapshot,
+                Err(_) => Err("reading the saved devices panicked".to_string()),
+            };
+        });
+    }
+
+    {
+        let sections = sections.clone();
+        let open_now = sections.open_now.clone();
+        let listening = sections.listening.clone();
+        let status_bar = sections.status_bar.clone();
         glib::spawn_future_local(async move {
             match with_timeout(fetch_helper_snapshot(), HELPER_TIMEOUT).await {
                 Some(Ok(snapshot)) => {
@@ -634,12 +779,7 @@ fn refresh(
                                 .collect();
                             open_now.set_rules(&rules);
                             listening.set_open_ports(&open_ports);
-                            wire_listening_open_buttons(
-                                &window,
-                                &open_now,
-                                &listening,
-                                &status_bar,
-                            );
+                            wire_listening_open_buttons(&sections);
                         }
                         Err(failure) => {
                             apply_failure_to_open_now(&open_now, &failure);
@@ -650,11 +790,13 @@ fn refresh(
                         Ok(status) => status_bar.set_status(&status),
                         Err(failure) => apply_failure_to_status_bar(&status_bar, &failure),
                     }
+                    apply_docker(&sections, snapshot.docker.ok());
                 }
                 Some(Err(failure)) => {
                     apply_failure_to_open_now(&open_now, &failure);
                     apply_failure_to_status_bar(&status_bar, &failure);
                     listening.set_open_ports_unknown();
+                    apply_docker(&sections, None);
                 }
                 None => {
                     // `with_timeout` won the race: the helper never
@@ -667,9 +809,30 @@ fn refresh(
                     apply_failure_to_open_now(&open_now, &failure);
                     apply_failure_to_status_bar(&status_bar, &failure);
                     listening.set_open_ports_unknown();
+                    apply_docker(&sections, None);
                 }
             }
         });
+    }
+}
+
+/// Hands one `docker_ports` outcome to both places that need it: the
+/// "Listening" section, which marks the rows it names, and the cache an
+/// [`OpenDialog`] opened later reads. `None` is every way that call did not
+/// produce a list -- no bus, a typed error, the timeout, a `Published` the
+/// helper encoded wrongly -- and reaches both as the same "could not check"
+/// state, which is what `listening_section.rs`'s own group note describes
+/// and what keeps an unmarked row from claiming Docker was consulted.
+fn apply_docker(sections: &Sections, published: Option<Vec<Published>>) {
+    match published {
+        Some(list) => {
+            sections.listening.set_docker_ports(&list);
+            sections.docker.replace(Some(list));
+        }
+        None => {
+            sections.listening.set_docker_unknown();
+            sections.docker.replace(None);
+        }
     }
 }
 

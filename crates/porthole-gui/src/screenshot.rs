@@ -1,6 +1,16 @@
-//! `main.rs`'s debug-only `--screenshot <path>` flag: populates a real
-//! [`PortholeWindow`] with invented data, renders exactly what GTK is
-//! currently displaying, saves that to `path` as a PNG, and exits.
+//! `main.rs`'s two debug-only screenshot flags.
+//!
+//! `--screenshot <path>` ([`run`]) populates a real [`PortholeWindow`] with
+//! invented data, renders exactly what GTK is currently displaying, saves
+//! that to `path` as a PNG, and exits. `docs/screenshot.png` is its output.
+//!
+//! `--screenshot-dialog <path>` ([`run_dialog`]) does the same for the open
+//! dialog and the Docker explanation it presents before opening a
+//! Docker-managed port -- two images, since only one of the two can be in
+//! front at a time. Nothing in the repository is its output; it exists so a
+//! change to the dialog can be looked at, which is how this project found a
+//! truncated row, a window forced wide by a single unwrapped line, and an
+//! unmarked "open to anyone" that no test had caught.
 //!
 //! **Fixture data, never live data.** [`run`] never lets a live helper round
 //! trip or a `/proc` scan touch the window at all --
@@ -19,18 +29,23 @@
 //! README and `docs/json-schema.md` already use as examples (`5173/tcp`,
 //! `10.10.10.0/24`, `firewalld 2.4.4`), so the screenshot reads as the same
 //! running example the rest of the documentation already shows, not a new
-//! one invented just for this image.
+//! one invented just for this image. The saved devices [`fixture_devices`]
+//! invents are the exception, having no counterpart in the documentation:
+//! one of them does not resolve, and one has a name long enough to show
+//! what an arbitrary one does to the dialog's layout.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use adw::prelude::*;
 
 use porthole_core::clock::{Clock, SystemClock};
+use porthole_core::docker::Published;
 use porthole_core::ipc::{WireRule, WireStatus};
 use porthole_core::listening::{Binding, Service};
 use porthole_core::model::Protocol;
 
+use crate::open_dialog::{DeviceEntry, OpenDialog};
 use crate::window::PortholeWindow;
 
 /// A session-bus application id distinct from the real one (`crate::app::APP_ID`)
@@ -38,6 +53,10 @@ use crate::window::PortholeWindow;
 /// run sharing a session bus with anything else this milestone starts never
 /// collides with it.
 const APP_ID: &str = "com.jacopobriccola.Porthole.Screenshot";
+
+/// [`run_dialog`]'s own id, for the same reason -- the two flags can be run
+/// one after the other on the same session bus.
+const DIALOG_APP_ID: &str = "com.jacopobriccola.Porthole.ScreenshotDialog";
 
 /// Two open rules: one mid-countdown towards the current subnet, one
 /// towards "anyone" and until reboot -- between them, both scope words
@@ -71,14 +90,15 @@ fn fixture_rules() -> Vec<WireRule> {
     ]
 }
 
-/// Five listening services, one of each thing `listening_section.rs` can
+/// Six listening services, one of each thing `listening_section.rs` can
 /// render: a network-facing one already open above (so its own "already
 /// open" wording shows, not a second Open button for a port `fixture_rules`
-/// already opened); a network-facing one still actionable; one reachable
-/// only over IPv6 (`Binding::BeyondReach`, the warning icon); and two
-/// loopback-only ones, one with a resolved process name and one without, the
-/// same distinction `porthole listen`'s own module doc measures as the
-/// common case on an ordinary desktop.
+/// already opened); a network-facing one still actionable; one published by
+/// a container, which [`fixture_docker`] then marks; one reachable only over
+/// IPv6 (`Binding::BeyondReach`, the warning icon); and two loopback-only
+/// ones, one with a resolved process name and one without, the same
+/// distinction `porthole listen`'s own module doc measures as the common
+/// case on an ordinary desktop.
 fn fixture_services() -> Vec<Service> {
     let beyond_reach_addr: Ipv6Addr = "2001:db8::1".parse().unwrap();
     vec![
@@ -97,6 +117,14 @@ fn fixture_services() -> Vec<Service> {
             binding: Binding::AllInterfaces,
             process: None,
             pid: None,
+        },
+        Service {
+            port: 9000,
+            protocol: Protocol::Tcp,
+            address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            binding: Binding::AllInterfaces,
+            process: Some("docker-proxy".to_string()),
+            pid: Some(3117),
         },
         Service {
             port: 22,
@@ -121,6 +149,45 @@ fn fixture_services() -> Vec<Service> {
             binding: Binding::LoopbackOnly,
             process: None,
             pid: None,
+        },
+    ]
+}
+
+/// One published container port, matching the `docker-proxy · 9000` service
+/// in [`fixture_services`] so the marker and the published address have a
+/// real row to land on. Invented, like everything else here; the shape is
+/// what `porthole_core::docker::parse_docker_chain` produces for a
+/// `-p 0.0.0.0:9000:80` publish.
+fn fixture_docker() -> Vec<Published> {
+    vec![Published {
+        host_addr: None,
+        host_port: 9000,
+        protocol: Protocol::Tcp,
+        container_addr: "172.17.0.2".parse().unwrap(),
+        container_port: 80,
+    }]
+}
+
+/// Three saved devices: two that resolve and one that does not, so the
+/// dialog's own unselectable row and its reason are both on screen. The
+/// second name is deliberately long -- a device name is whatever a person
+/// typed into `devices.toml`, and this is where a layout that cannot take
+/// one shows itself.
+fn fixture_devices() -> Vec<DeviceEntry> {
+    vec![
+        DeviceEntry {
+            name: "phone".to_string(),
+            resolved: Ok("10.10.10.245".parse().unwrap()),
+        },
+        DeviceEntry {
+            name: "living room television (the big one)".to_string(),
+            resolved: Ok("10.10.10.31".parse().unwrap()),
+        },
+        DeviceEntry {
+            name: "laptop".to_string(),
+            resolved: Err(
+                "`laptop` (bc:24:11:5e:1c:6e) is not on this network right now".to_string(),
+            ),
         },
     ]
 }
@@ -162,6 +229,23 @@ fn pump_main_context() {
     }
 }
 
+/// [`pump_main_context`], but also letting real time pass between rounds.
+///
+/// Presenting an `adw::Dialog` asks the whole window for a fresh layout,
+/// and that one arrives on the frame clock, which non-blocking main-context
+/// iterations alone do not advance: capturing straight after a `present()`
+/// hit GTK's own "Trying to snapshot AdwDialogHost without a current
+/// allocation" and produced no render node at all. Sleeping on this thread
+/// is exactly what a real application must never do, and exactly what this
+/// debug-only flag needs -- there is no user waiting on this main loop.
+fn settle() {
+    for _ in 0..10 {
+        pump_main_context();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    pump_main_context();
+}
+
 /// Renders `win` exactly as GTK is currently displaying it and writes the
 /// result to `path` as a PNG.
 ///
@@ -193,12 +277,46 @@ fn capture(win: &PortholeWindow, path: &Path) -> Result<(), String> {
     // whole.
     let content = AdwApplicationWindowExt::content(&**win)
         .ok_or_else(|| "the window has no content widget to render".to_string())?;
-    let parent = content
+    render_to_png(win, &content, path)
+}
+
+/// [`capture`], but rendering from as high in the window as
+/// `snapshot_child` can reach: the window's own single direct child.
+/// An `adw::Dialog` is presented into a host libadwaita interposes *above*
+/// the content widget [`capture`] renders, so a dialog on screen is
+/// simply not in that snapshot at all; this one contains it.
+///
+/// The climb reads the real widget tree rather than naming the widgets
+/// libadwaita happens to interpose today -- `capture`'s own comment records
+/// one of them (`AdwBreakpointBin`) already changing what `content.parent()`
+/// is.
+fn capture_with_dialogs(win: &PortholeWindow, path: &Path) -> Result<(), String> {
+    let content = AdwApplicationWindowExt::content(&**win)
+        .ok_or_else(|| "the window has no content widget to render".to_string())?;
+    let mut widget: gtk::Widget = content.upcast();
+    loop {
+        let Some(parent) = widget.parent() else { break };
+        // A widget with no parent of its own is the window: stop one step
+        // below it, since `snapshot_child` renders a child *from* its
+        // parent.
+        if parent.parent().is_none() {
+            break;
+        }
+        widget = parent;
+    }
+    render_to_png(win, &widget, path)
+}
+
+/// Renders `widget` from its own real parent and writes the result to
+/// `path`. Split out of [`capture`] so [`capture_with_dialogs`] can render a
+/// different widget the identical way.
+fn render_to_png(win: &PortholeWindow, widget: &gtk::Widget, path: &Path) -> Result<(), String> {
+    let parent = widget
         .parent()
-        .ok_or_else(|| "the content widget has no parent to render it from".to_string())?;
+        .ok_or_else(|| "the widget has no parent to render it from".to_string())?;
 
     let snapshot = gtk::Snapshot::new();
-    parent.snapshot_child(&content, &snapshot);
+    parent.snapshot_child(widget, &snapshot);
     let node = snapshot
         .to_node()
         .ok_or_else(|| "the window produced no render node".to_string())?;
@@ -234,10 +352,11 @@ pub fn run(path: &Path) -> gtk::glib::ExitCode {
         win.open_now().set_rules(&rules);
         win.listening().set_services(&fixture_services());
         win.listening().set_open_ports(&open_ports);
+        win.listening().set_docker_ports(&fixture_docker());
         win.status_bar().set_status(&fixture_status());
 
         // Taller than `PortholeWindow::build`'s own 480x560 default: this
-        // flag's own fixture data -- two "Open now" rows plus five
+        // flag's own fixture data -- two "Open now" rows plus six
         // "Listening" ones, deliberately one of every state those sections
         // can render -- does not fit the ordinary default without the
         // `gtk::ScrolledWindow` around them scrolling, which would leave the
@@ -246,7 +365,7 @@ pub fn run(path: &Path) -> gtk::glib::ExitCode {
         // first `present()`, never after -- see `window.rs`'s own module
         // doc on why a breakpoint (and, the same way, an allocation) only
         // ever reflects a size set before that first `present()`.
-        win.set_default_size(480, 660);
+        win.set_default_size(480, 700);
         win.present();
         pump_main_context();
 
@@ -256,6 +375,123 @@ pub fn run(path: &Path) -> gtk::glib::ExitCode {
                 outcome_for_activate.set(gtk::glib::ExitCode::SUCCESS);
             }
             Err(message) => eprintln!("porthole-gui: --screenshot failed: {message}"),
+        }
+        app.quit();
+    });
+
+    app.run_with_args::<&str>(&[]);
+    outcome.get()
+}
+
+/// `<stem>-alert.png` beside `path` -- where [`run_dialog`] writes its
+/// second image. Two images from one flag because the Docker explanation is
+/// a second dialog on top of the first, and a single snapshot can only show
+/// whichever is in front.
+fn alert_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "screenshot".to_string());
+    let extension = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_string())
+        .unwrap_or_else(|| "png".to_string());
+    path.with_file_name(format!("{stem}-alert.{extension}"))
+}
+
+/// `main.rs`'s debug-only `--screenshot-dialog <path>` flag: the same
+/// fixture window as [`run`], with an [`OpenDialog`] presented over it --
+/// saved devices in its target list, and the Docker list that makes its
+/// "Open Anyway" explanation appear. Writes two images: `path` for the
+/// dialog itself, and [`alert_path`] for the Docker explanation on top of
+/// it.
+///
+/// Neither one is `docs/screenshot.png`. This exists so a change to the
+/// dialog can be *looked at*, which is how this project found a truncated
+/// row, a window forced wide by one unwrapped line, and an unmarked "open
+/// to anyone" that no test had caught.
+pub fn run_dialog(path: &Path) -> gtk::glib::ExitCode {
+    let app = adw::Application::builder()
+        .application_id(DIALOG_APP_ID)
+        .build();
+    let path = path.to_path_buf();
+    let outcome = std::rc::Rc::new(std::cell::Cell::new(gtk::glib::ExitCode::FAILURE));
+    let outcome_for_activate = outcome.clone();
+
+    app.connect_activate(move |app| {
+        let win = PortholeWindow::new_without_initial_load(app);
+
+        let rules = fixture_rules();
+        let open_ports: Vec<u16> = rules.iter().map(|r| r.port).collect();
+        win.open_now().set_rules(&rules);
+        win.listening().set_services(&fixture_services());
+        win.listening().set_open_ports(&open_ports);
+        win.listening().set_docker_ports(&fixture_docker());
+        win.status_bar().set_status(&fixture_status());
+
+        // Wider than [`run`]'s own window, on purpose. Measured in the
+        // container while writing this: this dialog asks for 606 px --
+        // with the device list empty, that is, so it is the dialog's own
+        // width, not the saved devices' -- and libadwaita renders it
+        // clipped, warning `AdwFloatingSheet exceeds AdwBreakpointBin
+        // width`, in any window narrower than that. A clipped image is not
+        // something to look at, so this flag's window is big enough to hold
+        // it whole.
+        win.set_default_size(700, 820);
+        win.present();
+        pump_main_context();
+
+        let dialog = OpenDialog::for_port(9000);
+        dialog.set_current_network("10.10.10.0/24".parse().unwrap());
+        dialog.set_devices(&fixture_devices());
+        dialog.set_docker_ports(&fixture_docker());
+        dialog.present(Some(&*win));
+        settle();
+
+        let dialog_ok = match capture_with_dialogs(&win, &path) {
+            Ok(()) => {
+                eprintln!("porthole-gui: wrote a screenshot to {}", path.display());
+                true
+            }
+            Err(message) => {
+                eprintln!("porthole-gui: --screenshot-dialog failed: {message}");
+                false
+            }
+        };
+
+        // The same alert pressing Open would present, built by the same
+        // function the click handler calls -- not a lookalike assembled
+        // here.
+        let alert_ok = match dialog.docker_alert() {
+            Some(alert) => {
+                alert.present(Some(&*win));
+                settle();
+                let alert_path = alert_path(&path);
+                match capture_with_dialogs(&win, &alert_path) {
+                    Ok(()) => {
+                        eprintln!(
+                            "porthole-gui: wrote a screenshot to {}",
+                            alert_path.display()
+                        );
+                        true
+                    }
+                    Err(message) => {
+                        eprintln!("porthole-gui: --screenshot-dialog failed: {message}");
+                        false
+                    }
+                }
+            }
+            None => {
+                eprintln!(
+                    "porthole-gui: --screenshot-dialog: the fixture produced no Docker \
+                     explanation to render"
+                );
+                false
+            }
+        };
+
+        if dialog_ok && alert_ok {
+            outcome_for_activate.set(gtk::glib::ExitCode::SUCCESS);
         }
         app.quit();
     });
@@ -304,6 +540,38 @@ mod tests {
         assert!(services
             .iter()
             .any(|s| matches!(s.binding, Binding::BeyondReach(_))));
+    }
+
+    #[test]
+    fn the_docker_fixture_names_a_port_one_of_the_fixture_services_listens_on() {
+        // Otherwise the marker has nothing to land on and the image proves
+        // nothing about it.
+        let ports: Vec<u16> = fixture_services().iter().map(|s| s.port).collect();
+        for published in fixture_docker() {
+            assert!(
+                ports.contains(&published.host_port),
+                "no fixture service listens on {}",
+                published.host_port
+            );
+        }
+    }
+
+    #[test]
+    fn the_device_fixture_has_one_that_does_not_resolve_and_one_long_name() {
+        let devices = fixture_devices();
+        assert!(devices.iter().any(|d| d.resolved.is_err()));
+        assert!(
+            devices.iter().any(|d| d.name.len() > 30),
+            "a long device name is the case this fixture exists to show"
+        );
+    }
+
+    #[test]
+    fn the_alert_image_sits_beside_the_dialog_image() {
+        assert_eq!(
+            alert_path(Path::new("/tmp/dialog.png")),
+            PathBuf::from("/tmp/dialog-alert.png")
+        );
     }
 
     #[test]

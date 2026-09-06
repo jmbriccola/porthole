@@ -24,9 +24,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::rc::Rc;
 
 use adw::prelude::*;
+use porthole_core::docker::Published;
 use porthole_core::listening::{Binding, Service};
 use porthole_core::model::Protocol;
-use porthole_gui::listening_section::ListeningSection;
+use porthole_gui::listening_section::{ListeningSection, DOCKER_UNKNOWN_NOTE};
 
 /// Identical in shape to `tests/window.rs` and `tests/open_now.rs`'s own
 /// `activate` helper: runs `f` inside a real `adw::Application` activation,
@@ -632,13 +633,137 @@ fn the_loading_state_survives_a_set_open_ports_before_any_scan() -> Result<(), S
     Ok(())
 }
 
+fn published(port: u16, host_addr: Option<&str>) -> Published {
+    Published {
+        host_addr: host_addr.map(|a| a.parse().unwrap()),
+        host_port: port,
+        protocol: Protocol::Tcp,
+        container_addr: "172.17.0.2".parse().unwrap(),
+        container_port: 80,
+    }
+}
+
+/// The marker and the address, on the one row Docker's own list names --
+/// and on no other row, and no group-level caveat once the list has
+/// actually arrived.
+fn a_docker_published_row_carries_its_marker_and_address() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningDocker",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_services(&[
+                svc(8080, Some("docker-proxy"), Binding::AllInterfaces),
+                svc(4000, Some("node"), Binding::AllInterfaces),
+            ]);
+            section.set_docker_ports(&[published(8080, None)]);
+            let rows = section.rows();
+            let index = rows
+                .iter()
+                .position(|r| r.title().contains("8080"))
+                .expect("the 8080 row must exist");
+            let other = 1 - index;
+            *seen.borrow_mut() = Some((
+                rows[index].subtitle().map(|s| s.to_string()),
+                section.is_marked_docker(index),
+                section.is_marked_docker(other),
+                section.group_description(),
+            ));
+        },
+    );
+    let (subtitle, marked, other_marked, description) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    let subtitle = subtitle.ok_or("the row must have a subtitle")?;
+    if !subtitle.contains("docker: published on every interface") {
+        return Err(format!("expected the published address, got: {subtitle}"));
+    }
+    if !marked {
+        return Err("a published row must carry the marker".to_string());
+    }
+    if other_marked {
+        return Err("a row Docker does not publish must carry no marker".to_string());
+    }
+    if description.is_some() {
+        return Err(format!(
+            "a checked list needs no caveat, got: {description:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn a_row_published_on_one_address_names_that_address() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningDockerLoopback",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_services(&[svc(5432, Some("docker-proxy"), Binding::LoopbackOnly)]);
+            section.set_docker_ports(&[published(5432, Some("127.0.0.1"))]);
+            *seen.borrow_mut() = Some(section.rows()[0].subtitle().map(|s| s.to_string()));
+        },
+    );
+    let subtitle = result
+        .borrow_mut()
+        .take()
+        .ok_or("activation never ran")?
+        .ok_or("the row must have a subtitle")?;
+    if !subtitle.contains("docker: published on 127.0.0.1") {
+        return Err(format!("expected the published address, got: {subtitle}"));
+    }
+    Ok(())
+}
+
+/// "Not published" and "not checked" both leave a row unmarked, so the
+/// difference has to be said somewhere else -- once, under the group's
+/// title. Without it, an unchecked list would read as a checked one that
+/// found nothing.
+fn an_unchecked_docker_list_says_so_under_the_group() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningDockerUnknown",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_services(&[svc(8080, Some("node"), Binding::AllInterfaces)]);
+            let before = section.group_description();
+
+            section.set_docker_ports(&[published(8080, None)]);
+            let checked = (section.group_description(), section.is_marked_docker(0));
+
+            section.set_docker_unknown();
+            let after = (section.group_description(), section.is_marked_docker(0));
+
+            *seen.borrow_mut() = Some((before, checked, after));
+        },
+    );
+    let (before, checked, after) = result.borrow_mut().take().ok_or("activation never ran")?;
+    if before.as_deref() != Some(DOCKER_UNKNOWN_NOTE) {
+        return Err(format!(
+            "a section nobody has told about Docker must say so, got {before:?}"
+        ));
+    }
+    if checked.0.is_some() || !checked.1 {
+        return Err(format!(
+            "a checked list must mark and not caveat: {checked:?}"
+        ));
+    }
+    if after.0.as_deref() != Some(DOCKER_UNKNOWN_NOTE) || after.1 {
+        return Err(format!(
+            "losing the list must drop the marker and restore the caveat: {after:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below -- see `tests/window.rs`'s own
 /// `Case` alias for why this is a type alias rather than spelled out
 /// inline.
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 15] = [
+    let cases: [Case; 18] = [
         (
             "a_service_shows_its_name_and_port_the_way_the_spec_writes_it",
             a_service_shows_its_name_and_port_the_way_the_spec_writes_it,
@@ -698,6 +823,18 @@ fn main() {
         (
             "the_loading_state_survives_a_set_open_ports_before_any_scan",
             the_loading_state_survives_a_set_open_ports_before_any_scan,
+        ),
+        (
+            "a_docker_published_row_carries_its_marker_and_address",
+            a_docker_published_row_carries_its_marker_and_address,
+        ),
+        (
+            "a_row_published_on_one_address_names_that_address",
+            a_row_published_on_one_address_names_that_address,
+        ),
+        (
+            "an_unchecked_docker_list_says_so_under_the_group",
+            an_unchecked_docker_list_says_so_under_the_group,
         ),
     ];
 
