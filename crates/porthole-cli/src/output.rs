@@ -355,6 +355,7 @@ fn binding_tag(binding: &Binding) -> &'static str {
         Binding::LoopbackOnly => "loopback_only",
         Binding::AllInterfaces => "all_interfaces",
         Binding::Specific(_) => "specific",
+        Binding::BeyondReach(_) => "beyond_reach",
     }
 }
 
@@ -376,23 +377,44 @@ pub fn json_listening(services: &[Service]) -> Value {
     })
 }
 
-/// `porthole listen` for a person. Loopback-only rows are pulled into their
-/// own labelled group rather than mixed in with an "open" affordance next to
-/// every row alike: on an ordinary desktop they are usually the majority of
-/// the list (see `milestone-4-verified-facts.md`), and opening the firewall
-/// for one of them changes nothing, since the process is not listening on a
-/// network interface at all.
+/// `porthole listen` for a person. Grouped into up to three labelled
+/// sections rather than one flat list with a per-row "open" affordance:
+///
+/// - network-facing rows (`AllInterfaces`/`Specific`), unlabelled, at the
+///   top — these are the actionable ones, worth `porthole open`ing.
+/// - `BeyondReach` rows, if any: reachable over IPv6, but porthole manages
+///   IPv4 rules only and cannot open or close a rule for them. This is
+///   deliberately **not** worded as "changes nothing" -- unlike loopback-only,
+///   these sockets are exposed to the network; porthole is simply blind to
+///   that exposure. Conflating the two headings would be exactly the
+///   understated-risk bug `Binding::BeyondReach`'s own doc comment guards
+///   against.
+/// - `LoopbackOnly` rows, labelled plainly: on an ordinary desktop these are
+///   usually the majority of the list (see `milestone-4-verified-facts.md`),
+///   and opening the firewall for one of them genuinely changes nothing,
+///   since the process is not listening on a network interface at all.
 pub fn print_listening(services: &[Service]) {
-    println!("Listening on this machine");
-    println!();
+    print!("{}", render_listening(services));
+}
+
+/// The text `print_listening` prints, built as a `String` rather than
+/// printed line-by-line so tests can assert on it directly -- see the
+/// `BeyondReach` tests below, which check a *property* of this text (it must
+/// never claim the service is unreachable), not a literal sentence.
+fn render_listening(services: &[Service]) -> String {
+    use std::fmt::Write as _;
+    let w = "writing to a String cannot fail";
+    let mut out = String::new();
+    writeln!(out, "Listening on this machine").expect(w);
+    writeln!(out).expect(w);
 
     if services.is_empty() {
-        println!("Nothing is listening.");
-        return;
+        writeln!(out, "Nothing is listening.").expect(w);
+        return out;
     }
 
-    // One set of column widths across both groups, so the two lists still
-    // read as one table rather than two differently-aligned ones.
+    // One set of column widths across every group, so the lists still read
+    // as one table rather than several differently-aligned ones.
     let port_width = services
         .iter()
         .map(|s| format!("{}/{}", s.port, s.protocol).len())
@@ -404,21 +426,56 @@ pub fn print_listening(services: &[Service]) {
         .max()
         .unwrap_or(0);
 
-    let (loopback, network_facing): (Vec<&Service>, Vec<&Service>) = services
+    let network_facing: Vec<&Service> = services
         .iter()
-        .partition(|s| s.binding == Binding::LoopbackOnly);
+        .filter(|s| matches!(s.binding, Binding::AllInterfaces | Binding::Specific(_)))
+        .collect();
+    let beyond_reach: Vec<&Service> = services
+        .iter()
+        .filter(|s| matches!(s.binding, Binding::BeyondReach(_)))
+        .collect();
+    let loopback: Vec<&Service> = services
+        .iter()
+        .filter(|s| s.binding == Binding::LoopbackOnly)
+        .collect();
 
-    print_listening_rows(&network_facing, port_width, name_width);
-    if !loopback.is_empty() {
+    append_listening_rows(&mut out, &network_facing, port_width, name_width);
+
+    if !beyond_reach.is_empty() {
         if !network_facing.is_empty() {
-            println!();
+            writeln!(out).expect(w);
         }
-        println!("Loopback only — opening the firewall for these changes nothing:");
-        print_listening_rows(&loopback, port_width, name_width);
+        writeln!(
+            out,
+            "Reachable over IPv6 — porthole manages IPv4 firewall rules only and cannot \
+             open or close these:"
+        )
+        .expect(w);
+        append_listening_rows(&mut out, &beyond_reach, port_width, name_width);
     }
+
+    if !loopback.is_empty() {
+        if !network_facing.is_empty() || !beyond_reach.is_empty() {
+            writeln!(out).expect(w);
+        }
+        writeln!(
+            out,
+            "Loopback only — opening the firewall for these changes nothing:"
+        )
+        .expect(w);
+        append_listening_rows(&mut out, &loopback, port_width, name_width);
+    }
+
+    out
 }
 
-fn print_listening_rows(services: &[&Service], port_width: usize, name_width: usize) {
+fn append_listening_rows(
+    out: &mut String,
+    services: &[&Service],
+    port_width: usize,
+    name_width: usize,
+) {
+    use std::fmt::Write as _;
     for service in services {
         let port_proto = format!("{}/{}", service.port, service.protocol);
         let process = service.process.as_deref().unwrap_or("—").to_string();
@@ -426,7 +483,11 @@ fn print_listening_rows(services: &[&Service], port_width: usize, name_width: us
             .pid
             .map(|p| p.to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        println!("  {port_proto:port_width$}  {process:name_width$}  pid {pid}");
+        writeln!(
+            out,
+            "  {port_proto:port_width$}  {process:name_width$}  pid {pid}"
+        )
+        .expect("writing to a String cannot fail");
     }
 }
 
@@ -754,6 +815,7 @@ mod tests {
             Binding::LoopbackOnly => IpAddr::V4(Ipv4Addr::LOCALHOST),
             Binding::AllInterfaces => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             Binding::Specific(a) => IpAddr::V4(a),
+            Binding::BeyondReach(a) => IpAddr::V6(a),
         };
         Service {
             port,
@@ -812,5 +874,56 @@ mod tests {
     fn the_empty_listening_list_is_an_empty_array_not_a_missing_key() {
         let json = json_listening(&[]);
         assert_eq!(json["services"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_beyond_reach_binding_reports_its_own_tag_and_address() {
+        let services = vec![service(
+            9999,
+            Binding::BeyondReach("2001:db8::1".parse().unwrap()),
+            None,
+            None,
+        )];
+        let json = json_listening(&services);
+        assert_eq!(json["services"][0]["binding"], "beyond_reach");
+        assert_eq!(json["services"][0]["address"], "2001:db8::1");
+    }
+
+    #[test]
+    fn a_beyond_reach_row_never_reads_as_unreachable_from_the_network() {
+        // The bug this guards against: an earlier version of this renderer
+        // (inherited from classify_v6's own earlier bug) would have put this
+        // row under the loopback heading, or worded a heading for it the
+        // same way -- both claim "porthole cannot help" *because the socket
+        // is not reachable from the network*, which is false here: this
+        // address is reachable over IPv6, and porthole simply cannot open or
+        // close a rule for it. Assert the property (neither false claim
+        // appears), not today's exact sentence, so a future rewording cannot
+        // quietly reintroduce either one.
+        let services = vec![service(
+            9999,
+            Binding::BeyondReach("2001:db8::1".parse().unwrap()),
+            None,
+            None,
+        )];
+        let text = render_listening(&services);
+        let lower = text.to_lowercase();
+        assert!(
+            !lower.contains("changes nothing"),
+            "must not claim opening the firewall is a no-op for an exposed service: {text}"
+        );
+        assert!(
+            !lower.contains("only this machine"),
+            "must not claim this listener is unreachable from the network: {text}"
+        );
+    }
+
+    #[test]
+    fn a_loopback_row_still_says_the_firewall_change_is_a_no_op() {
+        // The other half of the same guard: fixing BeyondReach must not
+        // water down the (true, for loopback) claim this heading makes.
+        let services = vec![service(53, Binding::LoopbackOnly, None, None)];
+        let text = render_listening(&services);
+        assert!(text.contains("Loopback only — opening the firewall for these changes nothing:"));
     }
 }

@@ -193,6 +193,14 @@ whatever firewall created it.
       "binding": "loopback_only",
       "process": "code",
       "pid": 9816
+    },
+    {
+      "port": 8443,
+      "protocol": "tcp",
+      "address": "2001:db8::1",
+      "binding": "beyond_reach",
+      "process": null,
+      "pid": null
     }
   ]
 }
@@ -205,14 +213,26 @@ files are not read.
 `address` is the literal bound address: `"0.0.0.0"`, `"127.0.0.1"`, `"::"`,
 `"::1"`, or a specific interface address.
 
-`binding` is the derived fact that actually matters: whether opening
-porthole's firewall for this port could change anything.
+`binding` is the derived fact that actually matters: not just whether opening
+porthole's firewall for this port could change anything, but whether the
+service is even reachable from outside this machine in the first place.
 
 | `binding` | meaning |
 |---|---|
-| `"loopback_only"` | bound to `127.0.0.0/8` (or its IPv6 loopback/non-IPv4-reachable equivalent) — only this machine can reach it, and no firewall rule changes that. |
+| `"loopback_only"` | bound to `127.0.0.0/8`, or its IPv6 loopback equivalent (`::1`) — only this machine can reach it, and no firewall rule changes that. |
 | `"all_interfaces"` | bound to `0.0.0.0` or `::` — every interface, including whichever one the local network is reachable through. |
-| `"specific"` | bound to one interface's own address rather than the wildcard — still network-facing. |
+| `"specific"` | bound to one interface's own IPv4 address rather than the wildcard — still network-facing. |
+| `"beyond_reach"` | bound to a genuine IPv6 address — not the wildcard, not loopback, not v4-mapped. This service **is** reachable over IPv6, but porthole v1 manages IPv4 rules only and can neither open nor close a firewall rule for it. |
+
+`"loopback_only"` and `"beyond_reach"` both mean "porthole cannot act on
+this port", but for opposite reasons a script or a person must not conflate:
+a loopback-only service is safe — nothing outside this machine can reach it
+regardless of any firewall — while a `beyond_reach` service is exposed to the
+network and porthole is simply blind to it. Reading `beyond_reach` as a
+variant of "safe to ignore" is exactly the false-in-the-dangerous-direction
+mistake this field exists to prevent; a caller that only branches on whether
+`binding` is `"loopback_only"` to decide "nothing to worry about" must treat
+`"beyond_reach"` as its own case, not fold it in.
 
 On an ordinary desktop `loopback_only` is typically the *majority* of the
 list, not an edge case: on the machine this was built and measured on, six of
@@ -223,7 +243,11 @@ for a fix.
 A `::` listener is included as `all_interfaces`, not filtered out for being
 IPv6: on most systems it also accepts IPv4-mapped connections, so it is
 reachable over IPv4 too. porthole itself only ever opens IPv4 rules — see
-`porthole doctor`'s `IPv6` check for that standing caveat.
+`porthole doctor`'s `IPv6` check for that standing caveat, which is exactly
+the caveat that makes `beyond_reach` possible: any service bound to a real
+IPv6 address (not the wildcard, not loopback, not v4-mapped) is outside what
+porthole can see or touch, whether or not it is actually reachable from the
+public internet.
 
 `process` and `pid` are `null` — never the string `"unknown"` — when the
 owning process could not be identified. Resolving a listening socket to a

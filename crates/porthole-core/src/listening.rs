@@ -24,6 +24,15 @@
 //! the process is not listening on a network interface at all — so
 //! [`Binding::LoopbackOnly`] is marked plainly, not folded into a generic
 //! "open" affordance.
+//!
+//! A second distinction matters just as much, in the opposite direction: a
+//! socket bound to a genuine IPv6 address — not the wildcard, not loopback,
+//! not v4-mapped — **is** reachable from the network. Porthole simply cannot
+//! do anything about it, since v1 manages IPv4 rules only. That is a
+//! fundamentally different fact from loopback-only (safe, and nothing to do)
+//! rather than the same one worded differently, so it gets its own variant,
+//! [`Binding::BeyondReach`], rather than being folded into `LoopbackOnly`
+//! because porthole is equally unable to help with either.
 
 use crate::error::{Error, Result};
 use crate::model::Protocol;
@@ -31,18 +40,34 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// How a listening socket is reachable, coarsely — the one fact that decides
-/// whether opening porthole's (IPv4-only) firewall for it can do anything.
+/// whether opening porthole's (IPv4-only) firewall for it can do anything,
+/// and whether it is actually safe to leave alone.
+///
+/// `LoopbackOnly` and `BeyondReach` both mean "porthole cannot help", but for
+/// opposite reasons and with opposite implications for the user: the first
+/// is safe because nothing outside this machine can reach it; the second is
+/// exposed to the network and porthole is simply blind to it. Do not merge
+/// them, reword one to sound like the other, or treat "porthole can't act"
+/// as a stand-in for "this is fine" — see this module's own doc comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Binding {
-    /// Bound to `127.0.0.0/8`. Only processes on this machine can reach it;
-    /// no firewall rule changes that.
+    /// Bound to `127.0.0.0/8`, or its IPv6 loopback equivalent (`::1`). Only
+    /// processes on this machine can reach it; no firewall rule changes
+    /// that.
     LoopbackOnly,
     /// Bound to `0.0.0.0` (or, for a v6 listener, `::`): every interface,
     /// including whichever one the local network is reachable through.
     AllInterfaces,
-    /// Bound to one specific address — an interface's own IP, not the
+    /// Bound to one specific IPv4 address — an interface's own IP, not the
     /// wildcard. Still network-facing, just narrower than `AllInterfaces`.
     Specific(Ipv4Addr),
+    /// Bound to a genuine IPv6 address — not the wildcard, not loopback, not
+    /// v4-mapped. This listener **is** reachable over the network; porthole
+    /// simply cannot open or close a firewall rule for it, since v1 manages
+    /// IPv4 rules only. This is not `LoopbackOnly` worded differently: a
+    /// loopback-only listener is safe from the network, this one is exposed
+    /// to it and porthole cannot affect that exposure either way.
+    BeyondReach(Ipv6Addr),
 }
 
 fn classify_v4(addr: Ipv4Addr) -> Binding {
@@ -74,11 +99,17 @@ fn classify_v6(addr: Ipv6Addr) -> Binding {
         Binding::LoopbackOnly
     } else {
         // A genuine IPv6 address that is neither the wildcard, loopback, nor
-        // v4-mapped: not reachable over IPv4 by any path, and porthole v1
-        // has no IPv6 rule to open for it either. Opening porthole's firewall
-        // changes nothing for this listener either way -- the same practical
-        // fact `LoopbackOnly` exists to flag -- so it is grouped there too.
-        Binding::LoopbackOnly
+        // v4-mapped. It is not reachable over IPv4 -- true -- but it is
+        // reachable over IPv6, by whatever this address's own scope allows
+        // (link-local, unique-local, or a globally routable address if this
+        // one happens to be routable). Porthole cannot open or close a
+        // firewall rule for it either way, since v1 manages IPv4 rules only
+        // -- but that is a statement about porthole's reach, not the
+        // socket's. Folding this into `LoopbackOnly` (as an earlier version
+        // of this function did) would tell the user "only this machine can
+        // reach it" about a socket the network can reach -- false in the
+        // dangerous direction. See `Binding::BeyondReach`.
+        Binding::BeyondReach(addr)
     }
 }
 
@@ -179,7 +210,11 @@ fn listening_rows(text: &str) -> impl Iterator<Item = (&str, &str, u64)> {
     })
 }
 
-fn parse_proc_net_tcp(text: &str) -> Result<Vec<RawListener>> {
+/// Every row this parses is either used or silently skipped (see
+/// `listening_rows`'s own doc comment) -- there is no path through this
+/// function that produces an `Err`, so unlike almost everything else in this
+/// module it returns a plain `Vec`, not a `Result`.
+fn parse_proc_net_tcp(text: &str) -> Vec<RawListener> {
     let mut out = Vec::new();
     for (addr_hex, port_hex, inode) in listening_rows(text) {
         let (Ok(address), Ok(port)) = (parse_hex_addr_v4(addr_hex), parse_hex_port(port_hex))
@@ -193,10 +228,12 @@ fn parse_proc_net_tcp(text: &str) -> Result<Vec<RawListener>> {
             inode,
         });
     }
-    Ok(out)
+    out
 }
 
-fn parse_proc_net_tcp6(text: &str) -> Result<Vec<RawListener>> {
+/// The v6 counterpart of [`parse_proc_net_tcp`]. Same reasoning: no path
+/// here produces an `Err` either.
+fn parse_proc_net_tcp6(text: &str) -> Vec<RawListener> {
     let mut out = Vec::new();
     for (addr_hex, port_hex, inode) in listening_rows(text) {
         let (Ok(address), Ok(port)) = (parse_hex_addr_v6(addr_hex), parse_hex_port(port_hex))
@@ -210,7 +247,7 @@ fn parse_proc_net_tcp6(text: &str) -> Result<Vec<RawListener>> {
             inode,
         });
     }
-    Ok(out)
+    out
 }
 
 /// Everything `scan` needs from `/proc`, seamed out exactly the way
@@ -333,13 +370,11 @@ fn resolve_pids(fs: &dyn ProcFs, raw: &[RawListener]) -> HashMap<u64, (u32, Stri
 /// ever opens IPv4 rules regardless. Omitting a `::` listener here would
 /// hide a real, network-facing service.
 pub fn scan(fs: &dyn ProcFs) -> Result<Vec<Service>> {
-    let mut raw = parse_proc_net_tcp(&fs.net_tcp()?)?;
+    let mut raw = parse_proc_net_tcp(&fs.net_tcp()?);
     // A machine with IPv6 disabled entirely may have no /proc/net/tcp6 at
     // all; that is not a reason to fail a scan that is otherwise fine.
     if let Ok(text6) = fs.net_tcp6() {
-        if let Ok(mut v6) = parse_proc_net_tcp6(&text6) {
-            raw.append(&mut v6);
-        }
+        raw.extend(parse_proc_net_tcp6(&text6));
     }
 
     let resolved = resolve_pids(fs, &raw);
@@ -494,7 +529,7 @@ mod tests {
     fn only_listening_sockets_appear() {
         // st 0A is LISTEN; 01 is ESTABLISHED. An established connection is
         // not a service anyone can open a port for.
-        let found = parse_proc_net_tcp(PROC_NET_TCP).unwrap();
+        let found = parse_proc_net_tcp(PROC_NET_TCP);
         assert_eq!(
             found.len(),
             3,
@@ -504,7 +539,7 @@ mod tests {
 
     #[test]
     fn loopback_only_is_distinguished_from_network_facing() {
-        let found = parse_proc_net_tcp(PROC_NET_TCP).unwrap();
+        let found = parse_proc_net_tcp(PROC_NET_TCP);
         let by_port: std::collections::HashMap<u16, Binding> =
             found.iter().map(|s| (s.port, s.binding)).collect();
         assert_eq!(by_port[&46715], Binding::LoopbackOnly);
@@ -518,7 +553,7 @@ mod tests {
         // hiding it would make the list quietly incomplete -- porthole would
         // report nothing on 53 while something is plainly there. The process
         // name is what is unavailable without privilege, not the socket.
-        let found = parse_proc_net_tcp(PROC_NET_TCP).unwrap();
+        let found = parse_proc_net_tcp(PROC_NET_TCP);
         assert!(found.iter().any(|s| s.port == 53));
     }
 
@@ -580,7 +615,7 @@ mod tests {
         // default `net.ipv6.bindv6only=0`), so it is exactly as
         // network-facing as 0.0.0.0 -- folding it into LoopbackOnly would
         // hide a real, reachable service.
-        let found = parse_proc_net_tcp6(PROC_NET_TCP6).unwrap();
+        let found = parse_proc_net_tcp6(PROC_NET_TCP6);
         let by_port: HashMap<u16, Binding> = found.iter().map(|s| (s.port, s.binding)).collect();
         assert_eq!(by_port[&1716], Binding::AllInterfaces);
         assert_eq!(by_port[&631], Binding::LoopbackOnly);
@@ -623,6 +658,20 @@ mod tests {
         // loopback-only.
         let mapped: Ipv6Addr = "::ffff:127.0.0.1".parse().unwrap();
         assert_eq!(classify_v6(mapped), Binding::LoopbackOnly);
+    }
+
+    #[test]
+    fn a_genuine_global_ipv6_address_is_beyond_reach_not_loopback() {
+        // The bug this guards against: an earlier version of `classify_v6`
+        // folded this case into `LoopbackOnly`, which asserts "only this
+        // machine can reach it" -- false for a socket bound to a real,
+        // routable IPv6 address. 2001:db8::1 is the documentation range
+        // (RFC 3849): never actually assigned, but shaped exactly like a
+        // real global address, which is the point -- porthole cannot tell
+        // it apart from one that truly is reachable from the internet, and
+        // must not pretend otherwise.
+        let global: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert_eq!(classify_v6(global), Binding::BeyondReach(global));
     }
 
     #[test]
