@@ -54,45 +54,52 @@ pub struct Published {
 /// DOCKER`.
 ///
 /// `iptables(8)`'s own DIAGNOSTICS section (this machine's installed man
-/// page, quoted here rather than trusted from memory) gives this function a
-/// way to tell "nothing to find" apart from "could not check" without
-/// matching on locale-dependent error text: "other errors" — an absent
-/// chain, "No chain/target/match by that name", is exactly this case —
-/// "cause an exit code of 1", read here as the ordinary "no containers
-/// publishing anything" outcome, reported exactly the way an
-/// installed-but-empty chain is (an empty `Vec`; the chain persists,
-/// declared but ruleless, for as long as the Docker daemon runs with
-/// nothing published, captured live on this machine as `-N DOCKER` with no
-/// `-A` lines at all, exit 0). "Errors which indicate a resource problem,
-/// such as a busy lock, failing memory allocation or error messages from
-/// kernel cause an exit code of 4" — which this machine's own unprivileged
-/// read of this exact command actually hits, twice, for "Permission denied
-/// (you must be root)" — a real failure to check, not evidence of anything
-/// about Docker, and it propagates as `Err` rather than being folded into
-/// the same "no ports" result: reporting a resource problem as "checked,
-/// and Docker touches nothing here" would be exactly the confident-looking
-/// wrong answer this whole module exists to avoid. Exit `2` (invalid
-/// parameters) and `3` (kernel/userspace incompatibility) are documented as
-/// their own codes too, but this machine's own testing saw a
-/// kernel-incompatibility-sounding message come back as exit `1`, not `3`,
-/// at least once — so, rather than trust the documented convention past
-/// what was actually observed here, only `4` is singled out; everything
-/// else non-zero is read the same permissive way as `1`, the direction that
-/// cannot itself mislead a caller into skipping a real warning.
+/// page, `iptables v1.8.11 (nf_tables)`, quoted here rather than trusted
+/// from memory) assigns exit `2` to invalid or abused command line
+/// parameters, `3` to an incompatibility between kernel and user space, `4`
+/// to a resource problem "such as a busy lock, failing memory allocation or
+/// error messages from kernel", and `1` to "other errors". An absent chain —
+/// "No chain/target/match by that name", the shape of a machine where Docker
+/// has never run — falls in that last, catch-all class.
+///
+/// So exit `1` is the single non-zero status read as "nothing published",
+/// reported exactly the way an installed-but-empty chain is: an empty `Vec`.
+/// (The chain persists, declared but ruleless, for as long as the Docker
+/// daemon runs with nothing published — captured live on this machine as `-N
+/// DOCKER` with no `-A` lines at all, exit 0.)
+///
+/// Every other non-zero status is an `Err` — `2`, `3`, `4`, the `-1`
+/// [`crate::command::RealRunner`] reports for a process killed by a signal,
+/// and any code this function has no name for. The benign set is an
+/// allowlist, not the complement of a denylist of known failures, because
+/// the two differ exactly on the codes nobody anticipated; and for those,
+/// "checked, and Docker touches nothing here" describes a read that did not
+/// happen. That is worse here than a spurious error: a user told porthole
+/// could not check knows to look, while a user told Docker is uninvolved
+/// opens the port believing it.
+///
+/// One gap this does not close: exit `1` stays benign whatever its message
+/// says. This function branches on the status alone, never on
+/// locale-dependent error text, so a genuine failure that exits `1` is still
+/// read as an empty chain.
 pub fn published(runner: &dyn CommandRunner) -> Result<Vec<Published>> {
+    /// The one non-zero exit read as "nothing to find" rather than "could
+    /// not check" — `iptables(8)`'s catch-all, which an absent chain uses.
+    const NO_SUCH_CHAIN: i32 = 1;
+
     let cmd = Command::read("iptables", ["-t", "nat", "-S", "DOCKER"]);
     let out = runner.run(&cmd)?;
     if out.success() {
         return parse_docker_chain(&out.stdout);
     }
-    if out.status == 4 {
-        return Err(Error::CommandFailed {
-            command: cmd.display(),
-            status: out.status,
-            stderr: out.stderr.trim().to_string(),
-        });
+    if out.status == NO_SUCH_CHAIN {
+        return Ok(Vec::new());
     }
-    Ok(Vec::new())
+    Err(Error::CommandFailed {
+        command: cmd.display(),
+        status: out.status,
+        stderr: out.stderr.trim().to_string(),
+    })
 }
 
 /// `iptables -t nat -S DOCKER`, captured live from this machine's own
@@ -435,5 +442,72 @@ mod tests {
         }]);
         let err = published(&runner).unwrap_err();
         assert!(err.to_string().contains("status 4"), "got: {err}");
+    }
+
+    #[test]
+    fn published_propagates_a_kernel_userspace_mismatch_rather_than_reading_it_as_no_docker() {
+        use crate::command::{Output, RecordingRunner};
+        // `iptables(8)` documents exit 3 for "an incompatibility between
+        // kernel and user space" -- the iptables/nftables mismatch porthole's
+        // own README warns about. Not reproduced on this machine: the status
+        // and message below are constructed to the documented shape, and what
+        // this test pins is `published`'s branch on the status, which is the
+        // part that was wrong.
+        //
+        // Reading this as an empty chain would tell a user Docker publishes
+        // nothing on a machine porthole could not read at all, and they would
+        // open the port believing it.
+        let runner = RecordingRunner::with_responses(vec![Output {
+            status: 3,
+            stdout: String::new(),
+            stderr: "iptables v1.8.11 (nf_tables): Incompatible with this kernel".to_string(),
+        }]);
+        let err = published(&runner).unwrap_err();
+        assert!(err.to_string().contains("status 3"), "got: {err}");
+    }
+
+    #[test]
+    fn published_propagates_a_signal_killed_read_rather_than_reading_it_as_no_docker() {
+        use crate::command::{Output, RecordingRunner};
+        // A process killed by a signal has no exit code, and
+        // `command::RealRunner` maps that absence to -1. It is not a status
+        // `iptables(8)` documents at all, which is the point: an allowlist of
+        // benign codes has to reject what it has no name for.
+        let runner = RecordingRunner::with_responses(vec![Output {
+            status: -1,
+            stdout: String::new(),
+            stderr: String::new(),
+        }]);
+        let err = published(&runner).unwrap_err();
+        assert!(err.to_string().contains("status -1"), "got: {err}");
+    }
+
+    #[test]
+    fn published_reads_only_exit_one_as_an_absent_chain() {
+        use crate::command::{Output, RecordingRunner};
+        // The allowlist itself, stated as a test rather than only as prose:
+        // 1 is benign, every other non-zero status this loop tries is an
+        // error. 2, 3 and 4 are `iptables(8)`'s documented codes; -1 is a
+        // signal kill; 5 and 127 stand for codes with no documented meaning
+        // here -- 127 being what a shell reports for a missing binary.
+        for status in [-1, 2, 3, 4, 5, 127] {
+            let runner = RecordingRunner::with_responses(vec![Output {
+                status,
+                stdout: String::new(),
+                stderr: String::new(),
+            }]);
+            assert!(
+                published(&runner).is_err(),
+                "exit {status} must not be read as an absent chain"
+            );
+        }
+
+        let runner = RecordingRunner::with_responses(vec![Output::failure(
+            "iptables: No chain/target/match by that name.",
+        )]);
+        assert!(
+            published(&runner).unwrap().is_empty(),
+            "exit 1 stays benign"
+        );
     }
 }
