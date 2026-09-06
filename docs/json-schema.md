@@ -1,7 +1,13 @@
 # `--json` output
 
-Every command accepts `--json`. The shape is versioned by the top-level
-`schema` field, currently `1`. Fields are added, never renamed or removed.
+Every command accepts `--json`, and every failure honours it — see
+[Errors](#errors). Two commands accept the flag and then ignore it, because
+neither has a result to report: `porthole devices add` is an interactive
+prompt, and `porthole devices rm` confirms in prose. Everything else
+documented below prints one JSON object on stdout.
+
+The shape is versioned by the top-level `schema` field, currently `1`. Fields
+are added, never renamed or removed.
 
 All timestamps are **seconds since the Unix epoch**, as integers. Convert with
 `date -d @1757000000`.
@@ -32,6 +38,12 @@ Used in `list`, `status`, `open` and `close`.
   created this rule. See [docs/backends.md](backends.md) for what each one
   can and cannot do.
 - `expires_at` and `expires_in_seconds` are `null` for an `--until-reboot` rule.
+
+A rule opened with `--to <device name>` is indistinguishable here from one
+opened with `--to <IP>`: both record `scope: "network"` and a `target` of
+`<address>/32`, resolved at the moment of the open. Nothing in a rule records
+which saved device, if any, the request named — see
+[`porthole devices list --json`](#porthole-devices-list---json).
 
 ## `porthole list --json`
 
@@ -161,6 +173,15 @@ never touches them):
   never what was stopping it from being reachable, so opening it here does
   not make it reachable — the fix is in the container's own port binding, not
   in porthole.
+
+`null` is therefore two facts, and `open --json` carries nothing to tell them
+apart: **Docker was asked about and has no rule for this port**, and
+**Docker could not be asked at all**. Reading the `DOCKER` chain needs root,
+so it goes through the privileged helper; a helper that is absent or errors
+leaves `docker_note` at `null` and `open` proceeds regardless, since a missing
+warning is not a reason to refuse to open a port. A script that must not read
+`null` as "no container has this port" checks
+`porthole listen --json`'s `docker_checked` before believing it.
 
 Getting a container port reachable, or closed, when Docker itself has
 published or restricted it is outside what porthole can do — see
@@ -309,7 +330,9 @@ reading anything into a row's `docker: null`, or it cannot tell "checked,
 and Docker does not touch this port" from "not checked at all". When
 `docker_checked` is `true`, a row's `docker` is `{ "published_on": <addr or
 null> }` for a port a container has published, and `null` for one Docker
-does not touch. `published_on` is the address Docker's own rule restricts
+does not touch. A row is matched to a Docker rule on **both** the port and the
+protocol, so a published UDP port leaves a TCP row on the same number at
+`null`. `published_on` is the address Docker's own rule restricts
 the port to — `null` means every interface (no `-d` on the rule, i.e.
 published on `0.0.0.0`), a string like `"127.0.0.1"` means only that address.
 See `porthole open --json`'s own `docker_note` for the two-sentence version
@@ -347,13 +370,33 @@ device to an address before anything crosses the D-Bus boundary.
 
 `kind` is `"mac"` (resolved through the kernel's neighbour table) or `"host"`
 (resolved through the system resolver, e.g. an mDNS `.local` name); `address`
-is the saved MAC or hostname, unchanged. `resolvable` is whether the device
-answers on this network right now -- a saved device is not always present,
-and this is not an error, only a fact: opening `--to` an unresolvable device
+is the saved MAC or hostname, unchanged. `resolvable` is whether porthole can
+turn the saved MAC or hostname into an address right now -- a saved device is
+not always present, and this is not an error, only a fact: opening `--to` an
+unresolvable device
 fails with the `device_unreachable` kind and exit code 6, in the same
 `{code, kind, message}` shape the Errors section below describes for every
 other failure. `resolved_address` is the address it currently resolves to, or
 `null` when it does not resolve right now.
+
+`resolvable` is a live attempt, made once per row while this command runs:
+`ip -4 neigh show` for a `"mac"` device, `getent ahostsv4` for a `"host"` one.
+A MAC the neighbour table shows on two interfaces at once is settled by
+whichever interface currently carries the default route; a MAC on two
+interfaces where neither is that one reports `resolvable: false`, the same as
+a MAC that is not there at all.
+
+Read both values narrowly. `false` means the lookup found nothing here and
+now -- the neighbour table only holds what has spoken to this machine
+recently -- not "no such device". `true` means the lookup produced an
+address, and no more than that: every neighbour entry carrying an `lladdr` is
+accepted whatever its state, `STALE` included, so a device that has just gone
+away still resolves until the kernel drops its entry. Neither value is a
+reachability test, and porthole sends no packet to make one.
+
+A malformed `devices.toml` is a different failure from an unresolvable device
+and does not appear in this shape at all: it exits `2` with the
+`invalid_argument` error object below, naming the offending device.
 
 ## `porthole doctor --json`
 

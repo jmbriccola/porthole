@@ -11,9 +11,10 @@ Until it is, do the steps below by hand.
 
 ## The pieces
 
-Building the workspace (`cargo build --release`) produces the helper binary
-and the CLI; the workspace's own `default-members` leaves the GUI out of that
-command, so it needs its own `cargo build --release -p porthole-gui`, and (see
+Building the workspace (`cargo build --release`) produces the helper binary,
+the CLI and the session agent; the workspace's own `default-members` leaves
+the GUI out of that command, so it needs its own
+`cargo build --release -p porthole-gui`, and (see
 "The GUI", below) GTK4/libadwaita development headers installed first, unlike
 the helper and CLI. This project's own development host has no GTK4 installed
 and builds/tests the GUI only inside the container described in the top-level
@@ -81,6 +82,70 @@ Verify with `porthole doctor`: a fresh install should show `Firewall`, `State`
 and `Network` unaffected by any of this, `Helper` going from "not answering on
 the bus" to "answering", and `polkit` going from "not installed" to naming the
 file that now exists.
+
+## The agent: being told when a port closes
+
+`porthole-agent` is the session half: unprivileged, one per logged-in
+session, no window and no interface of its own. It listens on the system bus
+for the helper's `RuleClosed` signal and shows a desktop notification for the
+closes nobody asked for — an expiry, a network change, and a rule the
+firewall no longer had when porthole next looked — filtered to rules opened by
+that session's own uid. It has nothing to listen to until the helper above is
+installed. It closes nothing and keeps no view of what is open; the one thing
+it can cause is the `Reopen` button on an expiry notification, which re-sends
+an ordinary `open` request to the helper, polkit prompt and all.
+
+Three files, and one of the three commands below is **not** run as root:
+
+```bash
+sudo install -Dm755 target/release/porthole-agent \
+  /usr/local/bin/porthole-agent
+sudo install -Dm644 data/porthole-agent.service \
+  /usr/lib/systemd/user/porthole-agent.service
+sudo install -Dm644 data/porthole-agent.desktop \
+  /etc/xdg/autostart/porthole-agent.desktop
+
+# As your own user, not root: a user unit is enabled per account, and the
+# agent that matters is the one running as the person who opened the port.
+systemctl --user daemon-reload
+systemctl --user enable --now porthole-agent.service
+```
+
+`/usr/local/bin/porthole-agent` is the path the unit's `ExecStart=` names
+literally; a packaged install that puts the binary in `/usr/bin` has to change
+that line. The autostart entry needs no such edit — a desktop entry's `Exec=`
+is looked up on `$PATH`.
+
+**Both start files, on purpose.** Desktops differ in which of the two they
+honour, and there is no way to tell from here which yours does. A desktop
+that honours only one starts one agent; a desktop that honours both starts a
+second, which finds the session bus name
+`com.jacopobriccola.PortholeAgent` already taken, says so in the journal and
+exits — so installing both does not announce every close twice. If you know
+your desktop starts XDG autostart entries and not user units, the
+`systemctl --user enable` above is redundant rather than wrong.
+
+`WantedBy=graphical-session.target` is what starts the unit, so whether
+`enable` alone is enough depends on your desktop actually reaching that
+target (GNOME does). `--now` above sidesteps the question for the session you
+are in. `PartOf=graphical-session.target` stops it again with the session:
+this exists to put a notification on a screen, and after the session there is
+no screen. There is deliberately no `Restart=` — every reason this binary
+stops is one a restart would meet again immediately, and the one failure it
+must survive (a session with no notification service) it survives by carrying
+on rather than by exiting.
+
+Verify:
+
+```bash
+systemctl --user status porthole-agent.service
+journalctl --user -u porthole-agent.service -n 20
+```
+
+Expect `porthole-agent: listening for uid <your uid>`. For an end-to-end
+check, `porthole open 5173 --for 70s` and wait: the notification appears when
+the expiry timer closes the port, and the journal above records either the
+notification the agent sent or the reason it could not show one.
 
 ## The GUI: making it appear in the app grid
 
