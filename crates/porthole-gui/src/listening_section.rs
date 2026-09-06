@@ -63,6 +63,23 @@
 //! ready for a future variant or flag -- this section does not stub a fake
 //! "not a container" marking now. A marking that is always absent would look
 //! like it works when it does not, which is worse than no marking at all.
+//!
+//! ## A scan failure is not "nothing is listening"
+//!
+//! `set_services` is fed from `porthole_core::listening::scan`, a `/proc`
+//! read that can fail (however rarely on a normal Linux machine). The
+//! calm "Nothing else is listening" state is a confirmed fact this section
+//! earns by being *told* the list is empty, through `set_services(&[])` --
+//! it must not also be what a scan *failure* falls back to, or a caller
+//! choosing not to call `set_services` at all when the scan errors would
+//! silently present "porthole could not check" as "porthole checked and
+//! found nothing", the identical collapse `open_now.rs`'s own module doc
+//! describes. [`ListeningSection::set_scan_failed`] is the distinct state
+//! for it: a fourth widget, [`Inner::error_page`], never the calm one.
+//! [`Inner::loading_page`] is the fifth and last: shown before
+//! `set_services` has ever been called at all, since "nothing is
+//! listening" is equally not a fact this section has earned yet at
+//! construction.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -88,12 +105,20 @@ struct Row {
 
 struct Inner {
     /// What `PortholeWindow` appends into its `content()` box. Holds
-    /// exactly one child at a time: `status_page` when nothing is
-    /// listening, `group` otherwise -- the same shape
-    /// `open_now::Inner::container` uses, for the same reason.
+    /// exactly one child at a time: `loading_page` before `set_services`
+    /// has ever been called, `status_page` when nothing is listening,
+    /// `error_page` when the last scan failed, `group` otherwise -- the
+    /// same shape `open_now::Inner::container` uses, for the same reason.
     container: gtk::Box,
     group: adw::PreferencesGroup,
     status_page: adw::StatusPage,
+    /// A **different** widget from `status_page` -- see this module's own
+    /// doc comment on why a scan failure must never render as "nothing is
+    /// listening".
+    error_page: adw::StatusPage,
+    /// A **different** widget again, shown only before `set_services` has
+    /// ever been called -- see this module's own doc comment.
+    loading_page: adw::StatusPage,
     rows: RefCell<Vec<Row>>,
     /// The last list `set_services` was given. Kept so `set_open_ports`
     /// alone can re-render without a caller having to resupply the service
@@ -187,6 +212,17 @@ fn apply(inner: &Rc<Inner>) {
         inner.group.remove(&row.row);
     }
 
+    // A successful `apply` -- even from an empty list -- means the scan
+    // *did* answer, so any previous "scan failed"/"not scanned yet" state
+    // is stale and must go, the same way `error_page` and `loading_page`
+    // displace `group` and `status_page` in `apply_scan_failed` below.
+    if inner.error_page.parent().is_some() {
+        inner.container.remove(&inner.error_page);
+    }
+    if inner.loading_page.parent().is_some() {
+        inner.container.remove(&inner.loading_page);
+    }
+
     if services.is_empty() {
         if inner.group.parent().is_some() {
             inner.container.remove(&inner.group);
@@ -252,6 +288,36 @@ fn apply(inner: &Rc<Inner>) {
     inner.rows.replace(rows);
 }
 
+/// Replaces whatever `inner.container` was showing with `error_page`,
+/// described by `message` -- [`ListeningSection::set_scan_failed`]'s
+/// state. Clears `services` too (`open_ports` is untouched: it comes from
+/// an entirely different, independent round trip and a scan failure says
+/// nothing about whether it is stale), so a later `set_open_ports` alone
+/// cannot resurrect a stale row list out from under this failure -- it
+/// still needs a fresh `set_services` to get back to `group` or
+/// `status_page` at all.
+fn apply_scan_failed(inner: &Rc<Inner>, message: &str) {
+    inner.services.replace(Vec::new());
+    for row in inner.rows.replace(Vec::new()) {
+        inner.group.remove(&row.row);
+    }
+
+    if inner.group.parent().is_some() {
+        inner.container.remove(&inner.group);
+    }
+    if inner.status_page.parent().is_some() {
+        inner.container.remove(&inner.status_page);
+    }
+    if inner.loading_page.parent().is_some() {
+        inner.container.remove(&inner.loading_page);
+    }
+
+    inner.error_page.set_description(Some(message));
+    if inner.error_page.parent().is_none() {
+        inner.container.append(&inner.error_page);
+    }
+}
+
 /// The lower section of the main window: services running on this machine
 /// that are not open to the network, each offering an Open button only when
 /// pressing it could actually change something.
@@ -279,15 +345,35 @@ impl ListeningSection {
             .icon_name("network-server-symbolic")
             .build();
 
+        // A scan failure is a different fact from a confirmed-empty scan --
+        // see this module's own doc comment. Same shape as
+        // `open_now::Inner::error_page`: an icon and CSS class absent from
+        // the calm page above.
+        let error_page = adw::StatusPage::builder()
+            .title("Could not check what's listening")
+            .icon_name("dialog-error-symbolic")
+            .css_classes(["error"])
+            .build();
+
+        // Shown before `set_services` has ever been called -- see this
+        // module's own doc comment on why the calm page must not be the
+        // default. Neutral: no error/warning styling.
+        let loading_page = adw::StatusPage::builder()
+            .title("Checking what's listening…")
+            .icon_name("content-loading-symbolic")
+            .build();
+
         let container = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .build();
-        container.append(&status_page);
+        container.append(&loading_page);
 
         let inner = Rc::new(Inner {
             container,
             group,
             status_page,
+            error_page,
+            loading_page,
             rows: RefCell::new(Vec::new()),
             services: RefCell::new(Vec::new()),
             open_ports: RefCell::new(HashSet::new()),
@@ -320,11 +406,43 @@ impl ListeningSection {
         apply(&self.inner);
     }
 
+    /// The state for a `/proc` scan that failed outright -- see this
+    /// module's own doc comment for why this must not fall back to the
+    /// calm "Nothing else is listening" page. `message` is the scan's own
+    /// error, verbatim.
+    pub fn set_scan_failed(&self, message: &str) {
+        apply_scan_failed(&self.inner, message);
+    }
+
     /// `Some` only while there is nothing to list -- once there is a row,
-    /// this section shows rows, not the status page.
+    /// the last scan failed ([`ListeningSection::error_page`]), or no scan
+    /// has run yet ([`ListeningSection::loading_page`]), this section
+    /// shows something else instead.
     pub fn status_page(&self) -> Option<adw::StatusPage> {
         if self.inner.status_page.parent().is_some() {
             Some(self.inner.status_page.clone())
+        } else {
+            None
+        }
+    }
+
+    /// `Some` only while [`ListeningSection::set_scan_failed`]'s state is
+    /// showing -- a real, distinct widget from
+    /// [`ListeningSection::status_page`], never both at once.
+    pub fn error_page(&self) -> Option<adw::StatusPage> {
+        if self.inner.error_page.parent().is_some() {
+            Some(self.inner.error_page.clone())
+        } else {
+            None
+        }
+    }
+
+    /// `Some` only before `set_services` has ever been called -- the very
+    /// first widget a freshly constructed section shows, and gone for good
+    /// the moment `set_services` or `set_scan_failed` is called even once.
+    pub fn loading_page(&self) -> Option<adw::StatusPage> {
+        if self.inner.loading_page.parent().is_some() {
+            Some(self.inner.loading_page.clone())
         } else {
             None
         }

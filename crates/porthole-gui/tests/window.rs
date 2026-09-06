@@ -304,26 +304,61 @@ fn every_action_is_reachable_from_the_keyboard() -> Result<(), String> {
     Ok(())
 }
 
-/// `AdwBreakpoint` is a spec requirement and a missing one fails silently:
-/// the window simply becomes cramped, which no test notices unless it
-/// asks. `the_window_is_usable_at_a_narrow_width` above already proves the
-/// stronger, end-to-end version of this (a real window, really laid out,
-/// really narrow); this is the same property read structurally, through
-/// `has_breakpoint_below`, without presenting anything.
-fn a_narrow_window_keeps_every_row_readable() -> Result<(), String> {
-    let result = Rc::new(Cell::new(false));
+/// `AdwBreakpoint` is a spec requirement, and a registered breakpoint with
+/// no `Breakpoint::add_setter`/`add_setters` attached activates and
+/// changes nothing -- the window simply becomes cramped, which no test
+/// notices unless it asks something a bare `current_breakpoint()` check
+/// cannot answer: not just "did the breakpoint apply" (already proven by
+/// `the_window_is_usable_at_a_narrow_width` above) but "did applying it
+/// actually change the layout". This presents a real, really narrow window
+/// -- the same sequence that test uses -- and reads back `content`'s own,
+/// real margin, which `PortholeWindow::new` registers a setter to shrink
+/// while the breakpoint matches.
+fn a_narrow_window_shrinks_its_margins_so_every_row_stays_readable() -> Result<(), String> {
+    let result = Rc::new(Cell::new(None));
     let seen = result.clone();
     activate(
-        "com.jacopobriccola.Porthole.Test.BreakpointAccessor",
+        "com.jacopobriccola.Porthole.Test.BreakpointMargins",
         move |app| {
             let win = PortholeWindow::new(app);
-            seen.set(win.has_breakpoint_below(400.0));
+            win.set_default_size(300, 600); // narrower than the 400px threshold
+            win.present();
+            pump_main_context();
+            seen.set(Some(win.content().margin_top()));
         },
     );
-    if result.get() {
-        Ok(())
-    } else {
-        Err("no registered breakpoint applies at or below 400px".to_string())
+    match result.get() {
+        Some(12) => Ok(()),
+        Some(other) => Err(format!(
+            "expected the narrow-width margin (12px) to have applied, got {other}px -- either \
+             the breakpoint did not match or its setter did not run"
+        )),
+        None => Err("activation never ran".to_string()),
+    }
+}
+
+/// The other half: at the window's ordinary width, `content`'s margin must
+/// stay at its ordinary 24px -- without this, the test above could not
+/// tell a margin that is genuinely conditional on the breakpoint apart
+/// from one simply set to 12px unconditionally at construction.
+fn an_ordinary_width_window_keeps_its_ordinary_margins() -> Result<(), String> {
+    let result = Rc::new(Cell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.BreakpointMarginsControl",
+        move |app| {
+            let win = PortholeWindow::new(app);
+            win.present();
+            pump_main_context();
+            seen.set(Some(win.content().margin_top()));
+        },
+    );
+    match result.get() {
+        Some(24) => Ok(()),
+        Some(other) => Err(format!(
+            "expected the ordinary 24px margin at ordinary width, got {other}px"
+        )),
+        None => Err("activation never ran".to_string()),
     }
 }
 
@@ -412,7 +447,7 @@ fn main() {
     // A plain array, not `vec![]`: the list is fixed at compile time and
     // never grows, so there is nothing a `Vec` buys here, independently of
     // what clippy does or does not flag.
-    let cases: [Case; 9] = [
+    let cases: [Case; 10] = [
         (
             "the_window_is_actually_realized_not_merely_constructed",
             the_window_is_actually_realized_not_merely_constructed,
@@ -442,8 +477,12 @@ fn main() {
             every_action_is_reachable_from_the_keyboard,
         ),
         (
-            "a_narrow_window_keeps_every_row_readable",
-            a_narrow_window_keeps_every_row_readable,
+            "a_narrow_window_shrinks_its_margins_so_every_row_stays_readable",
+            a_narrow_window_shrinks_its_margins_so_every_row_stays_readable,
+        ),
+        (
+            "an_ordinary_width_window_keeps_its_ordinary_margins",
+            an_ordinary_width_window_keeps_its_ordinary_margins,
         ),
         (
             "a_construction_with_an_unreachable_helper_does_not_show_the_calm_empty_state",

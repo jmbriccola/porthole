@@ -355,13 +355,92 @@ fn an_unreachable_helper_does_not_render_as_the_calm_empty_state() -> Result<(),
     Ok(())
 }
 
+/// I5: before any of `set_rules`/`set_unreachable`/`set_refused` has ever
+/// been called, this section must not be sitting on the calm "No ports
+/// open" claim -- a fresh `OpenNowSection` has not earned the right to
+/// state that, and a zbus proxy carries no default per-call timeout to
+/// bound how long "brief" would actually be against a hung helper.
+fn the_initial_state_before_any_answer_is_neither_calm_nor_populated() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenNowLoading",
+        move |_app| {
+            let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
+            *seen.borrow_mut() = Some((
+                section.loading_page().is_some(),
+                section.status_page().is_some(),
+                section.error_page().is_some(),
+                section.rows().is_empty(),
+            ));
+        },
+    );
+    let (loading, calm, error, rows_empty) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if !loading {
+        return Err("a freshly constructed section must show its loading state".to_string());
+    }
+    if calm {
+        return Err(
+            "\"No ports open\" must not be the default before anything has been asked".to_string(),
+        );
+    }
+    if error {
+        return Err("there is no failure to report yet either".to_string());
+    }
+    if !rows_empty {
+        return Err("there must be no rows before any data has arrived".to_string());
+    }
+    Ok(())
+}
+
+/// I2: a helper that answered but refused a request is a different fact
+/// from one that could not be reached at all, and must not share its
+/// wording -- the same distinction `status_bar.rs`'s own pinned test
+/// checks, proven here on the real widget this section actually shows.
+fn a_refused_request_reads_differently_from_an_unreachable_helper() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenNowRefused",
+        move |_app| {
+            let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
+            section.set_refused("not authorized: com.jacopobriccola.Porthole.List");
+            let page = section.error_page();
+            let title = page.as_ref().map(|p| p.title().to_string());
+            let description = page
+                .as_ref()
+                .and_then(|p| p.description())
+                .map(|s| s.to_string());
+            *seen.borrow_mut() = Some((title, description));
+        },
+    );
+    let (title, description) = result.borrow_mut().take().ok_or("activation never ran")?;
+    let title = title.ok_or("a refused request must render the error page")?;
+    if title.to_lowercase().contains("unreachable") {
+        return Err(format!(
+            "a refused request must not be titled as if the helper could not be reached: \
+             {title:?}"
+        ));
+    }
+    match description.as_deref() {
+        Some(d) if d.contains("not authorized") => {}
+        other => {
+            return Err(format!(
+                "the helper's own refusal must survive verbatim: {other:?}"
+            ))
+        }
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below -- see `tests/window.rs`'s own
 /// `Case` alias for why this is a type alias rather than spelled out
 /// inline (the clippy finding that alias itself fixed there).
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 6] = [
+    let cases: [Case; 8] = [
         (
             "an_empty_list_is_a_calm_status_page_not_an_error",
             an_empty_list_is_a_calm_status_page_not_an_error,
@@ -385,6 +464,14 @@ fn main() {
         (
             "an_unreachable_helper_does_not_render_as_the_calm_empty_state",
             an_unreachable_helper_does_not_render_as_the_calm_empty_state,
+        ),
+        (
+            "the_initial_state_before_any_answer_is_neither_calm_nor_populated",
+            the_initial_state_before_any_answer_is_neither_calm_nor_populated,
+        ),
+        (
+            "a_refused_request_reads_differently_from_an_unreachable_helper",
+            a_refused_request_reads_differently_from_an_unreachable_helper,
         ),
     ];
 

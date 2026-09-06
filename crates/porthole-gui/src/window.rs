@@ -41,10 +41,13 @@
 //! header bar's own "Open a port" button and every "Listening" row's
 //! pre-filled one, through `present_open_dialog`.
 //!
-//! Neither read blocks the UI thread, and a failure to reach the helper is
-//! not rendered as an empty list -- see `refresh`'s own doc comment,
-//! `open_now.rs`'s and `status_bar.rs`'s module docs for why conflating
-//! those two facts is this project's characteristic defect.
+//! Neither read blocks the UI thread, and the helper round trip is bounded
+//! by [`HELPER_TIMEOUT`] (zbus proxies carry no default one of their own).
+//! No answer at all, a refused request, and a confirmed empty list are
+//! three different facts and render as three different things -- see
+//! `refresh`'s own doc comment, `open_now.rs`'s and `status_bar.rs`'s
+//! module docs for why conflating any pair of them is this project's
+//! characteristic defect.
 
 use std::ops::Deref;
 
@@ -66,6 +69,13 @@ use crate::status_bar::StatusBar;
 /// breakpoint exists, is registered on a real window, and genuinely applies
 /// once that window is narrow.
 const NARROW_WIDTH_PX: f64 = 400.0;
+
+/// `content`'s own margin, in CSS pixels, while the window is narrow --
+/// down from the ordinary 24px set at construction. Applied through
+/// `Breakpoint::add_setters` in [`PortholeWindow::new`]; libadwaita
+/// restores the original 24px on its own once the breakpoint stops
+/// matching.
+const NARROW_MARGIN_PX: i32 = 12;
 
 pub struct PortholeWindow {
     window: adw::ApplicationWindow,
@@ -148,6 +158,20 @@ impl PortholeWindow {
             adw::LengthUnit::Px,
         );
         let breakpoint = adw::Breakpoint::new(condition);
+        // The layout change this task attaches: `content`'s own margins
+        // shrink from the ordinary 24px down to `NARROW_MARGIN_PX` while
+        // the window is narrow, reclaiming real width for the rows inside
+        // it -- and back to 24px the moment the breakpoint stops matching,
+        // which `add_setters` restores on its own. A registered breakpoint
+        // with no setter activates and changes nothing; earlier drafts of
+        // this task left it exactly that inert, which
+        // `tests/window.rs`'s own margin test now catches.
+        breakpoint.add_setters(&[
+            (&content, "margin-top", NARROW_MARGIN_PX),
+            (&content, "margin-bottom", NARROW_MARGIN_PX),
+            (&content, "margin-start", NARROW_MARGIN_PX),
+            (&content, "margin-end", NARROW_MARGIN_PX),
+        ]);
         // `AdwApplicationWindowExt::add_breakpoint` takes ownership of the
         // `Breakpoint`, but it is a refcounted GObject handle like every
         // other widget here -- cloning keeps a second handle in `self` so
@@ -185,11 +209,15 @@ impl PortholeWindow {
 
         // The initial load this constructor owes -- see this module's own
         // doc comment on the planning defect this task repairs. Both
-        // sections start out showing their own calm "nothing yet" state
-        // (built into `OpenNowSection`/`ListeningSection` themselves) for
-        // the brief span before this resolves; `refresh` runs the same
-        // path a later explicit refresh does, there is no separate
-        // "first load" code.
+        // sections start out showing their own *indeterminate* "not
+        // answered yet" state (built into `OpenNowSection`/
+        // `ListeningSection` themselves, not the calm "nothing open"/
+        // "nothing listening" one -- a zbus proxy carries no default
+        // per-call timeout, so nothing bounds how long that would
+        // otherwise have to stand in for a confirmed fact it has not
+        // earned) until `refresh` resolves; `refresh` runs the same path a
+        // later explicit refresh does, there is no separate "first load"
+        // code.
         refresh(&window, &open_now, &listening, &status_bar);
 
         Self {
@@ -218,28 +246,6 @@ impl PortholeWindow {
     /// that resizes a real window and checks exactly that.
     pub fn breakpoint(&self) -> &adw::Breakpoint {
         &self.breakpoint
-    }
-
-    /// Whether the breakpoint this window registered would apply once the
-    /// window has narrowed to `px` -- reads the real, live
-    /// `BreakpointCondition`'s own string form back from the GObject
-    /// (`adw_breakpoint_condition_to_string`), rather than repeating the
-    /// `NARROW_WIDTH_PX` constant that built it, so a future edit that
-    /// changed the registered breakpoint without changing that constant
-    /// would still be caught here.
-    ///
-    /// `tests/window.rs`'s own `the_window_is_usable_at_a_narrow_width` is
-    /// the stronger, end-to-end version of this same property: a real
-    /// window, really laid out, really narrow. This accessor answers the
-    /// same question without presenting a window at all, and -- unlike
-    /// resizing a real, already-presented window (see this module's own
-    /// doc comment on why that is unreliable) -- can be asked more than
-    /// once.
-    pub fn has_breakpoint_below(&self, px: f64) -> bool {
-        self.breakpoint
-            .condition()
-            .and_then(|c| max_width_px(&c.to_str()))
-            .is_some_and(|threshold| threshold >= px)
     }
 
     /// The overlay any section can show an `adw::Toast` through. Wraps the
@@ -330,35 +336,102 @@ fn helper_message(e: &zbus::Error) -> String {
     }
 }
 
-/// Everything one refresh needs from the helper, fetched over a single
-/// D-Bus connection: every rule `list` currently reports, and the
-/// backend's own `status`.
-struct HelperSnapshot {
-    rules: Vec<WireRule>,
-    status: WireStatus,
+/// Two different facts a `list`/`status` call can fail with, neither of
+/// which may render as the other -- see `open_now.rs`'s and
+/// `status_bar.rs`'s own module docs for why conflating them is this
+/// project's characteristic defect. `Unreachable` is no answer at all: no
+/// bus, no helper process, the connection lost mid-call, or this refresh's
+/// own bounded wait (`with_timeout`, below) running out. `Refused` is the
+/// helper answering with a typed decision it declined -- a polkit denial
+/// being the common case, since `list` and `status` both go through the
+/// same authorization check `open`/`close` do (see
+/// `porthole-helper/src/service.rs`). [`classify_failure`] is what tells
+/// the two apart: only a `zbus::Error::MethodError` means the helper
+/// actually responded.
+enum HelperFailure {
+    Unreachable(String),
+    Refused(String),
 }
 
-/// A connection/proxy-construction failure and a call that reached the
-/// helper but was refused (a polkit denial, say -- `list` and `status`
-/// both go through the same authorization check `open`/`close` do, see
-/// `porthole-helper/src/service.rs`) are different facts, and this keeps
-/// them apart the same way `open_now.rs`'s `close_by_id_over_dbus` and
-/// `open_dialog.rs`'s `open_over_dbus` already do: the former gets the
-/// "could not reach the helper" wrapper every other D-Bus call in this
-/// crate uses for that exact failure; the latter gets the helper's own
-/// message, verbatim, through `helper_message`. Reformatting a polkit
-/// denial as "could not reach the helper" would itself be the two-facts-
-/// into-one collapse this milestone keeps finding.
-async fn fetch_helper_snapshot() -> Result<HelperSnapshot, String> {
-    let connection = zbus::Connection::system()
-        .await
-        .map_err(|e| format!("could not reach the porthole helper: {e}"))?;
-    let proxy = PortholeProxy::new(&connection)
-        .await
-        .map_err(|e| format!("could not reach the porthole helper: {e}"))?;
-    let rules = proxy.list().await.map_err(|e| helper_message(&e))?;
-    let status = proxy.status().await.map_err(|e| helper_message(&e))?;
+fn classify_failure(e: zbus::Error) -> HelperFailure {
+    match &e {
+        zbus::Error::MethodError(..) => HelperFailure::Refused(helper_message(&e)),
+        _ => HelperFailure::Unreachable(format!("could not reach the porthole helper: {e}")),
+    }
+}
+
+fn apply_failure_to_open_now(open_now: &OpenNowSection, failure: &HelperFailure) {
+    match failure {
+        HelperFailure::Unreachable(message) => open_now.set_unreachable(message),
+        HelperFailure::Refused(message) => open_now.set_refused(message),
+    }
+}
+
+fn apply_failure_to_status_bar(status_bar: &StatusBar, failure: &HelperFailure) {
+    match failure {
+        HelperFailure::Unreachable(message) => status_bar.set_unreachable(message),
+        HelperFailure::Refused(message) => status_bar.set_refused(message),
+    }
+}
+
+/// Everything one refresh needs from the helper: every rule `list`
+/// currently reports, and the backend's own `status` -- fetched over a
+/// single connection, but kept as two **independent** results rather than
+/// collapsed into one `Result` for the whole snapshot. An earlier draft of
+/// [`fetch_helper_snapshot`] did exactly that collapse: a `status` failure
+/// discarded a `list` that had already succeeded, known-good data thrown
+/// away because a second, unrelated call happened to fail. The outer
+/// `Result` [`fetch_helper_snapshot`] itself returns only fails when no
+/// connection or proxy could be made at all -- the one case where neither
+/// call was even attempted.
+struct HelperSnapshot {
+    rules: Result<Vec<WireRule>, HelperFailure>,
+    status: Result<WireStatus, HelperFailure>,
+}
+
+async fn fetch_helper_snapshot() -> Result<HelperSnapshot, HelperFailure> {
+    let connection = zbus::Connection::system().await.map_err(|e| {
+        HelperFailure::Unreachable(format!("could not reach the porthole helper: {e}"))
+    })?;
+    let proxy = PortholeProxy::new(&connection).await.map_err(|e| {
+        HelperFailure::Unreachable(format!("could not reach the porthole helper: {e}"))
+    })?;
+    let rules = proxy.list().await.map_err(classify_failure);
+    let status = proxy.status().await.map_err(classify_failure);
     Ok(HelperSnapshot { rules, status })
+}
+
+/// How long [`refresh`] waits for [`fetch_helper_snapshot`] before treating
+/// the helper as unreachable. zbus proxies carry no default per-call
+/// timeout of their own -- against a live-but-hung helper, an unbounded
+/// wait would leave both sections sitting on their own indeterminate "not
+/// answered yet" state (`OpenNowSection`'s and `ListeningSection`'s own
+/// `loading_page`) forever, rather than ever settling into a state a user
+/// can act on.
+const HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Races `fut` against a real wall-clock timeout: `Some(output)` if `fut`
+/// resolves first, `None` if `timeout` elapses first. No new dependency for
+/// one call site -- a small hand-rolled `poll_fn` combinator over `fut` and
+/// `glib::timeout_future`, which integrates with the same GLib main context
+/// `glib::spawn_future_local` already runs everything in this crate on, so
+/// this still never blocks that context either.
+async fn with_timeout<F: std::future::Future>(
+    fut: F,
+    timeout: std::time::Duration,
+) -> Option<F::Output> {
+    let mut fut = std::pin::pin!(fut);
+    let mut timer = glib::timeout_future(timeout);
+    std::future::poll_fn(move |cx| {
+        if let std::task::Poll::Ready(value) = fut.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Some(value));
+        }
+        if timer.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(None);
+        }
+        std::task::Poll::Pending
+    })
+    .await
 }
 
 /// Presents `dialog`, transient for `window`, and registers its
@@ -390,10 +463,14 @@ fn present_open_dialog(
 ///
 /// Every `set_services`/`set_open_ports` call rebuilds every row from
 /// scratch (`listening_section.rs`'s own `apply`), which drops whatever
-/// click handler a previous call to this function had connected -- so this
-/// has to run again after each refresh, which is exactly what `refresh`
-/// does, once, after both of `listening`'s setters have already run for
-/// that refresh. It lives here rather than inside `listening_section.rs`
+/// click handler a previous call to this function had connected -- so a
+/// caller must call this again *immediately* after whichever of those two
+/// setters it just called, every single time one of them runs, never once
+/// at the end of some larger sequence: calling it after a setter that was
+/// *skipped* (a failed scan, say, which calls `set_scan_failed` instead of
+/// `set_services`) would re-attach a second handler onto buttons that
+/// already have one from the last successful render, and each press would
+/// open two dialogs. It lives here rather than inside `listening_section.rs`
 /// itself because that module renders what it is given and knows nothing
 /// about `OpenDialog` or this window.
 fn wire_listening_open_buttons(
@@ -425,89 +502,166 @@ fn wire_listening_open_buttons(
     }
 }
 
-/// Populates "Open now" (and the status line) from the helper's own `list`
-/// and `status` over D-Bus, and "Listening" from a local `/proc` scan --
-/// the initial load this crate lacked before this task (see this module's
-/// own doc comment), and the same thing a successful open re-runs through
+/// Populates "Open now", "Listening" and the status line -- the initial
+/// load this crate lacked before this task (see this module's own doc
+/// comment), and the same thing a successful open re-runs through
 /// [`present_open_dialog`]'s `on_opened` hook.
 ///
+/// The `/proc` scan and the helper round trip run as two **independent**
+/// spawned futures below, not sequenced against each other. Each one wires
+/// its own rows (`wire_listening_open_buttons`) immediately after whichever
+/// of `listening`'s setters it just called -- so there is no shared "wire
+/// once, at the end" step left for the two to race over. An earlier draft
+/// of this function sequenced the scan before the helper fetch specifically
+/// to avoid that race (both eventually called `wire_listening_open_buttons`
+/// once, together, at the very end); that avoidance is no longer needed now
+/// that wiring happens right where each setter that could change the rows
+/// is actually called.
+///
 /// Neither read blocks the UI thread: the D-Bus round trip already yields
-/// at every `.await` -- the same `glib::spawn_future_local` shape
+/// at every `.await` (the same `glib::spawn_future_local` shape
 /// `open_now.rs`'s close button and `open_dialog.rs`'s Open button already
-/// use for their own calls -- and the scan, an ordinary blocking file read,
-/// runs on GLib's own I/O thread pool via `gio::spawn_blocking`, never on
-/// this one.
+/// use), and the scan, an ordinary blocking file read, runs on GLib's own
+/// I/O thread pool via `gio::spawn_blocking`, never on this one. The helper
+/// round trip is additionally bounded by [`HELPER_TIMEOUT`] -- see its own
+/// doc comment for why an unbounded wait would not be safe here the way it
+/// is for a single click's own D-Bus call elsewhere in this crate.
 ///
-/// The scan and the D-Bus fetch are awaited one after the other inside the
-/// same spawned future, not as two independent futures racing each other.
-/// `listening`'s two setters (`set_services`, called from the scan's own
-/// result; `set_open_ports`, called from the helper's) each rebuild every
-/// row, and two futures calling them in an unpredictable order could let
-/// whichever finished second silently discard the row click handlers
-/// `wire_listening_open_buttons` had just attached to rows that, by then,
-/// no longer exist. Sequencing them still blocks nothing: `.await` yields
-/// back to the main loop regardless of what runs next.
-///
-/// A failure to reach the helper is not an empty list -- see `open_now.rs`'s
-/// and `status_bar.rs`'s own module docs for why conflating those two facts
-/// is this project's characteristic defect. The listening scan is
-/// independent of the helper entirely and still renders even when the
-/// helper cannot be reached; nothing in this codebase today makes `/proc`
-/// itself unreadable, but a failure there is logged rather than silently
-/// treated as "nothing is listening" regardless.
+/// A failure to reach the helper is not an empty list, and a helper that
+/// answered but refused a request is not the same fact as one that never
+/// answered at all -- see `open_now.rs`'s and `status_bar.rs`'s own module
+/// docs for why conflating either pair is this project's characteristic
+/// defect. A `/proc` scan failure is the identical shape one layer down:
+/// [`ListeningSection::set_scan_failed`] is that state, not silence plus a
+/// stderr line standing in for "nothing is listening".
 fn refresh(
     window: &adw::ApplicationWindow,
     open_now: &OpenNowSection,
     listening: &ListeningSection,
     status_bar: &StatusBar,
 ) {
-    let window = window.clone();
-    let open_now = open_now.clone();
-    let listening = listening.clone();
-    let status_bar = status_bar.clone();
-    glib::spawn_future_local(async move {
-        let scanned =
-            gtk::gio::spawn_blocking(|| porthole_core::listening::scan(&RealProcFs)).await;
-        match scanned {
-            Ok(Ok(services)) => listening.set_services(&services),
-            Ok(Err(e)) => {
-                eprintln!("porthole-gui: could not scan listening services: {e}");
+    {
+        let window = window.clone();
+        let open_now = open_now.clone();
+        let listening = listening.clone();
+        let status_bar = status_bar.clone();
+        glib::spawn_future_local(async move {
+            let scanned =
+                gtk::gio::spawn_blocking(|| porthole_core::listening::scan(&RealProcFs)).await;
+            match scanned {
+                Ok(Ok(services)) => {
+                    listening.set_services(&services);
+                    wire_listening_open_buttons(&window, &open_now, &listening, &status_bar);
+                }
+                Ok(Err(e)) => {
+                    listening.set_scan_failed(&format!("could not check what is listening: {e}"));
+                }
+                Err(_) => {
+                    listening.set_scan_failed("the listening scan panicked");
+                }
             }
-            Err(_) => {
-                eprintln!("porthole-gui: the listening scan panicked");
-            }
-        }
+        });
+    }
 
-        match fetch_helper_snapshot().await {
-            Ok(snapshot) => {
-                let open_ports: Vec<u16> = snapshot.rules.iter().map(|r| r.port).collect();
-                open_now.set_rules(&snapshot.rules);
-                status_bar.set_status(&snapshot.status);
-                listening.set_open_ports(&open_ports);
+    {
+        let window = window.clone();
+        let open_now = open_now.clone();
+        let listening = listening.clone();
+        let status_bar = status_bar.clone();
+        glib::spawn_future_local(async move {
+            match with_timeout(fetch_helper_snapshot(), HELPER_TIMEOUT).await {
+                Some(Ok(snapshot)) => {
+                    match snapshot.rules {
+                        Ok(rules) => {
+                            let open_ports: Vec<u16> = rules.iter().map(|r| r.port).collect();
+                            open_now.set_rules(&rules);
+                            listening.set_open_ports(&open_ports);
+                            wire_listening_open_buttons(
+                                &window,
+                                &open_now,
+                                &listening,
+                                &status_bar,
+                            );
+                        }
+                        Err(failure) => apply_failure_to_open_now(&open_now, &failure),
+                    }
+                    match snapshot.status {
+                        Ok(status) => status_bar.set_status(&status),
+                        Err(failure) => apply_failure_to_status_bar(&status_bar, &failure),
+                    }
+                }
+                Some(Err(failure)) => {
+                    apply_failure_to_open_now(&open_now, &failure);
+                    apply_failure_to_status_bar(&status_bar, &failure);
+                }
+                None => {
+                    // `with_timeout` won the race: the helper never
+                    // answered within `HELPER_TIMEOUT` at all, which is
+                    // itself an "unreachable" fact, not a refusal -- the
+                    // helper never got the chance to refuse anything.
+                    let failure = HelperFailure::Unreachable(
+                        "could not reach the porthole helper: timed out".to_string(),
+                    );
+                    apply_failure_to_open_now(&open_now, &failure);
+                    apply_failure_to_status_bar(&status_bar, &failure);
+                }
             }
-            Err(message) => {
-                open_now.set_unreachable(&message);
-                status_bar.set_unreachable(&message);
-            }
-        }
-
-        wire_listening_open_buttons(&window, &open_now, &listening, &status_bar);
-    });
+        });
+    }
 }
 
-/// Parses the one shape `adw::BreakpointCondition::new_length` with
-/// `MaxWidth`/`Px` ever produces from `to_string`: `"max-width: 400px"`,
-/// confirmed against the real object in a container (GTK4 is not, and must
-/// not be, installed on the development host this was written on, so this
-/// could not be confirmed any other way -- see `tests/window.rs`'s own
-/// container notes). Returns `None` for anything else rather than
-/// guessing.
-fn max_width_px(condition_text: &str) -> Option<f64> {
-    let after = condition_text.split("max-width:").nth(1)?;
-    let digits: String = after
-        .trim_start()
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
-    digits.parse().ok()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Pure-function coverage of the one piece of this module's own logic
+    // that needs no GTK, no D-Bus connection and no async runtime --
+    // `classify_failure`'s MethodError-vs-everything-else distinction, the
+    // thing I2's fix depends on. Same shape as `open_now.rs`'s own
+    // `method_error` fixture, used there to unit-test `helper_message`'s
+    // identical verbatim pass-through.
+    fn method_error(name: &str, detail: Option<&str>) -> zbus::Error {
+        zbus::Error::MethodError(
+            zbus::names::OwnedErrorName::try_from(name.to_string()).unwrap(),
+            detail.map(str::to_string),
+            zbus::message::Message::method_call("/", "Noop")
+                .unwrap()
+                .build(&())
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_method_error_is_refused_not_unreachable() {
+        // I2: the helper answered here -- a typed refusal, not silence.
+        let e = method_error(
+            "com.jacopobriccola.Porthole.NotAuthorized",
+            Some("not authorized: com.jacopobriccola.Porthole.List"),
+        );
+        match classify_failure(e) {
+            HelperFailure::Refused(message) => {
+                assert_eq!(message, "not authorized: com.jacopobriccola.Porthole.List");
+            }
+            HelperFailure::Unreachable(message) => {
+                panic!("a MethodError must classify as Refused, not Unreachable: {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn a_non_method_error_is_unreachable_not_refused() {
+        // The connection-lost case: no typed answer came back at all.
+        let e = zbus::Error::Failure("the connection was lost".to_string());
+        match classify_failure(e) {
+            HelperFailure::Unreachable(message) => {
+                assert!(
+                    message.contains("could not reach the porthole helper"),
+                    "{message}"
+                );
+            }
+            HelperFailure::Refused(message) => {
+                panic!("a non-MethodError must classify as Unreachable, not Refused: {message}")
+            }
+        }
+    }
 }

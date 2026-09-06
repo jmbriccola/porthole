@@ -205,13 +205,86 @@ fn a_firewall_porthole_could_not_read_is_not_confused_with_a_confirmed_stop() ->
     Ok(())
 }
 
+/// I2: a helper that answered but refused a request is prominent too, but
+/// must not be worded as if the helper could not be reached at all -- the
+/// helper answered here.
+fn a_refused_request_is_prominent_but_not_worded_as_unreachable() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.StatusRefused",
+        move |_app| {
+            let bar = StatusBar::new();
+            bar.set_refused("not authorized: com.jacopobriccola.Porthole.List");
+            *seen.borrow_mut() = Some((bar.text(), bar.is_prominent()));
+        },
+    );
+    let (text, prominent) = result.borrow_mut().take().ok_or("activation never ran")?;
+    if !prominent {
+        return Err(
+            "a refused request must not be rendered as an ordinary status line".to_string(),
+        );
+    }
+    if text.to_lowercase().contains("could not reach") {
+        return Err(format!(
+            "the helper answered here -- \"could not reach\" is the other case's claim: {text:?}"
+        ));
+    }
+    if text.contains("already reachable") {
+        return Err(format!(
+            "a refused request must not claim reachability either way: {text:?}"
+        ));
+    }
+    if !text.contains("not authorized") {
+        return Err(format!(
+            "the helper's own refusal must survive verbatim: {text:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// I7: once the banner takes over, the ordinary line's own real, on-screen
+/// text must not still read a stale confirmed claim from an earlier,
+/// successful refresh -- `text()` alone cannot catch this (it prefers the
+/// revealed banner over the line), so this reads the line widget directly.
+fn the_ordinary_line_is_cleared_once_the_banner_takes_over() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.StatusStaleLine",
+        move |_app| {
+            let bar = StatusBar::new();
+            // A good refresh first, so the line carries a real, confirmed claim...
+            bar.set_status(&status(Some(("firewalld", "2.4.4")), true));
+            let line_before = bar.line_widget().label().to_string();
+            // ...then a bad one. The banner takes over; the line must not still
+            // say "enforcing" underneath it.
+            bar.set_unreachable("could not reach the porthole helper: timed out");
+            let line_after = bar.line_widget().label().to_string();
+            *seen.borrow_mut() = Some((line_before, line_after));
+        },
+    );
+    let (line_before, line_after) = result.borrow_mut().take().ok_or("activation never ran")?;
+    if !line_before.contains("firewalld") {
+        return Err(format!(
+            "expected the good refresh to have set the line first: {line_before:?}"
+        ));
+    }
+    if !line_after.is_empty() {
+        return Err(format!(
+            "the ordinary line must be cleared once the banner takes over, still: {line_after:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below -- see `tests/window.rs`'s own
 /// `Case` alias for why this is a type alias rather than spelled out
 /// inline.
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 5] = [
+    let cases: [Case; 7] = [
         (
             "the_status_line_names_the_backend_and_whether_it_is_enforcing",
             the_status_line_names_the_backend_and_whether_it_is_enforcing,
@@ -231,6 +304,14 @@ fn main() {
         (
             "a_firewall_porthole_could_not_read_is_not_confused_with_a_confirmed_stop",
             a_firewall_porthole_could_not_read_is_not_confused_with_a_confirmed_stop,
+        ),
+        (
+            "a_refused_request_is_prominent_but_not_worded_as_unreachable",
+            a_refused_request_is_prominent_but_not_worded_as_unreachable,
+        ),
+        (
+            "the_ordinary_line_is_cleared_once_the_banner_takes_over",
+            the_ordinary_line_is_cleared_once_the_banner_takes_over,
         ),
     ];
 

@@ -44,7 +44,7 @@
 //! network" and "Anyone" in that one function -- a data change, not a
 //! redesign.
 //!
-//! ## One thing this task left for a later one, on purpose
+//! ## `on_opened`: left uncalled here, wired by task 6
 //!
 //! [`OpenDialog::on_opened`] is a hook a caller can register to learn a
 //! request actually succeeded (the new [`WireRule`] the helper returned).

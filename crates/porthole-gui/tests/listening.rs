@@ -336,13 +336,132 @@ fn nothing_listening_is_a_calm_status_page_not_an_error() -> Result<(), String> 
     Ok(())
 }
 
+/// I5: before `set_services` has ever been called, this section must not
+/// be sitting on the calm "Nothing else is listening" claim -- a fresh
+/// `ListeningSection` has not scanned anything yet to earn that.
+fn the_initial_state_before_any_scan_is_neither_calm_nor_populated() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningLoading",
+        move |_app| {
+            let section = ListeningSection::new();
+            *seen.borrow_mut() = Some((
+                section.loading_page().is_some(),
+                section.status_page().is_some(),
+                section.error_page().is_some(),
+                section.rows().is_empty(),
+            ));
+        },
+    );
+    let (loading, calm, error, rows_empty) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if !loading {
+        return Err("a freshly constructed section must show its loading state".to_string());
+    }
+    if calm {
+        return Err(
+            "\"Nothing else is listening\" must not be the default before any scan has run"
+                .to_string(),
+        );
+    }
+    if error {
+        return Err("there is no scan failure to report yet either".to_string());
+    }
+    if !rows_empty {
+        return Err("there must be no rows before a scan has ever run".to_string());
+    }
+    Ok(())
+}
+
+/// I4: a `/proc` scan that fails outright must not leave the calm
+/// "Nothing else is listening" page up -- a stderr line is not a UI, and
+/// from the user's side "porthole could not check" and "porthole checked
+/// and found nothing" are exactly the collapse this project keeps finding.
+/// Checked structurally (icon, CSS class), the same way
+/// `nothing_listening_is_a_calm_status_page_not_an_error` above checks the
+/// calm state's own icon.
+fn a_scan_failure_does_not_render_as_the_calm_empty_state() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningScanFailed",
+        move |_app| {
+            let section = ListeningSection::new();
+            // A prior successful scan, so this also proves the failure
+            // state actually *displaces* real data rather than merely
+            // never having shown any.
+            section.set_services(&[svc(5173, Some("node"), Binding::AllInterfaces)]);
+            section.set_scan_failed("could not check what is listening: permission denied");
+            let calm = section.status_page();
+            let error = section.error_page();
+            let icon_name = error
+                .as_ref()
+                .and_then(|p| p.icon_name())
+                .map(|s| s.to_string());
+            let css_classes: Vec<String> = error
+                .as_ref()
+                .map(|p| p.css_classes().iter().map(|c| c.to_string()).collect())
+                .unwrap_or_default();
+            let description = error
+                .as_ref()
+                .and_then(|p| p.description())
+                .map(|s| s.to_string());
+            let rows_empty = section.rows().is_empty();
+            *seen.borrow_mut() = Some((
+                calm.is_some(),
+                error.is_some(),
+                icon_name,
+                css_classes,
+                description,
+                rows_empty,
+            ));
+        },
+    );
+    let (calm_showing, error_showing, icon_name, css_classes, description, rows_empty) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if calm_showing {
+        return Err(
+            "the calm \"Nothing else is listening\" page must not survive a scan \
+                     failure that came after it"
+                .to_string(),
+        );
+    }
+    if !error_showing {
+        return Err("a scan failure must render its own, distinguishable state".to_string());
+    }
+    let icon = icon_name.unwrap_or_default();
+    if !(icon.contains("error") || icon.contains("warning")) {
+        return Err(format!(
+            "the scan-failed state's icon must read as trouble: {icon:?}"
+        ));
+    }
+    if !css_classes.iter().any(|c| c == "error" || c == "warning") {
+        return Err(format!(
+            "the scan-failed state must carry an error/warning CSS class: {css_classes:?}"
+        ));
+    }
+    match description.as_deref() {
+        Some(d) if d.contains("permission denied") => {}
+        other => {
+            return Err(format!(
+                "the scan's own reason must be shown, verbatim: {other:?}"
+            ))
+        }
+    }
+    if !rows_empty {
+        return Err("the stale row from before the failure must not still be showing".to_string());
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below -- see `tests/window.rs`'s own
 /// `Case` alias for why this is a type alias rather than spelled out
 /// inline.
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 10] = [
+    let cases: [Case; 12] = [
         (
             "a_service_shows_its_name_and_port_the_way_the_spec_writes_it",
             a_service_shows_its_name_and_port_the_way_the_spec_writes_it,
@@ -382,6 +501,14 @@ fn main() {
         (
             "nothing_listening_is_a_calm_status_page_not_an_error",
             nothing_listening_is_a_calm_status_page_not_an_error,
+        ),
+        (
+            "the_initial_state_before_any_scan_is_neither_calm_nor_populated",
+            the_initial_state_before_any_scan_is_neither_calm_nor_populated,
+        ),
+        (
+            "a_scan_failure_does_not_render_as_the_calm_empty_state",
+            a_scan_failure_does_not_render_as_the_calm_empty_state,
         ),
     ];
 

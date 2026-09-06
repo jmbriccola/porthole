@@ -49,20 +49,33 @@
 //! `window.rs` (task 6) is what actually calls `set_rules`, fed from the
 //! helper's `list` over D-Bus -- and that round trip can fail before it
 //! ever produces a list at all: no bus, no helper process, a polkit denial.
-//! [`OpenNowSection::set_unreachable`] is the state for exactly that case,
-//! and it is a **third** widget, [`Inner::error_page`], not a repurposing of
-//! the calm `status_page` an empty list already shows. Rendering "No ports
-//! open" when the true state is "I could not ask" is this project's
-//! characteristic defect -- the same shape that in milestone 3 told an
-//! unprivileged user their port was already reachable when porthole had
-//! merely been denied permission to look -- reproduced here at the one
-//! layer left that could still make it. `error_page` carries a warning
-//! icon and the `error` style class, the calm page carries neither (see
+//! [`OpenNowSection::set_unreachable`] and [`OpenNowSection::set_refused`]
+//! are the states for exactly that -- two different facts (no answer at
+//! all, versus an answer that declined the request), both sharing one
+//! widget, [`Inner::error_page`], with different titles, and both distinct
+//! from a repurposed calm `status_page`. Rendering "No ports open" when the
+//! true state is "I could not ask" is this project's characteristic defect
+//! -- the same shape that in milestone 3 told an unprivileged user their
+//! port was already reachable when porthole had merely been denied
+//! permission to look -- reproduced here at the one layer left that could
+//! still make it. `error_page` carries a `dialog-error-symbolic` icon and
+//! the `error` style class, the calm page carries neither (see
 //! `tests/open_now.rs`'s own empty-state test for exactly what it checks),
 //! and the message shown is whatever the caller passed, verbatim -- see
 //! `status_bar.rs`'s own module doc for why the same distinction has to
 //! survive there too, worded so it never claims what porthole did not
 //! confirm.
+//!
+//! ## Before the first answer arrives
+//!
+//! [`Inner::loading_page`] is what this section shows before `set_rules`,
+//! `set_unreachable` or `set_refused` has ever been called -- a fourth,
+//! neutral widget, not the calm `status_page`. "No ports open" is a
+//! confirmed fact this section has not yet earned the right to state; a
+//! zbus proxy carries no default per-call timeout, so without this,
+//! construction would assert that confirmed fact for as long as a
+//! live-but-hung helper took to answer, which is unbounded. An
+//! indeterminate initial state is the honest one.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -86,9 +99,10 @@ struct Row {
 
 struct Inner {
     /// What `PortholeWindow` appends into its `content()` box. Holds
-    /// exactly one child at a time: `status_page` when there is nothing
-    /// open, `error_page` when the helper could not be reached, `group`
-    /// otherwise.
+    /// exactly one child at a time: `loading_page` before any answer has
+    /// arrived, `status_page` once the list is confirmed empty,
+    /// `error_page` when the helper could not be reached or refused the
+    /// request, `group` otherwise.
     container: gtk::Box,
     group: adw::PreferencesGroup,
     status_page: adw::StatusPage,
@@ -96,6 +110,10 @@ struct Inner {
     /// -- see this module's own doc comment on why a failure to reach the
     /// helper must never render as the calm empty state.
     error_page: adw::StatusPage,
+    /// A **different** widget again -- see this module's own doc comment on
+    /// why the calm "No ports open" claim must not be the default before
+    /// this section has actually heard back from anything.
+    loading_page: adw::StatusPage,
     rows: RefCell<Vec<Row>>,
     /// The last list `set_rules` was given, kept so a successful close can
     /// drop exactly the one rule that closed and re-render from the rest,
@@ -143,6 +161,15 @@ fn format_countdown(expires_at: u64, current: u64) -> String {
     let remaining = expires_at - current;
     format!("{:02}:{:02} left", remaining / 60, remaining % 60)
 }
+
+/// [`OpenNowSection::set_unreachable`]'s title -- no answer came back at
+/// all.
+const UNREACHABLE_TITLE: &str = "Porthole helper unreachable";
+
+/// [`OpenNowSection::set_refused`]'s title -- the helper answered and
+/// declined. Deliberately shares no wording with [`UNREACHABLE_TITLE`]:
+/// "unreachable" is not true of a helper that just responded.
+const REFUSED_TITLE: &str = "Porthole helper refused the request";
 
 fn subtitle_for(rule: &WireRule) -> String {
     if rule.scope == "anywhere" {
@@ -194,11 +221,15 @@ fn apply(inner: &Rc<Inner>, rules: &[WireRule]) {
     }
 
     // A successful `set_rules` -- even an empty one -- means the helper
-    // *was* reached, so any previous "could not reach the helper" state
-    // is stale and must go, the same way `error_page` displaces `group`
-    // and `status_page` in `apply_unreachable` below.
+    // *was* reached and answered, so any previous "could not reach"/
+    // "refused" state, or the initial "not answered yet" one, is stale and
+    // must go, the same way `error_page` and `loading_page` displace
+    // `group` and `status_page` in `apply_error` below.
     if inner.error_page.parent().is_some() {
         inner.container.remove(&inner.error_page);
+    }
+    if inner.loading_page.parent().is_some() {
+        inner.container.remove(&inner.loading_page);
     }
 
     if rules.is_empty() {
@@ -275,11 +306,13 @@ fn apply(inner: &Rc<Inner>, rules: &[WireRule]) {
 }
 
 /// Replaces whatever `inner.container` was showing with `error_page`,
-/// described by `message` -- the state [`OpenNowSection::set_unreachable`]
-/// renders. Clears `rows`/`rules` too: whatever list this section last had
-/// is now unconfirmed, not merely stale, so it must not keep being shown
-/// (or handed back to a close button) as if it still held.
-fn apply_unreachable(inner: &Rc<Inner>, message: &str) {
+/// titled `title` and described by `message` -- the shared shape behind
+/// [`OpenNowSection::set_unreachable`] and [`OpenNowSection::set_refused`],
+/// which differ only in which title they pass. Clears `rows`/`rules` too:
+/// whatever list this section last had is now unconfirmed, not merely
+/// stale, so it must not keep being shown (or handed back to a close
+/// button) as if it still held.
+fn apply_error(inner: &Rc<Inner>, title: &str, message: &str) {
     inner.rules.replace(Vec::new());
     for row in inner.rows.replace(Vec::new()) {
         inner.group.remove(&row.row);
@@ -291,7 +324,11 @@ fn apply_unreachable(inner: &Rc<Inner>, message: &str) {
     if inner.status_page.parent().is_some() {
         inner.container.remove(&inner.status_page);
     }
+    if inner.loading_page.parent().is_some() {
+        inner.container.remove(&inner.loading_page);
+    }
 
+    inner.error_page.set_title(title);
     inner.error_page.set_description(Some(message));
     if inner.error_page.parent().is_none() {
         inner.container.append(&inner.error_page);
@@ -343,27 +380,41 @@ impl OpenNowSection {
             .build();
 
         // The other case an empty list can mean: porthole did not confirm
-        // there is nothing open, it could not ask at all. A warning icon
-        // and the `error` style class -- both absent from `status_page`
-        // above -- are what make `tests/open_now.rs`'s own test able to
-        // tell the two apart structurally, not just by title. See this
-        // module's own doc comment.
+        // there is nothing open, it could not ask (or was refused). A
+        // `dialog-error-symbolic` icon and the `error` style class -- both
+        // absent from `status_page` above -- are what make
+        // `tests/open_now.rs`'s own test able to tell the two apart
+        // structurally, not just by title. See this module's own doc
+        // comment. The title itself is set per call by `apply_error`
+        // (`set_unreachable`/`set_refused` each pass their own); the one
+        // given here at construction is only the default until either is
+        // first called.
         let error_page = adw::StatusPage::builder()
-            .title("Porthole helper unreachable")
+            .title(UNREACHABLE_TITLE)
             .icon_name("dialog-error-symbolic")
             .css_classes(["error"])
+            .build();
+
+        // Shown before any answer has arrived -- see this module's own
+        // doc comment on why the calm `status_page` above must not be the
+        // default. Neutral: no error/warning styling, since not having
+        // heard back yet is not itself trouble.
+        let loading_page = adw::StatusPage::builder()
+            .title("Checking what's open…")
+            .icon_name("content-loading-symbolic")
             .build();
 
         let container = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .build();
-        container.append(&status_page);
+        container.append(&loading_page);
 
         let inner = Rc::new(Inner {
             container,
             group,
             status_page,
             error_page,
+            loading_page,
             rows: RefCell::new(Vec::new()),
             rules: RefCell::new(Vec::new()),
             clock,
@@ -404,18 +455,30 @@ impl OpenNowSection {
         apply(&self.inner, rules);
     }
 
-    /// The state for a `list` call that never produced a list at all --
-    /// see this module's own doc comment for why this is a distinct widget
-    /// from the calm empty state, not a relabelling of it. `message` is
-    /// shown verbatim, the same convention `helper_message` already holds
-    /// for a failed close.
+    /// The state for a `list`/`status` round trip that produced no answer
+    /// at all -- no bus, no helper process, the connection lost mid-call.
+    /// See this module's own doc comment for why this is a distinct widget
+    /// from the calm empty state, not a relabelling of it, and distinct
+    /// again from [`OpenNowSection::set_refused`]. `message` is shown
+    /// verbatim, the same convention `helper_message` already holds for a
+    /// failed close.
     pub fn set_unreachable(&self, message: &str) {
-        apply_unreachable(&self.inner, message);
+        apply_error(&self.inner, UNREACHABLE_TITLE, message);
+    }
+
+    /// The other failure state: the helper answered, but declined the
+    /// request (a polkit denial, most often). Same widget as
+    /// [`OpenNowSection::set_unreachable`], a different title -- see this
+    /// module's own doc comment for why "unreachable" would be a false
+    /// claim here. `message` is the helper's own text, verbatim.
+    pub fn set_refused(&self, message: &str) {
+        apply_error(&self.inner, REFUSED_TITLE, message);
     }
 
     /// `Some` only while the list is confirmed empty -- once there is a
-    /// row, or the helper could not be reached at all
-    /// ([`OpenNowSection::error_page`]), this section shows something
+    /// row, the helper could not be reached or refused the request
+    /// ([`OpenNowSection::error_page`]), or no answer has arrived yet
+    /// ([`OpenNowSection::loading_page`]), this section shows something
     /// else instead.
     pub fn status_page(&self) -> Option<adw::StatusPage> {
         if self.inner.status_page.parent().is_some() {
@@ -425,15 +488,30 @@ impl OpenNowSection {
         }
     }
 
-    /// `Some` only while [`OpenNowSection::set_unreachable`]'s state is
-    /// showing -- a real, distinct widget from [`OpenNowSection::status_page`],
-    /// never both at once. A test reads this (and its icon, and its CSS
+    /// `Some` only while [`OpenNowSection::set_unreachable`]'s or
+    /// [`OpenNowSection::set_refused`]'s state is showing -- a real,
+    /// distinct widget from [`OpenNowSection::status_page`], never both at
+    /// once. A test reads this (and its title, its icon, and its CSS
     /// classes) rather than trusting that "the list is empty" and "the
     /// helper could not be reached" render the same way just because both
     /// start from zero rows.
     pub fn error_page(&self) -> Option<adw::StatusPage> {
         if self.inner.error_page.parent().is_some() {
             Some(self.inner.error_page.clone())
+        } else {
+            None
+        }
+    }
+
+    /// `Some` only before this section has ever heard back from anything
+    /// -- the very first widget a freshly constructed section shows, and
+    /// gone for good the moment `set_rules`, `set_unreachable` or
+    /// `set_refused` is called even once. See this module's own doc
+    /// comment for why the calm `status_page` must not be that first
+    /// widget instead.
+    pub fn loading_page(&self) -> Option<adw::StatusPage> {
+        if self.inner.loading_page.parent().is_some() {
+            Some(self.inner.loading_page.clone())
         } else {
             None
         }
