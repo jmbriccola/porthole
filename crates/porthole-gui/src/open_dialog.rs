@@ -633,8 +633,10 @@ impl OpenDialog {
     }
 
     /// Registers `f` to run with the [`WireRule`] a successful Open press
-    /// produced. See this module's own doc comment: nothing in this crate
-    /// calls this yet.
+    /// produced. Left uncalled by anything in this crate when this method
+    /// was first added; that changed once something needed to react to a
+    /// successful open (a refresh, to pick up the new rule) and registered
+    /// through here.
     pub fn on_opened(&self, f: impl Fn(&WireRule) + 'static) {
         *self.inner.on_opened.borrow_mut() = Some(Box::new(f));
     }
@@ -680,6 +682,19 @@ mod tests {
         assert_eq!(
             duration_options()[1],
             ("1 hour", Lifetime::For(DEFAULT_DURATION))
+        );
+    }
+
+    #[test]
+    fn the_ceiling_option_is_built_from_the_shared_max_duration_constant() {
+        // Mirrors `the_one_hour_option_is_built_from_the_shared_default_
+        // constant` above, for the ceiling chip instead of the default one:
+        // without this, lowering `MAX_DURATION` would leave this chip still
+        // reading "8 hours" while sending whatever the constant actually is
+        // now, with every other test here still green.
+        assert_eq!(
+            duration_options()[3],
+            ("8 hours", Lifetime::For(MAX_DURATION))
         );
     }
 

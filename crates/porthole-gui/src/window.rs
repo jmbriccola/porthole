@@ -618,7 +618,20 @@ fn refresh(
                 Some(Ok(snapshot)) => {
                     match snapshot.rules {
                         Ok(rules) => {
-                            let open_ports: Vec<u16> = rules.iter().map(|r| r.port).collect();
+                            // Scan-derived `open_ports` marks are read by
+                            // `ListeningSection` to withhold the Open button
+                            // and print "already open" -- both claims this
+                            // list can only back up for a port porthole
+                            // itself opened, i.e. a TCP rule (`scan` reports
+                            // TCP sockets only); a UDP rule's port is not a
+                            // listener this section will ever list, and
+                            // including it here would mislabel whatever TCP
+                            // listener happens to share that port number.
+                            let open_ports: Vec<u16> = rules
+                                .iter()
+                                .filter(|r| r.protocol == "tcp")
+                                .map(|r| r.port)
+                                .collect();
                             open_now.set_rules(&rules);
                             listening.set_open_ports(&open_ports);
                             wire_listening_open_buttons(
@@ -628,7 +641,10 @@ fn refresh(
                                 &status_bar,
                             );
                         }
-                        Err(failure) => apply_failure_to_open_now(&open_now, &failure),
+                        Err(failure) => {
+                            apply_failure_to_open_now(&open_now, &failure);
+                            listening.set_open_ports_unknown();
+                        }
                     }
                     match snapshot.status {
                         Ok(status) => status_bar.set_status(&status),
@@ -638,6 +654,7 @@ fn refresh(
                 Some(Err(failure)) => {
                     apply_failure_to_open_now(&open_now, &failure);
                     apply_failure_to_status_bar(&status_bar, &failure);
+                    listening.set_open_ports_unknown();
                 }
                 None => {
                     // `with_timeout` won the race: the helper never
@@ -649,6 +666,7 @@ fn refresh(
                     );
                     apply_failure_to_open_now(&open_now, &failure);
                     apply_failure_to_status_bar(&status_bar, &failure);
+                    listening.set_open_ports_unknown();
                 }
             }
         });

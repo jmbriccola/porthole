@@ -189,7 +189,7 @@ fn the_note_on_anyone_is_one_dry_sentence_with_no_scolding() -> Result<(), Strin
     Ok(())
 }
 
-fn a_pre_filled_port_arrives_from_the_listening_list() -> Result<(), String> {
+fn a_dialog_built_for_a_port_pre_fills_that_port() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
     activate(
@@ -310,8 +310,8 @@ fn main() {
             the_note_on_anyone_is_one_dry_sentence_with_no_scolding,
         ),
         (
-            "a_pre_filled_port_arrives_from_the_listening_list",
-            a_pre_filled_port_arrives_from_the_listening_list,
+            "a_dialog_built_for_a_port_pre_fills_that_port",
+            a_dialog_built_for_a_port_pre_fills_that_port,
         ),
         (
             "port_zero_is_rejected_before_anything_is_sent",

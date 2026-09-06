@@ -482,13 +482,77 @@ fn an_errored_reply_reads_differently_from_an_unreachable_helper() -> Result<(),
     Ok(())
 }
 
+/// I1: a close already in flight when a refresh failure lands must not be
+/// able to repaint the calm empty state over the error page once it
+/// resolves. `set_unreachable` clears the section's own rule list because
+/// that list is unconfirmed once the helper cannot be reached -- but a
+/// close started before that failure landed is still out there, unaware,
+/// and its own success handler used to recompute "what's left open" from
+/// whatever `inner.rules` held *at the time the reply arrived*, not at the
+/// time the close was issued. Starting from the list `set_unreachable` had
+/// just emptied, that produced an empty "remaining" list and rendered the
+/// calm "No ports open" page directly over "Porthole helper unreachable".
+/// `simulate_close_succeeded` drives the real close-success code path
+/// without needing a live D-Bus reply (see its own doc comment for why the
+/// container this test runs in cannot provide one).
+fn a_close_resolving_after_a_refresh_failure_does_not_repaint_the_calm_state() -> Result<(), String>
+{
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenNowCloseRaceRefreshFailure",
+        move |_app| {
+            let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
+            let rule = wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 3600);
+            let id = rule.id.clone();
+            section.set_rules(&[rule]);
+
+            // The close is issued here, against the list above -- then,
+            // before its reply arrives, a refresh failure lands.
+            section.set_unreachable("could not reach the porthole helper: timed out");
+
+            // Only now does the close's reply arrive.
+            section.simulate_close_succeeded(&id);
+
+            let calm = section.status_page();
+            let error = section.error_page();
+            let error_title = error.as_ref().map(|p| p.title().to_string());
+            *seen.borrow_mut() = Some((calm.is_some(), error.is_some(), error_title));
+        },
+    );
+    let (calm_showing, error_showing, error_title) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if calm_showing {
+        return Err(
+            "the calm \"No ports open\" page must not reappear once a close in flight \
+             resolves after a refresh failure already reported the helper unreachable"
+                .to_string(),
+        );
+    }
+    if !error_showing {
+        return Err(
+            "the unreachable state must still be showing after the in-flight close resolves"
+                .to_string(),
+        );
+    }
+    match error_title.as_deref() {
+        Some(t) if t.contains("unreachable") => {}
+        other => {
+            return Err(format!(
+                "expected the unreachable title to survive the close's resolution, got {other:?}"
+            ))
+        }
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below -- see `tests/window.rs`'s own
 /// `Case` alias for why this is a type alias rather than spelled out
 /// inline (the clippy finding that alias itself fixed there).
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 9] = [
+    let cases: [Case; 10] = [
         (
             "an_empty_list_is_a_calm_status_page_not_an_error",
             an_empty_list_is_a_calm_status_page_not_an_error,
@@ -524,6 +588,10 @@ fn main() {
         (
             "an_errored_reply_reads_differently_from_an_unreachable_helper",
             an_errored_reply_reads_differently_from_an_unreachable_helper,
+        ),
+        (
+            "a_close_resolving_after_a_refresh_failure_does_not_repaint_the_calm_state",
+            a_close_resolving_after_a_refresh_failure_does_not_repaint_the_calm_state,
         ),
     ];
 

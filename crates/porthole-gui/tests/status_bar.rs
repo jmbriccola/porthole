@@ -272,6 +272,14 @@ fn a_firewall_porthole_could_not_read_is_not_confused_with_a_confirmed_stop() ->
             "a firewall porthole could not read must not claim it confirmed a stop: {text:?}"
         ));
     }
+    // The positive half: not merely "not the confirmed-stopped wording",
+    // which an `"enforcing"` claim -- the dangerous direction -- would also
+    // pass. Pin the actual word this case renders.
+    if !text.contains("status unknown") {
+        return Err(format!(
+            "expected the unconfirmed-activity wording \"status unknown\": {text:?}"
+        ));
+    }
     Ok(())
 }
 

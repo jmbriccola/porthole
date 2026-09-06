@@ -334,16 +334,7 @@ fn apply(inner: &Rc<Inner>, rules: &[WireRule]) {
             let id = id_for_click.clone();
             glib::spawn_future_local(async move {
                 match close_by_id_over_dbus(&id).await {
-                    Ok(()) => {
-                        let remaining: Vec<WireRule> = inner
-                            .rules
-                            .borrow()
-                            .iter()
-                            .filter(|r| r.id != id)
-                            .cloned()
-                            .collect();
-                        apply(&inner, &remaining);
-                    }
+                    Ok(()) => apply_close(&inner, &id),
                     Err(message) => inner.show_toast(&message),
                 }
             });
@@ -359,6 +350,27 @@ fn apply(inner: &Rc<Inner>, rules: &[WireRule]) {
         });
     }
     inner.rows.replace(rows);
+}
+
+/// The close button's own success path: drops rule `id` from `inner.rules`
+/// and re-renders from what remains, via `apply` above -- unless `id` is no
+/// longer in that list at all. A close is a `glib::spawn_future_local`
+/// awaiting a reply, and nothing about it can cancel or reorder against
+/// whatever else happens to `inner.rules` while it waits; if that list was
+/// replaced in the meantime (cleared to unconfirmed by an error state, or
+/// swapped for a fresher one by a later `set_rules`) and no longer contains
+/// `id`, it is not the list this close was issued against, and computing
+/// "remaining" from it would render state nobody confirmed -- including,
+/// starting from an emptied list, `apply`'s own calm empty-list rendering
+/// displacing whatever this section was showing instead.
+fn apply_close(inner: &Rc<Inner>, id: &str) {
+    let rules = inner.rules.borrow();
+    if !rules.iter().any(|r| r.id == id) {
+        return;
+    }
+    let remaining: Vec<WireRule> = rules.iter().filter(|r| r.id != id).cloned().collect();
+    drop(rules);
+    apply(inner, &remaining);
 }
 
 /// Replaces whatever `inner.container` was showing with `error_page`,
@@ -633,6 +645,25 @@ impl OpenNowSection {
     /// without waiting a real second for the timer to do it.
     pub fn refresh(&self) {
         self.inner.refresh_countdown_labels();
+    }
+
+    /// Drives the same state change a close button's own success reply
+    /// does, without going through `close_by_id_over_dbus` -- that function
+    /// opens a real system-bus connection, and `tests/open_now.rs` runs
+    /// inside this milestone's own container, which has no system bus at
+    /// all (see `tests/window.rs`'s own module doc for why), so a close's
+    /// success reply can never actually arrive there. This is the seam that
+    /// lets a test still put a real `OpenNowSection` through the one
+    /// interleaving that matters -- a refresh failure landing while a close
+    /// is in flight, then the close resolving after -- the same way
+    /// [`OpenNowSection::with_clock`] is `pub`, not `#[cfg(test)]`, for the
+    /// identical reason: this crate's own integration tests link the
+    /// library as a `test` binary, not with `cfg(test)` set on the library
+    /// itself. Nothing in this crate calls this outside of tests; the real
+    /// close button reaches the same underlying logic through
+    /// `close_by_id_over_dbus`'s own `Ok(())` arm.
+    pub fn simulate_close_succeeded(&self, id: &str) {
+        apply_close(&self.inner, id);
     }
 }
 

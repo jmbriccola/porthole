@@ -64,9 +64,10 @@ Everything above is also a window. `porthole-gui` shows what is open now with
 a live countdown, shows what is listening on this machine so you can open a
 port without typing a number, and opens one in two clicks. It talks to the
 same privileged helper over the same D-Bus interface the CLI uses, so it
-inherits the 8-hour ceiling, the polkit prompts and the exit-code semantics
-without restating any of them — nothing about *what* porthole will do changes
-depending on which one you run.
+inherits the 8-hour ceiling and the polkit prompts without restating either —
+nothing about *what* porthole will do changes depending on which one you run.
+A window has no exit code to inherit; a failed request shows the helper's own
+message in the GUI instead, the same wording the CLI would have printed.
 
 ![The Porthole window: two rules under "Open now", one with a live countdown and one until reboot, and five services under "Listening", one of them already open and one reachable only over IPv6](docs/screenshot.png)
 

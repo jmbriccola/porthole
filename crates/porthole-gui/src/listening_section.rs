@@ -478,6 +478,21 @@ impl ListeningSection {
         apply(&self.inner);
     }
 
+    /// The failure counterpart to [`ListeningSection::set_open_ports`]: a
+    /// helper round trip that could not confirm which ports are open at all
+    /// is not the same fact as one that confirmed there are none, and
+    /// `open_ports` must not keep holding whatever it last knew once that
+    /// round trip has failed -- a still-listed port would otherwise keep
+    /// reading "already open" and keep withholding its Open button on a
+    /// claim porthole can no longer stand behind. Same reasoning as
+    /// [`crate::open_now::OpenNowSection`]'s own rule list on a failed
+    /// refresh, applied to this section's own set instead of a list of
+    /// rows.
+    pub fn set_open_ports_unknown(&self) {
+        self.inner.open_ports.replace(HashSet::new());
+        apply(&self.inner);
+    }
+
     /// The state for a `/proc` scan that failed outright -- see this
     /// module's own doc comment for why this must not fall back to the
     /// calm "Nothing else is listening" page. `message` is the scan's own
@@ -642,25 +657,35 @@ mod tests {
     }
 
     #[test]
-    fn two_already_open_dual_stack_rows_still_read_as_two_sockets() {
+    fn two_already_open_rows_sharing_a_port_still_read_as_two_sockets() {
         // The already-open branch used to bypass the address-based
-        // disambiguation entirely, so two dual-stack rows that share a
-        // port that is *also* already open both rendered the bare string
-        // "already open" -- identical text for two different sockets, the
-        // exact collapse this module's own doc comment on dual-stack rows
-        // says the subtitle must never produce.
+        // disambiguation entirely, so two rows that share a port that is
+        // *also* already open both rendered the bare string "already open"
+        // -- identical text for two different sockets, the exact collapse
+        // this module's own doc comment on dual-stack rows says the
+        // subtitle must never produce. Both fixtures here are IPv4
+        // (`AllInterfaces`/`Specific`, not a genuine v4+v6 pair) -- the
+        // disambiguation this pins is address-based, not stack-based, so
+        // two same-port IPv4 sockets at different addresses already prove
+        // it without needing a real dual-stack pair.
         let mut open = HashSet::new();
         open.insert(53);
-        let v4 = svc(53, None, Binding::AllInterfaces);
-        let v6 = svc(53, None, Binding::Specific("10.0.0.5".parse().unwrap()));
-        let v4_subtitle = subtitle_for(&v4, &open);
-        let v6_subtitle = subtitle_for(&v6, &open);
+        let wildcard = svc(53, None, Binding::AllInterfaces);
+        let specific = svc(53, None, Binding::Specific("10.0.0.5".parse().unwrap()));
+        let wildcard_subtitle = subtitle_for(&wildcard, &open);
+        let specific_subtitle = subtitle_for(&specific, &open);
         assert_ne!(
-            v4_subtitle, v6_subtitle,
+            wildcard_subtitle, specific_subtitle,
             "two already-open sockets sharing a port must not render identically"
         );
-        assert!(v4_subtitle.contains("0.0.0.0"), "got: {v4_subtitle}");
-        assert!(v6_subtitle.contains("10.0.0.5"), "got: {v6_subtitle}");
+        assert!(
+            wildcard_subtitle.contains("0.0.0.0"),
+            "got: {wildcard_subtitle}"
+        );
+        assert!(
+            specific_subtitle.contains("10.0.0.5"),
+            "got: {specific_subtitle}"
+        );
     }
 
     #[test]

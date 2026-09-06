@@ -16,8 +16,12 @@ members = [
 # on this host exactly as before this crate existed. `--workspace` overrides
 # `default-members` (it always means literally every member), so a command
 # that passes `--workspace` explicitly still needs `--exclude porthole-gui`
-# on this host -- see `.superpowers/sdd/2026-09-05-milestone-4-gui/task-2-report.md`
-# for the exact invocations this project's host-side gates use.
+# on this host, e.g. `cargo test --workspace --exclude porthole-gui`,
+# `cargo clippy --workspace --all-targets --exclude porthole-gui -- -D warnings`,
+# and `cargo +1.87 check --workspace --all-targets --exclude porthole-gui`.
+# `porthole-gui` itself is built and tested only in the container:
+#   podman build -t porthole-gui-test -f tests/container/Containerfile.gui tests/container
+#   podman run --rm -v .:/src:z -w /src porthole-gui-test bash tests/container/gui-test.sh
 default-members = [
     "crates/porthole-core",
     "crates/porthole-cli",

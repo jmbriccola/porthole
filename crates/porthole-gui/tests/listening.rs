@@ -238,6 +238,77 @@ fn a_port_already_open_is_not_offered_again() -> Result<(), String> {
     Ok(())
 }
 
+/// I6: a helper round trip that fails must withdraw an "already open" claim
+/// it can no longer confirm, not leave it standing on whatever
+/// `set_open_ports` last said -- `set_open_ports_unknown` is the method a
+/// caller reaches for that.
+fn a_helper_failure_withdraws_a_stale_already_open_claim() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningOpenPortsUnknown",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_open_ports(&[5173]);
+            section.set_services(&[svc(5173, Some("node"), Binding::AllInterfaces)]);
+            let had_button_before = section.open_button_for(0).is_some();
+            let subtitle_before = section
+                .rows()
+                .first()
+                .and_then(|r| r.subtitle())
+                .map(|s| s.to_string());
+
+            section.set_open_ports_unknown();
+
+            let has_button_after = section.open_button_for(0).is_some();
+            let subtitle_after = section
+                .rows()
+                .first()
+                .and_then(|r| r.subtitle())
+                .map(|s| s.to_string());
+            *seen.borrow_mut() = Some((
+                had_button_before,
+                subtitle_before,
+                has_button_after,
+                subtitle_after,
+            ));
+        },
+    );
+    let (had_button_before, subtitle_before, has_button_after, subtitle_after) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if had_button_before {
+        return Err(
+            "fixture setup: expected the port to read as already open before the failure"
+                .to_string(),
+        );
+    }
+    match subtitle_before.as_deref() {
+        Some(s) if s.contains("already open") => {}
+        other => {
+            return Err(format!(
+                "fixture setup: expected \"already open\" in the subtitle before the \
+                 failure, got {other:?}"
+            ))
+        }
+    }
+    if !has_button_after {
+        return Err(
+            "set_open_ports_unknown must stop withholding the Open button on a claim \
+             porthole can no longer confirm"
+                .to_string(),
+        );
+    }
+    if subtitle_after
+        .as_deref()
+        .is_some_and(|s| s.contains("already open"))
+    {
+        return Err(format!(
+            "set_open_ports_unknown must stop the stale \"already open\" claim: {subtitle_after:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// The control half of the disambiguation check below: `LoopbackOnly`'s
 /// subtitle is a fixed safety fact, not an address report, so two
 /// `LoopbackOnly` rows on the same port -- a genuine `127.0.0.1` +
@@ -312,7 +383,11 @@ fn dual_stack_network_facing_rows_show_different_addresses() -> Result<(), Strin
     Ok(())
 }
 
-/// A calm empty state, not an error -- mirrors `OpenNowSection`'s own.
+/// A calm empty state, not an error -- mirrors `OpenNowSection`'s own
+/// `an_empty_list_is_a_calm_status_page_not_an_error`, checked the same way:
+/// title, icon and CSS classes, not title alone. A title-only check would
+/// still pass if the calm page grew `.css_classes(["error"])` and an error
+/// glyph.
 fn nothing_listening_is_a_calm_status_page_not_an_error() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
@@ -321,14 +396,37 @@ fn nothing_listening_is_a_calm_status_page_not_an_error() -> Result<(), String> 
         move |_app| {
             let section = ListeningSection::new();
             section.set_services(&[]);
-            let status_title = section.status_page().map(|p| p.title().to_string());
+            let status = section.status_page();
+            let title = status.as_ref().map(|p| p.title().to_string());
+            let icon_name = status
+                .as_ref()
+                .and_then(|p| p.icon_name())
+                .map(|s| s.to_string());
+            let css_classes: Vec<String> = status
+                .as_ref()
+                .map(|p| p.css_classes().iter().map(|c| c.to_string()).collect())
+                .unwrap_or_default();
             let rows_empty = section.rows().is_empty();
-            *seen.borrow_mut() = Some((status_title, rows_empty));
+            *seen.borrow_mut() = Some((title, icon_name, css_classes, rows_empty));
         },
     );
-    let (status_title, rows_empty) = result.borrow_mut().take().ok_or("activation never ran")?;
-    if status_title.is_none() {
-        return Err("expected a status page when nothing is listening".to_string());
+    let (title, icon_name, css_classes, rows_empty) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if title.as_deref() != Some("Nothing else is listening") {
+        return Err(format!(
+            "expected a status page titled \"Nothing else is listening\", got {title:?}"
+        ));
+    }
+    let icon = icon_name.unwrap_or_default();
+    if icon.contains("warning") || icon.contains("error") {
+        return Err(format!(
+            "the empty state's icon reads as a problem, not the ordinary state it is: {icon:?}"
+        ));
+    }
+    if css_classes.iter().any(|c| c == "error" || c == "warning") {
+        return Err(format!(
+            "the empty state carries an error/warning CSS class: {css_classes:?}"
+        ));
     }
     if !rows_empty {
         return Err("rows must be empty when nothing is listening".to_string());
@@ -540,7 +638,7 @@ fn the_loading_state_survives_a_set_open_ports_before_any_scan() -> Result<(), S
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 14] = [
+    let cases: [Case; 15] = [
         (
             "a_service_shows_its_name_and_port_the_way_the_spec_writes_it",
             a_service_shows_its_name_and_port_the_way_the_spec_writes_it,
@@ -568,6 +666,10 @@ fn main() {
         (
             "a_port_already_open_is_not_offered_again",
             a_port_already_open_is_not_offered_again,
+        ),
+        (
+            "a_helper_failure_withdraws_a_stale_already_open_claim",
+            a_helper_failure_withdraws_a_stale_already_open_claim,
         ),
         (
             "loopback_only_rows_share_the_same_reassurance_regardless_of_address",

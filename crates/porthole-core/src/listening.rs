@@ -258,9 +258,15 @@ pub trait ProcFs {
     /// Contents of `/proc/net/tcp`.
     fn net_tcp(&self) -> Result<String>;
     /// Contents of `/proc/net/tcp6`. A machine with no IPv6 support at all
-    /// may not have this file; that is not the same failure as
-    /// `/proc/net/tcp` itself being unreadable, and callers should treat an
-    /// `Err` here as "no IPv6 listeners", not as a reason to fail outright.
+    /// may not have this file, which [`RealProcFs::net_tcp6`] reports as
+    /// `Ok(String::new())` rather than an `Err` -- that absence is not the
+    /// same failure as `/proc/net/tcp` itself being unreadable, or as
+    /// `/proc/net/tcp6` existing but being unreadable for some other reason
+    /// (permissions, most plausibly): either of those is a real failure of
+    /// this scan, not "no IPv6 listeners", and callers must propagate an
+    /// `Err` here rather than swallow it -- silently doing so is exactly
+    /// what would hide every listener [`Binding::BeyondReach`] exists to
+    /// surface.
     fn net_tcp6(&self) -> Result<String>;
     /// Every pid currently visible in `/proc` — listing them needs no
     /// privilege; reading into one belonging to another user does.
@@ -283,8 +289,17 @@ impl ProcFs for RealProcFs {
     }
 
     fn net_tcp6(&self) -> Result<String> {
-        std::fs::read_to_string("/proc/net/tcp6")
-            .map_err(|e| Error::Unexpected(format!("could not read /proc/net/tcp6: {e}")))
+        match std::fs::read_to_string("/proc/net/tcp6") {
+            Ok(text) => Ok(text),
+            // The expected shape of "this machine has no IPv6 support":
+            // the file itself does not exist. Any other failure (most
+            // plausibly a permissions error) is a real one -- see this
+            // trait method's own doc comment.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(Error::Unexpected(format!(
+                "could not read /proc/net/tcp6: {e}"
+            ))),
+        }
     }
 
     fn pids(&self) -> Result<Vec<u32>> {
@@ -372,10 +387,12 @@ fn resolve_pids(fs: &dyn ProcFs, raw: &[RawListener]) -> HashMap<u64, (u32, Stri
 pub fn scan(fs: &dyn ProcFs) -> Result<Vec<Service>> {
     let mut raw = parse_proc_net_tcp(&fs.net_tcp()?);
     // A machine with IPv6 disabled entirely may have no /proc/net/tcp6 at
-    // all; that is not a reason to fail a scan that is otherwise fine.
-    if let Ok(text6) = fs.net_tcp6() {
-        raw.extend(parse_proc_net_tcp6(&text6));
-    }
+    // all; `ProcFs::net_tcp6` itself is what absorbs that one specific,
+    // expected case (see its own doc comment) -- anything it still returns
+    // as `Err` here is a real failure and must fail this scan the same way
+    // an unreadable `/proc/net/tcp` already does above, not be silently
+    // read as "no IPv6 listeners".
+    raw.extend(parse_proc_net_tcp6(&fs.net_tcp6()?));
 
     let resolved = resolve_pids(fs, &raw);
 
@@ -411,6 +428,13 @@ pub struct FakeProcFs {
     /// simulating "other users' processes exist, and this one cannot read
     /// them" without needing a socket of its own.
     extra_pids: Vec<u32>,
+    /// Simulates `/proc/net/tcp6` existing but being unreadable for some
+    /// reason other than not existing (permissions, most plausibly) -- the
+    /// case [`ProcFs::net_tcp6`]'s own doc comment says must fail the scan,
+    /// not be read as "no IPv6 listeners". Distinct from `tcp6` simply
+    /// being empty, which simulates the file existing and genuinely having
+    /// no listeners in it.
+    tcp6_unreadable: bool,
 }
 
 impl FakeProcFs {
@@ -441,6 +465,25 @@ impl FakeProcFs {
         self.sockets.push((inode, pid, comm.to_string()));
         self
     }
+
+    /// Supplies `/proc/net/tcp6`'s own contents, the way [`FakeProcFs::new`]
+    /// supplies `/proc/net/tcp`'s -- without this, `tcp6` defaults to an
+    /// empty string, which parses to zero listeners regardless of whether
+    /// that is meant to simulate "no IPv6 support" or "IPv6 supported, and
+    /// genuinely nothing listening".
+    pub fn with_tcp6(mut self, tcp6: &str) -> Self {
+        self.tcp6 = tcp6.to_string();
+        self
+    }
+
+    /// Simulates `/proc/net/tcp6` existing but failing to read for a reason
+    /// other than not existing (permissions, most plausibly) -- the case
+    /// [`ProcFs::net_tcp6`]'s own doc comment says must fail the scan, not
+    /// be read as "no IPv6 listeners".
+    pub fn with_tcp6_unreadable(mut self) -> Self {
+        self.tcp6_unreadable = true;
+        self
+    }
 }
 
 impl ProcFs for FakeProcFs {
@@ -449,6 +492,11 @@ impl ProcFs for FakeProcFs {
     }
 
     fn net_tcp6(&self) -> Result<String> {
+        if self.tcp6_unreadable {
+            return Err(Error::Unexpected(
+                "permission denied reading /proc/net/tcp6 (fake)".to_string(),
+            ));
+        }
         Ok(self.tcp6.clone())
     }
 
@@ -623,14 +671,26 @@ mod tests {
 
     #[test]
     fn scan_includes_v6_listeners_alongside_v4() {
-        let fs = FakeProcFs::new(PROC_NET_TCP);
-        // FakeProcFs's tcp6 defaults to empty, so wire the v6 fixture in by
-        // hand via a second fake sharing the same fd/process state would be
-        // needed for a full end-to-end check; here the parse-level test
-        // above already proves the v6 parsing itself, so this just proves
-        // `scan` does not drop tcp entries when tcp6 is present but empty.
+        let fs = FakeProcFs::new(PROC_NET_TCP).with_tcp6(PROC_NET_TCP6);
         let found = scan(&fs).unwrap();
+        // A v4 port from PROC_NET_TCP and a v6 port from PROC_NET_TCP6,
+        // both present in the same scan.
         assert!(found.iter().any(|s| s.port == 46715));
+        assert!(found.iter().any(|s| s.port == 1716));
+    }
+
+    #[test]
+    fn a_tcp6_read_failure_fails_the_scan_rather_than_hiding_v6_listeners() {
+        // A `/proc/net/tcp6` that exists but cannot be read (permissions,
+        // most plausibly) is not the same fact as "this machine has no
+        // IPv6 support", and must not be read as "no IPv6 listeners" --
+        // that is exactly the class of listener `Binding::BeyondReach`
+        // exists to surface.
+        let fs = FakeProcFs::new(PROC_NET_TCP).with_tcp6_unreadable();
+        assert!(
+            scan(&fs).is_err(),
+            "a tcp6 read failure other than \"not found\" must fail the scan"
+        );
     }
 
     #[test]

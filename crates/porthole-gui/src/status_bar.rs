@@ -49,14 +49,24 @@
 //!
 //! [`NO_FIREWALL_TITLE`] is what the banner's own `title` shows now: short,
 //! capitalised, authored for this surface, and -- deliberately -- it does
-//! not itself claim reachability. It states only what `set_status` can
-//! always verify directly, `!status.firewall_available`, without leaning on
-//! what any particular `detail` string happens to say. The reachability
-//! claim -- and the rest of `detail`'s own explanation, unedited -- still
-//! reaches the user, verbatim, on [`StatusBar::line`] right underneath:
-//! item 5's own principle (the helper's text must reach the user, not a
-//! GUI paraphrase resting on an invariant held elsewhere) survives; only
-//! which widget carries which half of it changed.
+//! not itself claim reachability. The reachability claim -- and the rest of
+//! `detail`'s own explanation, unedited -- still reaches the user, verbatim,
+//! on [`StatusBar::line`] right underneath: item 5's own principle (the
+//! helper's text must reach the user, not a GUI paraphrase resting on an
+//! invariant held elsewhere) survives; only which widget carries which half
+//! of it changed.
+//!
+//! `!status.firewall_available` is not, on its own, "no firewall is
+//! installed" -- `docs/json-schema.md` documents it as folding that together
+//! with "porthole could not detect a backend at all, for whatever reason",
+//! and only the first of those is what [`NO_FIREWALL_TITLE`] states. Neither
+//! backend health check this project ships can currently produce the second
+//! case (nothing here claims a future one never will), so `status.detail`
+//! today is always [`porthole_core::backend::NO_FIREWALL_MESSAGE`] itself
+//! whenever `firewall_available` is `false` -- but the banner title is
+//! chosen by checking that, not by assuming it: `set_status` shows
+//! [`NO_FIREWALL_TITLE`] only when `detail` actually is that message, and a
+//! separate, honestly-uncertain title otherwise.
 //!
 //! A third fact needs its own wording too, for the identical reason: a
 //! helper that *did* answer, but with a typed error, is not "could not
@@ -85,15 +95,35 @@
 //! previous, better refresh cannot linger underneath it.
 
 use adw::prelude::*;
+use porthole_core::backend::NO_FIREWALL_MESSAGE;
 use porthole_core::ipc::WireStatus;
 
-/// [`StatusBar::set_status`]'s no-firewall banner title -- short, and
-/// deliberately makes no claim beyond what `!status.firewall_available`
-/// itself already confirms. See this module's own doc comment for why the
-/// stronger "already reachable" claim belongs on [`StatusBar::line`]
-/// instead, verbatim from `status.detail`, not repeated or paraphrased
-/// here.
+/// [`StatusBar::set_status`]'s title for a confirmed no-firewall detection
+/// -- short, and deliberately makes no claim beyond that. See this module's
+/// own doc comment for why the stronger "already reachable" claim belongs
+/// on [`StatusBar::line`] instead, verbatim from `status.detail`, not
+/// repeated or paraphrased here, and for why this is not simply what
+/// `!status.firewall_available` means on its own.
 const NO_FIREWALL_TITLE: &str = "No firewall detected.";
+
+/// [`StatusBar::set_status`]'s title for `!status.firewall_available` when
+/// `status.detail` is not [`NO_FIREWALL_MESSAGE`] -- the second fact that
+/// bit folds together (see this module's own doc comment) and the one
+/// [`NO_FIREWALL_TITLE`] must not be shown for, since porthole did not
+/// confirm it.
+const COULD_NOT_DETERMINE_TITLE: &str = "Could not determine whether a firewall is installed.";
+
+/// Picks between [`NO_FIREWALL_TITLE`] and [`COULD_NOT_DETERMINE_TITLE`] by
+/// checking `status.detail` against [`NO_FIREWALL_MESSAGE`] directly, rather
+/// than assuming `!status.firewall_available` always means the confirmed
+/// case -- see this module's own doc comment.
+fn no_firewall_banner_title(status: &WireStatus) -> &'static str {
+    if status.detail == NO_FIREWALL_MESSAGE {
+        NO_FIREWALL_TITLE
+    } else {
+        COULD_NOT_DETERMINE_TITLE
+    }
+}
 
 fn unreachable_title(message: &str) -> String {
     format!("Could not reach the porthole helper — {message}")
@@ -193,10 +223,11 @@ impl StatusBar {
 
     /// Renders the helper's own `status`: the backend's name and version
     /// and plainly whether it is enforcing anything, or -- when
-    /// `firewall_available` is `false` -- the more serious, confirmed fact
-    /// that there is no firewall at all. See this module's own doc comment
-    /// for the distinction that must survive between this and
-    /// [`StatusBar::set_unreachable`].
+    /// `firewall_available` is `false` -- one of two more serious banners,
+    /// chosen from `status.detail` (see this module's own doc comment for
+    /// why `firewall_available: false` alone does not settle which). See
+    /// this module's own doc comment for the distinction that must survive
+    /// between either of those and [`StatusBar::set_unreachable`].
     ///
     /// The no-firewall case is the one place `line` is used *alongside* a
     /// revealed banner rather than cleared by it: `show_banner` clears
@@ -208,7 +239,7 @@ impl StatusBar {
     /// title.
     pub fn set_status(&self, status: &WireStatus) {
         if !status.firewall_available {
-            self.show_banner(NO_FIREWALL_TITLE);
+            self.show_banner(no_firewall_banner_title(status));
             self.line.set_label(&status.detail);
             // `show_banner` restores `dim-label` (the ordinary line's
             // default styling) along with clearing the text -- wrong here:
@@ -324,6 +355,41 @@ mod tests {
             !NO_FIREWALL_TITLE.to_lowercase().contains("reachable"),
             "the banner title must not itself claim reachability: {NO_FIREWALL_TITLE}"
         );
+    }
+
+    /// The fixture `docs/json-schema.md` describes as not live today:
+    /// `firewall_available: false` with a `detail` that is not
+    /// `NO_FIREWALL_MESSAGE`. This must not render as the confirmed
+    /// `NO_FIREWALL_TITLE` -- porthole did not confirm that in this case.
+    fn status_with_detail(detail: &str) -> WireStatus {
+        WireStatus {
+            backend: String::new(),
+            firewall_available: false,
+            firewall_active: false,
+            firewall_active_unknown: false,
+            firewall_version: String::new(),
+            detail: detail.to_string(),
+            location: String::new(),
+            interface: String::new(),
+            address: String::new(),
+            cidr: String::new(),
+            rules: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_no_firewall_title_is_used_only_when_detail_confirms_it() {
+        let confirmed = status_with_detail(NO_FIREWALL_MESSAGE);
+        assert_eq!(no_firewall_banner_title(&confirmed), NO_FIREWALL_TITLE);
+
+        let ambiguous = status_with_detail("could not read /proc/net/dev: permission denied");
+        assert_eq!(
+            no_firewall_banner_title(&ambiguous),
+            COULD_NOT_DETERMINE_TITLE,
+            "a detail that is not NO_FIREWALL_MESSAGE must not be shown under the \
+             confirmed-absence title"
+        );
+        assert_ne!(COULD_NOT_DETERMINE_TITLE, NO_FIREWALL_TITLE);
     }
 
     #[test]
