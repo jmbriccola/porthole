@@ -11,7 +11,7 @@
 use porthole_core::backend;
 use porthole_core::cli_path;
 use porthole_core::command::RealRunner;
-use porthole_core::ipc::{CloseReason, PATH, SERVICE};
+use porthole_core::ipc::{PATH, SERVICE};
 use porthole_core::reconcile::{self, SweepMode};
 use porthole_core::state::{ManagedRule, StateStore};
 use porthole_helper::authz::{AlwaysAllow, Authorizer};
@@ -100,26 +100,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // what is open, and these rules are exactly the ones that are not in it.
     announce_reconciled(&conn, &reconciled).await;
 
-    // Not spawned under `--session`: `crates/porthole-cli/tests/helper_e2e.rs`
-    // spawns a real `--session` helper directly on this development host, and
-    // its safety argument for the real backend it talks to rested partly on
-    // no helper process living long enough for a poll tick to fire -- timing,
-    // not anything enforced. NetworkManager only answers on the system bus
-    // regardless, so `--session` buys the monitor nothing there in
-    // production either.
-    //
-    // Known conflict, not silently papered over: `crates/porthole-cli/tests/
-    // container.rs`'s own network-change test starts `porthole-helper
-    // --session` *inside an isolated podman container*, specifically so
-    // netmon runs against a real, disposable firewall with no system
-    // bus/polkit stack required -- that test cannot pass with this gate in
-    // place. Left for the next review to resolve; this round's ask was the
-    // development-host risk.
+    // The monitor closes rules in whatever firewall this machine has, on its
+    // own timer, with no client asking -- so it runs on the system bus, and
+    // under `--session` only when `PORTHOLE_NETMON` says the firewall is
+    // disposable. `netmon::should_run` holds the whole rule and the reasons
+    // for it.
     //
     // Its own connection, not the one just moved into `service`: that one is
     // already spoken for (`Porthole` uses it to ask the bus daemon who a
     // caller is).
-    if !session {
+    if netmon::should_run(session) {
         tokio::spawn(netmon::run(conn.clone(), state_path, cli));
     }
 
@@ -221,6 +211,11 @@ fn reconcile_at_startup() -> Vec<ManagedRule> {
 /// the record -- which is a real thing to tell someone who opened a port
 /// before the last reboot, and a different thing from "your port has just
 /// been closed".
+///
+/// This sweep is not the only one that can drop a record: every operation
+/// reconciles too, and those drops reach the bus the same way, through
+/// `Porthole::announce_reconciled`. Only the emitter differs -- this one is
+/// built here because there is no client request to have supplied one.
 async fn announce_reconciled(conn: &zbus::Connection, rules: &[ManagedRule]) {
     if rules.is_empty() {
         return;
@@ -235,7 +230,5 @@ async fn announce_reconciled(conn: &zbus::Connection, rules: &[ManagedRule]) {
             None
         }
     };
-    for rule in rules {
-        Porthole::announce_autoclose(emitter.as_ref(), rule, CloseReason::Reconciled).await;
-    }
+    Porthole::announce_reconciled(emitter.as_ref(), rules).await;
 }

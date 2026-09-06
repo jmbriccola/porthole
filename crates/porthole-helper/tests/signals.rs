@@ -290,6 +290,73 @@ async fn a_close_that_finds_nothing_announces_nothing() {
 }
 
 #[tokio::test]
+async fn a_record_the_firewall_no_longer_has_is_announced_by_the_operation_that_finds_it() {
+    // The reload case, with no restart anywhere: the firewall has forgotten
+    // a rule, porthole's state file has not, and the next operation's own
+    // reconciliation sweep drops the record. Before this was plumbed the
+    // drop was silent on the journal and on the bus, so a client that keeps
+    // its view from signals showed the port as open forever.
+    //
+    // The close below *fails* -- the sweep dropped the rule a moment before
+    // it looked -- which is the case that matters most and the one a naive
+    // wiring would miss, because the method returns early.
+    //
+    // Firewalld only: the record's handle has to be one the detected backend
+    // would recognise as its own, and this is the backend whose read-only
+    // listing (`firewall-cmd --list-rich-rules`) an unprivileged caller can
+    // actually run. Nothing here mutates the firewall -- firewalld cannot
+    // prove which rules are porthole's, so its orphan sweep never runs (see
+    // `reconcile.rs`).
+    let runner = RealRunner;
+    match porthole_core::backend::detect(&runner) {
+        Ok(backend) if backend.id() == BackendId::Firewalld => {}
+        Ok(backend) => {
+            eprintln!(
+                "skipped: this host detects {}, and this test needs a firewalld handle",
+                backend.id()
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("skipped: no firewall backend on this host: {e}");
+            return;
+        }
+    }
+
+    let dir = TempDir::new().unwrap();
+    let state_path = dir.path().join("state.json");
+    let mut orphan = created_rule();
+    orphan.expires_at = None;
+    let mut store = StateStore::open(&state_path).unwrap();
+    store.insert(orphan.clone());
+    store.save().unwrap();
+
+    let (_server, name) = serve("SigReconciled", &state_path).await;
+    let proxy = proxy_to(&name).await;
+    let mut signals = proxy.receive_rule_closed().await.unwrap();
+
+    let failed = proxy.close(orphan.port, "tcp").await;
+    assert!(
+        failed.is_err(),
+        "the sweep dropped the record first, so the close has nothing to find"
+    );
+
+    let signal = next_signal(&mut signals).await;
+    let args = signal.args().unwrap();
+    assert_eq!(
+        args.reason,
+        CloseReason::Reconciled,
+        "porthole did not close this one -- it found the record of a rule the \
+         firewall no longer had"
+    );
+    assert_eq!(args.rule.id, orphan.id);
+    assert_eq!(args.rule.port, orphan.port);
+
+    // And the record really is gone, so a `list` and the signal agree.
+    assert!(proxy.list().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn a_forget_announces_no_close_because_nothing_was_closed() {
     // `close --id <id> --forget` drops porthole's record of a rule recorded
     // under a backend this machine no longer has, and touches no firewall at
@@ -489,9 +556,14 @@ async fn signal_survives(bus: &PrivateBus) -> bool {
     )
     .await;
 
-    tokio::time::timeout(ARRIVES_WITHIN, signals.next())
-        .await
-        .is_ok()
+    // `Ok(Some(_))`, not `is_ok()`: a stream that *ended* also completes the
+    // timeout, and counting that as a delivered signal would make the
+    // positive leg of the only test that measures the shipped policy pass on
+    // a dead subscriber.
+    matches!(
+        tokio::time::timeout(ARRIVES_WITHIN, signals.next()).await,
+        Ok(Some(_))
+    )
 }
 
 #[tokio::test]

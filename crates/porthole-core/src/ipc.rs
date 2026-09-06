@@ -86,6 +86,12 @@ pub enum CloseReason {
     /// longer has, and dropped the record. Nothing was removed from any
     /// firewall for this one: the port had already stopped being open, and
     /// this is porthole noticing.
+    ///
+    /// Not only at helper start-up. Every operation reconciles first, so a
+    /// `firewall-cmd --reload` (or a `ufw reload`) while the helper is
+    /// running produces this on whatever runs next -- including an operation
+    /// that then fails because the rule it was about to act on is the one
+    /// that had gone.
     Reconciled,
 }
 
@@ -295,6 +301,28 @@ pub trait Porthole {
     fn rule_opened(&self, rule: WireRule) -> zbus::Result<()>;
 
     /// A rule that has stopped being open, and why -- see [`CloseReason`].
+    ///
+    /// **`list` is the authority; these signals are notifications.** Three
+    /// things a subscriber that keeps its whole view from `RuleOpened` and
+    /// `RuleClosed` alone would get wrong:
+    ///
+    /// - A rule can leave `list` with no `RuleClosed` behind it.
+    ///   `close --id <id> --forget` drops porthole's record of a rule
+    ///   recorded under a backend this machine no longer has, without
+    ///   touching any firewall — so none of the four reasons is true of it
+    ///   and none is sent. A client that only listens goes on showing that
+    ///   rule as open.
+    /// - Signals are emitted after the state lock is released, so two
+    ///   clients acting at once can put a `RuleClosed` on the bus ahead of
+    ///   the `RuleOpened` for a different rule. Per-message ordering from one
+    ///   sender is preserved; the order two *operations* completed in is not.
+    /// - A signal sent before a client subscribed is simply gone. The
+    ///   helper's start-up sweep is the common case: it announces what it
+    ///   dropped as soon as it owns the bus name, which is before any agent
+    ///   started by a desktop session can be listening.
+    ///
+    /// So: subscribe, and also call `list` — at start-up, and whenever the
+    /// view has to be right rather than merely current.
     #[zbus(signal)]
     fn rule_closed(&self, rule: WireRule, reason: CloseReason) -> zbus::Result<()>;
 

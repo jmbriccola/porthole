@@ -74,6 +74,44 @@ use zbus::object_server::SignalEmitter;
 /// no NetworkManager at all) is still noticed within about a minute.
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Test-only opt-in that makes the monitor run under `--session` too.
+/// Honoured in debug builds only, the same rule
+/// `porthole_core::state::STATE_FILE_ENV` follows: a release binary runs
+/// privileged and must not take behaviour from the environment. See
+/// [`should_run`] for what the pair of conditions is actually for.
+pub const NETMON_ENV: &str = "PORTHOLE_NETMON";
+
+/// Whether [`run`] should be spawned at all.
+///
+/// The monitor closes rules in whatever firewall this machine actually has,
+/// on its own timer, with no client asking. What decides whether that is
+/// acceptable is not which bus the helper is on, it is whether the firewall
+/// is disposable.
+///
+/// A production helper is on the system bus, and its firewall is the one it
+/// is meant to manage: it runs. `--session` is the test-only mode, and a
+/// `--session` helper started on a developer's own machine talks to that
+/// machine's real firewall, so it does not -- see
+/// `crates/porthole-cli/tests/helper_e2e.rs`, which spawns exactly that. A
+/// `--session` helper inside a disposable container has a firewall of its
+/// own that nothing outside the container shares, and says so by setting
+/// [`NETMON_ENV`]; `crates/porthole-cli/tests/container.rs` is the only
+/// thing in this workspace that does.
+pub fn should_run(session: bool) -> bool {
+    decide(
+        session,
+        std::env::var_os(NETMON_ENV).is_some(),
+        cfg!(debug_assertions),
+    )
+}
+
+/// [`should_run`] with the environment and the build profile as plain
+/// values, so both halves -- including the one a test binary can never be
+/// (`debug_build: false`) -- are testable without touching either.
+fn decide(session: bool, opted_in: bool, debug_build: bool) -> bool {
+    !session || (debug_build && opted_in)
+}
+
 static SYSTEM_CLOCK: SystemClock = SystemClock;
 
 /// The subnet [`wake_up_blocking`] last resolved successfully. `None` before
@@ -111,6 +149,13 @@ struct CheckOutcome {
     transition: Option<(String, String)>,
     /// What [`LAST_KNOWN_SUBNET`] should hold after this wake-up.
     last_known: Option<Ipv4Net>,
+    /// Records the engine's own reconciliation dropped while this wake-up was
+    /// closing things -- rules the firewall no longer had at all. Nothing to
+    /// do with the network changing; collected here because this is the one
+    /// place that holds the engine, and announced as
+    /// [`CloseReason::Reconciled`], never as a network-change close. See
+    /// [`porthole_core::engine::Engine::take_reconciled`].
+    reconciled: Vec<ManagedRule>,
 }
 
 /// Re-resolve the current subnet, decide what changed relative to `previous`,
@@ -136,30 +181,39 @@ fn check_network(
     runner: &dyn CommandRunner,
     previous: Option<Ipv4Net>,
 ) -> CheckOutcome {
-    match net::current_network(runner) {
+    let mut outcome = match net::current_network(runner) {
         Ok(network) => match previous {
             Some(lost) if lost != network.cidr => CheckOutcome {
                 closed: engine.close_rules_outside(lost),
                 transition: Some((lost.to_string(), network.cidr.to_string())),
                 last_known: Some(network.cidr),
+                reconciled: Vec::new(),
             },
             _ => CheckOutcome {
                 closed: Vec::new(),
                 transition: None,
                 last_known: Some(network.cidr),
+                reconciled: Vec::new(),
             },
         },
         Err(Error::NoNetwork(_)) => CheckOutcome {
             closed: engine.close_rules_on_network_loss(),
             transition: previous.map(|lost| (lost.to_string(), String::new())),
             last_known: None,
+            reconciled: Vec::new(),
         },
         Err(_) => CheckOutcome {
             closed: Vec::new(),
             transition: None,
             last_known: previous,
+            reconciled: Vec::new(),
         },
-    }
+    };
+    // Taken after the match, not inside it: only the two arms that close
+    // anything reconcile at all, and this way a third arm added later cannot
+    // silently drop what its own sweep found.
+    outcome.reconciled = engine.take_reconciled();
+    outcome
 }
 
 /// One wake-up's synchronous half: detect the backend, take the state lock,
@@ -172,6 +226,7 @@ fn check_network(
 fn wake_up_blocking(state_path: &Path, executable: &Path) -> CheckOutcome {
     let previous = *LAST_KNOWN_SUBNET.lock().expect("not poisoned");
     let unchanged = CheckOutcome {
+        reconciled: Vec::new(),
         closed: Vec::new(),
         transition: None,
         last_known: previous,
@@ -227,6 +282,10 @@ async fn wake_up(state_path: &Path, executable: &Path, emitter: Option<&SignalEm
             return;
         }
     };
+
+    // First, and separately from anything about the network: these rules had
+    // already stopped being open before this wake-up looked at anything.
+    Porthole::announce_reconciled(emitter, &outcome.reconciled).await;
 
     if let Some((old, new)) = &outcome.transition {
         match emitter {
@@ -313,6 +372,33 @@ mod tests {
     const ROUTE_JSON: &str = r#"[{"dst":"default","dev":"wlo1","metric":600}]"#;
     const ADDR_JSON: &str = r#"[{"ifindex":2,"ifname":"wlo1","addr_info":[{"family":"inet","local":"10.10.10.119","prefixlen":24,"scope":"global"}]}]"#;
     const ADDR_JSON_OTHER_SUBNET: &str = r#"[{"ifindex":2,"ifname":"wlo1","addr_info":[{"family":"inet","local":"192.168.1.50","prefixlen":24,"scope":"global"}]}]"#;
+
+    #[test]
+    fn the_monitor_runs_on_the_system_bus_and_only_opts_in_on_a_session_one() {
+        // The distinction is not session-versus-system, it is
+        // disposable-versus-real: a `--session` helper on a developer's own
+        // machine talks to that machine's real firewall, so it needs the
+        // opt-in; one inside a container sets it.
+        assert!(
+            decide(false, false, true),
+            "a system-bus helper always runs"
+        );
+        assert!(decide(false, false, false));
+        assert!(
+            !decide(true, false, true),
+            "`--session` alone is not enough"
+        );
+        assert!(decide(true, true, true), "`--session` plus the opt-in runs");
+
+        // A release binary runs privileged and must not take this from the
+        // environment -- the same rule `PORTHOLE_STATE_FILE` follows. A test
+        // binary is always a debug build, so passing the profile in is the
+        // only way to check the release half at all.
+        assert!(
+            !decide(true, true, false),
+            "a release build must ignore the opt-in entirely"
+        );
+    }
 
     fn engine_with_rule<'a>(
         backend: &'a FakeBackend,

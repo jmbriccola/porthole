@@ -21,6 +21,16 @@
 //!    [`CloseReason`] value, and there is exactly one place a close could go
 //!    unannounced instead of one per method.
 //!
+//! A rule can also stop being open without any client asking. Every method
+//! that takes the exclusive lock reconciles first, and that sweep drops from
+//! state whatever the firewall no longer has -- a `firewall-cmd --reload`
+//! while the helper is running is enough. Those drops come back from
+//! [`Engine::take_reconciled`] and are announced through
+//! [`Porthole::announce_reconciled`] **before** the method's own signal and
+//! regardless of whether the method itself succeeded, because a `close`
+//! whose rule the sweep just dropped fails, and that is precisely when a
+//! subscriber would otherwise be left showing a port as open forever.
+//!
 //! # Where the announcements are actually tested
 //!
 //! Nothing on the development host can reach an `announce_*` call from a
@@ -151,7 +161,13 @@ impl Porthole {
         // `.await` below: a zbus interface method's future has to be `Send`.
         // It also drops the exclusive state lock before the announcement
         // rather than after it, which is the right order regardless.
-        let rule = {
+        //
+        // The engine's own result and what its reconciliation dropped come
+        // out separately, and the drops are announced first and
+        // unconditionally: an operation that fails *because* the sweep just
+        // dropped its rule is exactly the case where the drop most needs
+        // saying (see `Engine::take_reconciled`).
+        let (opened, reconciled) = {
             let backend = backend::detect(&runner).map_err(HelperError::from)?;
             let state = StateStore::open_exclusive(&self.state_path).map_err(HelperError::from)?;
             let mut engine = Engine::new(
@@ -161,12 +177,13 @@ impl Porthole {
                 state,
                 self.executable.clone(),
             );
-            engine
-                .open(port, protocol, &spec, lifetime, uid)
-                .map_err(HelperError::from)?
+            let opened = engine.open(port, protocol, &spec, lifetime, uid);
+            (opened, engine.take_reconciled())
         };
 
         // 5 and 6. The journal, then the bus.
+        Self::announce_reconciled(Some(&emitter), &reconciled).await;
+        let rule = opened.map_err(HelperError::from)?;
         Self::announce_open(&emitter, &rule).await;
 
         Ok(WireRule::from_rule(&rule))
@@ -199,7 +216,13 @@ impl Porthole {
         // `.await` below: a zbus interface method's future has to be `Send`.
         // It also drops the exclusive state lock before the announcement
         // rather than after it, which is the right order regardless.
-        let rule = {
+        //
+        // The engine's own result and what its reconciliation dropped come
+        // out separately, and the drops are announced first and
+        // unconditionally: an operation that fails *because* the sweep just
+        // dropped its rule is exactly the case where the drop most needs
+        // saying (see `Engine::take_reconciled`).
+        let (closed, reconciled) = {
             let runner = RealRunner;
             let backend = backend::detect(&runner).map_err(HelperError::from)?;
             let state = StateStore::open_exclusive(&self.state_path).map_err(HelperError::from)?;
@@ -210,10 +233,11 @@ impl Porthole {
                 state,
                 self.executable.clone(),
             );
-            engine
-                .close_by_port(port, protocol, false)
-                .map_err(HelperError::from)?
+            let closed = engine.close_by_port(port, protocol, false);
+            (closed, engine.take_reconciled())
         };
+        Self::announce_reconciled(Some(&emitter), &reconciled).await;
+        let rule = closed.map_err(HelperError::from)?;
         Self::announce_close(&emitter, &rule, closed_by, CloseReason::Requested).await;
         Ok(WireRule::from_rule(&rule))
     }
@@ -250,7 +274,13 @@ impl Porthole {
         // `.await` below: a zbus interface method's future has to be `Send`.
         // It also drops the exclusive state lock before the announcement
         // rather than after it, which is the right order regardless.
-        let rule = {
+        //
+        // The engine's own result and what its reconciliation dropped come
+        // out separately, and the drops are announced first and
+        // unconditionally: an operation that fails *because* the sweep just
+        // dropped its rule is exactly the case where the drop most needs
+        // saying (see `Engine::take_reconciled`).
+        let (closed, reconciled) = {
             let runner = RealRunner;
             let backend = backend::detect(&runner).map_err(HelperError::from)?;
             let state = StateStore::open_exclusive(&self.state_path).map_err(HelperError::from)?;
@@ -261,22 +291,28 @@ impl Porthole {
                 state,
                 self.executable.clone(),
             );
-            engine
-                .close_by_id(id, from_timer, forget)
-                .map_err(HelperError::from)?
+            let closed = engine.close_by_id(id, from_timer, forget);
+            (closed, engine.take_reconciled())
         };
+        Self::announce_reconciled(Some(&emitter), &reconciled).await;
+        let rule = closed.map_err(HelperError::from)?;
         // `forget` never touched any firewall -- `Engine::forget_rule`
         // refuses it for anything a real close could still reach -- so the
         // journal must not say "closed", which `format_close_log` always
         // does. A different, explicit line for a different, explicit action.
         //
-        // And no `RuleClosed` either, for the same reason and with the same
-        // consequence: none of the four reasons a `RuleClosed` can carry is
-        // true of a forget, and a subscriber told "closed" would tell someone
-        // a port had stopped being reachable when porthole did not touch any
-        // firewall and does not know whether it did. The state entry is gone
-        // from `list` either way, which is the only thing a forget actually
-        // changed.
+        // And no `RuleClosed` either, for the same reason: none of the four
+        // reasons a `RuleClosed` can carry is true of a forget, and a
+        // subscriber told "closed" would tell someone a port had stopped
+        // being reachable when porthole did not touch any firewall and does
+        // not know whether it did.
+        //
+        // The cost is real and is disclosed where the people who need it
+        // read it: `porthole_core::ipc`'s own `rule_closed` doc says that a
+        // rule can leave `list` with no `RuleClosed` behind it, so an agent
+        // that keeps its view from signals alone would go on showing a
+        // forgotten rule as open. Inventing a fifth reason, or reusing
+        // `requested`, would trade that for a worse claim.
         if forget {
             Self::log_forget(&rule, closed_by);
         } else {
@@ -311,7 +347,13 @@ impl Porthole {
         // `.await` below: a zbus interface method's future has to be `Send`.
         // It also drops the exclusive state lock before the announcement
         // rather than after it, which is the right order regardless.
-        let (closed, errors) = {
+        //
+        // The engine's own result and what its reconciliation dropped come
+        // out separately, and the drops are announced first and
+        // unconditionally: an operation that fails *because* the sweep just
+        // dropped its rule is exactly the case where the drop most needs
+        // saying (see `Engine::take_reconciled`).
+        let (closed, errors, reconciled) = {
             let runner = RealRunner;
             let backend = backend::detect(&runner).map_err(HelperError::from)?;
             let state = StateStore::open_exclusive(&self.state_path).map_err(HelperError::from)?;
@@ -325,8 +367,10 @@ impl Porthole {
             // `close --all` is never what the expiry timer invokes -- it
             // always closes a single rule by id -- so there is no
             // `from_timer` to thread through here.
-            engine.close_all(false)
+            let (closed, errors) = engine.close_all(false);
+            (closed, errors, engine.take_reconciled())
         };
+        Self::announce_reconciled(Some(&emitter), &reconciled).await;
         for rule in &closed {
             Self::announce_close(&emitter, rule, closed_by, CloseReason::Requested).await;
         }
@@ -522,13 +566,11 @@ impl Porthole {
     /// "closed by uid=" would have to invent a requester for a close no
     /// client ever made.
     ///
-    /// `emitter` is optional because both callers can run with no usable
-    /// emitter -- the start-up sweep happens before the helper has claimed
-    /// the bus name, and `SignalEmitter::new` can in principle fail. The
-    /// journal line is the audit trail and is written either way, which is
-    /// the reason the `Option` lives in here rather than at the call sites:
-    /// there is no arrangement of them that can log without announcing or
-    /// announce without logging.
+    /// `emitter` is `None` when `SignalEmitter::new` failed. The journal line
+    /// is the audit trail and is written either way, which is why the
+    /// `Option` lives in here rather than at the call sites: there is no
+    /// arrangement of them that can log without announcing or announce
+    /// without logging.
     pub async fn announce_autoclose(
         emitter: Option<&SignalEmitter<'_>>,
         rule: &porthole_core::state::ManagedRule,
@@ -538,6 +580,22 @@ impl Porthole {
         let Some(emitter) = emitter else { return };
         if let Err(e) = Self::rule_closed(emitter, WireRule::from_rule(rule), reason).await {
             eprintln!("porthole: could not announce the close on the bus, continuing: {e}");
+        }
+    }
+
+    /// Every record reconciliation dropped from state, announced as
+    /// [`CloseReason::Reconciled`].
+    ///
+    /// One function for all of them -- the helper's start-up sweep, every
+    /// interface method's own per-operation sweep, and the network monitor's
+    /// -- so `Reconciled` means the same thing and reads the same way
+    /// wherever it comes from. Usually empty, and cheap when it is.
+    pub async fn announce_reconciled(
+        emitter: Option<&SignalEmitter<'_>>,
+        rules: &[porthole_core::state::ManagedRule],
+    ) {
+        for rule in rules {
+            Self::announce_autoclose(emitter, rule, CloseReason::Reconciled).await;
         }
     }
 

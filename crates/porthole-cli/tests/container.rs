@@ -1027,6 +1027,109 @@ kill "$MONPID" 2>/dev/null || true
     );
 }
 
+/// A record dropped by a *per-operation* sweep, with the helper never
+/// restarting, reaches the bus as `CloseReason::Reconciled`.
+///
+/// The realistic trigger, and the one no restart-based test covers: a
+/// `firewall-cmd --reload` while the helper is running. porthole's rules are
+/// runtime-only, so the reload throws them away; the state file survives; and
+/// the next operation's own reconciliation drops the record. That operation
+/// here is a `porthole close`, which then **fails** -- the record it was
+/// about to act on is the one that just went -- which is exactly the shape
+/// that would hide the drop from a subscriber if the announcement were tied
+/// to the operation succeeding.
+///
+/// The host-side counterpart
+/// (`porthole-helper/tests/signals.rs`'s
+/// `a_record_the_firewall_no_longer_has_is_announced_by_the_operation_that_finds_it`)
+/// synthesises the orphaned record; this one gets it from a real reload of a
+/// real firewalld.
+#[test]
+fn a_reload_under_a_running_helper_announces_the_records_it_orphaned() {
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    ensure_image(FEDORA_IMAGE, "Containerfile.fedora");
+
+    let mut args: Vec<String> = vec!["--cap-add=NET_ADMIN".to_string()];
+    args.extend(cli_mounts(&cli, &helper));
+
+    let body = r#"
+stdbuf -oL dbus-monitor --session "type='signal',interface='com.jacopobriccola.Porthole1'" \
+  > /tmp/signals.txt 2>&1 &
+MONPID=$!
+for i in $(seq 1 100); do
+  if [ -s /tmp/signals.txt ]; then break; fi
+  sleep 0.1
+done
+
+porthole --session open 5173 --until-reboot
+
+# The firewall forgets. The helper does not restart, and porthole's state
+# file still has the record.
+firewall-cmd --reload
+echo '===PH_AFTER_RELOAD_START==='
+firewall-cmd --list-rich-rules
+echo '===PH_AFTER_RELOAD_END==='
+
+# Fails: this operation's own sweep drops the record before the close can
+# find it. The drop must be announced anyway.
+porthole --session close 5173 || true
+echo '===PH_AFTER_CLOSE_START==='
+porthole --session list --json
+echo '===PH_AFTER_CLOSE_END==='
+
+sleep 1
+kill "$MONPID" 2>/dev/null || true
+"#;
+
+    let script = format!(
+        "set -e\n{FAKE_LAN_INTERFACE}\n{FIREWALLD_DAEMON_SETUP}\n{}\n{}\n",
+        with_helper(body),
+        marker_block("SIGNALS", "cat /tmp/signals.txt"),
+    );
+
+    eprintln!("== firewalld test: a reload under a running helper is announced ==");
+    let out = podman_run(FEDORA_IMAGE, &args, &script);
+    eprintln!("{}", String::from_utf8_lossy(&out.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&out.stderr));
+    assert_container_ok(&out, "the firewalld reload container");
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+    let after_reload = extract_marker(&stdout, "AFTER_RELOAD");
+    assert!(
+        !after_reload.contains(r#"port="5173""#),
+        "the reload was supposed to leave the firewall without porthole's \
+         rule, so the next sweep has something to find: {after_reload}"
+    );
+    assert!(
+        extract_marker(&stdout, "AFTER_CLOSE").contains(r#""rules":[]"#),
+        "the record must be gone from state too: {}",
+        extract_marker(&stdout, "AFTER_CLOSE")
+    );
+
+    let signals = extract_marker(&stdout, "SIGNALS");
+    assert_eq!(
+        signals.matches("member=RuleClosed").count(),
+        1,
+        "exactly one RuleClosed, for the record the sweep dropped: {signals}"
+    );
+    assert!(
+        signals.contains(r#"string "reconciled""#),
+        "porthole did not close this one -- it found a record of a rule the \
+         firewall no longer had: {signals}"
+    );
+    assert!(
+        !signals.contains(r#"string "requested""#),
+        "the close failed, so nothing may claim a client asked for it: \
+         {signals}"
+    );
+    assert!(
+        signals.contains("uint16 5173"),
+        "the signal must name the record that was dropped: {signals}"
+    );
+}
+
 /// The start-up reconciliation sweep announces what it dropped, as
 /// `CloseReason::Reconciled`.
 ///
@@ -1146,6 +1249,13 @@ wait "$HPID" 2>/dev/null || true
 
 /// The network watcher announces the change and the closes it caused.
 ///
+/// `-e PORTHOLE_NETMON=1` is what lets the watcher run at all here. It does
+/// not run under `--session` otherwise, because a `--session` helper started
+/// on a developer's own machine would be closing rules in that machine's real
+/// firewall off a timer; this container's firewall is its own and goes away
+/// with it, which is what the variable asserts. See
+/// `porthole_helper::netmon::should_run`.
+///
 /// Two waits of just over `netmon::POLL_INTERVAL` (60s), which is what makes
 /// this test take well over two minutes: the poll is the only wake-up source
 /// a container has -- `org.freedesktop.NetworkManager` is not on this bus --
@@ -1163,7 +1273,11 @@ fn a_subnet_the_machine_left_is_announced_along_with_the_rules_it_closed() {
     let (cli, helper) = require_musl_binaries!();
     ensure_image(FEDORA_IMAGE, "Containerfile.fedora");
 
-    let mut args: Vec<String> = vec!["--cap-add=NET_ADMIN".to_string()];
+    let mut args: Vec<String> = vec![
+        "--cap-add=NET_ADMIN".to_string(),
+        "-e".to_string(),
+        "PORTHOLE_NETMON=1".to_string(),
+    ];
     args.extend(cli_mounts(&cli, &helper));
 
     let body = r#"
