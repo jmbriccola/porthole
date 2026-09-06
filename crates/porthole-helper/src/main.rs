@@ -15,6 +15,7 @@ use porthole_core::ipc::{PATH, SERVICE};
 use porthole_core::reconcile::{self, SweepMode};
 use porthole_core::state::StateStore;
 use porthole_helper::authz::{AlwaysAllow, Authorizer};
+use porthole_helper::netmon;
 use porthole_helper::polkit::PolkitAuthorizer;
 use porthole_helper::service::Porthole;
 
@@ -76,15 +77,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(PolkitAuthorizer::new(&bus).await?)
     };
 
-    let service = Porthole::new(authorizer, bus, StateStore::default_path(), cli);
+    let state_path = StateStore::default_path();
+    let service = Porthole::new(authorizer, bus, state_path.clone(), cli.clone());
 
-    let _conn = serving
+    let conn = serving
         .name(SERVICE)?
         .serve_at(PATH, service)?
         .build()
         .await?;
 
     eprintln!("porthole-helper: serving {SERVICE}");
+
+    // Its own connection, not the one just moved into `service`: that one is
+    // already spoken for (`Porthole` uses it to ask the bus daemon who a
+    // caller is), and NetworkManager only ever answers on the **system**
+    // bus, so under `--session` (tests only) there is nothing there to
+    // subscribe to -- `netmon::run` tolerates that on its own and falls back
+    // to its plain interval poll. See `netmon`'s own module docs for why this
+    // task, once spawned, keeps the helper alive for exactly as long as it
+    // needs to be.
+    tokio::spawn(netmon::run(conn.clone(), state_path, cli));
+
     tokio::signal::ctrl_c().await?;
     Ok(())
 }

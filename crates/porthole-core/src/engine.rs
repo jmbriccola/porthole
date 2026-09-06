@@ -20,6 +20,7 @@ use crate::net::{self, LocalNetwork};
 use crate::reconcile;
 use crate::state::{ManagedRule, StateStore};
 use crate::validate;
+use ipnet::Ipv4Net;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -408,6 +409,80 @@ impl<'a> Engine<'a> {
             }
         }
         (closed, errors)
+    }
+
+    /// Close every subnet-scoped rule that no longer belongs to `current`,
+    /// the subnet the machine is actually on right now.
+    ///
+    /// Whatever prompted this call is only ever a reason to look again, never
+    /// a description of what changed -- the comparison below is what
+    /// decides, nothing else: a rule's own stored CIDR is checked against
+    /// `current`, and if `current` does not contain it, the intent it was
+    /// opened for ("let this reach me, on this network") no longer holds, so
+    /// it is closed rather than left open, re-aimed, or reported as valid.
+    /// [`Target::Anywhere`] was never tied to any subnet, so nothing about it
+    /// became false when the network did -- it survives untouched.
+    ///
+    /// Reconciles first, exactly as [`Engine::close_all`] does: the same
+    /// batch of rules is about to be inspected and possibly closed, so this
+    /// should not cost a separate listing command per rule the way looping
+    /// [`Engine::close_by_id`] naively would. Keeps going after a failure for
+    /// the same reason `close_all` does -- one rule that will not close must
+    /// not leave the others open on a network they no longer belong to.
+    pub fn close_rules_outside(&mut self, current: Ipv4Net) -> Vec<ManagedRule> {
+        self.reconcile();
+        let ids: Vec<String> = self
+            .state
+            .rules()
+            .iter()
+            .filter(|r| match r.target {
+                Target::Anywhere => false,
+                Target::Network { cidr } => !current.contains(&cidr),
+            })
+            .map(|r| r.id.clone())
+            .collect();
+        self.close_ids_after_network_change(ids)
+    }
+
+    /// Close every subnet-scoped rule because the machine has no usable
+    /// network at all right now.
+    ///
+    /// With no current subnet to compare a rule's stored CIDR against, there
+    /// is no way to say any subnet-scoped rule is still honestly reachable,
+    /// so every one of them closes. [`Target::Anywhere`] survives, for the
+    /// same reason [`Engine::close_rules_outside`] leaves it alone.
+    pub fn close_rules_on_network_loss(&mut self) -> Vec<ManagedRule> {
+        self.reconcile();
+        let ids: Vec<String> = self
+            .state
+            .rules()
+            .iter()
+            .filter(|r| matches!(r.target, Target::Network { .. }))
+            .map(|r| r.id.clone())
+            .collect();
+        self.close_ids_after_network_change(ids)
+    }
+
+    /// Shared by [`Engine::close_rules_outside`] and
+    /// [`Engine::close_rules_on_network_loss`]: close each id, logging and
+    /// skipping whatever will not close rather than letting one stuck rule
+    /// stop the rest. No separate error list the way [`Engine::close_all`]
+    /// keeps one, on purpose -- nothing downstream of a network change reads
+    /// which rule failed and why, only that the ones that could close are
+    /// gone.
+    fn close_ids_after_network_change(&mut self, ids: Vec<String>) -> Vec<ManagedRule> {
+        let mut closed = Vec::new();
+        for id in ids {
+            match self.close_by_id_unreconciled(&id, false, false) {
+                Ok(rule) => closed.push(rule),
+                Err(e) => {
+                    eprintln!(
+                        "porthole: network change could not close rule {id}, continuing: {e}"
+                    );
+                }
+            }
+        }
+        closed
     }
 
     /// Close a rule the currently detected backend actually created.
@@ -1442,6 +1517,122 @@ mod tests {
         // must not pretend it did.
         assert_eq!(engine.rules().len(), 1);
         assert_eq!(engine.rules()[0].id, "stale");
+    }
+
+    #[test]
+    fn close_rules_outside_closes_a_rule_for_a_subnet_we_have_left() {
+        // The intent was "let my phone reach this, on this network". The
+        // network changed, so the intent no longer holds: closed, not
+        // re-aimed at the new network, not left listed as if still valid.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::Network("10.10.10.0/24".parse().unwrap()),
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        let closed = engine.close_rules_outside("192.168.1.0/24".parse().unwrap());
+        assert_eq!(closed.len(), 1);
+        assert!(engine.rules().is_empty());
+        assert!(
+            backend.handles().is_empty(),
+            "the firewall rule must really be gone, not just the state entry"
+        );
+    }
+
+    #[test]
+    fn close_rules_outside_leaves_a_rule_towards_anywhere_alone() {
+        // "Anyone" was never tied to a subnet, so nothing about it became
+        // false when the network did.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::Anywhere,
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        let closed = engine.close_rules_outside("192.168.1.0/24".parse().unwrap());
+        assert!(closed.is_empty());
+        assert_eq!(engine.rules().len(), 1);
+    }
+
+    #[test]
+    fn close_rules_outside_leaves_a_rule_for_the_network_we_are_still_on_alone() {
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::Network("10.10.10.0/24".parse().unwrap()),
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        assert!(engine
+            .close_rules_outside("10.10.10.0/24".parse().unwrap())
+            .is_empty());
+        assert_eq!(engine.rules().len(), 1);
+    }
+
+    #[test]
+    fn close_rules_on_network_loss_closes_every_subnet_rule_but_not_anywhere() {
+        // No network at all means every subnet-scoped rule is meaningless --
+        // there is nothing left to compare its CIDR against -- but a rule
+        // towards Anywhere was never tied to a subnet in the first place.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::Network("10.10.10.0/24".parse().unwrap()),
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+        engine
+            .open(
+                5432,
+                Protocol::Tcp,
+                &ScopeSpec::Anywhere,
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        let closed = engine.close_rules_on_network_loss();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].port, 5173);
+        assert_eq!(engine.rules().len(), 1);
+        assert_eq!(engine.rules()[0].port, 5432);
     }
 
     #[test]
