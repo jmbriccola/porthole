@@ -6,4 +6,5 @@
 //! bin-only crate.
 
 pub mod app;
+pub mod open_now;
 pub mod window;

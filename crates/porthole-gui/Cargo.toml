@@ -31,6 +31,14 @@ name = "window"
 path = "tests/window.rs"
 harness = false
 
+# Same reasoning, same shape, its own process: `tests/open_now.rs` is task
+# 3's own GTK-touching suite, kept out of `tests/window.rs` for exactly the
+# reason that file's comment (and this one) says to.
+[[test]]
+name = "open_now"
+path = "tests/open_now.rs"
+harness = false
+
 [dependencies]
 porthole-core = { path = "../porthole-core" }
 gtk = { package = "gtk4", version = "0.9" }

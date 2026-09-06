@@ -2,10 +2,12 @@
 //!
 //! `PortholeWindow` wraps a real `adw::ApplicationWindow` rather than
 //! subclassing one: nothing here needs a custom GObject property or signal,
-//! only a widget tree and two stable extension points -- the `content` box
-//! that Tasks 3-6 append their sections into, one per task, and the
-//! narrow-width `AdwBreakpoint` the spec requires (`INITIAL_PROMPT.md` §5:
-//! "finestra ridimensionabile fino a larghezze strette (`AdwBreakpoint`)").
+//! only a widget tree and three stable extension points -- the `content` box
+//! that Tasks 3-6 append their sections into, one per task; the narrow-width
+//! `AdwBreakpoint` the spec requires (`INITIAL_PROMPT.md` §5: "finestra
+//! ridimensionabile fino a larghezze strette (`AdwBreakpoint`)"); and the
+//! `AdwToastOverlay` any section can show a toast through, first used by
+//! Task 3's close button.
 //!
 //! `Deref` to the real window is what makes `.present()`, `.is_realized()`,
 //! `.current_breakpoint()` and every other `gtk::Window`/`gtk::Widget`/
@@ -25,6 +27,8 @@ use std::ops::Deref;
 
 use adw::prelude::*;
 
+use crate::open_now::OpenNowSection;
+
 /// The width, in CSS pixels, at or below which the narrow layout applies.
 /// Tasks 3-6 attach the actual layout changes to this same `Breakpoint`
 /// object, reachable via [`PortholeWindow::breakpoint`], through
@@ -37,6 +41,8 @@ pub struct PortholeWindow {
     window: adw::ApplicationWindow,
     content: gtk::Box,
     breakpoint: adw::Breakpoint,
+    toast_overlay: adw::ToastOverlay,
+    open_now: OpenNowSection,
 }
 
 impl Deref for PortholeWindow {
@@ -64,9 +70,15 @@ impl PortholeWindow {
             .hscrollbar_policy(gtk::PolicyType::Never)
             .build();
 
+        // Wraps the scrollable content area only, not the header bar, so a
+        // toast (e.g. a failed close, Task 3's close button) never covers
+        // window chrome.
+        let toast_overlay = adw::ToastOverlay::new();
+        toast_overlay.set_child(Some(&scroller));
+
         let toolbar_view = adw::ToolbarView::new();
         toolbar_view.add_top_bar(&adw::HeaderBar::new());
-        toolbar_view.set_content(Some(&scroller));
+        toolbar_view.set_content(Some(&toast_overlay));
 
         let window = adw::ApplicationWindow::builder()
             .application(app)
@@ -89,10 +101,19 @@ impl PortholeWindow {
         // the exact object that was registered.
         window.add_breakpoint(breakpoint.clone());
 
+        // "Open now" -- what is open comes before what could be opened, the
+        // spec's own ordering. Wired to this window's toast overlay so a
+        // failed close (the helper's own message) has somewhere to show up.
+        let open_now = OpenNowSection::new();
+        open_now.set_toast_overlay(&toast_overlay);
+        content.append(open_now.widget());
+
         Self {
             window,
             content,
             breakpoint,
+            toast_overlay,
+            open_now,
         }
     }
 
@@ -110,5 +131,17 @@ impl PortholeWindow {
     /// that resizes a real window and checks exactly that.
     pub fn breakpoint(&self) -> &adw::Breakpoint {
         &self.breakpoint
+    }
+
+    /// The overlay any section can show an `adw::Toast` through. Wraps the
+    /// scrollable content area, not the header bar.
+    pub fn toast_overlay(&self) -> &adw::ToastOverlay {
+        &self.toast_overlay
+    }
+
+    /// The "Open now" section this window owns, for a later task (or a
+    /// test) that needs to feed it a fresh rule list.
+    pub fn open_now(&self) -> &OpenNowSection {
+        &self.open_now
     }
 }
