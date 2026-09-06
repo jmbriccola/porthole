@@ -144,15 +144,27 @@ pub struct Neighbour {
     pub mac: String,
 }
 
+/// Neighbour states whose entry carries no mapping worth acting on,
+/// whatever else the line holds.
+///
+/// `INCOMPLETE` has no `lladdr` at all: address resolution is still in
+/// flight, and there is nothing to read. `FAILED` is the kernel's own record
+/// that it probed this address and got no answer -- the entry may still
+/// carry the `lladdr` it last knew, and that is exactly the mapping the
+/// probe disproved. Neither is a state a saved device should resolve
+/// through.
+const UNUSABLE_NEIGHBOUR_STATES: [&str; 2] = ["FAILED", "INCOMPLETE"];
+
 /// Parse `ip -4 neigh show`'s text output.
 ///
 /// Not a positional parse: `dev <iface>` and `lladdr <mac>` are found by
-/// their own keyword, not by column index. That distinction is load-bearing
-/// here specifically because an `INCOMPLETE` entry has no `lladdr` field at
-/// all -- a parse that assumed a fixed column held the MAC would read the
-/// state word `INCOMPLETE` itself as one. `STALE` (and any other state word)
-/// still carries a usable link-layer address and is kept; only an entry with
-/// no `lladdr` token anywhere on its line is skipped.
+/// their own keyword, not by column index, and this loop steps over the
+/// value it just consumed so a state word is never confused with an
+/// interface name or a MAC.
+///
+/// An entry is kept when it names an interface and an `lladdr`, and its
+/// state is not one of [`UNUSABLE_NEIGHBOUR_STATES`]. `STALE` is kept --
+/// see [`neighbours`] for what that does and does not mean.
 fn parse_neighbours(text: &str) -> Result<Vec<Neighbour>> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -163,12 +175,29 @@ fn parse_neighbours(text: &str) -> Result<Vec<Neighbour>> {
 
         let mut interface = None;
         let mut mac = None;
-        for i in 1..fields.len().saturating_sub(1) {
+        let mut unusable = false;
+        let mut i = 1;
+        while i < fields.len() {
             match fields[i] {
-                "dev" => interface = Some(fields[i + 1].to_string()),
-                "lladdr" => mac = Some(fields[i + 1].to_ascii_lowercase()),
-                _ => {}
+                "dev" => {
+                    interface = fields.get(i + 1).map(|f| f.to_string());
+                    i += 2;
+                }
+                "lladdr" => {
+                    mac = fields.get(i + 1).map(|f| f.to_ascii_lowercase());
+                    i += 2;
+                }
+                word => {
+                    if UNUSABLE_NEIGHBOUR_STATES.contains(&word) {
+                        unusable = true;
+                    }
+                    i += 1;
+                }
             }
+        }
+
+        if unusable {
+            continue;
         }
 
         if let (Some(interface), Some(mac)) = (interface, mac) {
@@ -182,11 +211,114 @@ fn parse_neighbours(text: &str) -> Result<Vec<Neighbour>> {
     Ok(out)
 }
 
-/// The kernel's IPv4 neighbour table.
+/// The kernel's IPv4 neighbour table, minus the entries that carry no
+/// mapping ([`UNUSABLE_NEIGHBOUR_STATES`]).
+///
+/// What a returned entry means, stated narrowly, because a saved device is
+/// resolved through this and a port is opened towards the address it gives:
+/// the kernel has an IP-to-MAC mapping recorded, and has not disproved it.
+/// It is not a reachability test, and nothing here sends a packet to make
+/// one.
+///
+/// `STALE` entries are included. The kernel marks an entry `STALE` once it
+/// has not been confirmed recently -- roughly 30s of idleness on this
+/// machine's `base_reachable_time_ms` -- which is the ordinary condition of
+/// a phone in a pocket, not a sign that anything is wrong. Excluding them
+/// would refuse a large share of a quiet network's devices: on this
+/// machine's own table, two of five entries were `STALE` at rest.
+///
+/// The cost of including them is real and worth naming. A `STALE` entry can
+/// be wrong -- the device left, its DHCP lease expired, and the address was
+/// handed to something else -- and on a small network the kernel may not
+/// correct it soon, because it garbage-collects the table only above
+/// `gc_thresh1` entries (128 by default, against five here). In practice a
+/// new lease-holder that announces itself by ARP causes the kernel to
+/// rewrite the entry for that address, after which the saved MAC no longer
+/// maps to it and the device stops resolving; that is the usual, and
+/// self-correcting, path.
+///
+/// Requiring `REACHABLE` would narrow that window but not close it, and the
+/// reason is not about neighbour states at all: a rule outlives the check
+/// that authorized it. A device may leave one second after the rule is
+/// written, and porthole re-examines nothing for as long as the rule stands.
+/// So a stricter gate here buys confidence at the moment of opening, on a
+/// rule that may live for hours, in exchange for refusing devices that are
+/// merely idle. That trade was judged not worth making; the limitation it
+/// would have narrowed is documented rather than hidden, in
+/// `docs/json-schema.md` alongside `resolvable`.
 pub fn neighbours(runner: &dyn CommandRunner) -> Result<Vec<Neighbour>> {
     let cmd = Command::read("ip", ["-4", "neigh", "show"]);
     let out = runner.run(&cmd)?.into_ok(&cmd)?;
     parse_neighbours(&out.stdout)
+}
+
+/// Every subnet this machine currently holds on a non-virtual interface,
+/// alongside the one the default route names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresentNetworks {
+    /// The default route's own subnet -- exactly what [`current_network`]
+    /// returns, and what "the network I am on" means wherever one answer is
+    /// wanted.
+    pub primary: LocalNetwork,
+    /// Every non-virtual interface's subnet, `primary`'s included,
+    /// de-duplicated and in the order `ip` listed them.
+    pub all: Vec<Ipv4Net>,
+}
+
+/// Both facts, from the same two reads [`current_network`] already makes.
+///
+/// A machine can hold several subnets at once -- a docked laptop with wifi
+/// and ethernet both up is the ordinary case -- and the default route names
+/// only one of them. A caller asking "is this subnet still up?" cannot get
+/// that from the default route, because a still-connected interface that
+/// does not carry the route is invisible to it.
+///
+/// The only difference from [`current_network`]'s own second command is that
+/// the address read is unfiltered (`ip -j -4 addr show`, no `dev`), so the
+/// same output answers both questions.
+pub fn present_networks(runner: &dyn CommandRunner) -> Result<PresentNetworks> {
+    let interface = default_route_interface(runner)?;
+    let cmd = Command::read("ip", ["-j", "-4", "addr", "show"]);
+    let out = runner.run(&cmd)?.into_ok(&cmd)?;
+    let primary = parse_addresses(&out.stdout, &interface)?;
+    let all = parse_all_subnets(&out.stdout)?;
+    Ok(PresentNetworks { primary, all })
+}
+
+/// Every non-virtual interface's global IPv4 subnet, from one unfiltered
+/// `ip -j -4 addr show`.
+///
+/// An interface with no global IPv4 address contributes nothing rather than
+/// failing the whole read: unlike [`parse_addresses`], which is asked about
+/// one named interface and must say when that interface has no address,
+/// this is a sweep, and a machine routinely carries interfaces that are up
+/// with nothing global on them.
+fn parse_all_subnets(json: &str) -> Result<Vec<Ipv4Net>> {
+    let entries: Vec<AddrEntry> = serde_json::from_str(json)
+        .map_err(|e| Error::Unexpected(format!("could not parse `ip -j addr` output: {e}")))?;
+
+    let mut out: Vec<Ipv4Net> = Vec::new();
+    for entry in entries {
+        if is_virtual_interface(&entry.ifname) {
+            continue;
+        }
+        for info in entry.addr_info {
+            if info.family != "inet" || info.scope != "global" {
+                continue;
+            }
+            let Ok(address) = info.local.parse::<Ipv4Addr>() else {
+                continue;
+            };
+            let Ok(cidr) = Ipv4Net::new(address, info.prefixlen) else {
+                continue;
+            };
+            let cidr = cidr.trunc();
+            if !out.contains(&cidr) {
+                out.push(cidr);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The subnet porthole opens towards by default.
@@ -335,6 +467,79 @@ mod tests {
 10.10.10.17 dev wlo1 lladdr bc:24:11:99:5d:f3 STALE
 ";
 
+    /// `ip -j -4 addr show`, verbatim from this machine (Fedora 44,
+    /// iproute2): one real wifi interface plus the three virtual ones this
+    /// machine actually carries -- loopback, `docker0`, and a `br-` bridge
+    /// left by an unrelated project. Captured rather than written, so the
+    /// virtual-exclusion test below runs against interfaces that really
+    /// exist and really have global IPv4 addresses.
+    const ADDR_JSON_ALL: &str = r#"[{"ifindex":1,"ifname":"lo","flags":["LOOPBACK","UP","LOWER_UP"],"mtu":65536,"qdisc":"noqueue","operstate":"UNKNOWN","group":"default","txqlen":1000,"addr_info":[{"family":"inet","local":"127.0.0.1","prefixlen":8,"scope":"host","label":"lo","valid_life_time":4294967295,"preferred_life_time":4294967295}]},{"ifindex":2,"ifname":"wlo1","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],"mtu":1500,"qdisc":"noqueue","operstate":"UP","group":"default","txqlen":1000,"altnames":["wlp0s20f3","wlxe8bfb85d9152"],"addr_info":[{"family":"inet","local":"10.10.10.119","prefixlen":24,"broadcast":"10.10.10.255","scope":"global","dynamic":true,"noprefixroute":true,"label":"wlo1","valid_life_time":726888,"preferred_life_time":726888}]},{"ifindex":3,"ifname":"docker0","flags":["NO-CARRIER","BROADCAST","MULTICAST","UP"],"mtu":1500,"qdisc":"noqueue","operstate":"DOWN","group":"default","addr_info":[{"family":"inet","local":"172.17.0.1","prefixlen":16,"broadcast":"172.17.255.255","scope":"global","label":"docker0","valid_life_time":4294967295,"preferred_life_time":4294967295}]},{"ifindex":4,"ifname":"br-5b772196d2da","flags":["NO-CARRIER","BROADCAST","MULTICAST","UP"],"mtu":1500,"qdisc":"noqueue","operstate":"DOWN","group":"default","addr_info":[{"family":"inet","local":"172.18.0.1","prefixlen":16,"broadcast":"172.18.255.255","scope":"global","label":"br-5b772196d2da","valid_life_time":4294967295,"preferred_life_time":4294967295}]}]"#;
+
+    #[test]
+    fn every_subnet_sweep_keeps_the_real_interface_and_drops_the_virtual_ones() {
+        // `docker0` and `br-5b772196d2da` both carry a global IPv4 address
+        // on this machine, so "has a global address" is not on its own
+        // enough to make a subnet one porthole is on.
+        let found = parse_all_subnets(ADDR_JSON_ALL).unwrap();
+        assert_eq!(found, vec!["10.10.10.0/24".parse::<Ipv4Net>().unwrap()]);
+    }
+
+    #[test]
+    fn every_subnet_sweep_reports_both_interfaces_of_a_docked_laptop() {
+        // The case the default route cannot express: two physical
+        // interfaces up at once, only one of which carries the route.
+        let two = ADDR_JSON_ALL.replace(
+            r#"{"ifindex":3,"ifname":"docker0""#,
+            r#"{"ifindex":5,"ifname":"enp0s31f6","addr_info":[{"family":"inet","local":"192.168.1.50","prefixlen":24,"scope":"global"}]},{"ifindex":3,"ifname":"docker0""#,
+        );
+        let found = parse_all_subnets(&two).unwrap();
+        assert_eq!(
+            found,
+            vec![
+                "10.10.10.0/24".parse::<Ipv4Net>().unwrap(),
+                "192.168.1.0/24".parse::<Ipv4Net>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_host_scoped_address_is_not_a_subnet_the_machine_is_on() {
+        // Loopback's 127.0.0.1/8 is `scope: host`, and `lo` is excluded by
+        // name as well -- checked here so neither guard is the only one.
+        let only_lo = r#"[{"ifindex":1,"ifname":"lo","addr_info":[{"family":"inet","local":"127.0.0.1","prefixlen":8,"scope":"host"}]}]"#;
+        assert!(parse_all_subnets(only_lo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn present_networks_names_the_default_route_subnet_and_still_lists_the_others() {
+        let two_routes = r#"[{"dst":"default","dev":"enp0s31f6","metric":100},{"dst":"default","dev":"wlo1","metric":600}]"#;
+        let two_addrs = ADDR_JSON_ALL.replace(
+            r#"{"ifindex":3,"ifname":"docker0""#,
+            r#"{"ifindex":5,"ifname":"enp0s31f6","addr_info":[{"family":"inet","local":"192.168.1.50","prefixlen":24,"scope":"global"}]},{"ifindex":3,"ifname":"docker0""#,
+        );
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(two_routes),
+            Output::stdout(&two_addrs),
+        ]);
+        let present = present_networks(&runner).unwrap();
+
+        assert_eq!(present.primary.interface, "enp0s31f6");
+        assert_eq!(
+            present.primary.cidr,
+            "192.168.1.0/24".parse::<Ipv4Net>().unwrap()
+        );
+        assert!(
+            present.all.contains(&"10.10.10.0/24".parse().unwrap()),
+            "the interface that does not carry the route is still up"
+        );
+
+        let commands = runner.recorded();
+        assert_eq!(commands[1].display(), "ip -j -4 addr show");
+        assert!(commands
+            .iter()
+            .all(|c| c.effect == crate::command::Effect::Read));
+    }
+
     #[test]
     fn an_incomplete_neighbour_has_no_mac_and_is_skipped_not_misread() {
         let found = parse_neighbours(IP_NEIGH).unwrap();
@@ -342,11 +547,55 @@ mod tests {
         assert!(found.iter().all(|n| n.mac != "incomplete"));
     }
 
+    /// Synthetic, not captured: this machine's own table held only
+    /// `REACHABLE` and `STALE` entries, so a `FAILED` line could not be
+    /// observed here. What it stands for is an entry the kernel probed and
+    /// got no answer for, which retains the `lladdr` it last knew -- the
+    /// shape that matters, since that residual MAC is what a parser keying
+    /// only on `lladdr` would accept.
+    const IP_NEIGH_FAILED: &str = "\
+10.10.10.1 dev wlo1 lladdr 50:e6:36:51:42:fd REACHABLE
+10.10.10.88 dev wlo1 lladdr bc:24:11:77:88:99 FAILED
+";
+
+    #[test]
+    fn a_failed_neighbour_is_rejected_even_though_it_still_carries_a_mac() {
+        // FAILED is the kernel's record that it asked this address and got
+        // nothing back. Accepting the lladdr it still carries would resolve
+        // a saved device through a mapping that has been actively
+        // disproved, and open a port towards it.
+        let found = parse_neighbours(IP_NEIGH_FAILED).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].mac, "50:e6:36:51:42:fd");
+        assert!(
+            !found.iter().any(|n| n.mac == "bc:24:11:77:88:99"),
+            "a FAILED entry must not resolve"
+        );
+    }
+
+    #[test]
+    fn a_state_word_is_never_mistaken_for_an_interface_or_a_mac() {
+        // The loop steps over the value it consumed after `dev` and
+        // `lladdr`, so the state scan only ever sees bare tokens. Pins that
+        // an interface or MAC could not smuggle a rejection in.
+        let found =
+            parse_neighbours("10.0.0.5 dev FAILED lladdr aa:bb:cc:dd:ee:ff STALE\n").unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "`dev FAILED` names an interface, not a state"
+        );
+        assert_eq!(found[0].interface, "FAILED");
+    }
+
     #[test]
     fn a_stale_neighbour_still_resolves() {
-        // STALE means the kernel has not confirmed the entry recently, not
-        // that it is wrong. Requiring REACHABLE would make a phone that has
-        // been idle for a minute "unreachable", which is most of the time.
+        // Deliberate, and documented on `neighbours`: STALE is the ordinary
+        // condition of an idle device, not evidence the mapping is wrong.
+        // Two of this machine's own five entries were STALE at rest, so
+        // refusing them would refuse much of a quiet network -- while still
+        // not bounding exposure, because a rule outlives the check that
+        // authorized it.
         let found = parse_neighbours(IP_NEIGH).unwrap();
         let phone = found.iter().find(|n| n.mac == "bc:24:11:5e:1c:6e").unwrap();
         assert_eq!(phone.address, "10.10.10.245".parse::<Ipv4Addr>().unwrap());

@@ -186,9 +186,11 @@ A few narrow edges worth knowing before you hit them:
   which says so per row. It is one for `open`, which fails with `device
   unreachable` and exit code 6 rather than opening towards a guess.
 - `resolves to <address>` reports what the neighbour table holds, not a
-  reachability test — porthole sends nothing to check. An entry that has gone
-  stale still resolves until the kernel drops it, so a device that has just
-  left can still be opened towards.
+  reachability test — porthole sends nothing to check. Entries the kernel
+  marks `FAILED` or `INCOMPLETE` are rejected, since neither carries a mapping
+  worth acting on. A `STALE` entry is accepted, because that is the ordinary
+  state of an idle device — so a device that has just left can still be opened
+  towards, until the kernel drops or rewrites its entry.
 
 ## Docker
 

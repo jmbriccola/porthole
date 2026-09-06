@@ -388,11 +388,31 @@ a MAC that is not there at all.
 
 Read both values narrowly. `false` means the lookup found nothing here and
 now -- the neighbour table only holds what has spoken to this machine
-recently -- not "no such device". `true` means the lookup produced an
-address, and no more than that: every neighbour entry carrying an `lladdr` is
-accepted whatever its state, `STALE` included, so a device that has just gone
-away still resolves until the kernel drops its entry. Neither value is a
-reachability test, and porthole sends no packet to make one.
+recently -- not "no such device". `true` means the kernel has a mapping
+recorded for that MAC and has not disproved it, and no more than that.
+
+Two neighbour states are rejected outright: `INCOMPLETE`, which has no
+link-layer address at all because resolution is still in flight, and
+`FAILED`, which is the kernel's record that it probed the address and got no
+answer -- an entry that may still carry the MAC it last knew, which is
+precisely the mapping the probe disproved.
+
+`STALE` entries are accepted, deliberately. `STALE` is what the kernel marks
+an entry once it has not been confirmed for roughly 30 seconds, which is the
+ordinary condition of an idle device rather than a sign anything is wrong.
+The consequence is that a device that has just left still resolves until the
+kernel drops or rewrites its entry, and on a small network that can take a
+while: the table is garbage-collected only above `gc_thresh1` entries, 128 by
+default. Usually the correction arrives on its own -- whatever takes the
+address next announces itself by ARP, the kernel rewrites that row, and the
+saved MAC stops mapping to it.
+
+Requiring `REACHABLE` instead would narrow that window without closing it,
+for a reason that has nothing to do with neighbour states: a rule outlives
+the check that authorized it. Nothing is re-examined once the rule is
+written, so a device may leave a second later and the rule stands until it
+expires. Neither value is a reachability test, and porthole sends no packet
+to make one.
 
 A malformed `devices.toml` is a different failure from an unresolvable device
 and does not appear in this shape at all: it exits `2` with the
