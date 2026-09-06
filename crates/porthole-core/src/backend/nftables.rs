@@ -566,7 +566,6 @@ impl FirewallBackend for Nftables<'_> {
                     .trim()
                     .to_string(),
             ),
-            Ok(_) => None,
             Err(Error::CommandSpawn { .. }) => {
                 return Ok(BackendHealth {
                     available: false,
@@ -577,7 +576,17 @@ impl FirewallBackend for Nftables<'_> {
                     caveat: None,
                 })
             }
-            Err(other) => return Err(other),
+            // Anything else is not proof the binary is absent -- only
+            // `CommandSpawn` is, and that already returned above.
+            // `RealRunner` can only ever fail this specific call with
+            // `CommandSpawn`, so this arm is dead through it -- but
+            // `CommandRunner` is a trait, and a hypothetical different
+            // failure here means only that this one read did not answer,
+            // not that nft is not installed. Fall through with no version
+            // known and let the next read -- `nft -j list chains`, a call
+            // this backend already has to make -- decide
+            // `available`/`active` on its own evidence.
+            Ok(_) | Err(_) => None,
         };
 
         // `nft -j list chains` needs root even just to summarise what is
@@ -654,17 +663,46 @@ impl FirewallBackend for Nftables<'_> {
                 // caution -- `status`, and `doctor`'s own `remedy` -- read a
                 // dedicated field rather than parsing prose for a "; "
                 // separator.
+                // `chain_itself_has_a_drop_or_reject` is one more read (`nft
+                // -j list chain ...` for this one chain's own rules), and a
+                // `?` here would be one more way `health()` could still
+                // return `Err` -- the same shape of gap this function's
+                // other two reads were just fixed for. In practice this read
+                // needs no more privilege than the `list_chains()` call that
+                // already succeeded to reach this arm at all, so a failure
+                // here is resource-level (the same category as firewalld's
+                // own `--state` spawn failure), not a live, reachable
+                // permission gap -- but propagating it would still turn a
+                // confirmed `active: true` nftables setup into "no firewall
+                // found" the moment this optional caveat could not be
+                // computed, which is a strictly worse outcome than simply
+                // not knowing the caveat. Report the failure as the caveat
+                // itself instead: honest about what could not be confirmed,
+                // never silently dropped and never fatal to the read that
+                // already succeeded.
                 let mut caveat = None;
                 if let [chain] = chains.as_slice() {
-                    if chain.policy.as_deref() == Some("accept")
-                        && !self.chain_itself_has_a_drop_or_reject(chain)?
-                    {
-                        caveat = Some(
-                            "its policy is accept and no rule in this chain drops or rejects \
-                             (a chain it jumps to might still), so closing a port here is not \
-                             on its own evidence that it becomes unreachable"
-                                .to_string(),
-                        );
+                    if chain.policy.as_deref() == Some("accept") {
+                        match self.chain_itself_has_a_drop_or_reject(chain) {
+                            Ok(false) => {
+                                caveat = Some(
+                                    "its policy is accept and no rule in this chain drops or \
+                                     rejects (a chain it jumps to might still), so closing a \
+                                     port here is not on its own evidence that it becomes \
+                                     unreachable"
+                                        .to_string(),
+                                );
+                            }
+                            Ok(true) => {}
+                            Err(e) => {
+                                caveat = Some(format!(
+                                    "its policy is accept, but porthole could not read this \
+                                     chain's own rules to check whether one of them drops or \
+                                     rejects ({e}) -- treat closing a port here as unconfirmed, \
+                                     not as evidence it becomes unreachable"
+                                ));
+                            }
+                        }
                     }
                 }
 
@@ -677,16 +715,21 @@ impl FirewallBackend for Nftables<'_> {
                     caveat,
                 })
             }
+            // Does not claim *why* the exit was non-zero: permission denial
+            // is the common cause (verified against the real binary, see
+            // the comment above this match), but not the only one a
+            // non-zero exit can mean, and porthole has not established
+            // which this is. Say only that nothing was confirmed, and name
+            // the real stderr `{e}` already carries.
             Err(e @ Error::CommandFailed { .. }) => Ok(BackendHealth {
                 available: true,
                 active: false,
                 active_unknown: true,
                 version,
                 detail: format!(
-                    "nft is installed, but listing its chains needs more privilege than this \
-                     process has ({e}) -- that is not the same as nothing being registered at \
-                     the input hook, it may already be enforcing traffic porthole cannot see \
-                     from here"
+                    "nft is installed, but listing its chains could not be confirmed ({e}) -- \
+                     that is not the same as nothing being registered at the input hook, it \
+                     may already be enforcing traffic porthole could not read from here"
                 ),
                 caveat: None,
             }),

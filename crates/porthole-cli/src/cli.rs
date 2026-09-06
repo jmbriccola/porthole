@@ -103,6 +103,12 @@ pub struct CloseArgs {
     /// the backend now detected. Refused for anything else -- forgetting a
     /// rule the current backend could actually close would leave it
     /// enforced with no record left able to close it later.
+    ///
+    /// Not the same outcome on every backend: a forgotten ufw or nftables
+    /// rule is still closed automatically once that backend is current
+    /// again (reconciliation proves it is theirs and sweeps it as an
+    /// orphan); a forgotten firewalld rule is not -- firewalld can never
+    /// prove a rule is its own, so nothing ever closes it, permanently.
     #[arg(long, requires = "id")]
     pub forget: bool,
 }

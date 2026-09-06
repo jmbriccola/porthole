@@ -90,10 +90,14 @@ pub struct WireStatus {
     /// carries (see `docs/json-schema.md`), reproduced here so a client on
     /// this surface is not left with the one undistinguished bit the local
     /// `--json` path already stopped carrying. The production helper always
-    /// runs as root, where this is effectively always `false`, but a
-    /// `--session` helper run by an ordinary user -- which this milestone's
-    /// own e2e suite does -- can still hit the permission-denied case a
-    /// system helper never would.
+    /// runs as root, which rules out the *permission-denied* case ufw and
+    /// nftables both have -- but not every case: an installed `nft` whose
+    /// ruleset porthole cannot parse sets this `true` for a root caller just
+    /// as it does for an unprivileged one (`Nftables::health`'s own
+    /// catch-all `Err` arm), and firewalld's resource-level `--state`
+    /// spawn failure can too. A `--session` helper run by an ordinary user
+    /// -- which this milestone's own e2e suite does -- can additionally hit
+    /// the permission-denied case a system helper never would.
     pub firewall_active_unknown: bool,
     /// Empty when unknown.
     pub firewall_version: String,

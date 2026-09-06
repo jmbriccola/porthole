@@ -217,7 +217,6 @@ impl FirewallBackend for Firewalld<'_> {
         let version_cmd = Command::read("firewall-cmd", ["--version"]);
         let version = match self.runner.run(&version_cmd) {
             Ok(out) if out.success() => Some(out.stdout.trim().to_string()),
-            Ok(_) => None,
             Err(Error::CommandSpawn { .. }) => {
                 return Ok(BackendHealth {
                     available: false,
@@ -228,33 +227,65 @@ impl FirewallBackend for Firewalld<'_> {
                     caveat: None,
                 })
             }
-            Err(other) => return Err(other),
+            // Anything else is not proof the binary is absent -- only
+            // `CommandSpawn` is, and that already returned above.
+            // `RealRunner` can only ever fail this specific call with
+            // `CommandSpawn`, so this arm is unreachable through it, but
+            // `CommandRunner` is a trait: a hypothetical different failure
+            // (a non-zero exit, or some other runner error) means only that
+            // this one read did not answer, not that firewalld is not
+            // installed. Fall through with no version known and let the
+            // next read -- `--state`, a call this backend already has to
+            // make -- decide `available`/`active` on its own evidence,
+            // rather than inventing a third outcome for a call `RealRunner`
+            // cannot actually produce.
+            Ok(_) | Err(_) => None,
         };
 
-        // `firewall-cmd --state` exits non-zero when the daemon is stopped, so
-        // the status is the answer, not an error. Unlike ufw's `status` or
-        // nft's `-j list chains`, this never needs more privilege than any
+        // `firewall-cmd --state` exits non-zero when the daemon is stopped,
+        // so a non-zero exit is the answer, not an error -- but a failure to
+        // even run the command (a resource-level `CommandSpawn`: EAGAIN,
+        // ENOMEM, EMFILE, or the binary swapped mid-upgrade between this
+        // call and the one above) is a different fact, and is not proof
+        // firewalld is stopped either. Unlike ufw's `status` or nft's `-j
+        // list chains`, this call itself never needs more privilege than any
         // user has -- firewalld's info actions are `yes` in its own policy
-        // for everyone -- so `active_unknown` is always `false` here; there
-        // is no permission-denied case for this backend to degrade.
+        // for everyone -- so there is no permission-denied case to degrade
+        // here, but there is still a "could not confirm" one, and it must
+        // degrade the same way theirs do rather than propagate: an installed
+        // firewalld this process could not currently ask is not the same
+        // fact as "no firewall found" once this reaches `detect`.
         let state_cmd = Command::read("firewall-cmd", ["--state"]);
-        let state = self.runner.run(&state_cmd)?;
-        let active = state.success() && state.stdout.trim() == "running";
-
-        let detail = if active {
-            match &version {
-                Some(v) => format!("firewalld {v} is running"),
-                None => "firewalld is running".to_string(),
+        let (active, active_unknown, detail) = match self.runner.run(&state_cmd) {
+            Ok(state) => {
+                let active = state.success() && state.stdout.trim() == "running";
+                let detail = if active {
+                    match &version {
+                        Some(v) => format!("firewalld {v} is running"),
+                        None => "firewalld is running".to_string(),
+                    }
+                } else {
+                    "firewalld is installed but not running, so no rule it holds is being \
+                     enforced"
+                        .to_string()
+                };
+                (active, false, detail)
             }
-        } else {
-            "firewalld is installed but not running, so no rule it holds is being enforced"
-                .to_string()
+            Err(e) => (
+                false,
+                true,
+                format!(
+                    "firewalld is installed, but checking whether it is running failed ({e}) \
+                     -- that is not the same as firewalld being stopped, it may already be \
+                     running and enforcing rules porthole could not confirm just now"
+                ),
+            ),
         };
 
         Ok(BackendHealth {
             available: true,
             active,
-            active_unknown: false,
+            active_unknown,
             version,
             detail,
             caveat: None,
@@ -569,6 +600,49 @@ pub(crate) mod tests {
         assert!(
             health.detail.contains("not running"),
             "got: {}",
+            health.detail
+        );
+    }
+
+    #[test]
+    fn a_state_spawn_failure_after_a_successful_version_is_still_available_not_an_error() {
+        // Item 2 of the eighth wave: `--version` succeeding already proves
+        // firewalld is installed; a resource-level failure to even run
+        // `--state` afterwards (EAGAIN, ENOMEM, EMFILE, the binary swapped
+        // mid-upgrade) is a different fact from "not installed" and must
+        // degrade the same way ufw's and nftables' own permission-denied
+        // reads do, not propagate with `?` -- which used to turn this into
+        // `detect()` reporting no firewall found at all on a machine running
+        // firewalld, the one backend the wave before this one did not touch.
+        struct VersionOkThenSpawnFails;
+        impl CommandRunner for VersionOkThenSpawnFails {
+            fn run(&self, cmd: &Command) -> Result<Output> {
+                if cmd.args.iter().any(|a| a == "--version") {
+                    Ok(Output::stdout("2.4.4"))
+                } else {
+                    Err(Error::CommandSpawn {
+                        command: cmd.display(),
+                        source: std::io::Error::other("resource busy"),
+                    })
+                }
+            }
+        }
+        let health = Firewalld::new(&VersionOkThenSpawnFails).health().unwrap();
+        assert!(
+            health.available,
+            "the binary is there; that must stand alone"
+        );
+        assert!(
+            !health.active,
+            "porthole cannot claim it is running when it could not check"
+        );
+        assert!(
+            health.active_unknown,
+            "this is the unknown case, not a confirmed-stopped one"
+        );
+        assert!(
+            health.detail.contains("resource busy"),
+            "must name the real failure: {}",
             health.detail
         );
     }

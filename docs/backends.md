@@ -55,6 +55,16 @@ port and protocol. Two things follow from that directly:
   on ufw and nftables, where a `porthole:<uuid>` marker makes ownership
   provable — see below.
 
+That same asymmetry reaches `porthole close --id <id> --forget` (the escape
+hatch for a rule recorded under a backend this machine no longer has — see
+`porthole close --help`). Forgetting a **ufw or nftables** rule is not
+permanent: both can prove a rule is their own, so the next time that backend
+is current again, reconciliation's orphan sweep finds the still-marked rule
+and closes it on its own. Forgetting a **firewalld** rule is permanent:
+firewalld can never prove a rich rule is its own, so that sweep never runs
+for it, on any account — nothing ever closes it automatically, even after
+firewalld is current again.
+
 ## ufw
 
 **ufw's rules are permanent by construction.** `ufw allow` writes straight

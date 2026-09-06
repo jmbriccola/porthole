@@ -132,7 +132,7 @@ fn firewall_check(backend: &dyn backend::FirewallBackend, runner: &dyn CommandRu
         // milestone spent a whole task guarding against elsewhere. Ask
         // `health` which case this is rather than assume the confirmed one.
         let remedy = if health.active_unknown {
-            privilege_needed_remedy(backend.id())
+            activity_unconfirmed_remedy(backend.id())
         } else {
             not_active_remedy(backend.id())
         };
@@ -237,7 +237,7 @@ fn health_error_remedy(id: BackendId) -> &'static str {
 /// What to tell someone when the detected backend is installed and
 /// *confirmed* not enforcing anything -- `health()` actually read its state
 /// and got a definite answer. Never call this for the other reason `active`
-/// can be `false`: see [`privilege_needed_remedy`] and
+/// can be `false`: see [`activity_unconfirmed_remedy`] and
 /// `BackendHealth::active_unknown`'s own doc comment for why the two need
 /// different, non-interchangeable wording.
 fn not_active_remedy(id: BackendId) -> &'static str {
@@ -260,36 +260,43 @@ fn not_active_remedy(id: BackendId) -> &'static str {
 }
 
 /// What to tell someone when the detected backend is installed, but
-/// `porthole doctor` — which runs unprivileged, by design — could not read
-/// enough of its ruleset to say whether anything is enforcing traffic.
+/// `porthole doctor` — which runs unprivileged, by design — could not
+/// confirm whether anything is enforcing traffic.
 ///
 /// Deliberately silent on which way the answer would actually go: naming a
 /// direction here would just be `not_active_remedy`'s mistake with the
-/// wording softened, not fixed. The one true thing porthole can say is that
-/// it does not know, and how to find out.
-fn privilege_needed_remedy(id: BackendId) -> &'static str {
+/// wording softened, not fixed. Also deliberately silent on asserting *why*
+/// porthole could not confirm it: a permission-denied read is the common
+/// reason for ufw and nftables, but `active_unknown` sets for any failure to
+/// confirm, not only that one -- a broken install or a stray traceback also
+/// exits non-zero, and porthole has not established which this is. Naming
+/// "needs privilege" unconditionally was a narrower claim than the condition
+/// that sets the flag actually supports; name it as the common cause worth
+/// ruling out first, not the established one.
+fn activity_unconfirmed_remedy(id: BackendId) -> &'static str {
     match id {
-        // Unreachable today: firewalld's reads (`firewall-cmd --version`,
-        // `--state`) are `yes` in its own policy for every user, so
-        // `active_unknown` never comes back `true` for this backend. Kept
-        // exhaustive, not a wildcard, so a change to that assumption breaks
-        // the build here instead of silently falling through to the wrong
-        // message.
+        // Reachable, if rarely: firewalld's own reads (`firewall-cmd
+        // --version`, `--state`) never need more privilege than any user
+        // has, but a resource-level failure to even run `--state` (EAGAIN,
+        // ENOMEM, the binary swapped mid-upgrade) still sets `active_unknown`
+        // -- see `Firewalld::health`'s own `Err(e)` arm on that call.
         BackendId::Firewalld => {
-            "porthole could not tell whether firewalld is enforcing anything, though this \
-             should never need more privilege than any user has. Run `porthole doctor` as \
-             root to rule that out, or check `firewall-cmd --state` by hand."
+            "porthole could not confirm whether firewalld is enforcing anything just now. \
+             This should never need more privilege than any user has, so try `porthole \
+             doctor` again, or check `firewall-cmd --state` by hand for the actual reason."
         }
         BackendId::Ufw => {
-            "porthole could not read ufw's status without more privilege than this process \
-             has, so it cannot say whether anything is enforced here — one way or the \
-             other. Run `porthole doctor` as root, or check `sudo ufw status` yourself."
+            "porthole could not confirm whether ufw is enforcing anything here -- one way \
+             or the other. The common reason is that reading its status needs more \
+             privilege than this process has; run `porthole doctor` as root to rule that \
+             out, or check `sudo ufw status` yourself for the actual reason."
         }
         BackendId::Nftables => {
-            "porthole could not read nftables' ruleset without more privilege than this \
-             process has, so it cannot say whether anything is filtering incoming traffic \
-             — one way or the other. Run `porthole doctor` as root, or check \
-             `sudo nft -j list chains` yourself."
+            "porthole could not confirm whether nftables is filtering incoming traffic \
+             here -- one way or the other. The common reason is that reading its ruleset \
+             needs more privilege than this process has; run `porthole doctor` as root to \
+             rule that out, or check `sudo nft -j list chains` yourself for the actual \
+             reason."
         }
     }
 }

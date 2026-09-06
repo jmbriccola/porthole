@@ -486,6 +486,34 @@ mod tests {
     }
 
     #[test]
+    fn detect_does_not_report_no_firewall_when_firewalld_state_spawn_fails() {
+        // Item 2 of the eighth wave, on the one backend the seventh
+        // instance's fix did not touch: `firewall-cmd --version` succeeding
+        // already proves firewalld is installed; a resource-level failure
+        // to even run `--state` afterwards used to propagate with `?` out
+        // of `Firewalld::health`, and `detect` propagates any `health()`
+        // error the same way -- so this reported "no firewall found" on a
+        // machine running firewalld. Verified through `detect` itself, the
+        // same reasoning as the nftables production-path test above.
+        struct VersionOkThenSpawnFails;
+        impl CommandRunner for VersionOkThenSpawnFails {
+            fn run(&self, cmd: &Command) -> crate::error::Result<Output> {
+                if cmd.args.iter().any(|a| a == "--version") {
+                    Ok(Output::stdout("2.4.4"))
+                } else {
+                    Err(Error::CommandSpawn {
+                        command: cmd.display(),
+                        source: std::io::Error::other("resource busy"),
+                    })
+                }
+            }
+        }
+        let backend = detect(&VersionOkThenSpawnFails)
+            .expect("an installed firewalld must still be detected");
+        assert_eq!(backend.id(), BackendId::Firewalld);
+    }
+
+    #[test]
     fn detect_still_prefers_an_installed_but_stopped_firewalld_over_ufw() {
         // Reporting "firewalld is installed but not running" is more useful
         // than silently managing a different firewall than the one the

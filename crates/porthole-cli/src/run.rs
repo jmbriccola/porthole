@@ -237,7 +237,14 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
         if cli.json {
             println!(
                 "{}",
-                output::json_closed(&closed, &failures, now, true, &runner.recorded())
+                output::json_closed(
+                    &closed,
+                    &failures,
+                    now,
+                    true,
+                    args.forget,
+                    &runner.recorded()
+                )
             );
         } else {
             // "Nothing to close." would be a lie when there WAS something and
@@ -289,7 +296,7 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
             let now = SystemClock.now();
             println!(
                 "{}",
-                output::json_closed(&closed, &failures, now, false, &[])
+                output::json_closed(&closed, &failures, now, false, args.forget, &[])
             );
         } else {
             if !closed.is_empty() || failures.is_empty() {

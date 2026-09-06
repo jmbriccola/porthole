@@ -152,6 +152,7 @@ otherwise.
   "schema": 1,
   "dry_run": false,
   "closed": [ /* rule objects */ ],
+  "forgotten": [ /* rule objects */ ],
   "errors": [ /* error objects, see below */ ],
   "commands": []
 }
@@ -161,6 +162,15 @@ otherwise.
 failure appears in `errors` with the same `{code, kind, message}` shape used
 below. The output is always a single object — the exit code carries the first
 failure's code.
+
+`forgotten` is `close --id <id> --forget` (see [docs/backends.md](backends.md)
+and `porthole close --help`): a rule that appears here was **not** closed in
+any firewall, only porthole's own record of it was dropped, because it was
+recorded under a backend this machine no longer has. It is always empty
+except on a `--forget` call, and `closed` is always empty on one — the two
+never share an entry, and a script must not treat an entry in `forgotten` the
+way it would treat one in `closed`: the port it named may still be open in
+whatever firewall created it.
 
 ## `porthole doctor --json`
 

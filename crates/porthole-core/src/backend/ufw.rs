@@ -304,7 +304,6 @@ impl FirewallBackend for Ufw<'_> {
                     .trim()
                     .to_string(),
             ),
-            Ok(_) => None,
             Err(Error::CommandSpawn { .. }) => {
                 return Ok(BackendHealth {
                     available: false,
@@ -315,7 +314,17 @@ impl FirewallBackend for Ufw<'_> {
                     caveat: None,
                 })
             }
-            Err(other) => return Err(other),
+            // Anything else is not proof the binary is absent -- only
+            // `CommandSpawn` is, and that already returned above.
+            // `RealRunner` can only ever fail this specific call with
+            // `CommandSpawn`, so this arm is dead through it -- but
+            // `CommandRunner` is a trait, and a hypothetical different
+            // failure here means only that this one read did not answer,
+            // not that ufw is not installed. Fall through with no version
+            // known and let the next read -- `ufw status`, a call this
+            // backend already has to make -- decide `available`/`active`
+            // on its own evidence.
+            Ok(_) | Err(_) => None,
         };
 
         // `ufw status` exits 0 whether the firewall is enabled or not -- when
@@ -326,9 +335,17 @@ impl FirewallBackend for Ufw<'_> {
         // process cannot read is still installed, and may well still be
         // enforcing rules porthole simply cannot see from here. Degrading to
         // `active: false` with an explanation, rather than propagating the
-        // failure with `?` as this used to, is what keeps a permission
-        // problem from reading as "no firewall at all" once it reaches
+        // failure with `?` as this used to, is what keeps a problem reading
+        // status from reading as "no firewall at all" once it reaches
         // `detect` -- see C1 in the milestone 3 merge-wave review.
+        //
+        // The non-success `Ok` arm below does not claim *why* the exit was
+        // non-zero: permission denial is the common cause, but a broken
+        // install or a Python traceback also exits non-zero here, and
+        // porthole has not established which one this is -- only that
+        // `ufw status` did not confirm anything. Say that plainly and name
+        // the real stderr, which is already interpolated, rather than assert
+        // a specific cause the evidence does not support.
         let status_cmd = Command::read("ufw", ["status"]);
         let (active, active_unknown, detail) = match self.runner.run(&status_cmd) {
             Ok(out) if out.success() => {
@@ -348,9 +365,9 @@ impl FirewallBackend for Ufw<'_> {
                 false,
                 true,
                 format!(
-                    "ufw is installed, but reading its status needs more privilege than this \
-                     process has ({}) -- that is not the same as ufw being inactive, it may \
-                     already be enforcing rules porthole cannot see from here",
+                    "ufw is installed, but its status could not be confirmed ({}) -- that is \
+                     not the same as ufw being inactive, it may already be enforcing rules \
+                     porthole could not read from here",
                     out.stderr.trim()
                 ),
             ),
@@ -360,7 +377,7 @@ impl FirewallBackend for Ufw<'_> {
                 format!(
                     "ufw is installed, but reading its status failed: {e} -- that is not the \
                      same as ufw being inactive, it may already be enforcing rules porthole \
-                     cannot see from here"
+                     could not read from here"
                 ),
             ),
         };

@@ -368,7 +368,7 @@ impl<'a> Engine<'a> {
             .cloned()
             .ok_or_else(|| Error::RuleNotFound(id.to_string()))?;
         if forget {
-            self.forget_rule(rule)
+            self.forget_rule(rule, from_timer)
         } else {
             self.close_rule(rule, from_timer)
         }
@@ -428,12 +428,35 @@ impl<'a> Engine<'a> {
     /// trap.
     fn close_rule(&mut self, rule: ManagedRule, from_timer: bool) -> Result<ManagedRule> {
         if rule.backend != self.backend.id() {
+            // I4: `--forget` is the same suggestion regardless of which
+            // backend created the rule, but forgetting does not mean the
+            // same thing for all three. ufw and nftables can prove a rule is
+            // their own (`Ownership::Marked`), so reconciliation's orphan
+            // sweep closes a forgotten one on its own the next time that
+            // backend is current again -- forgetting there only drops
+            // porthole's own record early. firewalld cannot
+            // (`Ownership::Unprovable`), so that sweep never runs on it at
+            // all: forgetting a firewalld-backed rule is permanent -- no
+            // record, and nothing ever closes it automatically, even after
+            // firewalld is current again.
+            let recovery = match rule.backend {
+                BackendId::Firewalld => {
+                    "firewalld can never prove a rule is its own, so forgetting this one \
+                     would be permanent: nothing closes it automatically, even after \
+                     firewalld is current again"
+                }
+                BackendId::Ufw | BackendId::Nftables => {
+                    "ufw and nftables can prove a rule is their own, so forgetting this one \
+                     is not permanent: once that backend is current again, the next \
+                     command's reconciliation closes it as an orphan on its own"
+                }
+            };
             return Err(Error::Unexpected(format!(
                 "{}/{} towards {} was recorded under the {} backend, but this machine now has \
                  {} -- porthole cannot remove a rule through a different backend than the one \
                  that created it. Close it by hand with {}'s own tools, switch back to {} and \
                  let the next porthole command reconcile it, or run `porthole close --id {} \
-                 --forget` to drop the record without touching any firewall",
+                 --forget` to drop the record without touching any firewall ({recovery})",
                 rule.port,
                 rule.protocol,
                 rule.target,
@@ -485,7 +508,7 @@ impl<'a> Engine<'a> {
     /// through `close_by_id` (see its own doc comment): forgetting always
     /// names one rule, by id, on purpose -- never a side effect of `--all`
     /// or a port lookup that might resolve to the wrong rule.
-    fn forget_rule(&mut self, rule: ManagedRule) -> Result<ManagedRule> {
+    fn forget_rule(&mut self, rule: ManagedRule, from_timer: bool) -> Result<ManagedRule> {
         if rule.backend == self.backend.id() {
             return Err(Error::InvalidArgument(format!(
                 "{}/{} towards {} was recorded under {}, the backend this machine still has -- \
@@ -501,10 +524,16 @@ impl<'a> Engine<'a> {
             self.state.save()?;
         }
 
-        // Same reasoning as `close_rule`'s own cancel: secondary, and must
-        // not turn a successful forget into a reported failure. A stray
-        // timer that fires later finds no such rule and exits, harmlessly.
-        if rule.expires_at.is_some() {
+        // Same reasoning as `close_rule`'s own cancel, `from_timer` guard
+        // included even though nothing wires `--forget` and `--from-timer`
+        // together today (the expiry timer only ever calls `close --id <id>
+        // --from-timer`, never with `--forget`): a close invoked *by* the
+        // expiry timer must not stop that timer, and this is the exact same
+        // trap `from_timer` exists to prevent, one flag away, if it is ever
+        // both. Secondary either way, and must not turn a successful forget
+        // into a reported failure -- a stray timer that fires later finds no
+        // such rule and exits, harmlessly.
+        if !from_timer && rule.expires_at.is_some() {
             let _ = expiry::cancel_close(self.runner, &rule.id);
         }
 
@@ -1035,10 +1064,62 @@ mod tests {
             text.contains("--forget"),
             "must point at the only way out: {text}"
         );
+        // I4: the recovery advice must not be the same sentence for every
+        // backend -- a forgotten nftables (or ufw) rule is not permanent,
+        // since reconciliation's orphan sweep closes it once that backend
+        // is current again.
+        assert!(
+            text.contains("not permanent"),
+            "must say a forgotten nftables rule is recoverable: {text}"
+        );
         assert_eq!(
             engine.rules().len(),
             1,
             "refusing to close it must not lose the only record of it either"
+        );
+    }
+
+    #[test]
+    fn closing_a_foreign_firewalld_entry_warns_that_forgetting_it_would_be_permanent() {
+        // I4: the opposite half of the same guard's advice. firewalld's
+        // ownership is `Unprovable`, so reconciliation's orphan sweep is
+        // skipped for it outright (see `reconcile.rs`) -- a firewalld-backed
+        // rule that gets forgotten is never swept up later the way a
+        // forgotten ufw/nftables one is. The message must say so, not reuse
+        // the other backends' "not permanent" reassurance.
+        use crate::backend::ufw::Ufw;
+
+        let harness = Harness::new();
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(UFW_STATUS_NO_ROWS),
+            Output::stdout(UFW_STATUS_NO_ROWS),
+        ]);
+        let backend = Ufw::new(&runner);
+        let clock = FixedClock(NOW);
+        let mut store = harness.store();
+        store.insert(ManagedRule {
+            backend: BackendId::Firewalld,
+            handle: RuleHandle::Firewalld {
+                zone: "FedoraWorkstation".to_string(),
+                rich_rule: r#"rule family="ipv4" source address="10.10.10.0/24" port \
+                              port="9999" protocol="tcp" accept"#
+                    .to_string(),
+            },
+            ..foreign_backend_rule("foreign-firewalld", 9999)
+        });
+        let mut engine = make_engine(&backend, &runner, &clock, store);
+
+        let err = engine
+            .close_by_id("foreign-firewalld", false, false)
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("permanent"),
+            "must warn that forgetting a firewalld-backed rule never gets swept up: {text}"
+        );
+        assert!(
+            !text.contains("not permanent"),
+            "must not reuse the ufw/nftables reassurance for firewalld: {text}"
         );
     }
 

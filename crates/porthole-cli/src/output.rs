@@ -199,17 +199,39 @@ pub fn print_dry_run(commands: &[Command]) {
 /// `--all` can partly succeed, so failures belong inside this object rather
 /// than in a second one printed afterwards: two top-level objects on stdout
 /// are unparseable by any JSON reader.
+///
+/// `forgotten` is `--forget`: the eighth instance of this milestone's own
+/// pattern was this function itself, immediately below `print_closed`'s own
+/// guard against exactly this, putting a forgotten rule in `closed` --
+/// which `docs/json-schema.md` documents as "rules that closed" -- when
+/// nothing was closed in any firewall, only porthole's own record was
+/// dropped. A script (or a GUI reading `WireStatus`) that trusted `closed`
+/// here would record a port as shut that may still be open in a firewall
+/// porthole can no longer reach.
+///
+/// `rules` goes into `forgotten` instead of `closed` when `forgotten` is
+/// `true`, never both: `--forget` always resolves to at most one rule (see
+/// `Engine::close_by_id`'s own doc comment), so a single call is either an
+/// ordinary close/close-all or a forget, never a mix.
 pub fn json_closed(
     rules: &[ManagedRule],
     errors: &[Error],
     now: u64,
     dry_run: bool,
+    forgotten: bool,
     commands: &[Command],
 ) -> Value {
+    let rule_jsons: Vec<Value> = rules.iter().map(|r| rule_json(r, now)).collect();
+    let (closed, forgotten_rules) = if forgotten {
+        (Vec::new(), rule_jsons)
+    } else {
+        (rule_jsons, Vec::new())
+    };
     json!({
         "schema": JSON_SCHEMA,
         "dry_run": dry_run,
-        "closed": rules.iter().map(|r| rule_json(r, now)).collect::<Vec<_>>(),
+        "closed": closed,
+        "forgotten": forgotten_rules,
         "errors": errors.iter().map(error_json).collect::<Vec<_>>(),
         "commands": commands.iter().map(Command::display).collect::<Vec<_>>(),
     })
@@ -595,6 +617,7 @@ mod tests {
             &[Error::RuleNotFound("9999/tcp".to_string())],
             1_757_000_000,
             false,
+            false,
             &[],
         );
         assert_eq!(json["schema"], 1);
@@ -602,5 +625,39 @@ mod tests {
         assert_eq!(json["errors"].as_array().unwrap().len(), 1);
         assert_eq!(json["errors"][0]["kind"], "rule_not_found");
         assert_eq!(json["errors"][0]["code"], 7);
+    }
+
+    #[test]
+    fn json_closed_never_reports_a_forgotten_rule_as_closed() {
+        // The eighth instance of this milestone's own pattern: `print_closed`
+        // was taught never to say "Closed" for a forget, in the same commit
+        // that left this function saying exactly that in `closed` -- which
+        // `docs/json-schema.md` documents as "rules that closed". A script
+        // (or a GUI reading `WireStatus`, widened one wave ago for precisely
+        // this reason) trusting `closed` here would record a port as shut
+        // that may still be open in a firewall porthole can no longer reach.
+        let json = json_closed(&[rule()], &[], 1_757_000_000, true, true, &[]);
+        assert_eq!(
+            json["closed"].as_array().unwrap().len(),
+            0,
+            "a forgotten rule must never appear in `closed`: {json}"
+        );
+        let forgotten = json["forgotten"].as_array().unwrap();
+        assert_eq!(
+            forgotten.len(),
+            1,
+            "it must appear in `forgotten` instead: {json}"
+        );
+        assert_eq!(forgotten[0]["id"], "1f0c8b6e-0000-4000-8000-000000000001");
+    }
+
+    #[test]
+    fn json_closed_puts_an_ordinary_close_in_closed_never_forgotten() {
+        // The other half of the same guard: an ordinary close (or close
+        // --all) must not grow a phantom `forgotten` entry just because the
+        // field exists now.
+        let json = json_closed(&[rule()], &[], 1_757_000_000, false, false, &[]);
+        assert_eq!(json["closed"].as_array().unwrap().len(), 1);
+        assert_eq!(json["forgotten"].as_array().unwrap().len(), 0);
     }
 }
