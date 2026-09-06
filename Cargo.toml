@@ -1,6 +1,26 @@
 [workspace]
 resolver = "2"
-members = ["crates/porthole-core", "crates/porthole-cli", "crates/porthole-helper"]
+members = [
+    "crates/porthole-core",
+    "crates/porthole-cli",
+    "crates/porthole-helper",
+    "crates/porthole-gui",
+]
+# porthole-gui links gtk4/libadwaita, which need GTK4 development headers
+# that are not installed -- and must not be installed -- on the host that
+# runs a bare `cargo build`/`cargo test`. It only ever builds and runs inside
+# tests/container/Containerfile.gui. Leaving it out of `default-members`
+# keeps a flagless `cargo build`/`cargo test` at the workspace root working
+# on this host exactly as before this crate existed. `--workspace` overrides
+# `default-members` (it always means literally every member), so a command
+# that passes `--workspace` explicitly still needs `--exclude porthole-gui`
+# on this host -- see `.superpowers/sdd/2026-09-05-milestone-4-gui/task-2-report.md`
+# for the exact invocations this project's host-side gates use.
+default-members = [
+    "crates/porthole-core",
+    "crates/porthole-cli",
+    "crates/porthole-helper",
+]
 
 [workspace.package]
 version = "0.1.0"

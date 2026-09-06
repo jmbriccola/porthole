@@ -1,0 +1,39 @@
+[package]
+name = "porthole-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "GTK4/libadwaita application for porthole."
+
+[lib]
+name = "porthole_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "porthole-gui"
+path = "src/main.rs"
+
+# `harness = false`: see the module doc comment at the top of tests/window.rs
+# for why. In short, gtk4-rs enforces that every GTK call in a process comes
+# from whichever OS thread made the *first* one -- and cargo's normal test
+# harness spawns each `#[test]` function on its own fresh thread, which trips
+# that check the moment a second test touches GTK. Each `[[test]]` target is
+# its own process, so a plain `fn main()` that runs its checks in sequence
+# keeps everything on that process's one real main thread. A later task
+# adding a new GTK-touching test file follows the same pattern: a new
+# `[[test]]` entry here with `harness = false`, not more tests crammed into
+# this one.
+[[test]]
+name = "window"
+path = "tests/window.rs"
+harness = false
+
+[dependencies]
+porthole-core = { path = "../porthole-core" }
+gtk = { package = "gtk4", version = "0.9" }
+adw = { package = "libadwaita", version = "0.7", features = ["v1_4"] }
+zbus.workspace = true
+tokio.workspace = true
