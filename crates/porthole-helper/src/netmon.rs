@@ -35,14 +35,18 @@
 //! this module adds anything; [`run`]'s own loop then simply lives exactly
 //! as long as the process that spawned it.
 
+use crate::service::Porthole;
 use porthole_core::backend;
 use porthole_core::clock::SystemClock;
 use porthole_core::command::{CommandRunner, RealRunner};
 use porthole_core::engine::Engine;
+use porthole_core::ipc::{CloseReason, PATH};
 use porthole_core::net;
 use porthole_core::state::{ManagedRule, StateStore};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use zbus::object_server::SignalEmitter;
 
 /// How often the fallback poll re-checks the subnet. Two read-only `ip`
 /// commands, cheap enough to repeat this often; chosen with a comfortable
@@ -69,6 +73,19 @@ trait NetworkManager {
     fn state_changed(&self, state: u32) -> zbus::Result<()>;
 }
 
+/// What one look at the network found.
+#[derive(Debug)]
+pub struct Check {
+    /// The subnet the machine is on right now, rendered exactly as it
+    /// crosses the bus: a CIDR, or **empty for "no usable network"**. D-Bus
+    /// has no optional types, the same reason `WireRule::expires_at` uses
+    /// `0`, and the empty string can never be a CIDR.
+    pub cidr: String,
+    /// The rules this look closed, all of them for the same reason:
+    /// [`CloseReason::NetworkChanged`].
+    pub closed: Vec<ManagedRule>,
+}
+
 /// Re-resolve the current subnet and close whatever no longer belongs to it.
 ///
 /// Split out from [`wake_up`] so the decision is testable without a bus, a
@@ -78,20 +95,38 @@ trait NetworkManager {
 /// treated the same as "no usable network", regardless of which specific
 /// reason it failed for: either way there is no current subnet left to
 /// honestly compare a rule's CIDR against.
-pub fn check_network(engine: &mut Engine<'_>, runner: &dyn CommandRunner) -> Vec<ManagedRule> {
+pub fn check_network(engine: &mut Engine<'_>, runner: &dyn CommandRunner) -> Check {
     match net::current_network(runner) {
-        Ok(network) => engine.close_rules_outside(network.cidr),
-        Err(_) => engine.close_rules_on_network_loss(),
+        Ok(network) => Check {
+            cidr: network.cidr.to_string(),
+            closed: engine.close_rules_outside(network.cidr),
+        },
+        Err(_) => Check {
+            cidr: String::new(),
+            closed: engine.close_rules_on_network_loss(),
+        },
     }
 }
 
-/// One wake-up: detect the backend, take the state lock, run the check, log
-/// what closed. Best-effort throughout, the same policy `Engine::reconcile`
-/// already applies to its own sweep -- a backend that cannot be detected, or
-/// a lock that is momentarily busy, is a reason to wait for the next
-/// wake-up, not to bring down the helper that is the only thing left
-/// watching for it.
-fn wake_up(state_path: &PathBuf, executable: &Path) {
+/// The subnet porthole saw the last time it looked, as [`Check::cidr`]
+/// renders it. `None` means it has not looked yet, which is a different fact
+/// from having looked and found nothing: there is no "old" network to name
+/// in a `NetworkChanged` on the very first look, so the first look never
+/// emits one.
+type LastSeen = Mutex<Option<String>>;
+
+/// Detect the backend, take the state lock, run the check. `None` when
+/// there was nothing to check or nothing to check it with. Best-effort
+/// throughout, the same policy `Engine::reconcile` already applies to its own
+/// sweep -- a backend that cannot be detected, or a lock that is momentarily
+/// busy, is a reason to wait for the next wake-up, not to bring down the
+/// helper that is the only thing left watching for it.
+///
+/// Synchronous, and separate from [`wake_up`]'s announcements, because the
+/// `Engine` it builds borrows `&dyn CommandRunner` and `&dyn Clock`, neither
+/// of them `Sync`: it must be gone before anything is awaited, or [`run`]'s
+/// future stops being `Send` and `tokio::spawn` will not take it.
+fn look(state_path: &Path, executable: &Path) -> Option<Check> {
     let runner = RealRunner;
 
     // Nothing recorded means nothing a network change could invalidate --
@@ -99,20 +134,19 @@ fn wake_up(state_path: &PathBuf, executable: &Path) {
     // An unreadable state file is a different fact from an empty one, so it
     // does not take this shortcut; the detect/lock attempts below will fail
     // loudly (and harmlessly) on their own in that case instead.
+    //
+    // It also means porthole does not look at the network at all while
+    // nothing is open, which is what makes `NetworkChanged`'s `old_cidr` the
+    // previous *look* rather than the previous *state of the world*: see
+    // [`wake_up`].
     if let Ok(state) = StateStore::open(state_path) {
         if state.rules().is_empty() {
-            return;
+            return None;
         }
     }
 
-    let backend = match backend::detect(&runner) {
-        Ok(backend) => backend,
-        Err(_) => return, // No firewall to close anything in; try the next wake-up.
-    };
-    let state = match StateStore::open_exclusive(state_path) {
-        Ok(state) => state,
-        Err(_) => return, // Lock momentarily held elsewhere; try the next wake-up.
-    };
+    let backend = backend::detect(&runner).ok()?; // No firewall to close anything in.
+    let state = StateStore::open_exclusive(state_path).ok()?; // Lock busy elsewhere.
 
     let mut engine = Engine::new(
         backend.as_ref(),
@@ -121,11 +155,45 @@ fn wake_up(state_path: &PathBuf, executable: &Path) {
         state,
         executable.to_path_buf(),
     );
-    for rule in check_network(&mut engine, &runner) {
-        eprintln!(
-            "porthole-helper: network changed, closed {}/{} towards {} (opened by uid={})",
-            rule.port, rule.protocol, rule.target, rule.uid
-        );
+    Some(check_network(&mut engine, &runner))
+}
+
+/// One wake-up: [`look`], then say what happened -- to the journal and, when
+/// there is a bus to say it on, to whoever is subscribed.
+///
+/// `NetworkChanged` compares this look against the previous one, not against
+/// what was true an instant ago: porthole only looks when something is
+/// recorded (see [`look`]), so `old_cidr` is the subnet as of porthole's last
+/// look and may be older than the change itself. The signal's own
+/// documentation in `porthole_core::ipc` says the same thing to the client
+/// that reads it.
+///
+/// It is emitted before the closes it explains, so a subscriber that shows
+/// both has them in the order they make sense in.
+async fn wake_up(
+    state_path: &Path,
+    executable: &Path,
+    emitter: Option<&SignalEmitter<'_>>,
+    last_seen: &LastSeen,
+) {
+    let Some(check) = look(state_path, executable) else {
+        return;
+    };
+
+    // Held only long enough to swap; nothing is awaited under it.
+    let previous = last_seen
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .replace(check.cidr.clone());
+
+    if let (Some(emitter), Some(previous)) = (emitter, previous.as_ref()) {
+        if previous != &check.cidr {
+            Porthole::announce_network_change(emitter, previous, &check.cidr).await;
+        }
+    }
+
+    for rule in &check.closed {
+        Porthole::announce_autoclose(emitter, rule, CloseReason::NetworkChanged).await;
     }
 }
 
@@ -136,8 +204,26 @@ fn wake_up(state_path: &PathBuf, executable: &Path) {
 /// does not depend on it either way) and always runs the fallback poll
 /// alongside it.
 pub async fn run(bus: zbus::Connection, state_path: PathBuf, executable: PathBuf) {
+    // One emitter for both wake-up sources, and one record of what the last
+    // look saw, shared between them: the poll and the NetworkManager signal
+    // are two prompts to do the same thing, so a change noticed by one must
+    // not be re-announced by the other.
+    let emitter = match SignalEmitter::new(&bus, PATH) {
+        Ok(emitter) => Some(emitter.into_owned()),
+        Err(e) => {
+            eprintln!(
+                "porthole-helper: no signal emitter, network changes will go unannounced \
+                 (they are still acted on): {e}"
+            );
+            None
+        }
+    };
+    let last_seen: Arc<LastSeen> = Arc::new(Mutex::new(None));
+
     let poll_state = state_path.clone();
     let poll_executable = executable.clone();
+    let poll_emitter = emitter.clone();
+    let poll_last_seen = Arc::clone(&last_seen);
     let poll = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(POLL_INTERVAL);
         // The first tick fires immediately; the helper's own start-up sweep
@@ -145,7 +231,13 @@ pub async fn run(bus: zbus::Connection, state_path: PathBuf, executable: PathBuf
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            wake_up(&poll_state, &poll_executable);
+            wake_up(
+                &poll_state,
+                &poll_executable,
+                poll_emitter.as_ref(),
+                &poll_last_seen,
+            )
+            .await;
         }
     });
 
@@ -153,7 +245,7 @@ pub async fn run(bus: zbus::Connection, state_path: PathBuf, executable: PathBuf
         if let Ok(mut signals) = nm.receive_state_changed().await {
             use futures_util::StreamExt;
             while signals.next().await.is_some() {
-                wake_up(&state_path, &executable);
+                wake_up(&state_path, &executable, emitter.as_ref(), &last_seen).await;
             }
             // The stream ended -- NetworkManager left the bus, or the
             // connection dropped. The poll task above does not depend on it
@@ -210,9 +302,9 @@ mod tests {
             Output::stdout(ROUTE_JSON),
             Output::stdout(ADDR_JSON),
         ]);
-        let closed = check_network(&mut engine, &probe_runner);
+        let check = check_network(&mut engine, &probe_runner);
 
-        assert_eq!(closed.len(), 1);
+        assert_eq!(check.closed.len(), 1);
         assert!(engine.rules().is_empty());
     }
 
@@ -243,10 +335,45 @@ mod tests {
         // No default route at all: a real "no default route" response, the
         // same shape `porthole_core::net`'s own tests capture.
         let probe_runner = RecordingRunner::with_responses(vec![Output::stdout("[]")]);
-        let closed = check_network(&mut engine, &probe_runner);
+        let check = check_network(&mut engine, &probe_runner);
 
-        assert_eq!(closed.len(), 1);
+        assert_eq!(check.closed.len(), 1);
         assert!(engine.rules().is_empty());
+    }
+
+    #[test]
+    fn a_look_reports_the_subnet_it_found_or_the_empty_sentinel() {
+        // `Check::cidr` is what `NetworkChanged` puts on the wire, so the
+        // "no usable network" case has to be the empty string and not, say,
+        // `0.0.0.0/0` -- which is a real CIDR meaning the opposite of
+        // "nowhere".
+        for (probe, expected) in [
+            (
+                RecordingRunner::with_responses(vec![
+                    Output::stdout(ROUTE_JSON),
+                    Output::stdout(ADDR_JSON),
+                ]),
+                "10.10.10.0/24",
+            ),
+            (
+                RecordingRunner::with_responses(vec![Output::stdout("[]")]),
+                "",
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let store = StateStore::open(dir.path().join("state.json")).unwrap();
+            let backend = FakeBackend::new();
+            let clock = FixedClock(NOW);
+            let mut engine = Engine::new(
+                &backend,
+                &probe,
+                &clock,
+                store,
+                PathBuf::from("/usr/bin/porthole"),
+            );
+
+            assert_eq!(check_network(&mut engine, &probe).cidr, expected);
+        }
     }
 
     #[test]
@@ -280,8 +407,8 @@ mod tests {
                 )
                 .unwrap();
 
-            let closed = check_network(&mut engine, &probe);
-            assert!(closed.is_empty());
+            let check = check_network(&mut engine, &probe);
+            assert!(check.closed.is_empty());
             assert_eq!(engine.rules().len(), 1);
         }
     }

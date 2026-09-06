@@ -61,6 +61,54 @@ impl WireRule {
     }
 }
 
+/// Why a rule stopped being open, as it crosses the bus in `RuleClosed`.
+///
+/// A single undifferentiated "closed" would force every subscriber to guess:
+/// a rule that ran out its own clock, one a person asked to close, one the
+/// helper closed because the machine left the network it was scoped to, and
+/// one that was already gone from the firewall by the time porthole looked
+/// are four different things to tell a user about. The wire form is the slug
+/// [`CloseReason::as_str`] returns — one source of truth for the string,
+/// which the journal line and the signal both derive from, so neither can
+/// drift from the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[zvariant(signature = "s")]
+#[serde(rename_all = "kebab-case")]
+pub enum CloseReason {
+    /// The rule's own lifetime ran out and the expiry timer closed it.
+    Expired,
+    /// Somebody asked: `close`, `close --id`, or `close --all`.
+    Requested,
+    /// The rule was scoped to a subnet the machine is no longer on -- see
+    /// `porthole_core::engine::Engine::close_rules_outside`.
+    NetworkChanged,
+    /// Reconciliation found porthole's record of a rule the firewall no
+    /// longer has, and dropped the record. Nothing was removed from any
+    /// firewall for this one: the port had already stopped being open, and
+    /// this is porthole noticing.
+    Reconciled,
+}
+
+impl CloseReason {
+    /// The exact slug that crosses the bus. Kept next to the enum rather
+    /// than spelled out at each call site so the journal and the signal
+    /// cannot disagree about what a close was.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CloseReason::Expired => "expired",
+            CloseReason::Requested => "requested",
+            CloseReason::NetworkChanged => "network-changed",
+            CloseReason::Reconciled => "reconciled",
+        }
+    }
+}
+
+impl std::fmt::Display for CloseReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One failure from `close_all`, carried structurally rather than as a bare
 /// rendered string.
 ///
@@ -238,6 +286,29 @@ pub trait Porthole {
     /// the same `list` polkit action as `list`/`status`: it is exactly as
     /// unprivileged a read as either.
     async fn docker_ports(&self) -> zbus::Result<Vec<WireDockerPort>>;
+
+    /// A rule the helper just created. **The rule, not the request**: the id,
+    /// the resolved target and the expiry are all decided by the helper, so a
+    /// subscriber that reconstructed them from what a client asked for would
+    /// be showing something else.
+    #[zbus(signal)]
+    fn rule_opened(&self, rule: WireRule) -> zbus::Result<()>;
+
+    /// A rule that has stopped being open, and why -- see [`CloseReason`].
+    #[zbus(signal)]
+    fn rule_closed(&self, rule: WireRule, reason: CloseReason) -> zbus::Result<()>;
+
+    /// The machine's own subnet, as porthole last resolved it, changed.
+    ///
+    /// Both arguments are CIDRs, or **empty for "no usable network"** --
+    /// D-Bus has no optional types, the same reason [`WireRule::expires_at`]
+    /// uses `0` as its sentinel, and the empty string can never be a CIDR.
+    /// `old_cidr` is what the previous check saw, not necessarily what was
+    /// true an instant before this one: the helper only looks when it wakes
+    /// up (see `porthole_helper::netmon`), so the two values are porthole's
+    /// last two observations and nothing finer.
+    #[zbus(signal)]
+    fn network_changed(&self, old_cidr: &str, new_cidr: &str) -> zbus::Result<()>;
 }
 
 #[cfg(test)]
@@ -439,6 +510,50 @@ mod tests {
         assert_eq!(wire.host_port, 8080);
         assert_eq!(wire.container_addr, "172.17.0.2");
         assert_eq!(wire.container_port, 80);
+    }
+
+    #[test]
+    fn every_close_carries_why() {
+        // "expired", "requested", "network-changed", "reconciled". The
+        // notification says something different for each, and a single
+        // undifferentiated ClosedSignal would force the agent to guess.
+        //
+        // Both halves are checked for every variant: the slug `as_str`
+        // returns (what the journal line is built from) and the string that
+        // actually crosses the bus (what a subscriber matches on). They are
+        // produced by different machinery -- a `match` and serde's
+        // `rename_all` -- so a test that checked only one would let the two
+        // drift apart silently, which is exactly the failure a reason code
+        // exists to prevent.
+        use zbus::zvariant::{serialized::Context, to_bytes, LE};
+
+        for (reason, expected) in [
+            (CloseReason::Expired, "expired"),
+            (CloseReason::Requested, "requested"),
+            (CloseReason::NetworkChanged, "network-changed"),
+            (CloseReason::Reconciled, "reconciled"),
+        ] {
+            assert_eq!(reason.as_str(), expected);
+            assert_eq!(reason.to_string(), expected);
+
+            let encoded = to_bytes(Context::new_dbus(LE, 0), &reason).unwrap();
+            let on_the_wire: String = encoded.deserialize().unwrap().0;
+            assert_eq!(
+                on_the_wire, expected,
+                "{reason:?} crosses the bus as {on_the_wire:?}, not as its own slug"
+            );
+
+            let back: CloseReason = encoded.deserialize().unwrap().0;
+            assert_eq!(back, reason, "a subscriber must be able to read it back");
+        }
+    }
+
+    #[test]
+    fn the_close_reason_is_a_plain_string_on_the_wire() {
+        // A subscriber written against the published signature -- and the
+        // `dbus-monitor` output the container suite greps -- both depend on
+        // this being `s` and not the `u` a bare unit enum would default to.
+        assert_eq!(CloseReason::SIGNATURE, "s");
     }
 
     #[test]
