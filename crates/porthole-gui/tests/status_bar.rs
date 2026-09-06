@@ -24,6 +24,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use porthole_core::backend::NO_FIREWALL_MESSAGE;
 use porthole_core::ipc::WireStatus;
 use porthole_gui::status_bar::StatusBar;
 
@@ -42,18 +43,14 @@ fn activate<F: FnOnce(&adw::Application) + 'static>(app_id: &str, f: F) {
     app.run_with_args::<&str>(&[]);
 }
 
-/// The exact sentence `porthole_core::backend::detect` fails with today
-/// when no firewall is installed -- used here (rather than a shorter
-/// fixture-only string) so `no_firewall_at_all_is_prominent_not_a_footnote`
-/// proves `StatusBar` really does show `WireStatus::detail` verbatim, the
-/// same text a real helper would actually send.
-const NO_FIREWALL_DETAIL: &str = "no firewall found: none of firewalld, ufw or nftables is \
-     installed. Without a firewall this port is already reachable from your network.";
-
 /// A `WireStatus` fixture. `backend_and_version` is `None` for "no firewall
 /// at all" (`firewall_available: false`, `detail` set to
-/// [`NO_FIREWALL_DETAIL`]); `Some((name, version))` for an installed
-/// backend, `active` deciding whether it is reported as enforcing anything.
+/// `porthole_core::backend::NO_FIREWALL_MESSAGE` -- imported, not retyped:
+/// an earlier version of this fixture retyped a shortened, 136-character
+/// prefix of that 248-character string, so nothing here ever rendered what
+/// `StatusBar` actually shows for this case); `Some((name, version))` for
+/// an installed backend, `active` deciding whether it is reported as
+/// enforcing anything.
 fn status(backend_and_version: Option<(&str, &str)>, active: bool) -> WireStatus {
     let (backend, version, available, detail) = match backend_and_version {
         Some((backend, version)) => (
@@ -66,7 +63,7 @@ fn status(backend_and_version: Option<(&str, &str)>, active: bool) -> WireStatus
             String::new(),
             String::new(),
             false,
-            NO_FIREWALL_DETAIL.to_string(),
+            NO_FIREWALL_MESSAGE.to_string(),
         ),
     };
     WireStatus {
@@ -108,9 +105,14 @@ fn the_status_line_names_the_backend_and_whether_it_is_enforcing() -> Result<(),
     Ok(())
 }
 
-/// With no firewall the port is already reachable. A grey line at the
-/// bottom of the window is not where that belongs: the user would read the
-/// rest of the app as if it were protecting them.
+/// With no firewall, every port is already reachable, and a grey line at
+/// the bottom of the window is not where that belongs: the user would read
+/// the rest of the app as if it were protecting them. Prominence itself is
+/// what this checks -- the banner is revealed, with a real, non-empty
+/// title. What that title actually says (and, separately, where the full
+/// "already reachable" explanation lives) is
+/// `the_no_firewall_case_shows_a_short_banner_and_the_full_detail_on_the_line`'s
+/// job, below.
 fn no_firewall_at_all_is_prominent_not_a_footnote() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
@@ -119,28 +121,35 @@ fn no_firewall_at_all_is_prominent_not_a_footnote() -> Result<(), String> {
         move |_app| {
             let bar = StatusBar::new();
             bar.set_status(&status(None, false));
-            *seen.borrow_mut() = Some((bar.text(), bar.is_prominent()));
+            *seen.borrow_mut() =
+                Some((bar.is_prominent(), bar.banner_widget().title().to_string()));
         },
     );
-    let (text, prominent) = result.borrow_mut().take().ok_or("activation never ran")?;
+    let (prominent, banner_title) = result.borrow_mut().take().ok_or("activation never ran")?;
     if !prominent {
         return Err(
             "no firewall at all must not be rendered as an ordinary status line".to_string(),
         );
     }
-    if !text.contains("already reachable") {
-        return Err(format!("expected \"already reachable\" in {text:?}"));
+    if banner_title.is_empty() {
+        return Err("the banner must show a real title, not an empty one".to_string());
     }
     Ok(())
 }
 
-/// Item 5: the real banner widget shows `WireStatus::detail` verbatim, not
-/// a sentence `StatusBar` invented itself -- checked by exact equality
-/// against the fixture's own [`NO_FIREWALL_DETAIL`], not merely a
-/// substring, so a future edit that started paraphrasing it would be
-/// caught even if the paraphrase still happened to mention "already
-/// reachable".
-fn the_no_firewall_banner_shows_the_wires_own_detail_verbatim() -> Result<(), String> {
+/// Round 3's own fix: an earlier version of this case put
+/// `WireStatus::detail` -- three sentences, written for a CLI's own
+/// per-command error ("**this port** is already reachable… Setting up a
+/// firewall is outside what porthole does") -- directly into the banner's
+/// one-line `title`. This checks the real widgets carry the corrected
+/// split: a short, banner-appropriate title (nothing from `detail`'s own
+/// CLI-register tail), and the full `detail`, verbatim, on `line`
+/// underneath -- checked by exact equality against
+/// `porthole_core::backend::NO_FIREWALL_MESSAGE`, the real constant
+/// `backend::detect` actually fails with, not a fixture's own
+/// paraphrase of it.
+fn the_no_firewall_case_shows_a_short_banner_and_the_full_detail_on_the_line() -> Result<(), String>
+{
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
     activate(
@@ -148,13 +157,29 @@ fn the_no_firewall_banner_shows_the_wires_own_detail_verbatim() -> Result<(), St
         move |_app| {
             let bar = StatusBar::new();
             bar.set_status(&status(None, false));
-            *seen.borrow_mut() = Some(bar.text());
+            *seen.borrow_mut() = Some((
+                bar.banner_widget().title().to_string(),
+                bar.line_widget().label().to_string(),
+            ));
         },
     );
-    let text = result.borrow_mut().take().ok_or("activation never ran")?;
-    if text != NO_FIREWALL_DETAIL {
+    let (banner_title, line_text) = result.borrow_mut().take().ok_or("activation never ran")?;
+    if banner_title.len() >= NO_FIREWALL_MESSAGE.len() {
         return Err(format!(
-            "expected the wire's own detail verbatim ({NO_FIREWALL_DETAIL:?}), got {text:?}"
+            "the banner title must be short, authored for this surface -- not the helper's own \
+             {}-character explanation: {banner_title:?}",
+            NO_FIREWALL_MESSAGE.len()
+        ));
+    }
+    if banner_title.to_lowercase().contains("reachable") {
+        return Err(format!(
+            "the banner title must not itself claim reachability: {banner_title:?}"
+        ));
+    }
+    if line_text != NO_FIREWALL_MESSAGE {
+        return Err(format!(
+            "expected the wire's own detail verbatim on the line ({NO_FIREWALL_MESSAGE:?}), got \
+             {line_text:?}"
         ));
     }
     Ok(())
@@ -345,8 +370,8 @@ fn main() {
             no_firewall_at_all_is_prominent_not_a_footnote,
         ),
         (
-            "the_no_firewall_banner_shows_the_wires_own_detail_verbatim",
-            the_no_firewall_banner_shows_the_wires_own_detail_verbatim,
+            "the_no_firewall_case_shows_a_short_banner_and_the_full_detail_on_the_line",
+            the_no_firewall_case_shows_a_short_banner_and_the_full_detail_on_the_line,
         ),
         (
             "an_installed_but_stopped_firewall_says_stopped_not_missing",

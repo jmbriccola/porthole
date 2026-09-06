@@ -114,10 +114,11 @@ struct Row {
     row: adw::ActionRow,
     countdown_label: gtk::Label,
     close_button: gtk::Button,
-    /// `Some` only for a rule open to anyone -- the icon's own presence in
-    /// the widget tree *is* the marking [`OpenNowSection::is_marked_significant`]
-    /// reports, not a separately tracked flag that could drift from what
-    /// the row actually shows (see `open_dialog.rs`'s own
+    /// `Some` only for a rule open to anyone. [`OpenNowSection::is_marked_significant`]
+    /// does not trust this field's mere `Some`-ness -- that would only
+    /// prove an icon was *constructed*, not that it was ever actually
+    /// attached to `row` -- so it also checks the icon's own `parent()`
+    /// against the live widget tree (see `open_dialog.rs`'s own
     /// `TargetRow::significant_icon` for the identical pattern, and the
     /// reason it exists).
     significant_icon: Option<gtk::Image>,
@@ -209,22 +210,13 @@ fn subtitle_for(rule: &WireRule) -> String {
     }
 }
 
-/// Item 7: the subtitle text above already distinguishes "open to anyone"
-/// from "open to 10.10.10.0/24", but text alone reads as the same weight at
-/// a glance -- two rows scanned quickly, not read word for word, look
-/// identical. `open_dialog.rs`'s target list marks this exact choice with a
-/// `dialog-warning-symbolic` icon (`significant`/`TargetRow::significant_icon`),
-/// and `listening_section.rs` marks the *lesser* concern of a `BeyondReach`
-/// service with the same icon -- so the most exposed state porthole can
-/// produce was, until this, the only one of the three rendered with no
-/// mark at all, in the one list whose job is showing what is currently
-/// open. This tooltip deliberately mirrors `open_dialog.rs`'s own
-/// `anyone_note()` wording (a private function there, not reachable from
-/// here, hence the duplication -- the same shape `helper_message` is
-/// already duplicated in for an unrelated reason) rather than inventing a
-/// second sentence about the identical fact.
-const OPEN_TO_ANYONE_TOOLTIP: &str =
-    "Open to anyone your machine can reach, not just devices on this network.";
+// Item 7's own marking (built in `apply`, below) uses `open_dialog.rs`'s
+// own `anyone_note()` for its tooltip, called directly rather than kept as
+// a second, separate copy of the sentence -- an earlier version of this
+// module did exactly that, as a private constant worded slightly
+// differently ("Open to anyone…" vs. `anyone_note()`'s own "Opens the port
+// to anyone…"), which is precisely the drift `open_dialog.rs`'s own module
+// doc says keeping this sentence to one function is meant to rule out.
 
 /// The helper's own rendered text from a D-Bus method error, verbatim.
 ///
@@ -308,13 +300,12 @@ fn apply(inner: &Rc<Inner>, rules: &[WireRule]) {
         // same way the other two surfaces already mark the identical
         // (`open_dialog.rs`) or a lesser (`listening_section.rs`'s
         // `BeyondReach`) concern -- an icon, not colour alone, and no
-        // alarming wording in its tooltip (see `OPEN_TO_ANYONE_TOOLTIP`'s
-        // own doc comment).
+        // alarming wording in its tooltip (see the doc comment above).
         let significant_icon = if rule.scope == "anywhere" {
             let icon = gtk::Image::from_icon_name("dialog-warning-symbolic");
             icon.add_css_class("warning");
             icon.set_valign(gtk::Align::Center);
-            icon.set_tooltip_text(Some(OPEN_TO_ANYONE_TOOLTIP));
+            icon.set_tooltip_text(Some(&crate::open_dialog::anyone_note()));
             action_row.add_prefix(&icon);
             Some(icon)
         } else {
@@ -602,17 +593,22 @@ impl OpenNowSection {
             .map(|r| r.close_button.clone())
     }
 
-    /// Item 7: whether row `index` carries the "open to anyone" marking --
-    /// the icon's real presence on the row, not a copy of the data
-    /// (`rule.scope == "anywhere"`) that produced it, so this cannot drift
-    /// from what a user actually sees. Mirrors `OpenDialog::
-    /// is_marked_significant`'s own reasoning for the identical pattern.
+    /// Item 7: whether row `index` carries the "open to anyone" marking,
+    /// checked against the live widget tree -- the icon's own `parent()`
+    /// -- rather than only whether `significant_icon` is `Some`. `Some`
+    /// alone would only prove an icon was constructed; a future edit that
+    /// built one and never reached `add_prefix` would leave it `Some`
+    /// while nothing actually rendered, and `parent()` is what catches
+    /// that. Same shape as `OpenDialog::is_marked_significant`, which
+    /// checks `parent()` for the identical reason -- an earlier version
+    /// of this accessor checked `is_some()` alone, the exact defect that
+    /// method's own doc comment was written to rule out.
     pub fn is_marked_significant(&self, index: usize) -> bool {
-        self.inner
-            .rows
-            .borrow()
-            .get(index)
-            .is_some_and(|r| r.significant_icon.is_some())
+        self.inner.rows.borrow().get(index).is_some_and(|r| {
+            r.significant_icon
+                .as_ref()
+                .is_some_and(|icon| icon.parent().is_some())
+        })
     }
 
     /// The countdown text as it actually reads on screen right now --

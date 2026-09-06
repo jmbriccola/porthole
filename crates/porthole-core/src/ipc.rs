@@ -102,16 +102,18 @@ pub struct WireStatus {
     /// Empty when unknown.
     pub firewall_version: String,
     /// `BackendHealth::detail`, verbatim -- the same text `porthole-cli`'s
-    /// own `print_status`/`--json` already show a person or a script.
-    /// Never empty in practice today (every `BackendHealth` this codebase
-    /// constructs sets it), but a client must not assume it always will be:
-    /// this is what lets a GUI render *this* crate's own account of why a
-    /// firewall is unavailable or inactive, verbatim, instead of a client-
-    /// authored guess resting on an invariant ("the only way `detect` can
-    /// fail is 'no firewall installed'") held entirely in this crate, with
-    /// nothing in the wire type connecting the two. See
-    /// `porthole-gui/src/status_bar.rs`'s own `no_firewall_title` for the
-    /// client that needed exactly this.
+    /// own `print_status` (plain `porthole status`, not `--json`, which
+    /// deliberately does not carry this field -- see `docs/json-schema.md`'s
+    /// own paragraph on the collapse that leaves unnamed) already shows a
+    /// person. Never empty in practice today (every `BackendHealth` this
+    /// codebase constructs sets it), but a client must not assume it always
+    /// will be: this is what lets a GUI render *this* crate's own account of
+    /// why a firewall is unavailable or inactive, verbatim, instead of a
+    /// client-authored guess resting on an invariant ("the only way `detect`
+    /// can fail is 'no firewall installed'") held entirely in this crate,
+    /// with nothing in the wire type connecting the two. See
+    /// `porthole-gui/src/status_bar.rs`'s own module doc for the client that
+    /// needed exactly this.
     pub detail: String,
     /// The firewalld zone, or empty.
     pub location: String,
@@ -336,10 +338,12 @@ mod tests {
     #[test]
     fn wire_status_carries_the_health_detail_verbatim() {
         // A D-Bus client (the GUI today) must be able to show the same
-        // sentence `porthole-cli`'s own `print_status`/`--json` already
-        // do, rather than resting a claim -- "no firewall means already
-        // reachable" -- on an invariant held only in this crate, with
-        // nothing in the wire type connecting the two if it ever changed.
+        // sentence `porthole-cli`'s own `print_status` already does (not
+        // `--json`, which deliberately omits this field -- see
+        // `docs/json-schema.md`), rather than resting a claim -- "no
+        // firewall means already reachable" -- on an invariant held only in
+        // this crate, with nothing in the wire type connecting the two if
+        // it ever changed.
         let status = Status {
             backend: BackendId::Firewalld,
             health: BackendHealth {

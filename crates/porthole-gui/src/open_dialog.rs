@@ -113,9 +113,15 @@ fn duration_options() -> Vec<(&'static str, Lifetime)> {
 
 /// One dry sentence about what "Anyone" means, reused verbatim everywhere
 /// this dialog mentions it (the target row's subtitle, its icon's tooltip,
-/// and [`OpenDialog::note_for_anyone`]) so the three cannot drift into
-/// different claims about the same choice.
-fn anyone_note() -> String {
+/// and [`OpenDialog::note_for_anyone`]) so those three cannot drift into
+/// different claims about the same choice. `pub(crate)`, not private: a
+/// fourth site outside this module makes the identical claim about the
+/// identical choice -- `open_now.rs`'s "open to anyone" marking on an
+/// already-open rule -- and calls this directly rather than keeping its
+/// own, separate copy of the sentence (an earlier version did exactly
+/// that, worded slightly differently, outside every guard that keeps
+/// these three in sync).
+pub(crate) fn anyone_note() -> String {
     "Opens the port to anyone your machine can reach, not just devices on this network.".to_string()
 }
 
@@ -679,6 +685,10 @@ mod tests {
 
     #[test]
     fn the_note_on_anyone_is_one_dry_sentence_with_no_scolding() {
+        // Guards `anyone_note()` itself, which now covers four call sites,
+        // not three: this dialog's own target row/icon/`note_for_anyone`,
+        // plus `open_now.rs`'s "open to anyone" marking on an already-open
+        // rule.
         let note = anyone_note();
         assert_eq!(note.matches('.').count(), 1, "one sentence: {note}");
         for scolding in ["careful", "dangerous", "warning", "risk", "are you sure"] {

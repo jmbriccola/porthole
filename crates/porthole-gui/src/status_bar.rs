@@ -33,18 +33,30 @@
 //! pins this apart directly: the unreachable-helper text must not contain
 //! the reachability claim the no-firewall text does.
 //!
-//! That reachability claim itself is not this module's own to make.
-//! [`no_firewall_title`] shows `WireStatus::detail` verbatim -- the exact
-//! sentence `porthole-core`'s own `backend::detect` failure carries, the
-//! same one `porthole-cli`'s `print_status`/`--json` already show -- rather
-//! than a GUI-authored sentence that merely happens to be true today
-//! because `detect` cannot currently fail any other way. An earlier
-//! version of this module hardcoded that sentence as a constant, which
-//! rested the "already reachable" claim on an invariant held entirely in
-//! `porthole-core`, with nothing in the wire type connecting the two: if a
-//! future `detect` failure mode ever stopped confirming reachability, this
-//! module would have kept claiming it anyway. Showing `detail` verbatim
-//! means this module states only what the helper actually said.
+//! That reachability claim itself is not this module's own to make, and
+//! this took two attempts to get right. The first version of this fix
+//! hardcoded the claim as a GUI-authored constant -- true today only
+//! because `backend::detect` cannot currently fail any other way, with
+//! nothing in the wire type connecting the two. The second put
+//! `WireStatus::detail` (`porthole-core`'s own text, verbatim, reaching the
+//! wire through `BackendHealth::detail`) directly into the banner's own
+//! `title` -- which fixed the first problem and created a different one:
+//! `detail` is three sentences, written for a CLI's own per-command error
+//! ("**this port** is already reachable... Setting up a firewall is
+//! outside what porthole does"), and a window-level banner with a whole
+//! paragraph in lowercase-initial CLI register, about a port nobody asked
+//! about, is not what "prominent" was ever supposed to mean.
+//!
+//! [`NO_FIREWALL_TITLE`] is what the banner's own `title` shows now: short,
+//! capitalised, authored for this surface, and -- deliberately -- it does
+//! not itself claim reachability. It states only what `set_status` can
+//! always verify directly, `!status.firewall_available`, without leaning on
+//! what any particular `detail` string happens to say. The reachability
+//! claim -- and the rest of `detail`'s own explanation, unedited -- still
+//! reaches the user, verbatim, on [`StatusBar::line`] right underneath:
+//! item 5's own principle (the helper's text must reach the user, not a
+//! GUI paraphrase resting on an invariant held elsewhere) survives; only
+//! which widget carries which half of it changed.
 //!
 //! A third fact needs its own wording too, for the identical reason: a
 //! helper that *did* answer, but with a typed error, is not "could not
@@ -74,21 +86,13 @@
 
 use porthole_core::ipc::WireStatus;
 
-/// [`StatusBar::set_status`]'s no-firewall wording: `status.detail`,
-/// verbatim -- see this module's own doc comment for why this must not be
-/// a sentence of this module's own invention. `detail` is never empty in
-/// practice (every `BackendHealth` this codebase constructs sets it, see
-/// its own doc comment in `porthole-core`), but a client must not assume
-/// the wire will always honour that -- the fallback here is neutral and,
-/// unlike the sentence an earlier version of this function hardcoded,
-/// does not claim reachability porthole has not actually confirmed.
-fn no_firewall_title(status: &WireStatus) -> String {
-    if status.detail.is_empty() {
-        "No firewall detected.".to_string()
-    } else {
-        status.detail.clone()
-    }
-}
+/// [`StatusBar::set_status`]'s no-firewall banner title -- short, and
+/// deliberately makes no claim beyond what `!status.firewall_available`
+/// itself already confirms. See this module's own doc comment for why the
+/// stronger "already reachable" claim belongs on [`StatusBar::line`]
+/// instead, verbatim from `status.detail`, not repeated or paraphrased
+/// here.
+const NO_FIREWALL_TITLE: &str = "No firewall detected.";
 
 fn unreachable_title(message: &str) -> String {
     format!("Could not reach the porthole helper — {message}")
@@ -146,10 +150,26 @@ impl Default for StatusBar {
 
 impl StatusBar {
     pub fn new() -> Self {
+        // `wrap`/`max_width_chars` matter now in a way they did not before
+        // this task: the ordinary enforcing/not-running line is always
+        // short, but `set_status`'s no-firewall case puts `WireStatus::
+        // detail` here too -- porthole-core's own no-firewall sentence is
+        // 248 characters. Confirmed in a container, by rendering it: an
+        // unwrapped label does not truncate or scroll, it makes the
+        // *window* as wide as the whole unbroken line demands (`AdwToolbarView
+        // ... exceeds AdwApplicationWindow width: requested 1234 px, 470 px
+        // available`, and the window itself grew to match) -- the label
+        // wrapping is what keeps a long `detail` from doing that again.
         let line = gtk::Label::builder()
             .css_classes(["dim-label", "caption"])
             .margin_top(6)
             .margin_bottom(6)
+            .margin_start(12)
+            .margin_end(12)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .justify(gtk::Justification::Center)
+            .max_width_chars(60)
             .build();
 
         let banner = adw::Banner::new("");
@@ -176,9 +196,19 @@ impl StatusBar {
     /// that there is no firewall at all. See this module's own doc comment
     /// for the distinction that must survive between this and
     /// [`StatusBar::set_unreachable`].
+    ///
+    /// The no-firewall case is the one place `line` is used *alongside* a
+    /// revealed banner rather than cleared by it: `show_banner` clears
+    /// `line` first (as it does for the other two prominent cases, so a
+    /// stale confirmed claim cannot linger), and this then immediately
+    /// gives `line` new, current content of its own -- `status.detail`,
+    /// verbatim -- rather than leaving it empty. See this module's own doc
+    /// comment for why the detail belongs here and not in the banner's own
+    /// title.
     pub fn set_status(&self, status: &WireStatus) {
         if !status.firewall_available {
-            self.show_banner(&no_firewall_title(status));
+            self.show_banner(NO_FIREWALL_TITLE);
+            self.line.set_label(&status.detail);
             return;
         }
         self.banner.set_revealed(false);
@@ -219,16 +249,23 @@ impl StatusBar {
     /// underneath a banner now saying the helper cannot even be reached --
     /// `text()` would not show it (it prefers the revealed banner), but the
     /// line widget itself, real and still visible in the toolbar's bottom
-    /// bar, would.
+    /// bar, would. `set_status`'s own no-firewall branch is the one caller
+    /// that gives `line` new content of its own immediately afterward
+    /// (`status.detail`) rather than leaving it cleared -- see that
+    /// method's own doc comment.
     fn show_banner(&self, title: &str) {
         self.banner.set_title(title);
         self.banner.set_revealed(true);
         self.line.set_label("");
     }
 
-    /// The text as it actually reads on screen right now: the banner's own
-    /// title while it is the one showing, the line's own label otherwise
-    /// -- never a value recomputed independently of the real widgets.
+    /// The banner's own title while it is the one showing, the line's own
+    /// label otherwise -- never a value recomputed independently of the
+    /// real widgets. Not literally everything on screen: the one case
+    /// where both widgets carry meaningful text at once is the no-firewall
+    /// banner (see [`StatusBar::set_status`]), where `line` also holds
+    /// `status.detail` -- read [`StatusBar::line_widget`] directly for
+    /// that, the way `tests/status_bar.rs` does.
     pub fn text(&self) -> String {
         if self.banner.is_revealed() {
             self.banner.title().to_string()
@@ -254,45 +291,18 @@ mod tests {
     // crate's ordinary unit-test binary. The GTK-backed proof that the
     // real widgets carry this same text lives in `tests/status_bar.rs`.
 
-    /// A `WireStatus` with `firewall_available: false` and `detail` set to
-    /// `detail` -- everything else is irrelevant to `no_firewall_title`.
-    fn no_firewall_status(detail: &str) -> WireStatus {
-        WireStatus {
-            backend: String::new(),
-            firewall_available: false,
-            firewall_active: false,
-            firewall_active_unknown: false,
-            firewall_version: String::new(),
-            detail: detail.to_string(),
-            location: String::new(),
-            interface: String::new(),
-            address: String::new(),
-            cidr: String::new(),
-            rules: Vec::new(),
-        }
-    }
-
     #[test]
-    fn no_firewall_title_shows_the_wires_own_detail_verbatim() {
-        // Item 5: this must be the helper's own text, not a sentence this
-        // module invented and merely hoped stayed true -- see this
-        // module's own doc comment.
-        let detail = "no firewall found: none of firewalld, ufw or nftables is installed. \
-                       Without a firewall this port is already reachable from your network.";
-        assert_eq!(no_firewall_title(&no_firewall_status(detail)), detail);
-    }
-
-    #[test]
-    fn no_firewall_title_falls_back_to_a_neutral_sentence_when_detail_is_empty() {
-        // `BackendHealth::detail` is never empty in practice, but this
-        // function must not assume the wire will always honour that by
-        // falling back to a claim ("already reachable") it cannot support
-        // without a `detail` to have gotten that claim from.
-        let title = no_firewall_title(&no_firewall_status(""));
-        assert!(!title.is_empty());
+    fn the_no_firewall_title_does_not_itself_claim_reachability() {
+        // Item 6 (round 3): the banner's own short title must not
+        // independently assert "already reachable" -- that would rest the
+        // claim on a GUI-authored sentence again, the exact thing item 5
+        // fixed once already. The claim belongs to `status.detail`,
+        // verbatim, on `line` -- see `the_no_firewall_banner_shows_a_short_
+        // title_with_the_full_detail_on_the_line` in `tests/status_bar.rs`
+        // for the real widgets carrying that split.
         assert!(
-            !title.contains("already reachable"),
-            "with no detail to have said so, the fallback must not claim reachability: {title}"
+            !NO_FIREWALL_TITLE.to_lowercase().contains("reachable"),
+            "the banner title must not itself claim reachability: {NO_FIREWALL_TITLE}"
         );
     }
 
@@ -302,21 +312,13 @@ mod tests {
         // firewall vs. porthole simply not knowing), and collapsing them
         // into the same sentence is exactly the defect this module's own
         // doc comment describes. If a future edit ever makes
-        // `unreachable_title` reuse `no_firewall_title`'s wording, or vice
+        // `unreachable_title` reuse `NO_FIREWALL_TITLE`'s wording, or vice
         // versa, this fails.
-        let no_firewall = no_firewall_title(&no_firewall_status(
-            "no firewall found: none of firewalld, ufw or nftables is installed. Without a \
-             firewall this port is already reachable from your network.",
-        ));
         let unreachable = unreachable_title("could not reach the porthole helper: timed out");
-        assert_ne!(unreachable, no_firewall);
+        assert_ne!(unreachable, NO_FIREWALL_TITLE);
         assert!(
             !unreachable.contains("already reachable"),
             "an unreachable helper must not claim reachability either way: {unreachable}"
-        );
-        assert!(
-            no_firewall.contains("already reachable"),
-            "the confirmed no-firewall case must still make that claim: {no_firewall}"
         );
     }
 
@@ -327,12 +329,8 @@ mod tests {
         // three titles apart the same way the test above pins the first two.
         let errored = errored_title("not authorized: com.jacopobriccola.Porthole.List");
         let unreachable = unreachable_title("could not reach the porthole helper: timed out");
-        let no_firewall = no_firewall_title(&no_firewall_status(
-            "no firewall found: none of firewalld, ufw or nftables is installed. Without a \
-             firewall this port is already reachable from your network.",
-        ));
         assert_ne!(errored, unreachable);
-        assert_ne!(errored, no_firewall);
+        assert_ne!(errored, NO_FIREWALL_TITLE);
         assert!(
             !errored.contains("already reachable"),
             "an errored reply must not claim reachability either way: {errored}"

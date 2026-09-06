@@ -137,10 +137,12 @@ struct Inner {
     /// listening", and stays that way through a `set_open_ports` that
     /// arrives afterward.
     error_page: adw::StatusPage,
-    /// A **different** widget again, shown while `scanned` is `false` --
-    /// see this module's own doc comment. Not "before `set_services` has
-    /// ever been called" alone: `set_open_ports` alone cannot displace it
-    /// either, which is exactly the property an earlier version of this
+    /// A **different** widget again, shown only while `scanned` is `false`
+    /// -- necessary, not sufficient: `scanned` is also `false` right after
+    /// `set_scan_failed`, when `error_page` is what actually shows. See
+    /// this module's own doc comment. Not "before `set_services` has ever
+    /// been called" alone either: `set_open_ports` alone cannot displace
+    /// it, which is exactly the property an earlier version of this
     /// section did not have.
     loading_page: adw::StatusPage,
     rows: RefCell<Vec<Row>>,

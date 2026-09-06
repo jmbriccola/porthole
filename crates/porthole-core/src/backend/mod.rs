@@ -186,6 +186,23 @@ pub trait FirewallBackend {
     }
 }
 
+/// The exact message [`detect`] fails with when no firewall is installed at
+/// all -- `pub` (not `pub(crate)`) so a client that needs this same text for
+/// a test fixture can import it rather than retyping it. It reaches every
+/// caller through `Error::BackendUnavailable`'s own `Display`, and reaches
+/// the wire verbatim as `BackendHealth::detail` and then `WireStatus::detail`
+/// (`porthole-helper/src/service.rs`'s `status_for_undetected_backend`,
+/// `porthole-core/src/ipc.rs`'s `WireStatus::from_status`) -- which is what
+/// `porthole-gui`'s own `StatusBar` shows a user, and what
+/// `porthole-gui/tests/status_bar.rs`'s `NO_FIREWALL_DETAIL` fixture is for:
+/// an earlier version of that fixture retyped a shortened, non-verbatim copy
+/// of this string, which is exactly the drift this constant exists to rule
+/// out.
+pub const NO_FIREWALL_MESSAGE: &str = "no firewall found: none of firewalld, ufw or nftables is \
+     installed. Without a firewall this port is already reachable from your network — \
+     porthole cannot change that, and will not pretend it has. Setting up \
+     a firewall is outside what porthole does.";
+
 /// Pick a backend: firewalld, then ufw, then nftables.
 ///
 /// All three are chosen on being **available** (installed), never on being
@@ -214,13 +231,7 @@ pub fn detect<'a>(runner: &'a dyn CommandRunner) -> Result<Box<dyn FirewallBacke
     if nft.health()?.available {
         return Ok(Box::new(nft));
     }
-    Err(Error::BackendUnavailable(
-        "no firewall found: none of firewalld, ufw or nftables is installed. \
-         Without a firewall this port is already reachable from your network — \
-         porthole cannot change that, and will not pretend it has. Setting up \
-         a firewall is outside what porthole does."
-            .to_string(),
-    ))
+    Err(Error::BackendUnavailable(NO_FIREWALL_MESSAGE.to_string()))
 }
 
 #[cfg(test)]

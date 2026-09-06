@@ -66,16 +66,15 @@ use crate::status_bar::StatusBar;
 /// The `Breakpoint` object itself is reachable via
 /// [`PortholeWindow::breakpoint`]; task 6 is what attaches its first real
 /// layout change, `NARROW_MARGIN_PX` below, through `Breakpoint::add_setters`
-/// in [`PortholeWindow::new`] -- a registered breakpoint with no setter
-/// attached activates and changes nothing, which is what this crate shipped
-/// until that call existed.
+/// during construction -- a registered breakpoint with no setter attached
+/// activates and changes nothing, which is what this crate shipped until
+/// that call existed.
 const NARROW_WIDTH_PX: f64 = 400.0;
 
 /// `content`'s own margin, in CSS pixels, while the window is narrow --
 /// down from the ordinary 24px set at construction. Applied through
-/// `Breakpoint::add_setters` in [`PortholeWindow::new`]; libadwaita
-/// restores the original 24px on its own once the breakpoint stops
-/// matching.
+/// `Breakpoint::add_setters` during construction; libadwaita restores the
+/// original 24px on its own once the breakpoint stops matching.
 const NARROW_MARGIN_PX: i32 = 12;
 
 pub struct PortholeWindow {
@@ -262,11 +261,10 @@ impl PortholeWindow {
         &self.content
     }
 
-    /// The narrow-width breakpoint registered on this window --
-    /// `PortholeWindow::new` already attaches its own layout change
-    /// (`NARROW_MARGIN_PX`) to this exact object; a later section that
-    /// wants a second one calls `Breakpoint::add_setters` again on what
-    /// this returns.
+    /// The narrow-width breakpoint registered on this window -- its own
+    /// layout change (`NARROW_MARGIN_PX`) is already attached to this exact
+    /// object during construction; a later section that wants a second one
+    /// calls `Breakpoint::add_setters` again on what this returns.
     ///
     /// This is the same object `current_breakpoint()` (from
     /// `AdwApplicationWindowExt`, reachable via `Deref`) reports back once

@@ -303,15 +303,27 @@ fn activity_unconfirmed_remedy(id: BackendId) -> &'static str {
 
 /// What the bus said when we asked the helper for the rule list.
 ///
-/// `list` is polkit-gated on the helper's side, so a refusal is *proof the
-/// helper is running* — the opposite of what a swallowed error suggests.
-/// Collapsing these into one "not answering" verdict makes doctor recommend
-/// reinstalling a package that is already correctly installed.
+/// `list` is polkit-gated on the helper's side, so *any* typed error the
+/// helper itself returns is proof the helper is running -- the opposite of
+/// what a swallowed error suggests. Collapsing these into one "not
+/// answering" verdict makes doctor recommend reinstalling a package that is
+/// already correctly installed.
+///
+/// `Errored` is not only a polkit denial, though that is the common case:
+/// `list` can also fail with `HelperError::State` (a `StateStore` read
+/// failure) or the `HelperError::Failed` catch-all, neither of which is a
+/// decision anyone made to decline the request -- an earlier version of
+/// this variant was named and rendered as `Refused`, which was true of a
+/// denial and false of everything else a `MethodError` can carry (the
+/// identical shape `porthole-gui`'s own `window.rs::HelperFailure` was
+/// caught in the same milestone, one crate over). `helper_check` below
+/// still names polkit specifically, since that remains the *common* cause
+/// worth a specific remedy, but no longer states it as the only one.
 enum HelperState {
     Answering(usize),
     NotOnTheBus(String),
     NoBus(String),
-    Refused(String),
+    Errored(String),
 }
 
 fn ask_helper(session: bool) -> HelperState {
@@ -343,7 +355,7 @@ fn ask_helper(session: bool) -> HelperState {
                             HelperState::NotOnTheBus(message)
                         }
                         // Anything else came *from the helper*. It is running.
-                        _ => HelperState::Refused(message),
+                        _ => HelperState::Errored(message),
                     }
                 }
                 Err(e) => HelperState::NotOnTheBus(e.to_string()),
@@ -371,14 +383,16 @@ fn helper_check(state: HelperState) -> Check {
             "No session/system bus is reachable. This is almost never the case \
              on a desktop; check what changed about how this machine starts D-Bus.",
         ),
-        HelperState::Refused(detail) => Check::bad(
+        HelperState::Errored(detail) => Check::bad(
             "Helper",
-            format!("running, but refused: {detail}"),
+            format!("running, but reported an error: {detail}"),
             &format!(
                 "The helper is running and answered — this is not a missing-package \
-                 problem. It refused the request, which is usually polkit: check \
-                 that {POLICY_PATH} is installed and that its rules allow you. \
-                 Opening and closing do not work until it does."
+                 problem. Its own message above says why; the common cause is polkit \
+                 refusing the request, so check that {POLICY_PATH} is installed and \
+                 that its rules allow you, but a permission problem is not the only \
+                 thing this message can mean. Opening and closing do not work until \
+                 it is resolved."
             ),
         ),
     }
@@ -875,11 +889,12 @@ mod tests {
     }
 
     #[test]
-    fn refused_is_a_failure_that_names_the_policy_and_does_not_say_install() {
-        // A refusal is proof the helper is running: the fix is polkit, not
-        // reinstalling a package that is already there. Getting this backwards
-        // is exactly the wrong-lead bug this mapping exists to prevent.
-        let check = helper_check(HelperState::Refused("Not authorized".to_string()));
+    fn an_errored_reply_is_a_failure_that_names_the_policy_and_does_not_say_install() {
+        // A typed error from the helper is proof it is running: the fix is
+        // not reinstalling a package that is already there. Getting this
+        // backwards is exactly the wrong-lead bug this mapping exists to
+        // prevent.
+        let check = helper_check(HelperState::Errored("Not authorized".to_string()));
         assert!(!check.ok);
         assert!(check.detail.contains("Not authorized"));
         assert!(check.remedy.contains(POLICY_PATH));
@@ -887,6 +902,28 @@ mod tests {
             .remedy
             .to_lowercase()
             .contains("install the porthole package"));
+    }
+
+    #[test]
+    fn an_errored_reply_does_not_claim_a_refusal_is_the_only_possible_cause() {
+        // A `StateStore` failure inside the helper reaches this exact
+        // rendering too (`ask_helper` cannot tell it apart from a polkit
+        // denial without the wire's own error name, which this layer does
+        // not read) -- pinning that the remedy still names polkit as the
+        // *common* cause without asserting it as the only one.
+        let check = helper_check(HelperState::Errored(
+            "could not read /run/porthole/state.json: permission denied".to_string(),
+        ));
+        assert!(
+            !check.detail.to_lowercase().contains("refus"),
+            "must not claim a refusal: {}",
+            check.detail
+        );
+        assert!(
+            !check.remedy.to_lowercase().contains("is usually polkit"),
+            "must not assert polkit as the only cause: {}",
+            check.remedy
+        );
     }
 
     #[test]
