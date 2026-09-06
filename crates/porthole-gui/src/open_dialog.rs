@@ -14,12 +14,16 @@
 //!
 //! **"Anyone".** [`build_targets`] always puts it last and marks it (an
 //! icon, not colour alone -- colour alone fails a colour-blind user and a
-//! high-contrast theme). `build_targets` carries no selection state at all,
-//! though -- never being preselected is [`rebuild_targets`]'s doing: it
-//! defaults `Inner::selected_target_index` to `0` ("This network") and only
-//! ever moves it in response to a real click on a check button, so "Anyone"
-//! (never index `0`) starts unselected and stays that way until a user
-//! chooses it. [`anyone_note`] is the one dry sentence the spec asks for:
+//! high-contrast theme). It is never preselected: the selected index starts
+//! at `0` ("This network") and only ever moves on a real click, and "Anyone"
+//! is never index `0`.
+//!
+//! That sentence deliberately names no function. Two earlier attempts to
+//! attribute the behaviour were both wrong -- first to `build_targets`, which
+//! carries no selection state, then to `rebuild_targets`, which does not set
+//! the default and in fact *preserves* the existing index on every call after
+//! the first. Attributing a behaviour is where this file kept going wrong;
+//! stating it is enough. [`anyone_note`] is the one dry sentence the spec asks for:
 //! "niente toni allarmistici o didattici, solo una frase asciutta su cosa
 //! comporta." A warning that lectures gets dismissed unread, which makes the
 //! genuinely significant choice less safe, not more.
