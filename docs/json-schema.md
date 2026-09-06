@@ -244,10 +244,11 @@ A `::` listener is included as `all_interfaces`, not filtered out for being
 IPv6: on most systems it also accepts IPv4-mapped connections, so it is
 reachable over IPv4 too. porthole itself only ever opens IPv4 rules — see
 `porthole doctor`'s `IPv6` check for that standing caveat, which is exactly
-the caveat that makes `beyond_reach` possible: any service bound to a real
-IPv6 address (not the wildcard, not loopback, not v4-mapped) is outside what
-porthole can see or touch, whether or not it is actually reachable from the
-public internet.
+the caveat that makes `beyond_reach` possible: porthole can **see** a service
+bound to a real IPv6 address — it is in this very listing — but has no rule it
+can open or close for it, whether or not it is actually reachable from the
+public internet. Seeing it and being unable to act on it is the whole point of
+reporting the binding separately.
 
 `process` and `pid` are `null` — never the string `"unknown"` — when the
 owning process could not be identified. Resolving a listening socket to a
