@@ -300,10 +300,10 @@ impl Porthole {
 
         let runner = RealRunner;
         let backend = backend::detect(&runner).map_err(HelperError::from)?;
-        // Read-only open: reconciliation may still save a corrected state
-        // file if it finds drift, but that save is best effort here, not
-        // required for status to answer correctly, and status must not
-        // block behind a writer to do it.
+        // Read-only open: `Engine::status` reconciles read-only (`SweepMode::
+        // ReadOnly`), so it never saves and never touches the firewall --
+        // see `reconcile.rs`. status must not block behind a writer either,
+        // which is the other reason this is the plain, non-exclusive open.
         let state = StateStore::open(&self.state_path).map_err(HelperError::from)?;
         let mut engine = Engine::new(
             backend.as_ref(),

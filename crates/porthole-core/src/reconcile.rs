@@ -431,6 +431,14 @@ mod tests {
         // it must not even call owned_rules, let alone close.
         let backend = FakeBackend::new();
         let handle = backend.open(&request(5173), "porthole:orphan").unwrap();
+        // If a read-only sweep ever called owned_rules at all, this makes
+        // that call fail and land in `report.failures` -- which the
+        // assertions below check is empty. Without this, a regression that
+        // made ReadOnly call owned_rules anyway (and find nothing to close)
+        // would leave `removed_orphans` empty exactly as it already is here,
+        // and this test would keep passing while proving nothing about
+        // whether the call happened at all.
+        backend.fail_owned_rules();
         // Nothing in state claims this rule -- under Apply mode this would
         // be removed as an orphan. Under ReadOnly it must survive untouched.
         let (_dir, mut store) = store_with(vec![]);

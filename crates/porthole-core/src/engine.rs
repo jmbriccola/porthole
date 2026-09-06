@@ -137,18 +137,11 @@ impl<'a> Engine<'a> {
     /// `open`, `close_by_id`, `close_by_port`, `close_all`. `status` and
     /// `rules` use [`Engine::reconcile_read_only`] instead -- see there for
     /// why the split exists at all.
-    ///
-    /// A sweep failure is logged and otherwise ignored -- the caller asked to
-    /// open a port or close one, not to tidy up, and refusing that because an
-    /// unrelated stale rule would not delete is a worse outcome than a rule
-    /// left behind.
     fn reconcile(&mut self) {
         let mode = reconcile::SweepMode::Apply {
             dry_run: self.runner.is_dry_run(),
         };
-        if let Err(e) = reconcile::sweep(self.backend, &mut self.state, mode) {
-            eprintln!("porthole: reconciliation failed, continuing anyway: {e}");
-        }
+        self.run_sweep(mode);
     }
 
     /// [`Engine::reconcile`], but for a read path.
@@ -163,12 +156,35 @@ impl<'a> Engine<'a> {
     /// and `rules` are commonly reached without the exclusive state lock
     /// held at all.
     fn reconcile_read_only(&mut self) {
-        if let Err(e) = reconcile::sweep(
-            self.backend,
-            &mut self.state,
-            reconcile::SweepMode::ReadOnly,
-        ) {
-            eprintln!("porthole: reconciliation failed, continuing anyway: {e}");
+        self.run_sweep(reconcile::SweepMode::ReadOnly);
+    }
+
+    /// Run one sweep and log whatever it found wrong, without ever letting it
+    /// fail the operation the caller actually asked for: the caller asked to
+    /// open a port, close one, or read the truth about what is open, not to
+    /// tidy up, and refusing that because an unrelated stale rule would not
+    /// delete is a worse outcome than a rule left behind.
+    ///
+    /// Two distinct kinds of "went wrong", both logged: `sweep` itself
+    /// returning `Err` (a failure to list rules, or to save), and a
+    /// successful sweep whose `Report::failures` is non-empty (an
+    /// individual orphan that would not close, or `owned_rules` itself
+    /// failing -- see `reconcile.rs`). The second used to be invisible: it
+    /// no longer aborts `sweep` with `?`, so silently dropping it here would
+    /// have turned a real, reportable failure into one nothing ever prints.
+    fn run_sweep(&mut self, mode: reconcile::SweepMode) {
+        match reconcile::sweep(self.backend, &mut self.state, mode) {
+            Ok(report) => {
+                for failure in &report.failures {
+                    eprintln!(
+                        "porthole: reconciliation could not remove one orphaned rule, \
+                         continuing: {failure}"
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("porthole: reconciliation failed, continuing anyway: {e}");
+            }
         }
     }
 

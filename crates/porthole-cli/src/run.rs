@@ -39,12 +39,12 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
 
             let status = match backend::detect(runner.as_ref()) {
                 Ok(backend) => {
-                    // Never for_write: status only ever reads, regardless of
-                    // --dry-run. `Engine::status` now reconciles first, which
-                    // can save a corrected state file if it finds drift; that
-                    // save is opportunistic here (best effort, no lock held
-                    // for it), never required for status to answer correctly.
-                    let mut engine = make_engine(backend.as_ref(), runner.as_ref(), false)?;
+                    // status only ever reads, regardless of --dry-run.
+                    // `Engine::status` reconciles read-only (`SweepMode::
+                    // ReadOnly`): it can update its own in-memory view of
+                    // what is actually open, but it never saves and never
+                    // touches the firewall -- see `reconcile.rs`.
+                    let mut engine = make_engine(backend.as_ref(), runner.as_ref())?;
                     engine.status()?
                 }
                 Err(Error::BackendUnavailable(detail)) => Status {
@@ -116,7 +116,7 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
         // — first would defeat that.
         let runner = make_runner(cli);
         let backend = backend::detect(runner.as_ref())?;
-        let mut engine = make_engine(backend.as_ref(), runner.as_ref(), false)?;
+        let mut engine = make_engine(backend.as_ref(), runner.as_ref())?;
 
         let rule = engine.open(port, protocol, &scope, lifetime, requesting_uid())?;
         // Render against the rule's own opening instant rather than reading the
@@ -175,7 +175,7 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
         // Unchanged: local, unprivileged, no helper needed.
         let runner = make_runner(cli);
         let backend = backend::detect(runner.as_ref())?;
-        let mut engine = make_engine(backend.as_ref(), runner.as_ref(), false)?;
+        let mut engine = make_engine(backend.as_ref(), runner.as_ref())?;
 
         let mut failures: Vec<Error> = Vec::new();
         let closed = if args.all {
@@ -277,22 +277,24 @@ fn make_runner(cli: &Cli) -> Box<dyn CommandRunner> {
     }
 }
 
-/// `for_write` is `true` only for the call sites that can actually save: `open`
-/// and `close`, and only when they are not `--dry-run`. `status` never saves —
-/// no matter what `--dry-run` says — so it always passes `false`: taking the
-/// lock would call `ensure_dir` on `/run/porthole`, which an unprivileged user
-/// cannot create, and `porthole status` is documented to need no privileges.
+/// Always opens the state store non-exclusively, on purpose: every real
+/// (non-dry-run) `open`/`close` crosses the bus via `client::*` instead of
+/// building an `Engine` here at all (see `open`/`close` below), so the only
+/// local `Engine`s this binary ever constructs are for `--dry-run` and for
+/// `status` -- and `status` never writes, regardless of `--dry-run`. Taking
+/// the exclusive lock would call `ensure_dir` on `/run/porthole`, which an
+/// unprivileged user cannot create, and neither of these callers is
+/// documented to need any privilege at all. There is deliberately no
+/// `for_write` parameter here any more: one existed, but every call site
+/// passed `false`, since `open_exclusive`'s branch had no caller that could
+/// ever reach it from this binary -- a doc comment describing the unreachable
+/// branch as real is exactly how that went unnoticed.
 fn make_engine<'a>(
     backend: &'a dyn FirewallBackend,
     runner: &'a dyn CommandRunner,
-    for_write: bool,
 ) -> Result<Engine<'a>> {
     let path = StateStore::default_path();
-    let state = if for_write {
-        StateStore::open_exclusive(path)?
-    } else {
-        StateStore::open(path)?
-    };
+    let state = StateStore::open(path)?;
     let executable = std::env::current_exe()
         .map_err(|e| Error::Unexpected(format!("could not determine porthole's own path: {e}")))?;
     Ok(Engine::new(

@@ -437,3 +437,59 @@ fn closing_a_seeded_phantom_rule_is_pruned_by_reconciliation_not_falsely_reporte
          a port is open that never really was: {state_text}"
     );
 }
+
+#[test]
+fn the_helper_reconciles_at_startup_with_no_client_request_at_all() {
+    // Fix round 2, item 1: the spec's mandatory acceptance test is "open a
+    // port on ufw, reboot, verify it is closed". Nothing but a start-up
+    // sweep can make that true -- the helper is D-Bus activated, so nothing
+    // runs between a reboot and the first client request, and that request
+    // may never come before the machine reboots again. This seeds a phantom
+    // state entry (same shape as the one above) and starts the helper --
+    // and only the helper, no client call of any kind -- to prove the entry
+    // is pruned by start-up alone.
+    //
+    // No sleep needed to give the sweep time to run: `start_or_skip!` only
+    // returns once the helper's name appears on the bus, which happens in
+    // `main` strictly after the start-up sweep -- both run sequentially,
+    // before the bus connection is even opened. By the time this test can
+    // see the helper on the bus at all, the sweep has already finished.
+    let _guard = lock_helper();
+    let dir = TempDir::new().unwrap();
+    let state = dir.path().join("state.json");
+
+    const RULE_ID: &str = "startup-phantom";
+    const PORT: u16 = 25199;
+    const CIDR: &str = "203.0.113.0/24"; // TEST-NET-3: never a real subnet.
+    let zone = default_zone();
+    let rich_rule = format!(
+        r#"rule family="ipv4" source address="{CIDR}" port port="{PORT}" protocol="tcp" accept"#
+    );
+    let seeded = serde_json::json!({
+        "schema_version": 1,
+        "rules": [{
+            "id": RULE_ID,
+            "port": PORT,
+            "protocol": "tcp",
+            "target": {"kind": "network", "cidr": CIDR},
+            "backend": "firewalld",
+            "opened_at": 1_757_000_000_u64,
+            "expires_at": null,
+            "uid": 999_999,
+            "handle": {"backend": "firewalld", "zone": zone, "rich_rule": rich_rule},
+        }]
+    });
+    std::fs::write(&state, serde_json::to_string_pretty(&seeded).unwrap())
+        .expect("seed the state file");
+
+    let mut helper = start_or_skip!(&state);
+    let _ = helper.0.kill();
+    let _ = helper.0.wait();
+
+    let state_text = std::fs::read_to_string(&state).expect("the state file still exists");
+    assert!(
+        !state_text.contains(RULE_ID),
+        "start-up reconciliation must prune a phantom entry even with no \
+         client request ever made: {state_text}"
+    );
+}
