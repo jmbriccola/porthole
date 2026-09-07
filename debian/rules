@@ -1,0 +1,127 @@
+#!/usr/bin/make -f
+# The install layout lives in the Makefile at the top of the source tree and
+# nowhere else. Nothing here lists a file: `make install` puts down the base
+# package's 25 files and `make install-gui` the GUI package's 3, so the .deb
+# contents and what crates/porthole-cli/tests/install_layout.rs compares for
+# equality on every `cargo test` are two readings of one table.
+#
+# That is also why there are no debian/*.install files. Splitting the two
+# packages out of a single debian/tmp would mean writing the file list a
+# second time here, and the Makefile already draws the same line: WITH_GUI=0
+# drops exactly the GUI binary, its desktop entry and its AppStream metainfo,
+# which is exactly what the porthole-gui package holds.
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+# Cargo must not write into the build user's ~/.cargo. Removed by
+# override_dh_auto_clean below.
+export CARGO_HOME = $(CURDIR)/debian/cargo-home
+
+# cargo's release profile carries debug = false, which leaves the binaries
+# with a symbol table and no DWARF -- and dh_strip then builds -dbgsym
+# packages holding a .debug file with no debug information in it. debug = 1
+# (line tables) makes those packages worth the space they take; dh_strip
+# moves it all out of the shipped binaries either way.
+export CARGO_PROFILE_RELEASE_DEBUG = 1
+
+# Native builds only. porthole-gui links GTK4 through gtk4-sys, and nothing
+# here sets up a cross toolchain or a cross pkg-config; a cross build would
+# need both.
+WITH_GUI := 1
+ifneq (,$(filter pkg.porthole.nogui,$(DEB_BUILD_PROFILES)))
+WITH_GUI := 0
+endif
+
+CARGO_FLAGS := --release --locked
+
+%:
+	dh $@
+
+# A Makefile at the top of the tree makes dh pick its makefile build system,
+# whose dh_auto_configure would run ./configure if one existed. There is none.
+override_dh_auto_configure:
+
+# The workspace's default-members leave porthole-gui out, so the first line
+# builds the CLI, the helper and the agent -- and, through
+# crates/porthole-cli/build.rs, the eleven man pages and the three completion
+# files that `make install` then installs.
+override_dh_auto_build:
+	cargo build $(CARGO_FLAGS)
+ifeq ($(WITH_GUI),1)
+	cargo build $(CARGO_FLAGS) -p porthole-gui
+endif
+
+# No test run here, and the reason is not that the suite is slow.
+#
+# `porthole doctor` asks the system bus for the helper, and the one test that
+# pins its answer -- doctor_says_the_helper_is_missing_when_it_is -- wants the
+# check to report a missing helper. In a build chroot there is no system bus
+# at all, so it reports a missing *bus* instead and the test fails. Observed
+# in a debian:13 container, with and without dbus-run-session: a session bus
+# does not stand in for the system one here.
+#
+# `cargo test --release` fails four more, for a separate reason worth writing
+# down before someone adds --release back: PORTHOLE_STATE_FILE,
+# PORTHOLE_DEVICES_FILE and the helper's --session are all gated on
+# cfg!(debug_assertions), and the tests that drive the binary through them
+# need a debug build.
+#
+# The suite runs on a developer machine and in CI, where there is a bus.
+override_dh_auto_test:
+
+# PREFIX=/usr, not the Makefile's own default being taken on trust:
+# data/com.jacopobriccola.Porthole.service and data/porthole-helper.service
+# both name /usr/libexec/porthole-helper literally, and `make install-helper`
+# stops when LIBEXECDIR and those two files disagree.
+override_dh_auto_install:
+	$(MAKE) install DESTDIR=$(CURDIR)/debian/porthole PREFIX=/usr WITH_GUI=0
+ifeq ($(WITH_GUI),1)
+	$(MAKE) install-gui DESTDIR=$(CURDIR)/debian/porthole-gui PREFIX=/usr
+endif
+
+override_dh_auto_clean:
+	rm -rf $(CURDIR)/debian/cargo-home
+	rm -rf target/generated target/install-check
+
+# porthole-helper.service is Type=dbus with no [Install] section, reached
+# through /usr/share/dbus-1/system-services/com.jacopobriccola.Porthole.service.
+# There is nothing for `systemctl enable` to link and nothing to start at
+# install time: the bus starts it when a client first addresses the name. So
+# --no-enable --no-start.
+#
+# What those two produce, read out of the built package rather than inferred:
+# a preinst that runs `deb-systemd-invoke stop porthole-helper.service` on an
+# upgrade, a postrm that runs `systemctl --system daemon-reload` on a remove,
+# and no dh_installsystemd snippet in postinst at all. A fresh install
+# therefore starts no helper, and an upgrade leaves the old one stopped for
+# the next client call to re-activate on the new binary. (--no-start also
+# turns off dh_installsystemd's own restart-after-upgrade default: it sets
+# RESTART_AFTER_UPGRADE only when NO_START is empty.)
+#
+# The gap that stop opens is real and is not repaired here. An opened rule's
+# automatic close is a transient systemd timer outside this process and
+# survives; the helper's network-change monitor is inside it, so a subnet
+# change between the stop and the next client call goes unnoticed.
+#
+# --no-start also suppresses the stop-on-remove dh_installsystemd would
+# otherwise put in prerm -- it emits that one `unless NO_START`. That stop is
+# in debian/porthole.prerm instead; see the comment there.
+#
+# -pporthole because the unit is only in that package; without it
+# dh_installsystemd stops on porthole-gui, which installs no units at all.
+override_dh_installsystemd:
+	dh_installsystemd -pporthole --no-enable --no-start porthole-helper.service
+
+# porthole-agent.service is the other decision, and it is a different one:
+# WantedBy=graphical-session.target, Restart=on-failure, enabled globally so a
+# graphical login starts it. porthole also installs an XDG autostart entry for
+# desktops that do not start session services through systemd; a desktop that
+# honours both starts two agents and the second exits on finding the bus name
+# taken.
+#
+# dh_installsystemduser generates enable and disable snippets only -- it has
+# no --no-start, because it starts nothing: unpacking runs as root, where
+# there is no user session to start a user unit in. The next graphical login
+# starts it.
+override_dh_installsystemduser:
+	dh_installsystemduser -pporthole porthole-agent.service

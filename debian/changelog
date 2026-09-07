@@ -1,0 +1,12 @@
+porthole (0.1.0-1) unstable; urgency=medium
+
+  * Initial Debian packaging. Two binary packages: porthole (the command-line
+    tool, the privileged helper with its polkit policy and D-Bus files, and
+    the notification agent) and porthole-gui (the GTK4/libadwaita
+    application, split out so a headless machine need not pull in GTK4).
+  * debian/rules calls the source tree's own `make install`, which is the
+    single place the install layout is written down.
+  * Build-Depends on rustc/cargo (>= 1.87), which trixie satisfies only from
+    trixie-backports. See debian/README.source.
+
+ -- Jacopo Maria Briccola <jmbriccola@gmail.com>  Mon, 07 Sep 2026 03:29:17 +0200

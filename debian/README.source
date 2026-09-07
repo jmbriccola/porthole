@@ -1,0 +1,184 @@
+Building this package on Debian 13
+==================================
+
+The toolchain
+-------------
+
+porthole's MSRV is 1.87. Debian 13 (trixie) ships rustc 1.85.0:
+
+    # apt-cache policy rustc
+    rustc:
+      Installed: (none)
+      Candidate: 1.85.0+dfsg3-1
+      Version table:
+         1.94.1+dfsg1-1~bpo13+3 100
+            100 http://deb.debian.org/debian trixie-backports/main amd64 Packages
+         1.85.0+dfsg3-1 500
+            500 http://deb.debian.org/debian trixie/main amd64 Packages
+
+    # apt-cache policy cargo
+    cargo:
+      Installed: (none)
+      Candidate: 1.85.0+dfsg3-1
+      Version table:
+         1.94.1+dfsg1-1~bpo13+3 100
+            100 http://deb.debian.org/debian trixie-backports/main amd64 Packages
+         1.85.0+dfsg3-1 500
+            500 http://deb.debian.org/debian trixie/main amd64 Packages
+
+(Run in a debian:13 container against deb.debian.org on 2026-09-07.)
+
+trixie-backports carries 1.94.1, which is why debian/control says
+`rustc (>= 1.87)` and `cargo (>= 1.87)` rather than fetching a toolchain
+during the build. The dependency is a real Debian dependency on a real
+Debian package, so an unprepared machine is told exactly what is wrong:
+
+    $ apt-get build-dep .
+     builddeps:. : Depends: cargo (>= 1.87) but 1.85.0+dfsg3-1 is to be installed
+                   Depends: rustc (>= 1.87) but 1.85.0+dfsg3-1 is to be installed
+    E: Unable to correct problems, you have held broken packages.
+
+rather than failing halfway through the build with a compiler error nobody
+would read as a version problem.
+
+Enabling the suite is not enough on its own -- the output above is from a
+container that has it enabled. Backports sit at pin priority 100, and apt
+does not reach past the candidate to satisfy a versioned dependency. Two
+things do work, both run in a debian:13 container:
+
+    # Ask for the whole build-dep resolution against backports.
+    apt-get build-dep -t trixie-backports .
+    # -> rustc, cargo 1.94.1+dfsg1-1~bpo13+3; also debhelper 13.31~bpo13+1,
+    #    because -t raises the suite for everything, not just the two.
+
+    # Or pin the toolchain alone and leave the rest on trixie. rustc's own
+    # Depends: libstd-rust-dev (= <same version>) is why the stanza cannot
+    # name just the two: pinning `rustc cargo` alone leaves apt with
+    # "rustc : Depends: libstd-rust-dev (= 1.94.1+dfsg1-1~bpo13+3) but
+    # 1.85.0+dfsg3-1 is to be installed".
+    cat > /etc/apt/preferences.d/rust-backports <<'PIN'
+    Package: rustc cargo libstd-rust-dev libstd-rust-*
+    Pin: release n=trixie-backports
+    Pin-Priority: 600
+    PIN
+    apt-get update && apt-get build-dep .
+    # -> rustc, cargo 1.94.1+dfsg1-1~bpo13+3; debhelper stays at 13.24.2.
+
+Installing the two directly works too:
+
+    apt-get install -t trixie-backports rustc cargo
+
+Why the floor is not lowered to meet trixie instead: 1.87 was chosen against
+a security trade-off, not for convenience. Holding 1.85 would mean pinning
+zbus and the whole family of crates around it, which would freeze the D-Bus
+library of a *privileged* helper against its security updates. A build that
+needs one extra apt line is the cheaper of the two.
+
+The network
+-----------
+
+`debian/rules` runs `cargo build --locked`, and cargo resolves the
+dependencies in Cargo.lock from crates.io. The build therefore needs network
+access, which the Debian archive's own buildds do not grant. Building for
+the archive rather than for yourself would need the crates vendored into the
+source package (`cargo vendor` plus a `.cargo/config.toml` pointing at it),
+or the dependencies packaged separately and built with dh-cargo. Neither is
+done here.
+
+CARGO_HOME is redirected to debian/cargo-home so the build does not write
+into the build user's ~/.cargo; override_dh_auto_clean removes it.
+
+The test suite
+--------------
+
+debian/rules overrides dh_auto_test with nothing in it. `cargo test
+--workspace --exclude porthole-gui` passes on a developer machine, and in a
+debian:13 container all of it passes except
+doctor_says_the_helper_is_missing_when_it_is: that test wants the Helper
+check to report a missing helper, and with no system bus in the chroot the
+check reports a missing bus instead. Running the suite under
+dbus-run-session, which supplies a session bus, does not change that -- the
+check porthole doctor makes without --session is against the system bus.
+
+Anyone re-adding the run should also drop --release from it. PORTHOLE_STATE_FILE,
+PORTHOLE_DEVICES_FILE and the helper's --session are gated on
+cfg!(debug_assertions); a release test build fails four more tests in
+crates/porthole-cli/tests/cli.rs for that reason alone.
+
+Build profiles
+--------------
+
+porthole-gui links GTK4 and libadwaita, and its build-dependencies
+(libgtk-4-dev, libadwaita-1-dev) are behind the pkg.porthole.nogui build
+profile. A host without those headers can still produce the porthole binary
+package:
+
+    DEB_BUILD_PROFILES=pkg.porthole.nogui apt-get build-dep .
+    DEB_BUILD_PROFILES=pkg.porthole.nogui dpkg-buildpackage -b -us -uc
+
+That drops the porthole-gui package entirely. It is the same line the source
+tree's Makefile draws with WITH_GUI=0. Run in a debian:13 container with the
+pin stanza above and no libgtk-4-dev installed: two files out,
+porthole_0.1.0-1_amd64.deb and porthole-dbgsym_0.1.0-1_amd64.deb, lintian
+clean.
+
+The file list
+-------------
+
+There is none, on purpose. debian/rules calls `make install` and
+`make install-gui`; the Makefile at the top of the tree is the only place the
+install layout is written down, and crates/porthole-cli/tests/install_layout.rs
+compares that layout for equality on every `cargo test`. A debian/*.install
+file would be a second copy, free to drift from the one the test guards.
+
+Where the helper goes
+---------------------
+
+/usr/libexec/porthole-helper, and nowhere else.
+data/com.jacopobriccola.Porthole.service (the D-Bus activation file) and
+data/porthole-helper.service (the systemd unit) both name that path
+literally, and the bus and systemd read it out of the installed file.
+`make install-helper` greps both and stops when LIBEXECDIR disagrees with
+them, so debian/rules passes PREFIX=/usr and lets that check run.
+
+Maintainer scripts
+------------------
+
+Almost all of them are generated:
+
+  dh_installsystemd -pporthole --no-enable --no-start porthole-helper.service
+      preinst/postinst/postrm snippets for the system unit.
+  dh_installsystemduser -pporthole porthole-agent.service
+      postinst/postrm snippets for the user unit, enabled globally so a
+      graphical login starts it.
+  dh_icons
+      generates nothing here, on purpose: hicolor-icon-theme carries
+      `interest-noawait /usr/share/icons/hicolor`, so dpkg's trigger does the
+      cache update and dh_icons skips the hicolor and gnome themes.
+
+Three more directories are covered by dpkg triggers rather than by anything
+in this package:
+
+  /usr/share/dbus-1/system.d and /usr/share/dbus-1/system-services
+      interest-noawait in both dbus and dbus-broker.
+  /usr/share/applications
+      interest-noawait in desktop-file-utils.
+
+/usr/share/metainfo has no such trigger -- appstream 1.0.5 registers
+interest-noawait only on the three /usr/share/app-info directories -- and
+nothing here adds one.
+
+debian/porthole.prerm is the one hand-written script, and it exists because
+dh_installsystemd emits its stop-on-remove `unless NO_START`: passing
+--no-start to keep a D-Bus activated service from being started at install
+time also drops the stop. Its own comment says the rest.
+
+What removing the package does not do
+-------------------------------------
+
+It does not close ports porthole has open. The rules live in firewalld, ufw
+or nftables, and an opening's automatic close is a transient systemd timer
+running /usr/bin/porthole -- which the removal is deleting, so a timer that
+fires afterwards finds no binary. A reboot closes everything either way,
+because porthole writes no permanent rule; `porthole close --all` before the
+removal closes it sooner. Nothing in the maintainer scripts attempts either.

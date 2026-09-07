@@ -1,0 +1,26 @@
+#!/bin/sh
+set -e
+
+# Stop the helper when the package is being removed.
+#
+# dh_installsystemd emits this same snippet itself, but only `unless NO_START`
+# -- and debian/rules passes --no-start, because porthole-helper.service is
+# D-Bus activated and nothing should start it at install time. Without the
+# lines below, removing the package leaves a root daemon running from a
+# deleted binary, still holding com.jacopobriccola.Porthole and still able to
+# open ports.
+#
+# `remove` only. The upgrade case is dh_installsystemd's: it puts its own
+# `deb-systemd-invoke stop` in preinst, and the next client call re-activates
+# the helper on the new binary.
+#
+# The guards are the ones debhelper's own prerm-systemd-restart template uses:
+# DPKG_ROOT for a chroot install, /run/systemd/system for a machine actually
+# running systemd.
+if [ -z "$DPKG_ROOT" ] && [ "$1" = remove ] && [ -d /run/systemd/system ] ; then
+	deb-systemd-invoke stop porthole-helper.service >/dev/null || true
+fi
+
+#DEBHELPER#
+
+exit 0
