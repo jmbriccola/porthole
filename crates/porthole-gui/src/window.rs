@@ -33,13 +33,13 @@
 //! the same way; task 5 left `OpenDialog::on_opened` uncalled for the
 //! identical reason. This task is what finally calls all three: the free
 //! function `refresh` (module-private -- reached through
-//! [`PortholeWindow::refresh`] and run once at the end of
-//! [`PortholeWindow::new`]) populates "Open now" and the status line from
-//! the helper's own `list`/`status` over D-Bus, and "Listening" from
-//! `porthole_core::listening::scan`, and the same function runs again
-//! every time [`OpenDialog::on_opened`] fires -- wired onto both the
-//! header bar's own "Open a port" button and every "Listening" row's
-//! pre-filled one, through `present_open_dialog`.
+//! [`PortholeWindow::refresh`], and run for the initial load by the task
+//! [`PortholeWindow::new`] starts) populates "Open now" and the status line
+//! from the helper's own `list`/`status` over D-Bus, and "Listening" from
+//! `porthole_core::listening::scan`, and the same function runs again every
+//! time [`OpenDialog::on_opened`] fires -- wired onto both the header bar's
+//! own "Open a port" button and every "Listening" row's pre-filled one,
+//! through `present_open_dialog`.
 //!
 //! Neither read blocks the UI thread, and the helper round trip is bounded
 //! by [`HELPER_TIMEOUT`] (zbus proxies carry no default one of their own).
@@ -48,6 +48,27 @@
 //! different things -- see `refresh`'s own doc comment, `open_now.rs`'s and
 //! `status_bar.rs`'s module docs for why conflating any pair of them is
 //! this project's characteristic defect.
+//!
+//! ## What is open changes without this window doing anything
+//!
+//! A rule runs out its own clock. Someone runs `porthole close` in a
+//! terminal. The machine leaves the subnet a rule was scoped to. The
+//! helper's reconciliation sweep finds a record the firewall no longer has.
+//! None of those goes through this process, and until this window listened
+//! for them it went on showing a list that had stopped being true -- a user
+//! on a Fedora Workstation VM watched a row stand for a port their firewall
+//! had already stopped holding open.
+//!
+//! [`listen_and_load`] is the repair: subscribe to the helper's own
+//! `RuleOpened`, `RuleClosed` and `NetworkChanged`, and re-read `list` when
+//! any of them arrives. What an announcement *carries* is dropped -- see
+//! [`subscribe`] for why `list` is the only thing this window ever renders,
+//! and [`PortholeWindow::start_listening`] for how the subscription ends.
+//! Whose rules those are is unchanged by any of this: `list` is authorized
+//! for everyone by polkit and reports every rule porthole holds regardless
+//! of who opened it, the announcements are broadcasts carrying the opening
+//! uid, and this window filters on neither -- it shows exactly what `list`
+//! returns, exactly as it did before.
 //!
 //! ## The saved devices and Docker's own ports
 //!
@@ -67,11 +88,12 @@
 //! Docker's rules; every one of these surfaces only ever reads and
 //! explains.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::Deref;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use futures_util::StreamExt;
 use gtk::glib;
 
 use porthole_core::command::RealRunner;
@@ -113,6 +135,8 @@ struct Sections {
     /// in either `None` case, so it needs no finer distinction than this;
     /// the "Listening" section does, and keeps its own.
     docker: Rc<RefCell<Option<Vec<Published>>>>,
+    /// Whether a refresh is already scheduled -- see [`schedule_refresh`].
+    refresh_pending: Rc<Cell<bool>>,
 }
 
 /// The width, in CSS pixels, at or below which the narrow layout applies.
@@ -141,6 +165,7 @@ pub struct PortholeWindow {
     open_button: gtk::Button,
     devices: Rc<RefCell<DeviceSnapshot>>,
     docker: Rc<RefCell<Option<Vec<Published>>>>,
+    refresh_pending: Rc<Cell<bool>>,
 }
 
 impl Deref for PortholeWindow {
@@ -165,7 +190,11 @@ impl PortholeWindow {
         // earned) until `refresh` resolves; `refresh` runs the same path a
         // later explicit refresh does, there is no separate "first load"
         // code.
-        refresh(&window.sections());
+        //
+        // That load is now made *inside* the subscription task, after the
+        // match rules exist and never conditionally on them -- see
+        // [`listen_and_load`] for the ordering and why it is that order.
+        window.start_listening();
         window
     }
 
@@ -287,6 +316,7 @@ impl PortholeWindow {
         let devices: Rc<RefCell<DeviceSnapshot>> =
             Rc::new(RefCell::new(Err(DEVICES_NOT_READ_YET.to_string())));
         let docker: Rc<RefCell<Option<Vec<Published>>>> = Rc::new(RefCell::new(None));
+        let refresh_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
         let sections_for_open = Sections {
             window: window.clone(),
@@ -295,6 +325,7 @@ impl PortholeWindow {
             status_bar: status_bar.clone(),
             devices: devices.clone(),
             docker: docker.clone(),
+            refresh_pending: refresh_pending.clone(),
         };
         open_button.connect_clicked(move |_| {
             present_open_dialog(&sections_for_open, &OpenDialog::new());
@@ -314,6 +345,7 @@ impl PortholeWindow {
             status_bar: status_bar.clone(),
             devices: devices.clone(),
             docker: docker.clone(),
+            refresh_pending: refresh_pending.clone(),
         };
         listening.connect_open_requested(move |port| {
             present_open_dialog(&sections_for_row, &OpenDialog::for_port(port));
@@ -354,6 +386,7 @@ impl PortholeWindow {
             open_button,
             devices,
             docker,
+            refresh_pending,
         }
     }
 
@@ -369,6 +402,7 @@ impl PortholeWindow {
             status_bar: self.status_bar.clone(),
             devices: self.devices.clone(),
             docker: self.docker.clone(),
+            refresh_pending: self.refresh_pending.clone(),
         }
     }
 
@@ -456,6 +490,71 @@ impl PortholeWindow {
     /// neither read blocks the UI thread.
     pub fn refresh(&self) {
         refresh(&self.sections());
+    }
+
+    /// Starts the one task that keeps this window's view of what is open
+    /// tied to the helper's, and arranges for it to end.
+    ///
+    /// **How it ends.** Two things here hold this window: the task, and the
+    /// expiry callback left on the "Open now" section. The window's own
+    /// `close-request` releases both, and nothing else holds either. Every
+    /// window `app::build`'s activation handler makes gets its own
+    /// subscription, and closing one ends that one.
+    ///
+    /// Removing the task's source from the main context drops the future,
+    /// the signal streams and the D-Bus connection under them -- so the
+    /// match rules go too. `slot` holds the source's id and nothing else, a
+    /// plain integer, so the handler hanging off the window is not a second
+    /// reference back into the task; whichever of the two empties it first
+    /// -- the task on its way out, the handler on its way in -- leaves
+    /// nothing for the other, because `SourceId::remove` on a source that
+    /// has already finished is a panic, not a no-op.
+    ///
+    /// The callback is the cut described on
+    /// [`OpenNowSection::forget_expiry_unconfirmed`]: that section outlives
+    /// every window in this process, and the callback registered below holds
+    /// this one.
+    ///
+    /// **`close-request`, not `destroy`.** Measured in this milestone's own
+    /// container, on a real presented window: `gtk::Window::destroy` hid the
+    /// window and emitted no `destroy` signal at all, so a handler on that
+    /// signal never ran. GTK4 emits it from the widget's own dispose, which
+    /// needs every reference to have gone -- and this crate holds one that
+    /// does not, the `Sections` inside `ListeningSection`'s own
+    /// `connect_open_requested` callback, which points back at the window
+    /// that holds the section. `close-request` is the signal the window
+    /// manager's close button, `Ctrl-W` and `gtk::Window::close` all raise,
+    /// and it fires with references outstanding.
+    fn start_listening(&self) {
+        // The other half of the same problem, one section down: a countdown
+        // reaching zero is a deadline, not an outcome, and only `list` can
+        // settle what happened -- which "Open now" never calls. It reports
+        // the deadline; this is what reads.
+        let sections_for_expiry = self.sections();
+        self.open_now.connect_expiry_unconfirmed(move || {
+            schedule_refresh(&sections_for_expiry);
+        });
+
+        let slot: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let sections = self.sections();
+        let slot_for_task = slot.clone();
+        let handle = glib::spawn_future_local(async move {
+            listen_and_load(sections).await;
+            slot_for_task.borrow_mut().take();
+        });
+        // The task cannot have run yet: it only runs when the main context
+        // iterates, and this is still inside the constructor.
+        *slot.borrow_mut() = handle.into_source_id().ok();
+        let open_now = self.open_now.clone();
+        self.window.connect_close_request(move |_| {
+            if let Some(id) = slot.borrow_mut().take() {
+                id.remove();
+            }
+            open_now.forget_expiry_unconfirmed();
+            // Nothing here is a reason to keep the window: this is
+            // bookkeeping on the way out, not a veto.
+            glib::Propagation::Proceed
+        });
     }
 }
 
@@ -655,6 +754,102 @@ async fn with_timeout<F: std::future::Future>(
         std::task::Poll::Pending
     })
     .await
+}
+
+/// One refresh per burst of announcements.
+///
+/// `close --all` announces every rule it closed, one signal each, and a
+/// refresh is three D-Bus calls, a `/proc` scan and a subprocess per saved
+/// device. The first announcement schedules a refresh this far ahead; the
+/// rest arrive inside that window and are absorbed by it.
+const SIGNAL_COALESCE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Asks for a [`refresh`] shortly, unless one is already asked for.
+///
+/// The flag is cleared before the refresh runs, so an announcement that
+/// arrives while that refresh is in flight schedules the next one rather
+/// than being dropped into it.
+fn schedule_refresh(sections: &Sections) {
+    if sections.refresh_pending.replace(true) {
+        return;
+    }
+    let sections = sections.clone();
+    glib::timeout_add_local_once(SIGNAL_COALESCE, move || {
+        sections.refresh_pending.set(false);
+        refresh(&sections);
+    });
+}
+
+/// Every announcement the helper makes, as one stream of "read `list`
+/// again", together with the connection and proxy they arrive over -- both
+/// returned so the caller's own frame keeps them alive for as long as the
+/// stream is read.
+///
+/// `None` is every way there was nothing to subscribe to: no bus, no
+/// activatable helper, a connection lost while the match rules were being
+/// installed.
+///
+/// **The payloads are dropped here.** `RuleOpened` carries the rule the
+/// helper created and `RuleClosed` carries the rule and why it stopped being
+/// open, and this window renders neither. `porthole_core::ipc`'s own
+/// `rule_closed` doc gives three reasons a subscriber cannot keep its view
+/// from these alone: `close --id --forget` drops a record with nothing
+/// announced at all, announcements are emitted after the state lock is
+/// released so one can arrive ahead of the `RuleOpened` for a different
+/// rule, and anything sent before the match rules existed is simply gone.
+/// So `list` is the authority here in the strongest sense available -- it is
+/// the only thing this window ever renders, and an announcement is a cue to
+/// read it. There is no second account of what is open for the list to
+/// disagree with.
+async fn subscribe() -> Option<(
+    zbus::Connection,
+    PortholeProxy<'static>,
+    futures_util::stream::LocalBoxStream<'static, ()>,
+)> {
+    let connection = zbus::Connection::system().await.ok()?;
+    let proxy = PortholeProxy::new(&connection).await.ok()?;
+    let opened = proxy.receive_rule_opened().await.ok()?;
+    let closed = proxy.receive_rule_closed().await.ok()?;
+    // The machine's own subnet changing is not itself a rule leaving the
+    // list, but it is what the helper closes subnet-scoped rules for, and
+    // it changes the network the status line reports either way.
+    let network = proxy.receive_network_changed().await.ok()?;
+    let signals = futures_util::stream::select_all(vec![
+        opened.map(|_| ()).boxed_local(),
+        closed.map(|_| ()).boxed_local(),
+        network.map(|_| ()).boxed_local(),
+    ])
+    .boxed_local();
+    Some((connection, proxy, signals))
+}
+
+/// Subscribes, then loads, then keeps loading whenever the helper says
+/// something changed.
+///
+/// **Subscribe first, then call.** The helper is D-Bus activated, so the
+/// call that reaches it is what starts it, and its start-up sweep announces
+/// what it dropped as soon as it owns the bus name. A client whose match
+/// rules already exist by then receives those; one that calls first can lose
+/// them. `porthole-agent`'s own `main` does this in the same order, for the
+/// same reason, and says so at greater length.
+///
+/// The load runs whether or not subscribing worked. A window that could not
+/// subscribe still has to populate, and a helper that is not there is a
+/// state both sections and the status line already render as itself.
+async fn listen_and_load(sections: Sections) {
+    let subscription = subscribe().await;
+    refresh(&sections);
+    let Some((_connection, _proxy, mut signals)) = subscription else {
+        return;
+    };
+    while signals.next().await.is_some() {
+        schedule_refresh(&sections);
+    }
+    // The stream ends when the connection under it does. One more read
+    // replaces what is on screen with whatever the next call finds, rather
+    // than leaving the last answer standing with nothing left that could
+    // ever change it.
+    refresh(&sections);
 }
 
 /// Presents `dialog`, transient for `window`, and registers its

@@ -290,11 +290,23 @@ fn until_reboot_says_so_instead_of_showing_a_countdown() -> Result<(), String> {
     Ok(())
 }
 
-/// The other half of the live-countdown property: a rule that still has a
-/// few seconds left when the section first renders it must flip to
-/// "closing" -- on the real widget, via `refresh()` -- once that time has
-/// genuinely passed, rather than ever showing a negative duration.
-fn an_expired_rule_reads_as_closing_not_as_a_negative_time() -> Result<(), String> {
+/// The other half of the live-countdown property, and the defect a person
+/// found on a Fedora Workstation VM.
+///
+/// A rule with a few seconds left when the section first renders it must,
+/// once that time has genuinely passed, stop counting down -- and what it
+/// says instead must be true of what this section actually knows. This
+/// section never calls `list`. It knows the deadline arrived and nothing
+/// else, so that is all the row may say: not "closing", which is an outcome,
+/// and which read identically whether the close had already succeeded or had
+/// failed an hour ago.
+///
+/// Checked on the real widget, via `refresh()`, at three points across the
+/// deadline the fixture itself carries: still counting down before it,
+/// saying the same thing at it and an hour past it while nothing new has
+/// been read, and never marked as something to look at while that is all
+/// that is known.
+fn an_expired_rule_states_the_clock_and_claims_no_outcome() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
     activate(
@@ -303,16 +315,185 @@ fn an_expired_rule_reads_as_closing_not_as_a_negative_time() -> Result<(), Strin
             let clock = SharedClock::at(BASE_TIME);
             let section = OpenNowSection::with_clock(Box::new(clock.clone()));
             // 65s lifetime, opened 60s before BASE_TIME: 5 seconds left as
-            // of BASE_TIME, still a normal countdown at construction.
-            section.set_rules(&[wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 65)]);
-            clock.advance_to(BASE_TIME + 65);
+            // of BASE_TIME, still a normal countdown at construction. Every
+            // clock reading below is taken from the fixture's own
+            // `expires_at`, never from that arithmetic repeated by hand.
+            let rule = wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 65);
+            let deadline = rule.expires_at;
+            section.set_rules(&[rule]);
+            let before = section.countdown_text(0);
+            clock.advance_to(deadline);
             section.refresh();
-            *seen.borrow_mut() = Some(section.countdown_text(0));
+            let at_the_deadline = section.countdown_text(0);
+            // An hour later, with no fresher list handed over: still the
+            // same thing, because still nothing more is known.
+            clock.advance_to(deadline + 3_600);
+            section.refresh();
+            *seen.borrow_mut() = Some((
+                before,
+                at_the_deadline,
+                section.countdown_text(0),
+                section.countdown_is_marked_overdue(0),
+            ));
         },
     );
-    let text = result.borrow_mut().take().ok_or("activation never ran")?;
-    if text != "closing" {
-        return Err(format!("expected \"closing\", got {text:?}"));
+    let (before, at_the_deadline, an_hour_later, marked) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if before != "00:05 left" {
+        return Err(format!(
+            "expected a live countdown before the deadline, got {before:?}"
+        ));
+    }
+    if at_the_deadline.contains("clos") || an_hour_later.contains("clos") {
+        return Err(format!(
+            "the row must not name an outcome this section cannot know: {at_the_deadline:?} \
+             then {an_hour_later:?}"
+        ));
+    }
+    if at_the_deadline != an_hour_later {
+        return Err(format!(
+            "nothing was read between these two, so the row must not have changed what it \
+             claims: {at_the_deadline:?} then {an_hour_later:?}"
+        ));
+    }
+    if marked {
+        return Err(
+            "a deadline nobody has checked yet must not be marked as something to look at"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The case a close that failed produces, and the one the old single word
+/// made unreachable: a list read well past a rule's deadline that still
+/// names the rule.
+///
+/// That is a different fact from the one above -- porthole asked, rather
+/// than porthole not having heard -- so it must not read the same, and it
+/// carries the marking the other does not.
+fn a_list_read_past_the_deadline_that_still_names_the_rule_reads_differently() -> Result<(), String>
+{
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenNowStillListed",
+        move |_app| {
+            let clock = SharedClock::at(BASE_TIME);
+            let section = OpenNowSection::with_clock(Box::new(clock.clone()));
+            let rule = wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 65);
+            let deadline = rule.expires_at;
+            section.set_rules(std::slice::from_ref(&rule));
+            clock.advance_to(deadline);
+            section.refresh();
+            let unconfirmed = section.countdown_text(0);
+
+            // A minute past the deadline, the helper is asked again and
+            // still names the rule. That is the answer, and it is not the
+            // one above.
+            clock.advance_to(deadline + 60);
+            section.set_rules(&[rule]);
+            *seen.borrow_mut() = Some((
+                unconfirmed,
+                section.countdown_text(0),
+                section.countdown_is_marked_overdue(0),
+            ));
+        },
+    );
+    let (unconfirmed, still_listed, marked) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if unconfirmed == still_listed {
+        return Err(format!(
+            "a close that has not been checked and a port the helper still reports open past \
+             its deadline must not read the same: both said {still_listed:?}"
+        ));
+    }
+    if still_listed.contains("clos") {
+        return Err(format!(
+            "a port the helper still reports open must not be described as closing or closed: \
+             {still_listed:?}"
+        ));
+    }
+    if !marked {
+        return Err(
+            "a port the helper still reports open past its own deadline must be marked, not \
+             left reading like an ordinary row"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The section cannot settle a passed deadline on its own -- it never calls
+/// `list` -- so it says so, once, to whoever does.
+///
+/// Reported only after the deadline is far enough behind for a list to be an
+/// answer about it, and only for a row built from a list read before that
+/// point: a row built from a list already read past it has its answer
+/// already, and reporting again would ask for a fresh list every second for
+/// as long as the rule stayed open.
+fn a_passed_deadline_is_reported_once_to_whoever_can_re_read_the_list() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenNowExpiryReported",
+        move |_app| {
+            let clock = SharedClock::at(BASE_TIME);
+            let section = OpenNowSection::with_clock(Box::new(clock.clone()));
+            let reports = Rc::new(Cell::new(0u32));
+            let counted = reports.clone();
+            section.connect_expiry_unconfirmed(move || counted.set(counted.get() + 1));
+
+            let rule = wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 65);
+            let deadline = rule.expires_at;
+            section.set_rules(std::slice::from_ref(&rule));
+            // Right at the deadline: a close may well be under way, and
+            // nothing is asked for yet.
+            clock.advance_to(deadline);
+            section.refresh();
+            let at_the_deadline = reports.get();
+
+            // A minute past it, with the list still the one read before.
+            clock.advance_to(deadline + 60);
+            section.refresh();
+            let after = reports.get();
+            // Every following tick, with nothing having changed.
+            section.refresh();
+            section.refresh();
+            let after_more_ticks = reports.get();
+
+            // The fresh list arrives and still names the rule. The answer is
+            // on screen; nothing more is to be asked.
+            section.set_rules(&[rule]);
+            section.refresh();
+            section.refresh();
+            *seen.borrow_mut() = Some((at_the_deadline, after, after_more_ticks, reports.get()));
+        },
+    );
+    let (at_the_deadline, after, after_more_ticks, after_a_fresh_list) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if at_the_deadline != 0 {
+        return Err(format!(
+            "the deadline itself must not be reported -- a close is ordinarily under way at \
+             that moment; got {at_the_deadline}"
+        ));
+    }
+    if after != 1 {
+        return Err(format!(
+            "a deadline the list cannot yet account for must be reported exactly once, got \
+             {after}"
+        ));
+    }
+    if after_more_ticks != 1 {
+        return Err(format!(
+            "the once-a-second tick must not repeat the report, got {after_more_ticks}"
+        ));
+    }
+    if after_a_fresh_list != 1 {
+        return Err(format!(
+            "a row built from a list already read past its own deadline has its answer and \
+             must ask for nothing, got {after_a_fresh_list}"
+        ));
     }
     Ok(())
 }
@@ -630,7 +811,7 @@ fn an_ordinary_close_announces_the_rules_that_remain() -> Result<(), String> {
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 12] = [
+    let cases: [Case; 14] = [
         (
             "an_empty_list_is_a_calm_status_page_not_an_error",
             an_empty_list_is_a_calm_status_page_not_an_error,
@@ -652,8 +833,16 @@ fn main() {
             until_reboot_says_so_instead_of_showing_a_countdown,
         ),
         (
-            "an_expired_rule_reads_as_closing_not_as_a_negative_time",
-            an_expired_rule_reads_as_closing_not_as_a_negative_time,
+            "an_expired_rule_states_the_clock_and_claims_no_outcome",
+            an_expired_rule_states_the_clock_and_claims_no_outcome,
+        ),
+        (
+            "a_list_read_past_the_deadline_that_still_names_the_rule_reads_differently",
+            a_list_read_past_the_deadline_that_still_names_the_rule_reads_differently,
+        ),
+        (
+            "a_passed_deadline_is_reported_once_to_whoever_can_re_read_the_list",
+            a_passed_deadline_is_reported_once_to_whoever_can_re_read_the_list,
         ),
         (
             "an_unreachable_helper_does_not_render_as_the_calm_empty_state",

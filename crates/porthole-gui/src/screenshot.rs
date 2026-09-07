@@ -17,7 +17,9 @@
 //! [`PortholeWindow::new_without_initial_load`] is what makes that true,
 //! rather than [`PortholeWindow::new`] plus a hope that the fixture setters
 //! below win whatever race they would otherwise be in against the real
-//! ones. Either real source would be the wrong picture for this flag's own
+//! ones. That constructor also starts no subscription to the helper's
+//! announcements, so nothing can arrive later and re-read over the fixture
+//! either. Either real source would be the wrong picture for this flag's own
 //! purpose: the container this runs in has no `porthole-helper` and nothing
 //! open, so a live read would screenshot an empty window, and `/proc` in
 //! that same container reflects whatever this milestone's own test process

@@ -63,6 +63,18 @@ name = "status_bar"
 path = "tests/status_bar.rs"
 harness = false
 
+# Same reasoning again, and one addition of its own: `tests/signals.rs`
+# points `DBUS_SYSTEM_BUS_ADDRESS` at the private session bus this whole
+# target runs under, so the window's own system-bus connection reaches a
+# stand-in helper served from inside the test. That environment variable is
+# process-wide, and every other target here depends on there being no system
+# bus at all, which is the second reason this is its own `[[test]]` rather
+# than cases added to `tests/window.rs`.
+[[test]]
+name = "signals"
+path = "tests/signals.rs"
+harness = false
+
 [dependencies]
 porthole-core = { path = "../porthole-core" }
 gtk = { package = "gtk4", version = "0.9" }
@@ -73,3 +85,7 @@ adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
 ipnet.workspace = true
 zbus.workspace = true
 tokio.workspace = true
+# One combined stream over the helper's three signals -- see
+# `window.rs`'s own `subscribe`. `porthole-agent` already takes this
+# dependency for the same job on the same signals.
+futures-util.workspace = true
