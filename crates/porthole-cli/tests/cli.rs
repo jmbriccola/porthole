@@ -788,3 +788,108 @@ fn devices_add_with_nothing_to_offer_is_not_reported_as_an_unexpected_failure() 
         stderr(&out)
     );
 }
+
+/// Puts an executable `name` in `bin`, running `body`.
+fn stub(bin: &Path, name: &str, body: &str) {
+    let path = bin.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The whole picker, end to end, on the table that produced both defects:
+/// two Docker containers on a user-created bridge and two real devices on
+/// wifi.
+///
+/// Driven by stub `ip` and `getent` on `PATH`, for the reason the
+/// nothing-to-offer tests above give: a real neighbour table and a real
+/// resolver are neither deterministic nor this machine's to depend on. The
+/// stub `getent` answers for one address and not the other, so both halves
+/// of "show a name where one can be found" are exercised in one run.
+#[test]
+fn the_picker_hides_containers_and_shows_a_name_where_the_resolver_has_one() {
+    let dir = TempDir::new().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    // `PATH` is this directory alone, so every stub uses shell builtins
+    // only: nothing else is reachable, which is the point.
+    stub(
+        &bin,
+        "ip",
+        "echo '172.18.0.2 dev br-5b772196d2da lladdr 6a:df:71:ff:3c:e4 STALE'\n\
+         echo '10.10.10.1 dev wlo1 lladdr 50:e6:36:51:42:fd REACHABLE'\n\
+         echo '172.18.0.3 dev br-5b772196d2da lladdr 8e:3a:fc:5b:5c:dc STALE'\n\
+         echo '10.10.10.245 dev wlo1 lladdr bc:24:11:5e:1c:6e REACHABLE'",
+    );
+    // Answers for the gateway and knows nothing about the phone -- exit 2
+    // with nothing on stdout is what `getent hosts` really does for an
+    // address it cannot find.
+    stub(
+        &bin,
+        "getent",
+        "case \"$2\" in\n\
+         10.10.10.1) echo '10.10.10.1 router.example';;\n\
+         *) exit 2;;\n\
+         esac",
+    );
+
+    let book = dir.path().join("devices.toml");
+    write_book(&book, "");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_porthole"))
+        .args(["devices", "add"])
+        .env("PORTHOLE_STATE_FILE", state_path(&dir))
+        .env("PORTHOLE_DEVICES_FILE", &book)
+        .env("PATH", &bin)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("porthole binary runs");
+    {
+        use std::io::Write as _;
+        // Pick row 1 and name it. Row 1 is the gateway only because the two
+        // container rows are gone; before the filter it was `172.18.0.2`.
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin was piped")
+            .write_all(b"1\nrouter\n")
+            .unwrap();
+    }
+    let out = child.wait_with_output().expect("porthole exits");
+    let prompt = stderr(&out);
+
+    assert_eq!(code(&out), 0, "{prompt}");
+    assert!(
+        !prompt.contains("br-5b772196d2da")
+            && !prompt.contains("172.18.0.2")
+            && !prompt.contains("6a:df:71:ff:3c:e4"),
+        "a Docker container is not a device to open a firewall port towards: {prompt}"
+    );
+    assert!(
+        prompt.contains("1) 50:e6:36:51:42:fd  10.10.10.1  (wlo1)  router.example"),
+        "the row carries the name the resolver answered: {prompt}"
+    );
+    assert!(
+        prompt.contains("2) bc:24:11:5e:1c:6e  10.10.10.245  (wlo1)\n"),
+        "an address with no answer gets no name and no stand-in: {prompt}"
+    );
+    assert!(
+        !prompt.contains("unknown") && !prompt.contains("Unknown"),
+        "nothing is invented for a device the resolver had no answer for: {prompt}"
+    );
+    // The MAC is the identity, and it is what the save records -- the name
+    // shown beside it is not stored and not matched.
+    assert!(
+        stdout(&out).contains("Saved `router` as 50:e6:36:51:42:fd"),
+        "{}",
+        stdout(&out)
+    );
+    let saved = std::fs::read_to_string(&book).unwrap();
+    assert!(saved.contains("50:e6:36:51:42:fd"), "{saved}");
+    assert!(
+        !saved.contains("router.example"),
+        "the resolver's answer must not reach the address book: {saved}"
+    );
+}

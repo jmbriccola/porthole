@@ -558,16 +558,21 @@ fn fixture_neighbours() -> Vec<NeighbourChoice> {
             mac: "bc:24:11:5e:1c:6e".to_string(),
             address: "10.10.10.245".parse().unwrap(),
             interface: "wlo1".to_string(),
+            name: Some("phone.example".to_string()),
         },
         NeighbourChoice {
             mac: "aa:bb:cc:dd:ee:ff".to_string(),
             address: "10.10.10.31".parse().unwrap(),
             interface: "wlo1".to_string(),
+            name: Some("_gateway".to_string()),
         },
+        // The third has no name, so the picture shows both shapes of row --
+        // a resolver answering nothing is ordinary, not an error state.
         NeighbourChoice {
             mac: "de:ad:be:ef:00:01".to_string(),
             address: "10.10.10.7".parse().unwrap(),
             interface: "enp3s0".to_string(),
+            name: None,
         },
     ]
 }

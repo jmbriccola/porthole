@@ -96,11 +96,28 @@ pub struct NeighbourChoice {
     pub mac: String,
     pub address: Ipv4Addr,
     pub interface: String,
+    /// What this machine's resolver answered for `address`, where it
+    /// answered anything. A hint for the person choosing a row; the MAC is
+    /// what the row saves.
+    pub name: Option<String>,
 }
 
 /// What the neighbour row under a picked device reads.
+///
+/// The name goes first because it is the part a person can recognise, and
+/// stays in the subtitle because the title is the MAC -- which is the
+/// identity, the thing the row writes into the field, and the thing the
+/// book records. A saved device's title is a name its owner chose; putting
+/// a resolver's answer in that same position would make the two look like
+/// the same kind of thing.
+///
+/// A row the resolver answered nothing for reads exactly as it did before:
+/// address and interface, with nothing standing in for the missing name.
 fn neighbour_subtitle(choice: &NeighbourChoice) -> String {
-    format!("{} on {}", choice.address, choice.interface)
+    match &choice.name {
+        Some(name) => format!("{name} · {} on {}", choice.address, choice.interface),
+        None => format!("{} on {}", choice.address, choice.interface),
+    }
 }
 
 /// What a saved device's row reads under its name.
@@ -298,12 +315,21 @@ fn load_everything() -> Loaded {
     };
     let seen = net::neighbours(&runner)
         .map(|found| {
+            // One `getent` per address, bounded twice over -- see
+            // `porthole_core::net::resolver_names`. This runs on the I/O
+            // thread pool with the rest of `load_everything`, so the bound
+            // is what keeps the dialog's own load from dragging, not what
+            // keeps the UI thread responsive.
+            let addresses: Vec<Ipv4Addr> = found.iter().map(|n| n.address).collect();
+            let names = net::resolver_names(&runner, &addresses);
             found
                 .into_iter()
-                .map(|n| NeighbourChoice {
+                .zip(names)
+                .map(|(n, name)| NeighbourChoice {
                     mac: n.mac,
                     address: n.address,
                     interface: n.interface,
+                    name,
                 })
                 .collect()
         })
@@ -389,6 +415,9 @@ struct Inner {
     /// "Nothing has been seen on this network yet" -- an answered question
     /// with an empty answer.
     neighbours_quiet: gtk::Label,
+    /// Shown only while some row carries a name, since it explains where
+    /// those names came from and there is nothing to explain otherwise.
+    names_caption: gtk::Label,
     /// Deliberately a different widget of a different type from the line
     /// above: "there is nothing here" and "porthole could not find out" must
     /// not be readable as each other. See `quiet.rs`.
@@ -516,6 +545,9 @@ fn rebuild_neighbours(inner: &Rc<Inner>, seen: &[NeighbourChoice]) {
     inner.neighbours_trouble.widget().set_visible(false);
     inner.neighbours_quiet.set_visible(seen.is_empty());
     inner.neighbour_list.set_visible(!seen.is_empty());
+    inner
+        .names_caption
+        .set_visible(seen.iter().any(|c| c.name.is_some()));
 
     let mut rows = Vec::with_capacity(seen.len());
     for choice in seen {
@@ -556,6 +588,7 @@ fn show_neighbours_unavailable(inner: &Rc<Inner>, reason: &str) {
     }
     inner.neighbour_list.set_visible(false);
     inner.neighbours_quiet.set_visible(false);
+    inner.names_caption.set_visible(false);
     inner
         .neighbours_trouble
         .set_title("Could not list this network");
@@ -684,6 +717,15 @@ impl DevicesDialog {
              not appear here; its MAC address can still be typed above.",
         );
         neighbours_quiet.set_visible(false);
+
+        // What `getent hosts` was asked and what a row saves. It does not
+        // say where an answer came from, because `getent` merges the host's
+        // name sources and reports which of them answered for none of it.
+        let names_caption = quiet_note(
+            "The name on a row is what this machine's resolver answered for that address. The \
+             MAC is what gets saved.",
+        );
+        names_caption.set_visible(false);
         let neighbours_trouble = TroubleNote::new();
         neighbours_trouble.widget().set_visible(false);
 
@@ -720,6 +762,7 @@ impl DevicesDialog {
         add_box.append(&neighbours_quiet);
         add_box.append(neighbours_trouble.widget());
         add_box.append(&neighbour_list);
+        add_box.append(&names_caption);
         add_box.append(&note);
         add_box.append(&save_button);
 
@@ -799,6 +842,7 @@ impl DevicesDialog {
             neighbour_list,
             neighbour_rows: RefCell::new(Vec::new()),
             neighbours_quiet,
+            names_caption,
             neighbours_trouble,
             save_button: save_button.clone(),
             note,
@@ -947,6 +991,21 @@ impl DevicesDialog {
             .is_some_and(|r| r.picked.is_visible())
     }
 
+    /// Whether the line explaining where a row's name came from is showing.
+    pub fn names_caption_is_showing(&self) -> bool {
+        self.inner.names_caption.is_visible()
+    }
+
+    /// The subtitle under each picker row, read back off the real widgets.
+    pub fn neighbour_subtitles(&self) -> Vec<String> {
+        self.inner
+            .neighbour_rows
+            .borrow()
+            .iter()
+            .map(|r| r.row.subtitle().unwrap_or_default().to_string())
+            .collect()
+    }
+
     /// Whether the picker's quiet "nothing seen yet" line is showing.
     pub fn neighbours_quiet_is_showing(&self) -> bool {
         self.inner.neighbours_quiet.is_visible()
@@ -1059,7 +1118,23 @@ mod tests {
             mac: mac.to_string(),
             address: "10.10.10.245".parse().unwrap(),
             interface: "wlo1".to_string(),
+            name: None,
         }
+    }
+
+    #[test]
+    fn a_subtitle_carries_a_name_when_there_is_one_and_nothing_when_there_is_not() {
+        let mut with_name = choice("bc:24:11:5e:1c:6e");
+        with_name.name = Some("phone.example".to_string());
+        assert_eq!(
+            neighbour_subtitle(&with_name),
+            "phone.example · 10.10.10.245 on wlo1"
+        );
+
+        // No stand-in for a name that was not found: the row reads exactly
+        // as it did before there were names at all.
+        let without = choice("bc:24:11:5e:1c:6e");
+        assert_eq!(neighbour_subtitle(&without), "10.10.10.245 on wlo1");
     }
 
     #[test]

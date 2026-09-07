@@ -106,11 +106,89 @@ fn saved_names() -> Vec<String> {
 }
 
 fn choice(mac: &str, address: &str) -> NeighbourChoice {
+    named_choice(mac, address, None)
+}
+
+fn named_choice(mac: &str, address: &str, name: Option<&str>) -> NeighbourChoice {
     NeighbourChoice {
         mac: mac.to_string(),
         address: address.parse().unwrap(),
         interface: "wlo1".to_string(),
+        name: name.map(str::to_string),
     }
+}
+
+/// A picker row carries whatever the resolver answered for its address, and
+/// a row it answered nothing for carries no substitute for one.
+///
+/// The MAC stays the row's title in both cases. That is what the row writes
+/// into the field and what the book records, and this asserts it against
+/// the real widgets rather than against the values handed in.
+fn a_row_shows_a_name_where_there_is_one_and_invents_none_where_there_is_not() -> Result<(), String>
+{
+    reset_book();
+    let outcome: Rc<RefCell<Result<(), String>>> =
+        Rc::new(RefCell::new(Err("activation never ran".to_string())));
+    let seen = outcome.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.DeviceNames",
+        move |_app| {
+            let dialog = DevicesDialog::new();
+            dialog.set_neighbours(&[
+                named_choice("bc:24:11:5e:1c:6e", "10.10.10.245", Some("phone.example")),
+                named_choice("de:ad:be:ef:00:01", "10.10.10.7", None),
+            ]);
+
+            let titles = dialog.neighbour_labels();
+            let subtitles = dialog.neighbour_subtitles();
+            *seen.borrow_mut() = (|| {
+                if titles != vec!["bc:24:11:5e:1c:6e", "de:ad:be:ef:00:01"] {
+                    return Err(format!("the MAC stays the row's title, got {titles:?}"));
+                }
+                if subtitles[0] != "phone.example · 10.10.10.245 on wlo1" {
+                    return Err(format!(
+                        "a row with a name shows it, got `{}`",
+                        subtitles[0]
+                    ));
+                }
+                if subtitles[1] != "10.10.10.7 on wlo1" {
+                    return Err(format!(
+                        "a row without one shows address and interface alone, got `{}`",
+                        subtitles[1]
+                    ));
+                }
+                if !dialog.names_caption_is_showing() {
+                    return Err(
+                        "a row carries a name, so the line saying what it is shows".to_string()
+                    );
+                }
+                Ok(())
+            })();
+        },
+    );
+    outcome.replace(Err("activation never ran".to_string()))
+}
+
+/// The negative control for the caption: with no name on any row there is
+/// nothing to explain, and the line stays away.
+fn nothing_explains_a_name_when_no_row_has_one() -> Result<(), String> {
+    reset_book();
+    let outcome: Rc<RefCell<Result<(), String>>> =
+        Rc::new(RefCell::new(Err("activation never ran".to_string())));
+    let seen = outcome.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.DeviceNoNames",
+        move |_app| {
+            let dialog = DevicesDialog::new();
+            dialog.set_neighbours(&[choice("bc:24:11:5e:1c:6e", "10.10.10.245")]);
+            *seen.borrow_mut() = if dialog.names_caption_is_showing() {
+                Err("no row has a name, so nothing should explain one".to_string())
+            } else {
+                Ok(())
+            };
+        },
+    );
+    outcome.replace(Err("activation never ran".to_string()))
 }
 
 /// The whole point of this task, asserted from one end to the other: a
@@ -589,6 +667,14 @@ fn main() {
         (
             "the_main_menu_has_a_saved_devices_entry_the_window_can_answer",
             the_main_menu_has_a_saved_devices_entry_the_window_can_answer,
+        ),
+        (
+            "a_row_shows_a_name_where_there_is_one_and_invents_none_where_there_is_not",
+            a_row_shows_a_name_where_there_is_one_and_invents_none_where_there_is_not,
+        ),
+        (
+            "nothing_explains_a_name_when_no_row_has_one",
+            nothing_explains_a_name_when_no_row_has_one,
         ),
     ];
 

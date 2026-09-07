@@ -11,6 +11,7 @@ use crate::error::{Error, Result};
 use ipnet::Ipv4Net;
 use serde::Deserialize;
 use std::net::Ipv4Addr;
+use std::time::{Duration, Instant};
 
 /// Interface name prefixes that are never "the network I am on".
 const VIRTUAL_PREFIXES: &[&str] = &[
@@ -276,6 +277,81 @@ pub fn neighbours(runner: &dyn CommandRunner) -> Result<Vec<Neighbour>> {
     let cmd = Command::read("ip", ["-4", "neigh", "show"]);
     let out = runner.run(&cmd)?.into_ok(&cmd)?;
     parse_neighbours(&out.stdout)
+}
+
+/// How long one name lookup may take before it is abandoned.
+///
+/// A resolver that does not answer is ordinary on a home network, and the
+/// picker has to appear either way. On the machine this was measured on the
+/// local resolver answered in 3-4 ms, and an address it had no record for
+/// came back in 0.32 s; a second is far above both, and a resolver that has
+/// not answered within one is not going to make the list better by being
+/// waited for.
+pub const NAME_LOOKUP_BOUND: Duration = Duration::from_secs(1);
+
+/// How long a whole pass of them may take, however many addresses there are.
+///
+/// The per-lookup bound alone does not bound the picker: a silent resolver
+/// costs [`NAME_LOOKUP_BOUND`] per address, and a busy network has plenty of
+/// addresses. Once this is spent the remaining addresses get no name, which
+/// is the same outcome as a resolver that answered nothing for them.
+pub const NAME_LOOKUP_BUDGET: Duration = Duration::from_secs(2);
+
+/// What this machine's resolver answers for each address, in the same order,
+/// `None` where it answered nothing.
+///
+/// This is a hint for a person choosing a row, and nothing else. A device is
+/// saved and resolved by MAC; no value from here is stored, matched, or used
+/// to pick a row.
+///
+/// `getent hosts` is what is asked, so the answer is whatever the host's
+/// name service returns -- which on a typical machine merges `/etc/hosts`,
+/// locally synthesised names, mDNS and DNS, and reports which of them
+/// answered for none of it. So an answer is shown as an answer to that
+/// question and nothing is claimed about where it came from. Where there is
+/// no answer there is no name: nothing is substituted for one.
+///
+/// Bounded twice, by [`NAME_LOOKUP_BOUND`] per address and
+/// [`NAME_LOOKUP_BUDGET`] over the pass. Nothing here fails: a lookup that
+/// could not be spawned, exited non-zero, timed out or printed something
+/// unparseable is an address with no name, not an error, since a picker that
+/// refused to appear because a name could not be found would be worse than
+/// one that shows the MAC alone.
+pub fn resolver_names(runner: &dyn CommandRunner, addresses: &[Ipv4Addr]) -> Vec<Option<String>> {
+    let deadline = Instant::now() + NAME_LOOKUP_BUDGET;
+    addresses
+        .iter()
+        .map(|address| {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            resolver_name(runner, *address)
+        })
+        .collect()
+}
+
+fn resolver_name(runner: &dyn CommandRunner, address: Ipv4Addr) -> Option<String> {
+    let cmd = Command::read("getent", ["hosts", &address.to_string()]);
+    let out = runner.run_within(&cmd, NAME_LOOKUP_BOUND).ok()??;
+    if !out.success() {
+        return None;
+    }
+    parse_getent_hosts(&out.stdout)
+}
+
+/// The canonical name on `getent hosts`'s first line.
+///
+/// The format is `/etc/hosts`'s: an address, then the canonical name, then
+/// any aliases. This machine's own resolver returned two names for one
+/// address and eleven for another, so taking the first is a choice -- it is
+/// the one the name service put first, and the alternative is a row too wide
+/// to read.
+fn parse_getent_hosts(text: &str) -> Option<String> {
+    text.lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)
+        .map(|name| name.to_string())
 }
 
 /// Every subnet this machine currently holds on a non-virtual interface,
@@ -584,6 +660,126 @@ pub(crate) mod tests {
 172.18.0.3 dev br-5b772196d2da lladdr 8e:3a:fc:5b:5c:dc STALE
 10.10.10.245 dev wlo1 lladdr bc:24:11:5e:1c:6e REACHABLE
 ";
+
+    #[test]
+    fn a_name_is_read_from_the_canonical_column_not_the_address_or_an_alias() {
+        // `getent hosts` output shape, verbatim from this machine: the
+        // address, the canonical name, then aliases.
+        assert_eq!(
+            parse_getent_hosts("192.168.177.142 laptop.example alias.example"),
+            Some("laptop.example".to_string())
+        );
+        assert_eq!(
+            parse_getent_hosts("192.168.177.1 _gateway"),
+            Some("_gateway".to_string())
+        );
+    }
+
+    #[test]
+    fn an_answer_with_no_name_in_it_yields_no_name_rather_than_the_address() {
+        assert_eq!(parse_getent_hosts(""), None);
+        assert_eq!(parse_getent_hosts("192.168.177.9"), None);
+        assert_eq!(parse_getent_hosts("\n"), None);
+    }
+
+    #[test]
+    fn each_address_gets_the_name_its_own_lookup_answered() {
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout("10.10.10.1 _gateway"),
+            Output::stdout("10.10.10.245 phone.example phone"),
+        ]);
+        let names = resolver_names(
+            &runner,
+            &[
+                "10.10.10.1".parse().unwrap(),
+                "10.10.10.245".parse().unwrap(),
+            ],
+        );
+        assert_eq!(
+            names,
+            vec![
+                Some("_gateway".to_string()),
+                Some("phone.example".to_string())
+            ]
+        );
+
+        let commands = runner.recorded();
+        assert_eq!(commands[0].display(), "getent hosts 10.10.10.1");
+        assert_eq!(commands[1].display(), "getent hosts 10.10.10.245");
+        assert!(commands
+            .iter()
+            .all(|c| c.effect == crate::command::Effect::Read));
+    }
+
+    #[test]
+    fn an_address_the_resolver_has_nothing_for_gets_no_name_and_no_stand_in() {
+        // What `getent hosts` does with an address it cannot find: exit 2,
+        // nothing on stdout. The row keeps its MAC and its address and
+        // gains nothing else -- no "unknown device", no vendor guessed off
+        // the MAC prefix.
+        let runner = RecordingRunner::with_responses(vec![Output {
+            status: 2,
+            stdout: String::new(),
+            stderr: String::new(),
+        }]);
+        let names = resolver_names(&runner, &["10.10.10.7".parse().unwrap()]);
+        assert_eq!(names, vec![None]);
+    }
+
+    #[test]
+    fn a_lookup_that_cannot_be_run_at_all_is_a_missing_name_not_a_failure() {
+        // A picker that refused to appear because `getent` is not there
+        // would be worse than one showing MAC and address alone.
+        let cmd = Command::read("porthole-no-such-program-exists", ["hosts"]);
+        let runner = crate::command::RealRunner;
+        assert!(runner.run_within(&cmd, NAME_LOOKUP_BOUND).is_err());
+
+        let names = resolver_names(&runner, &["203.0.113.1".parse().unwrap()]);
+        assert_eq!(
+            names,
+            vec![None],
+            "a spawn failure is an address with no name"
+        );
+    }
+
+    #[test]
+    fn a_command_that_never_answers_is_abandoned_at_the_bound() {
+        // The bound is real, not documentation: this child would run for
+        // thirty seconds. Bounded at 200ms here rather than
+        // `NAME_LOOKUP_BOUND` so the suite does not pay a second for it.
+        let runner = crate::command::RealRunner;
+        let cmd = Command::read("sleep", ["30"]);
+        let started = Instant::now();
+        let answer = runner
+            .run_within(&cmd, Duration::from_millis(200))
+            .expect("spawning `sleep` succeeds even though waiting for it does not");
+        assert!(
+            answer.is_none(),
+            "the bound was reached, so there is no output"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait must be bounded, not merely described as bounded: took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_command_that_answers_inside_the_bound_is_not_cut_off() {
+        // The negative control for the test above: the same bounded call,
+        // on a command that finishes, returns its real output.
+        let runner = crate::command::RealRunner;
+        let cmd = Command::read("echo", ["10.10.10.1 named.example"]);
+        let answer = runner
+            .run_within(&cmd, Duration::from_secs(5))
+            .unwrap()
+            .expect("a command that finishes inside the bound has output");
+        assert_eq!(answer.status, 0);
+        assert_eq!(
+            parse_getent_hosts(&answer.stdout),
+            Some("named.example".to_string())
+        );
+    }
 
     #[test]
     fn a_docker_container_is_not_offered_as_a_device_on_this_network() {

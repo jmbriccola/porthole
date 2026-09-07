@@ -215,8 +215,10 @@ table at the moment the port is opened — never earlier.
 ```console
 $ porthole devices add
 Seen on this network:
-  1) bc:24:11:5e:1c:6e  10.10.10.245  (wlo1)
-  2) 50:e6:36:1a:9f:04  10.10.10.1    (wlo1)
+  1) bc:24:11:5e:1c:6e  10.10.10.245  (wlo1)  phone.example
+  2) 50:e6:36:1a:9f:04  10.10.10.1  (wlo1)  _gateway
+  3) de:ad:be:ef:00:01  10.10.10.7  (enp3s0)
+The name after an address is what this machine's resolver answered for it. The MAC is what gets saved.
 Pick a number: 1
 Name this device: phone
 Saved `phone` as bc:24:11:5e:1c:6e.
@@ -249,6 +251,23 @@ interfaces reports as not on this network rather than resolving to an address
 outside every subnet this machine holds. A device
 named by hostname (`host = "printer.local"`, resolved through `getent`) is
 added by editing `~/.config/porthole/devices.toml` by hand.
+
+The name on a row is there so a person can tell two MAC addresses apart —
+picking the wrong one opens a port towards the wrong machine. porthole asks
+`getent hosts` for each address, which is the host's own name service: on a
+typical machine that merges `/etc/hosts`, locally synthesised names, mDNS and
+DNS, and it does not report which of them answered. So the name is shown as
+the answer to that question and nothing is claimed about where it came from
+— it is a hint, not an identity. **The MAC is the identity.** It is what the
+picker saves, what `devices.toml` records and what `--to` matches; no name
+seen here is stored or matched.
+
+An address the resolver answers nothing for gets no name. Nothing stands in
+for one — no "unknown device", no vendor guessed from the MAC prefix. Each
+lookup is abandoned after **1 second** and the whole pass after **2**, since
+a resolver that does not answer is ordinary on a home network and the picker
+has to appear either way; addresses left over when the budget runs out are
+shown without a name, exactly as an unanswered one is.
 
 The GUI writes the same file, through **Saved Devices** in its menu or the
 button beside the open dialog's target list. It offers the same picker and

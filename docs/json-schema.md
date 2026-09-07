@@ -469,6 +469,12 @@ Neither object carries `resolvable` or `resolved_address`. Those are a live
 lookup `devices list` performs and neither of these commands does, so
 reporting them would mean resolving a device nobody asked to resolve.
 
+`devices add`'s picker prints a name beside an address when `getent hosts`
+answers for it, on stderr with the rest of the prompt -- stdout is unchanged,
+and no name reaches the address book or any JSON field. Each lookup is
+bounded at one second and the pass at two; an address with no answer is
+printed without a name.
+
 `devices add` has one refusal of its own: an empty neighbour table, with
 nothing to put in front of you to pick. It exits `9` with the
 `nothing_to_offer` error object below, on stdout, like every other failure —

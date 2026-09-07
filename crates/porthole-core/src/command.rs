@@ -7,8 +7,9 @@
 
 use crate::error::{Error, Result};
 use std::collections::VecDeque;
-use std::process::Command as StdCommand;
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effect {
@@ -127,6 +128,22 @@ impl Output {
 pub trait CommandRunner {
     fn run(&self, cmd: &Command) -> Result<Output>;
 
+    /// Run `cmd`, giving up on it after `bound`.
+    ///
+    /// `Ok(None)` is the bound being reached and the child being killed;
+    /// the command produced no answer and there is none to report. A
+    /// command that finishes in time returns `Ok(Some(output))` with
+    /// whatever status it exited with, exactly as [`CommandRunner::run`]
+    /// does.
+    ///
+    /// The default runs `cmd` with no bound at all. It fits the runners
+    /// that cannot block -- a scripted one replaying recorded output has
+    /// nothing to wait for -- and means a runner only implements this when
+    /// waiting is a thing it can really do.
+    fn run_within(&self, cmd: &Command, _bound: Duration) -> Result<Option<Output>> {
+        self.run(cmd).map(Some)
+    }
+
     /// True when mutations are withheld. Backends use this to skip read-back
     /// steps that cannot work when nothing was actually changed.
     fn is_dry_run(&self) -> bool {
@@ -138,6 +155,11 @@ pub trait CommandRunner {
         Vec::new()
     }
 }
+
+/// How often a bounded run asks whether the child has finished. Short
+/// enough that the bound is met closely, long enough that a command
+/// answering in milliseconds costs one wake-up.
+const BOUNDED_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Runs commands for real.
 pub struct RealRunner;
@@ -160,6 +182,53 @@ impl CommandRunner for RealRunner {
                 .trim_end()
                 .to_string(),
         })
+    }
+
+    /// Spawns, polls [`Child::try_wait`], and kills the child once `bound`
+    /// has passed. Output is read only after the child has exited, so it
+    /// suits a command whose output fits the pipe buffer -- a child that
+    /// filled 64 KiB and blocked writing would never be seen to exit, and
+    /// would be killed at the bound. Every caller here runs a name lookup
+    /// that answers in one short line.
+    ///
+    /// [`Child::try_wait`]: std::process::Child::try_wait
+    fn run_within(&self, cmd: &Command, bound: Duration) -> Result<Option<Output>> {
+        let spawn_error = |source| Error::CommandSpawn {
+            command: cmd.display(),
+            source,
+        };
+        let mut child = StdCommand::new(&cmd.program)
+            .args(&cmd.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(spawn_error)?;
+
+        let deadline = Instant::now() + bound;
+        while child.try_wait().map_err(spawn_error)?.is_none() {
+            if Instant::now() >= deadline {
+                // Both are best-effort on a child that is already gone or
+                // already reaped; neither failure changes the answer, which
+                // is that the bound was reached and there is nothing to
+                // report.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(None);
+            }
+            std::thread::sleep(BOUNDED_POLL_INTERVAL);
+        }
+
+        let output = child.wait_with_output().map_err(spawn_error)?;
+        Ok(Some(Output {
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout)
+                .trim_end()
+                .to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr)
+                .trim_end()
+                .to_string(),
+        }))
     }
 }
 
@@ -188,6 +257,21 @@ impl CommandRunner for DryRunRunner {
                     .expect("dry-run recorder is not poisoned")
                     .push(cmd.clone());
                 Ok(Output::empty())
+            }
+        }
+    }
+
+    fn run_within(&self, cmd: &Command, bound: Duration) -> Result<Option<Output>> {
+        match cmd.effect {
+            // The bound is the inner runner's to keep: a dry run executes
+            // reads for real, so a read that hangs hangs a dry run too.
+            Effect::Read => self.inner.run_within(cmd, bound),
+            Effect::Mutate => {
+                self.recorded
+                    .lock()
+                    .expect("dry-run recorder is not poisoned")
+                    .push(cmd.clone());
+                Ok(Some(Output::empty()))
             }
         }
     }
