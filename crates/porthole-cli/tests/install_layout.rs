@@ -1,15 +1,18 @@
 //! What `make install` puts on disk.
 //!
-//! Every packaging format in this project calls `make install` and lists no
-//! files of its own, so this file is where a missing row shows up. The one
-//! it exists to catch is a package that ships the helper binary without its
-//! polkit policy: nothing fails to build, nothing fails to install, and the
-//! first `porthole open` on a user's machine is refused by a polkit that
-//! never heard of the action.
+//! The install layout is written down in the Makefile at the top of the
+//! tree. These tests stage real `make install` runs into throwaway DESTDIRs
+//! and pin what those runs produce. The failure they exist to catch is an
+//! install that puts down the helper binary without its polkit policy:
+//! nothing fails to build, nothing fails to install, and the first
+//! `porthole open` on a user's machine is refused by a polkit that never
+//! heard of the action.
 //!
-//! The expected set below is compared for equality, not containment. A row
-//! added to the Makefile and not added here fails just as loudly as a row
-//! dropped from the Makefile, which is what keeps the two from drifting.
+//! The expected set below is compared for equality, not containment, and
+//! twice: against the whole `make install`, and against the union of what
+//! `make install WITH_GUI=0` and `make install-gui` put down separately,
+//! which must also share no path between them. A row added to the Makefile
+//! and not added here fails just as loudly as a row dropped from it.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -50,16 +53,16 @@ fn binary_stubs(dir: &Path) {
     }
 }
 
-/// `make install DESTDIR=<a temporary directory> PREFIX=/usr`, returning the
-/// directory it installed into.
-fn staged_install(scratch: &Path) -> PathBuf {
-    let destdir = scratch.join("destdir");
+/// `make <goal> DESTDIR=<scratch>/<into> PREFIX=/usr <extra...>`, returning
+/// the directory it installed into.
+fn staged(scratch: &Path, into: &str, goal: &str, extra: &[&str]) -> PathBuf {
+    let destdir = scratch.join(into);
     let bindir = scratch.join("bin");
     binary_stubs(&bindir);
 
     let output = Command::new("make")
         .current_dir(repo_root())
-        .arg("install")
+        .arg(goal)
         .arg("PREFIX=/usr")
         .arg(format!("DESTDIR={}", destdir.display()))
         .arg(format!("BINSRC={}", bindir.display()))
@@ -68,15 +71,22 @@ fn staged_install(scratch: &Path) -> PathBuf {
             "TARGETDIR={}",
             scratch.join("maketarget").display()
         ))
+        .args(extra)
         .output()
         .expect("`make` runs; it is how every package in this project installs");
     assert!(
         output.status.success(),
-        "make install failed: {}\n{}",
+        "make {goal} failed: {}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
     destdir
+}
+
+/// `make install DESTDIR=<a temporary directory> PREFIX=/usr`, returning the
+/// directory it installed into.
+fn staged_install(scratch: &Path) -> PathBuf {
+    staged(scratch, "destdir", "install", &[])
 }
 
 fn installed_files(destdir: &Path) -> BTreeSet<String> {
@@ -141,6 +151,46 @@ fn make_install_produces_exactly_the_documented_layout() {
         missing.is_empty() && extra.is_empty(),
         "make install and this test disagree.\n  never installed: {missing:?}\n  \
          installed but undocumented: {extra:?}"
+    );
+}
+
+#[test]
+fn the_two_packages_split_the_whole_install_between_them_and_share_nothing() {
+    // Every packaging format here builds two packages out of this one layout:
+    // the base package runs `make install WITH_GUI=0`, the GUI package runs
+    // `make install-gui`. Two properties both packages rest on, and neither
+    // is the union the test above checks:
+    //
+    //   disjoint  dpkg refuses to unpack a file another package already owns
+    //             ("trying to overwrite ..., which is also in package ..."),
+    //             and pacman reports the same as a file conflict. A row added
+    //             to install-cli *and* install-gui leaves the union unchanged,
+    //             so the test above stays green while every upgrade of the two
+    //             packages together fails.
+    //
+    //   complete  a row in neither half is installed by the full `make
+    //             install` and by no package at all, so it exists on a
+    //             developer's machine and nowhere a user can reach.
+    let scratch = tempfile::tempdir().unwrap();
+    let base = installed_files(&staged(scratch.path(), "base", "install", &["WITH_GUI=0"]));
+    let gui = installed_files(&staged(scratch.path(), "gui", "install-gui", &[]));
+
+    let shared: Vec<_> = base.intersection(&gui).collect();
+    assert!(
+        shared.is_empty(),
+        "`make install WITH_GUI=0` and `make install-gui` both install \
+         {shared:?}; dpkg and pacman each refuse two packages owning one path"
+    );
+
+    let union: BTreeSet<String> = base.union(&gui).cloned().collect();
+    let expected: BTreeSet<String> = EXPECTED.iter().map(|s| (*s).to_string()).collect();
+    let missing: Vec<_> = expected.difference(&union).collect();
+    let extra: Vec<_> = union.difference(&expected).collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "the two halves do not add up to the full install.\n  \
+         in the full install and in neither package: {missing:?}\n  \
+         in a package and not in the full install: {extra:?}"
     );
 }
 
@@ -254,8 +304,23 @@ fn every_file_checked_into_data_is_installed_by_something() {
     // A file added to data/ that no Makefile row copies is invisible: it
     // builds, it installs, and the feature it belongs to is simply absent
     // from every package.
+    //
+    // Checked against the file set a real `make install` produces, not
+    // against the Makefile's text: a data/ file named anywhere in that text
+    // satisfies a text search, and the Makefile's comments name data/ files
+    // in prose several lines away from the rules that install them.
+    //
+    // Matched on the file name rather than the whole path, because the path
+    // is what the layout chooses: data/porthole-agent.service is installed
+    // under /usr/lib/systemd/user/, and with its ExecStart= line rewritten,
+    // so the name is what survives the trip.
     let root = repo_root();
-    let makefile = std::fs::read_to_string(root.join("Makefile")).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let installed = installed_files(&staged_install(scratch.path()));
+    let names: BTreeSet<&str> = installed
+        .iter()
+        .filter_map(|path| path.rsplit('/').next())
+        .collect();
 
     fn walk(dir: &Path, into: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).unwrap() {
@@ -273,9 +338,11 @@ fn every_file_checked_into_data_is_installed_by_something() {
 
     for file in files {
         let relative = file.strip_prefix(&root).unwrap().display().to_string();
+        let name = file.file_name().unwrap().to_str().unwrap();
         assert!(
-            makefile.contains(&relative),
-            "{relative} exists but no Makefile rule installs it"
+            names.contains(name),
+            "{relative} exists and `make install` installs nothing called \
+             {name}; add a row to the Makefile"
         );
     }
 }
