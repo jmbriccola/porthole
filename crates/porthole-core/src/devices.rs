@@ -195,7 +195,18 @@ struct RawDevice {
 }
 
 /// Validate and lower-case a MAC address: six colon-separated hex bytes.
-fn normalize_mac(device_name: &str, raw: &str) -> Result<String> {
+///
+/// Public because a MAC reaches the address book two ways -- picked out of
+/// the neighbour table, where it can only ever be one this machine has
+/// already seen, and typed by hand, where it can be anything. Both are held
+/// to this one rule, in one place, so a MAC one of them accepts is never
+/// one [`Book::load`] then refuses.
+///
+/// The error names the offending text and the shape expected, and nothing
+/// about where it came from: [`normalize_mac`] adds the device it belongs
+/// to, and a caller reading a field a person is still typing has no device
+/// to name yet.
+pub fn parse_mac(raw: &str) -> Result<String> {
     let bytes: Vec<&str> = raw.split(':').collect();
     let valid = bytes.len() == 6
         && bytes
@@ -203,11 +214,18 @@ fn normalize_mac(device_name: &str, raw: &str) -> Result<String> {
             .all(|b| b.len() == 2 && b.chars().all(|c| c.is_ascii_hexdigit()));
     if !valid {
         return Err(Error::InvalidArgument(format!(
-            "device `{device_name}` has `mac = \"{raw}\"`, which is not a MAC address; \
-             expected six colon-separated hex bytes, e.g. bc:24:11:5e:1c:6e"
+            "`{raw}` is not a MAC address; expected six colon-separated hex bytes, \
+             e.g. bc:24:11:5e:1c:6e"
         )));
     }
     Ok(raw.to_ascii_lowercase())
+}
+
+/// [`parse_mac`], with the device the MAC was written against named -- what
+/// a book being loaded can say and a field being typed into cannot.
+fn normalize_mac(device_name: &str, raw: &str) -> Result<String> {
+    parse_mac(raw)
+        .map_err(|e| Error::InvalidArgument(format!("device `{device_name}` has a bad mac: {e}")))
 }
 
 /// Why this name cannot be used, or `None` when it can.
@@ -708,6 +726,42 @@ mod tests {
             ),
             PathBuf::from("/tmp/porthole-test/devices.toml")
         );
+    }
+
+    #[test]
+    fn parse_mac_accepts_what_the_neighbour_table_and_a_typed_field_both_produce() {
+        assert_eq!(parse_mac("BC:24:11:5E:1C:6E").unwrap(), "bc:24:11:5e:1c:6e");
+        assert_eq!(parse_mac("bc:24:11:5e:1c:6e").unwrap(), "bc:24:11:5e:1c:6e");
+    }
+
+    #[test]
+    fn parse_mac_refuses_anything_that_is_not_six_hex_bytes() {
+        for raw in [
+            "",
+            "not-a-mac",
+            "bc:24:11:5e:1c",
+            "bc:24:11:5e:1c:6e:7f",
+            "bc:24:11:5e:1c:6g",
+            "bc-24-11-5e-1c-6e",
+            "bc:24:11:5e:1c:6",
+        ] {
+            let err = parse_mac(raw).unwrap_err();
+            assert!(
+                err.to_string().contains(raw),
+                "the offending text must be named, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_mac_in_the_file_still_names_the_device_it_belongs_to() {
+        // `parse_mac` names the text and nothing else, since a field being
+        // typed into has no device to name yet. Loading a file does, and
+        // that is where the device's name is added back.
+        let err = normalize_mac("broken", "not-a-mac").unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("broken"), "got: {text}");
+        assert!(text.contains("not-a-mac"), "got: {text}");
     }
 
     #[test]

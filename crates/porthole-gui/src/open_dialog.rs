@@ -66,6 +66,13 @@
 //! -- a name and either an address or a reason -- computed by whoever fed it
 //! in, on a thread that is not this one.
 //!
+//! Beside that list's heading is a button, and
+//! [`OpenDialog::on_manage_devices`] is the slot for what it does. This
+//! dialog does not know what that is: the saved-devices dialog it reaches is
+//! `window.rs`'s business, exactly as [`OpenDialog::on_opened`] already is.
+//! What that button is for is the gap it closes -- the address book was
+//! readable here and writable only from a terminal.
+//!
 //! ## Docker
 //!
 //! porthole never touches Docker's rules; it explains them. When Docker
@@ -399,6 +406,13 @@ struct Inner {
     /// not check". `None` is not an empty list: an empty list is a checked
     /// answer, and only a checked answer can say a port is *not* Docker's.
     docker: RefCell<Option<Vec<Published>>>,
+    /// The button beside the "Open towards" heading, and the slot
+    /// `window.rs` fills so pressing it can present the saved-devices
+    /// dialog. This dialog knows nothing about that one -- the same shape
+    /// `on_opened` already uses, and for the same reason: only `window.rs`
+    /// knows about more than one of these at a time.
+    manage_devices_button: gtk::Button,
+    on_manage_devices: RefCell<Option<Box<dyn Fn()>>>,
     open_button: gtk::Button,
     /// This dialog's own busy indication for the `open` its button sends.
     /// `refresh_submit_state` reads it as well as `disable_while_busy`
@@ -682,6 +696,11 @@ async fn open_over_dbus(
 }
 
 /// Where a user chooses what to open, for how long, and towards whom.
+///
+/// `Clone` is another handle on the same dialog, never a second dialog:
+/// `window.rs` keeps one so a saved device written while this dialog is on
+/// screen can be pushed straight back into its target list.
+#[derive(Clone)]
 pub struct OpenDialog {
     inner: Rc<Inner>,
 }
@@ -806,6 +825,16 @@ impl OpenDialog {
         let target_group = adw::PreferencesGroup::builder()
             .title("Open towards")
             .build();
+        // Beside the heading of the list it adds to: the need for a saved
+        // device arises here, while choosing who to open towards, and until
+        // this button existed the only way to create one was a terminal.
+        let manage_devices_button = gtk::Button::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text("Save a device")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        target_group.set_header_suffix(Some(&manage_devices_button));
 
         let open_button = gtk::Button::builder()
             .label("Open")
@@ -883,6 +912,8 @@ impl OpenDialog {
             devices: RefCell::new(Vec::new()),
             selected_target: RefCell::new(TargetKey::CurrentSubnet),
             docker: RefCell::new(None),
+            manage_devices_button: manage_devices_button.clone(),
+            on_manage_devices: RefCell::new(None),
             open_button: open_button.clone(),
             busy: busy.clone(),
             on_opened: RefCell::new(None),
@@ -904,6 +935,13 @@ impl OpenDialog {
             chip.button
                 .connect_toggled(move |_| refresh_submit_state(&inner_for_chip));
         }
+
+        let inner_for_manage = inner.clone();
+        manage_devices_button.connect_clicked(move |_| {
+            if let Some(f) = inner_for_manage.on_manage_devices.borrow().as_ref() {
+                f();
+            }
+        });
 
         let inner_for_click = inner.clone();
         open_button.connect_clicked(move |_| {
@@ -1249,6 +1287,18 @@ impl OpenDialog {
     /// The real `adw::Dialog` this wraps -- the parent anything presented
     /// *over* this dialog needs, which is what the Open button presents its
     /// own Docker explanation over.
+    /// The button beside the "Open towards" heading, for a caller that
+    /// wants to press it (`emit_clicked`) or read its state back.
+    pub fn manage_devices_button(&self) -> &gtk::Button {
+        &self.inner.manage_devices_button
+    }
+
+    /// What that button does, registered by `window.rs` -- see
+    /// [`OpenDialog::on_opened`] for the same shape and the same reason.
+    pub fn on_manage_devices(&self, f: impl Fn() + 'static) {
+        self.inner.on_manage_devices.replace(Some(Box::new(f)));
+    }
+
     pub fn dialog(&self) -> &adw::Dialog {
         &self.inner.dialog
     }

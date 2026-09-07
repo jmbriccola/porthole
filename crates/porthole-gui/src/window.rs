@@ -87,6 +87,21 @@
 //! such state, the open dialog's group description. porthole never touches
 //! Docker's rules; every one of these surfaces only ever reads and
 //! explains.
+//!
+//! ## Writing the address book
+//!
+//! Until [`present_devices_dialog`] existed, that book could only be read
+//! here: a device became a target in the open dialog, and the only way to
+//! put one there was a terminal. Two things reach it now -- the main menu's
+//! own entry ([`DEVICES_ACTION`]), and the button beside the open dialog's
+//! target list, whose slot this file fills. Both present a
+//! [`crate::devices_dialog::DevicesDialog`], and both register the hook that
+//! re-reads the book after every write, so a device saved while the open
+//! dialog is up appears in its target list without it being closed.
+//!
+//! The helper is not involved in any of it. The address book is
+//! client-side, it never crosses the bus, and what does cross it at the
+//! moment a port is opened is an already-resolved address.
 
 use std::cell::{Cell, RefCell};
 use std::ops::Deref;
@@ -103,6 +118,7 @@ use porthole_core::ipc::{PortholeProxy, WireDockerPort, WireRule, WireStatus};
 use porthole_core::listening::RealProcFs;
 
 use crate::busy::BusyIndicator;
+use crate::devices_dialog::DevicesDialog;
 use crate::listening_section::ListeningSection;
 use crate::open_dialog::{DeviceEntry, OpenDialog};
 use crate::open_now::OpenNowSection;
@@ -112,7 +128,7 @@ use crate::status_bar::StatusBar;
 /// the address book itself could not be read -- two facts an empty `Vec`
 /// alone cannot tell apart, and the second of which must not render as "no
 /// devices are saved".
-type DeviceSnapshot = Result<Vec<DeviceEntry>, String>;
+pub type DeviceSnapshot = Result<Vec<DeviceEntry>, String>;
 
 /// What [`refresh`] fills in, and what it keeps for an [`OpenDialog`]
 /// opened later. One value rather than six parameters threaded through four
@@ -144,6 +160,14 @@ struct Sections {
     busy: BusyIndicator,
 }
 
+/// The saved-devices entry in the window's own main menu: the action's
+/// bare name, as `gio::SimpleAction::new` takes it, and the same action
+/// prefixed for the menu item that points at it. Two constants rather than
+/// one string written twice -- a menu item naming an action the window does
+/// not have renders insensitive and says nothing about why.
+const DEVICES_ACTION_NAME: &str = "devices";
+const DEVICES_ACTION: &str = "win.devices";
+
 /// The width, in CSS pixels, at or below which the narrow layout applies.
 /// The `Breakpoint` object itself is reachable via
 /// [`PortholeWindow::breakpoint`]; task 6 is what attaches its first real
@@ -168,6 +192,7 @@ pub struct PortholeWindow {
     listening: ListeningSection,
     status_bar: StatusBar,
     open_button: gtk::Button,
+    menu_button: gtk::MenuButton,
     devices: Rc<RefCell<DeviceSnapshot>>,
     docker: Rc<RefCell<Option<Vec<Published>>>>,
     refresh_pending: Rc<Cell<bool>>,
@@ -251,6 +276,22 @@ impl PortholeWindow {
             .build();
         let header_bar = adw::HeaderBar::new();
         header_bar.pack_start(&open_button);
+
+        // The window's main menu, and the one entry it has: the saved
+        // devices, reachable without opening a port. The open dialog's own
+        // button beside its target list is the other way to the same
+        // dialog; this is the way that does not start by choosing a port.
+        // A `gio::Menu` item rather than a button, so the same entry is
+        // reachable by keyboard through the menu and can grow a second one
+        // later without another piece of header chrome.
+        let menu = gtk::gio::Menu::new();
+        menu.append(Some("Saved Devices"), Some(DEVICES_ACTION));
+        let menu_button = gtk::MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .tooltip_text("Main menu")
+            .menu_model(&menu)
+            .build();
+        header_bar.pack_end(&menu_button);
 
         // Where a refresh says it is still waiting. In the header bar
         // rather than in either section: a refresh is a fact about the
@@ -370,6 +411,26 @@ impl PortholeWindow {
             present_open_dialog(&sections_for_row, &OpenDialog::for_port(port));
         });
 
+        // What the menu entry above actually does. A `gio::SimpleAction` on
+        // the window rather than a click handler on a widget: that is what a
+        // `gio::Menu` item can point at, and it is the same action whether
+        // it is reached with the mouse or from the keyboard.
+        let sections_for_devices = Sections {
+            window: window.clone(),
+            open_now: open_now.clone(),
+            listening: listening.clone(),
+            status_bar: status_bar.clone(),
+            devices: devices.clone(),
+            docker: docker.clone(),
+            refresh_pending: refresh_pending.clone(),
+            busy: busy.clone(),
+        };
+        let devices_action = gtk::gio::SimpleAction::new(DEVICES_ACTION_NAME, None);
+        devices_action.connect_activate(move |_, _| {
+            present_devices_dialog(&sections_for_devices, None);
+        });
+        window.add_action(&devices_action);
+
         // The other direction: what a successful close in "Open now" does
         // to "Listening". That section withholds a row's Open button for a
         // port the rule list names, and a close changes that list -- so it
@@ -403,6 +464,7 @@ impl PortholeWindow {
             listening,
             status_bar,
             open_button,
+            menu_button,
             devices,
             docker,
             refresh_pending,
@@ -477,6 +539,14 @@ impl PortholeWindow {
     /// keeps around.
     pub fn open_button(&self) -> &gtk::Button {
         &self.open_button
+    }
+
+    /// The header bar's main menu, for a test that wants to check it is
+    /// reachable from the keyboard and that it really carries an entry --
+    /// the entry itself is a `gio::Menu` item, activated through
+    /// [`DEVICES_ACTION`] rather than by pressing a widget.
+    pub fn menu_button(&self) -> &gtk::MenuButton {
+        &self.menu_button
     }
 
     /// The header bar's own busy indication -- `is_busy()` for "a helper
@@ -740,7 +810,7 @@ const DEVICES_NOT_READ_YET: &str = "porthole has not read the saved devices yet.
 /// absent phone does not hide the laptop that is here. Only the address
 /// book itself failing to load produces the outer `Err`, since then there
 /// are no devices to report at all.
-fn load_devices() -> DeviceSnapshot {
+pub fn load_devices() -> DeviceSnapshot {
     let book = devices::Book::load(&devices::default_path()).map_err(|e| e.to_string())?;
     let runner = RealRunner;
     Ok(book
@@ -909,7 +979,83 @@ fn present_open_dialog(sections: &Sections, dialog: &OpenDialog) {
     dialog.on_opened(move |_rule| {
         refresh(&sections_for_refresh);
     });
+
+    // What the button beside the target list does. Registered here, and not
+    // in `open_dialog.rs`, for the reason every other cross-section callback
+    // in this file is: that dialog knows nothing about the saved-devices one.
+    let sections_for_devices = sections.clone();
+    let dialog_for_devices = dialog.clone();
+    dialog.on_manage_devices(move || {
+        present_devices_dialog(&sections_for_devices, Some(dialog_for_devices.clone()));
+    });
+
     dialog.present(Some(&sections.window));
+}
+
+/// Re-reads the address book, off the UI thread, into the cache
+/// [`present_open_dialog`] hands to every dialog it opens -- and, when one
+/// is currently on screen, straight into that one as well.
+///
+/// Two callers, one function: [`refresh`] runs it as a third read alongside
+/// the `/proc` scan and the helper round trip, and
+/// [`present_devices_dialog`] runs it again after every write to the book,
+/// so a device saved while the open dialog is up appears in its target list
+/// without the dialog being closed and re-opened.
+///
+/// Reading the book resolves every device in it, and each resolution runs a
+/// subprocess, so this goes to GLib's own I/O thread pool. Nothing on screen
+/// changes when a `None` call lands: it fills a cache.
+fn reload_devices(sections: &Sections, dialog: Option<OpenDialog>) {
+    let sections = sections.clone();
+    glib::spawn_future_local(async move {
+        let loaded = gtk::gio::spawn_blocking(load_devices).await;
+        let snapshot = match loaded {
+            Ok(snapshot) => snapshot,
+            Err(_) => Err("reading the saved devices panicked".to_string()),
+        };
+        if let Some(dialog) = &dialog {
+            match &snapshot {
+                Ok(entries) => dialog.set_devices(entries),
+                Err(reason) => dialog.set_devices_unreadable(reason),
+            }
+        }
+        *sections.devices.borrow_mut() = snapshot;
+    });
+}
+
+/// Presents a fresh [`DevicesDialog`] -- from the main menu, where
+/// `open_dialog` is `None`, and from the open dialog's own button beside its
+/// target list, where it is the dialog that button was pressed in.
+///
+/// Registered on it: a hook that re-reads the address book after every write
+/// and pushes the result back into that same open dialog, when there is one.
+/// This is the only place that knows about both dialogs at once, exactly as
+/// it is the only place that knows about more than one section.
+///
+/// Nothing here goes near the helper. The address book is client-side and the
+/// helper never learns that devices exist -- see
+/// `porthole_core::devices`'s own module doc for what that keeps small.
+fn present_devices_dialog(sections: &Sections, open_dialog: Option<OpenDialog>) {
+    let dialog = DevicesDialog::new();
+
+    let sections_for_changed = sections.clone();
+    let open_dialog_for_changed = open_dialog.clone();
+    dialog.on_changed(move || {
+        reload_devices(&sections_for_changed, open_dialog_for_changed.clone());
+    });
+
+    // The book and the neighbour table are read here rather than in the
+    // constructor, so a test can build one of these and drive it with
+    // fixture data -- the same split `PortholeWindow::new_without_initial_load`
+    // exists for.
+    dialog.reload();
+
+    // Presented over whichever dialog asked for it, so dismissing it returns
+    // to the choice that was interrupted rather than to the window.
+    match &open_dialog {
+        Some(open) => dialog.present(Some(open.dialog())),
+        None => dialog.present(Some(&sections.window)),
+    }
 }
 
 /// Which ports [`ListeningSection::set_open_ports`] is given: the TCP ones,
@@ -985,22 +1131,10 @@ fn refresh(sections: &Sections) {
         });
     }
 
-    {
-        // A third independent read, alongside the `/proc` scan and the
-        // helper round trip: reading the address book and resolving every
-        // device in it runs subprocesses, so it goes to the same I/O thread
-        // pool the scan does and never touches the UI thread. Nothing on
-        // screen changes when it lands -- it fills the cache
-        // `present_open_dialog` reads when a dialog is actually opened.
-        let sections = sections.clone();
-        glib::spawn_future_local(async move {
-            let loaded = gtk::gio::spawn_blocking(load_devices).await;
-            *sections.devices.borrow_mut() = match loaded {
-                Ok(snapshot) => snapshot,
-                Err(_) => Err("reading the saved devices panicked".to_string()),
-            };
-        });
-    }
+    // A third independent read, alongside the `/proc` scan and the helper
+    // round trip -- see [`reload_devices`], which a write to the address
+    // book runs again on its own.
+    reload_devices(sections, None);
 
     {
         let sections = sections.clone();
