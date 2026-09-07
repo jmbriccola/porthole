@@ -279,10 +279,7 @@ fn a_rule_opened_elsewhere_appears_without_the_window_asking(
             win.present();
 
             let loaded = pump_until(
-                || {
-                    win.open_now().status_page().is_some()
-                        && listening_row_for(&win, port).is_some()
-                },
+                || win.open_now().empty_note().is_some() && listening_row_for(&win, port).is_some(),
                 DEADLINE,
             );
             if !loaded {

@@ -389,11 +389,11 @@ fn a_construction_with_an_unreachable_helper_does_not_show_the_calm_empty_state(
             let win = PortholeWindow::new(app);
             win.present();
             let settled = pump_until(
-                || win.open_now().status_page().is_none() && win.open_now().error_page().is_some(),
+                || win.open_now().empty_note().is_none() && win.open_now().error_note().is_some(),
                 Duration::from_secs(5),
             );
-            let calm_showing = win.open_now().status_page().is_some();
-            let error_showing = win.open_now().error_page().is_some();
+            let calm_showing = win.open_now().empty_note().is_some();
+            let error_showing = win.open_now().error_note().is_some();
             let status_bar_prominent = win.status_bar().is_prominent();
             seen.replace(Some((
                 settled,

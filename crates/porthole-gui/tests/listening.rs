@@ -31,6 +31,11 @@ use porthole_gui::listening_section::{
     ListeningSection, DOCKER_NOT_CHECKED_NOTE, DOCKER_UNAVAILABLE_NOTE,
 };
 
+/// `PortholeWindow`'s own default window width, in pixels -- the width a
+/// height measurement here has to be taken at for the wrapping it sees to
+/// be the wrapping a user gets.
+const WINDOW_WIDTH_PX: i32 = 480;
+
 /// Identical in shape to `tests/window.rs` and `tests/open_now.rs`'s own
 /// `activate` helper: runs `f` inside a real `adw::Application` activation,
 /// on the session bus `dbus-run-session` provides (see
@@ -387,11 +392,11 @@ fn dual_stack_network_facing_rows_show_different_addresses() -> Result<(), Strin
 }
 
 /// A calm empty state, not an error -- mirrors `OpenNowSection`'s own
-/// `an_empty_list_is_a_calm_status_page_not_an_error`, checked the same way:
-/// title, icon and CSS classes, not title alone. A title-only check would
-/// still pass if the calm page grew `.css_classes(["error"])` and an error
-/// glyph.
-fn nothing_listening_is_a_calm_status_page_not_an_error() -> Result<(), String> {
+/// `an_empty_list_is_a_calm_note_not_an_error`, checked the same way: the
+/// CSS classes and the absence of the scan-failure state, not the words
+/// alone. A text-only check would still pass if the calm note grew
+/// `.css_classes(["error"])`.
+fn nothing_listening_is_a_calm_note_not_an_error() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
     activate(
@@ -399,37 +404,36 @@ fn nothing_listening_is_a_calm_status_page_not_an_error() -> Result<(), String> 
         move |_app| {
             let section = ListeningSection::new();
             section.set_services(&[]);
-            let status = section.status_page();
-            let title = status.as_ref().map(|p| p.title().to_string());
-            let icon_name = status
+            let note = section.empty_note();
+            let text = note.as_ref().map(|n| n.label().to_string());
+            let css_classes: Vec<String> = note
                 .as_ref()
-                .and_then(|p| p.icon_name())
-                .map(|s| s.to_string());
-            let css_classes: Vec<String> = status
-                .as_ref()
-                .map(|p| p.css_classes().iter().map(|c| c.to_string()).collect())
+                .map(|n| n.css_classes().iter().map(|c| c.to_string()).collect())
                 .unwrap_or_default();
+            let error_showing = section.error_note().is_some();
             let rows_empty = section.rows().is_empty();
-            *seen.borrow_mut() = Some((title, icon_name, css_classes, rows_empty));
+            *seen.borrow_mut() = Some((text, css_classes, error_showing, rows_empty));
         },
     );
-    let (title, icon_name, css_classes, rows_empty) =
+    let (text, css_classes, error_showing, rows_empty) =
         result.borrow_mut().take().ok_or("activation never ran")?;
-    if title.as_deref() != Some("Nothing else is listening") {
+    let text = text.ok_or("a confirmed-empty scan must show its own note")?;
+    if !text.starts_with("Nothing else is listening") {
         return Err(format!(
-            "expected a status page titled \"Nothing else is listening\", got {title:?}"
-        ));
-    }
-    let icon = icon_name.unwrap_or_default();
-    if icon.contains("warning") || icon.contains("error") {
-        return Err(format!(
-            "the empty state's icon reads as a problem, not the ordinary state it is: {icon:?}"
+            "expected the confirmed-empty note to say so, got {text:?}"
         ));
     }
     if css_classes.iter().any(|c| c == "error" || c == "warning") {
         return Err(format!(
             "the empty state carries an error/warning CSS class: {css_classes:?}"
         ));
+    }
+    if error_showing {
+        return Err(
+            "the \"could not check\" state must not be on screen alongside a confirmed-empty \
+             scan"
+                .to_string(),
+        );
     }
     if !rows_empty {
         return Err("rows must be empty when nothing is listening".to_string());
@@ -448,9 +452,9 @@ fn the_initial_state_before_any_scan_is_neither_calm_nor_populated() -> Result<(
         move |_app| {
             let section = ListeningSection::new();
             *seen.borrow_mut() = Some((
-                section.loading_page().is_some(),
-                section.status_page().is_some(),
-                section.error_page().is_some(),
+                section.loading_note().is_some(),
+                section.empty_note().is_some(),
+                section.error_note().is_some(),
                 section.rows().is_empty(),
             ));
         },
@@ -480,7 +484,7 @@ fn the_initial_state_before_any_scan_is_neither_calm_nor_populated() -> Result<(
 /// from the user's side "porthole could not check" and "porthole checked
 /// and found nothing" are exactly the collapse this project keeps finding.
 /// Checked structurally (icon, CSS class), the same way
-/// `nothing_listening_is_a_calm_status_page_not_an_error` above checks the
+/// `nothing_listening_is_a_calm_note_not_an_error` above checks the
 /// calm state's own icon.
 fn a_scan_failure_does_not_render_as_the_calm_empty_state() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
@@ -494,8 +498,8 @@ fn a_scan_failure_does_not_render_as_the_calm_empty_state() -> Result<(), String
             // never having shown any.
             section.set_services(&[svc(5173, Some("node"), Binding::AllInterfaces)]);
             section.set_scan_failed("could not check what is listening: permission denied");
-            let calm = section.status_page();
-            let error = section.error_page();
+            let calm = section.empty_note();
+            let error = section.error_note();
             let icon_name = error
                 .as_ref()
                 .and_then(|p| p.icon_name())
@@ -576,8 +580,8 @@ fn a_scan_failure_survives_a_later_set_open_ports() -> Result<(), String> {
             section.set_scan_failed("could not check what is listening: permission denied");
             section.set_open_ports(&[5173]);
             *seen.borrow_mut() = Some((
-                section.status_page().is_some(),
-                section.error_page().is_some(),
+                section.empty_note().is_some(),
+                section.error_note().is_some(),
             ));
         },
     );
@@ -611,8 +615,8 @@ fn the_loading_state_survives_a_set_open_ports_before_any_scan() -> Result<(), S
             let section = ListeningSection::new();
             section.set_open_ports(&[5173]);
             *seen.borrow_mut() = Some((
-                section.loading_page().is_some(),
-                section.status_page().is_some(),
+                section.loading_note().is_some(),
+                section.empty_note().is_some(),
             ));
         },
     );
@@ -828,13 +832,54 @@ fn a_section_waiting_on_the_helper_does_not_report_a_failure() -> Result<(), Str
     Ok(())
 }
 
+/// The same measurement `tests/open_now.rs` makes on its own section, on
+/// this one: a quiet state is one section among several, not a view of its
+/// own. Both sections draw their quiet states from the same function
+/// (`quiet.rs`), and a window has both, so a regression in either one is
+/// what puts the other below the fold.
+fn the_confirmed_empty_state_is_no_taller_than_one_rendered_service() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningEmptyHeight",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_services(&[]);
+            let (_, empty, _, _) = section
+                .widget()
+                .measure(gtk::Orientation::Vertical, WINDOW_WIDTH_PX);
+            section.set_services(&[svc(5173, Some("node"), Binding::AllInterfaces)]);
+            let (_, one_service, _, _) = section
+                .widget()
+                .measure(gtk::Orientation::Vertical, WINDOW_WIDTH_PX);
+            let expands = section.widget().compute_expand(gtk::Orientation::Vertical);
+            *seen.borrow_mut() = Some((empty, one_service, expands));
+        },
+    );
+    let (empty, one_service, expands) = result.borrow_mut().take().ok_or("activation never ran")?;
+    if empty > one_service {
+        return Err(format!(
+            "the empty state wants {empty}px of height, more than the {one_service}px this \
+             section takes with a service actually in it"
+        ));
+    }
+    if expands {
+        return Err(
+            "the empty state claims vertical expansion, which is what pushes every other \
+             section down the window"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below -- see `tests/window.rs`'s own
 /// `Case` alias for why this is a type alias rather than spelled out
 /// inline.
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 20] = [
+    let cases: [Case; 21] = [
         (
             "a_service_shows_its_name_and_port_the_way_the_spec_writes_it",
             a_service_shows_its_name_and_port_the_way_the_spec_writes_it,
@@ -876,8 +921,12 @@ fn main() {
             dual_stack_network_facing_rows_show_different_addresses,
         ),
         (
-            "nothing_listening_is_a_calm_status_page_not_an_error",
-            nothing_listening_is_a_calm_status_page_not_an_error,
+            "nothing_listening_is_a_calm_note_not_an_error",
+            nothing_listening_is_a_calm_note_not_an_error,
+        ),
+        (
+            "the_confirmed_empty_state_is_no_taller_than_one_rendered_service",
+            the_confirmed_empty_state_is_no_taller_than_one_rendered_service,
         ),
         (
             "the_initial_state_before_any_scan_is_neither_calm_nor_populated",

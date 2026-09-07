@@ -56,6 +56,11 @@ fn activate<F: FnOnce(&adw::Application) + 'static>(app_id: &str, f: F) {
 /// on either side of a second boundary.
 const BASE_TIME: u64 = 1_757_100_000;
 
+/// `PortholeWindow`'s own default window width, in pixels -- the width a
+/// height measurement here has to be taken at for the wrapping it sees to
+/// be the wrapping a user gets.
+const WINDOW_WIDTH_PX: i32 = 480;
+
 /// A `Clock` a test can move forward directly, by mutating the `Cell` it
 /// shares with whichever `OpenNowSection` was built with a clone of it via
 /// `OpenNowSection::with_clock`. The test keeps the only other handle to
@@ -107,10 +112,10 @@ fn wire_rule(base: u64, port: u16, protocol: &str, target: &str, lifetime_secs: 
 /// "No ports open" is this machine's normal state, not an error. Presenting
 /// it as a problem -- a warning icon, an error style, a red anything --
 /// teaches the user to ignore the one part of this window that should mean
-/// something. Checked structurally (the icon name, the CSS classes), not
-/// only the title -- a title alone would still pass if a later change added
-/// `.add_css_class("error")` or swapped in a warning glyph.
-fn an_empty_list_is_a_calm_status_page_not_an_error() -> Result<(), String> {
+/// something. Checked structurally (the CSS classes, and that the error
+/// state is genuinely absent), not only the text -- text alone would still
+/// pass if a later change added `.add_css_class("error")`.
+fn an_empty_list_is_a_calm_note_not_an_error() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
     activate(
@@ -118,37 +123,36 @@ fn an_empty_list_is_a_calm_status_page_not_an_error() -> Result<(), String> {
         move |_app| {
             let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
             section.set_rules(&[]);
-            let status = section.status_page();
-            let title = status.as_ref().map(|p| p.title().to_string());
-            let icon_name = status
+            let note = section.empty_note();
+            let text = note.as_ref().map(|n| n.label().to_string());
+            let css_classes: Vec<String> = note
                 .as_ref()
-                .and_then(|p| p.icon_name())
-                .map(|s| s.to_string());
-            let css_classes: Vec<String> = status
-                .as_ref()
-                .map(|p| p.css_classes().iter().map(|c| c.to_string()).collect())
+                .map(|n| n.css_classes().iter().map(|c| c.to_string()).collect())
                 .unwrap_or_default();
+            let error_showing = section.error_note().is_some();
             let rows_empty = section.rows().is_empty();
-            *seen.borrow_mut() = Some((title, icon_name, css_classes, rows_empty));
+            *seen.borrow_mut() = Some((text, css_classes, error_showing, rows_empty));
         },
     );
-    let (title, icon_name, css_classes, rows_empty) =
+    let (text, css_classes, error_showing, rows_empty) =
         result.borrow_mut().take().ok_or("activation never ran")?;
-    if title.as_deref() != Some("No ports open") {
+    let text = text.ok_or("a confirmed-empty list must show its own note")?;
+    if !text.starts_with("No ports open") {
         return Err(format!(
-            "expected a status page titled \"No ports open\", got {title:?}"
-        ));
-    }
-    let icon = icon_name.unwrap_or_default();
-    if icon.contains("warning") || icon.contains("error") {
-        return Err(format!(
-            "the empty state's icon reads as a problem, not the ordinary state it is: {icon:?}"
+            "expected the confirmed-empty note to say so, got {text:?}"
         ));
     }
     if css_classes.iter().any(|c| c == "error" || c == "warning") {
         return Err(format!(
             "the empty state carries an error/warning CSS class: {css_classes:?}"
         ));
+    }
+    if error_showing {
+        return Err(
+            "the \"could not ask\" state must not be on screen alongside a confirmed-empty \
+             list"
+                .to_string(),
+        );
     }
     if !rows_empty {
         return Err("rows must be empty when nothing is open".to_string());
@@ -503,7 +507,7 @@ fn a_passed_deadline_is_reported_once_to_whoever_can_re_read_the_list() -> Resul
 /// conflating "confirmed nothing is open" with "could not ask" is this
 /// project's characteristic defect. Checked structurally (icon, CSS
 /// classes, and that the calm page is genuinely gone, not merely covered),
-/// the same way `an_empty_list_is_a_calm_status_page_not_an_error` checks
+/// the same way `an_empty_list_is_a_calm_note_not_an_error` checks
 /// the calm state's own icon/CSS rather than only its title.
 fn an_unreachable_helper_does_not_render_as_the_calm_empty_state() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
@@ -513,8 +517,8 @@ fn an_unreachable_helper_does_not_render_as_the_calm_empty_state() -> Result<(),
         move |_app| {
             let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
             section.set_unreachable("could not reach the porthole helper: timed out");
-            let calm = section.status_page();
-            let error = section.error_page();
+            let calm = section.empty_note();
+            let error = section.error_note();
             let icon_name = error
                 .as_ref()
                 .and_then(|p| p.icon_name())
@@ -588,9 +592,9 @@ fn the_initial_state_before_any_answer_is_neither_calm_nor_populated() -> Result
         move |_app| {
             let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
             *seen.borrow_mut() = Some((
-                section.loading_page().is_some(),
-                section.status_page().is_some(),
-                section.error_page().is_some(),
+                section.loading_note().is_some(),
+                section.empty_note().is_some(),
+                section.error_note().is_some(),
                 section.rows().is_empty(),
             ));
         },
@@ -629,7 +633,7 @@ fn an_errored_reply_reads_differently_from_an_unreachable_helper() -> Result<(),
         move |_app| {
             let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
             section.set_errored("not authorized: com.jacopobriccola.Porthole.List");
-            let page = section.error_page();
+            let page = section.error_note();
             let title = page.as_ref().map(|p| p.title().to_string());
             let description = page
                 .as_ref()
@@ -695,8 +699,8 @@ fn a_close_resolving_after_a_refresh_failure_does_not_repaint_the_calm_state() -
             // Only now does the close's reply arrive.
             section.simulate_close_succeeded(&id);
 
-            let calm = section.status_page();
-            let error = section.error_page();
+            let calm = section.empty_note();
+            let error = section.error_note();
             let error_title = error.as_ref().map(|p| p.title().to_string());
             *seen.borrow_mut() = Some((calm.is_some(), error.is_some(), error_title));
         },
@@ -805,16 +809,65 @@ fn an_ordinary_close_announces_the_rules_that_remain() -> Result<(), String> {
     }
 }
 
+/// The confirmed-empty state is one section among several, not a whole
+/// view of its own. Measured on the real widget rather than argued from
+/// its type: the section is asked how tall it wants to be at the window's
+/// own default width, first with nothing open and then holding one rule,
+/// and the empty state must not want more room than the section does with
+/// something actually in it. A whole-view empty state fails this by a wide
+/// margin -- its icon and padding alone are several rows tall -- and what
+/// that costs is the rest of the window scrolling out of sight to make
+/// room for a sentence.
+fn the_confirmed_empty_state_is_no_taller_than_one_rendered_rule() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenNowEmptyHeight",
+        move |_app| {
+            let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
+            section.set_rules(&[]);
+            // `WINDOW_WIDTH_PX` is `PortholeWindow`'s own default width, so
+            // the wrapping this measurement sees is the wrapping a user
+            // gets.
+            let (_, empty, _, _) = section
+                .widget()
+                .measure(gtk::Orientation::Vertical, WINDOW_WIDTH_PX);
+            section.set_rules(&[wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 3600)]);
+            let (_, one_rule, _, _) = section
+                .widget()
+                .measure(gtk::Orientation::Vertical, WINDOW_WIDTH_PX);
+            let expands = section.widget().compute_expand(gtk::Orientation::Vertical);
+            *seen.borrow_mut() = Some((empty, one_rule, expands));
+        },
+    );
+    let (empty, one_rule, expands) = result.borrow_mut().take().ok_or("activation never ran")?;
+    if empty > one_rule {
+        return Err(format!(
+            "the empty state wants {empty}px of height, more than the {one_rule}px this \
+             section takes with a rule actually in it -- a section-scaled quiet state \
+             cannot cost more room than the content it stands in for"
+        ));
+    }
+    if expands {
+        return Err(
+            "the empty state claims vertical expansion, which is what pushes every other \
+             section down the window"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below -- see `tests/window.rs`'s own
 /// `Case` alias for why this is a type alias rather than spelled out
 /// inline (the clippy finding that alias itself fixed there).
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 14] = [
+    let cases: [Case; 15] = [
         (
-            "an_empty_list_is_a_calm_status_page_not_an_error",
-            an_empty_list_is_a_calm_status_page_not_an_error,
+            "an_empty_list_is_a_calm_note_not_an_error",
+            an_empty_list_is_a_calm_note_not_an_error,
         ),
         (
             "each_rule_shows_port_protocol_target_and_a_close_button",
@@ -867,6 +920,10 @@ fn main() {
         (
             "an_ordinary_close_announces_the_rules_that_remain",
             an_ordinary_close_announces_the_rules_that_remain,
+        ),
+        (
+            "the_confirmed_empty_state_is_no_taller_than_one_rendered_rule",
+            the_confirmed_empty_state_is_no_taller_than_one_rendered_rule,
         ),
     ];
 

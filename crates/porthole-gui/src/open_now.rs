@@ -78,14 +78,15 @@
 //! [`OpenNowSection::set_unreachable`] and [`OpenNowSection::set_errored`]
 //! are the states for exactly that -- two different facts (no answer at
 //! all, versus an answer that was itself an error), both sharing one
-//! widget, [`Inner::error_page`], with different titles, and both distinct
-//! from a repurposed calm `status_page`. Rendering "No ports open" when the
+//! widget, [`Inner::error_note`], with different titles, and both distinct
+//! from a repurposed calm `empty_note`. Rendering "No ports open" when the
 //! true state is "I could not ask" is this project's characteristic defect
 //! -- the same shape that in milestone 3 told an unprivileged user their
 //! port was already reachable when porthole had merely been denied
 //! permission to look -- reproduced here at the one layer left that could
-//! still make it. `error_page` carries a `dialog-error-symbolic` icon and
-//! the `error` style class, the calm page carries neither (see
+//! still make it. `error_note` carries a `dialog-error-symbolic` icon and
+//! the `error` style class; the calm state is a bare `gtk::Label`, which
+//! has no icon and neither class (see
 //! `tests/open_now.rs`'s own empty-state test for exactly what it checks),
 //! and the message shown is whatever the caller passed, verbatim -- see
 //! `status_bar.rs`'s own module doc for why the same distinction has to
@@ -94,9 +95,9 @@
 //!
 //! ## Before the first answer arrives
 //!
-//! [`Inner::loading_page`] is what this section shows before `set_rules`,
+//! [`Inner::loading_note`] is what this section shows before `set_rules`,
 //! `set_unreachable` or `set_errored` has ever been called -- a fourth,
-//! neutral widget, not the calm `status_page`. "No ports open" is a
+//! neutral widget, not the calm `empty_note`. "No ports open" is a
 //! confirmed fact this section has not yet earned the right to state; a
 //! zbus proxy carries no default per-call timeout, so without this,
 //! construction would assert that confirmed fact for as long as a
@@ -126,6 +127,8 @@ use gtk::glib;
 
 use porthole_core::clock::{Clock, SystemClock};
 use porthole_core::ipc::{PortholeProxy, WireRule};
+
+use crate::quiet::{quiet_note, TroubleNote};
 
 /// What a caller registers through
 /// [`OpenNowSection::connect_close_succeeded`] to hear that a close this
@@ -170,21 +173,23 @@ struct Row {
 
 struct Inner {
     /// What `PortholeWindow` appends into its `content()` box. Holds
-    /// exactly one child at a time: `loading_page` before any answer has
-    /// arrived, `status_page` once the list is confirmed empty,
-    /// `error_page` when the helper could not be reached or answered with
+    /// exactly one child at a time: `loading_note` before any answer has
+    /// arrived, `empty_note` once the list is confirmed empty,
+    /// `error_note` when the helper could not be reached or answered with
     /// an error, `group` otherwise.
     container: gtk::Box,
     group: adw::PreferencesGroup,
-    status_page: adw::StatusPage,
-    /// A **different** widget from `status_page`, not a relabelling of it
+    /// The confirmed-empty state: one dim line, section-scaled, carrying
+    /// [`EMPTY_NOTE`] and no icon at all.
+    empty_note: gtk::Label,
+    /// A **different** widget from `empty_note`, not a relabelling of it
     /// -- see this module's own doc comment on why a failure to reach the
     /// helper must never render as the calm empty state.
-    error_page: adw::StatusPage,
+    error_note: TroubleNote,
     /// A **different** widget again -- see this module's own doc comment on
     /// why the calm "No ports open" claim must not be the default before
     /// this section has actually heard back from anything.
-    loading_page: adw::StatusPage,
+    loading_note: gtk::Label,
     rows: RefCell<Vec<Row>>,
     /// The last list `set_rules` was given, kept so a successful close can
     /// drop exactly the one rule that closed and re-render from the rest,
@@ -345,6 +350,22 @@ fn tick(inner: &Rc<Inner>) {
     }
 }
 
+/// What the section says once a `list` has come back and named nothing.
+///
+/// One dim line rather than a whole-view empty state: this is one section
+/// among several, and a widget that fills a window pushes the rest of the
+/// window's content out of sight to say it. Measured in this milestone's
+/// own container, at the window's own default width: the whole-view shape
+/// this replaced asked for 300px of height where the same section asks for
+/// 94px with a rule actually rendered in it.
+const EMPTY_NOTE: &str = "No ports open. Open a port below when you need one.";
+
+/// What the section says before any answer has arrived. Same shape and
+/// same scale as [`EMPTY_NOTE`], different words -- see this module's own
+/// doc comment on why not having heard yet is not the same fact as having
+/// heard "nothing".
+const LOADING_NOTE: &str = "Checking what's open…";
+
 /// [`OpenNowSection::set_unreachable`]'s title -- no answer came back at
 /// all.
 const UNREACHABLE_TITLE: &str = "Porthole helper unreachable";
@@ -419,27 +440,27 @@ fn apply(inner: &Rc<Inner>, rules: &[WireRule], listed_at: u64) {
     // A successful `set_rules` -- even an empty one -- means the helper
     // *was* reached and answered, so any previous "could not reach"/
     // "errored" state, or the initial "not answered yet" one, is stale and
-    // must go, the same way `error_page` and `loading_page` displace
-    // `group` and `status_page` in `apply_error` below.
-    if inner.error_page.parent().is_some() {
-        inner.container.remove(&inner.error_page);
+    // must go, the same way `error_note` displaces `group`, `empty_note`
+    // and `loading_note` in `apply_error` below.
+    if inner.error_note.is_showing() {
+        inner.container.remove(inner.error_note.widget());
     }
-    if inner.loading_page.parent().is_some() {
-        inner.container.remove(&inner.loading_page);
+    if inner.loading_note.parent().is_some() {
+        inner.container.remove(&inner.loading_note);
     }
 
     if rules.is_empty() {
         if inner.group.parent().is_some() {
             inner.container.remove(&inner.group);
         }
-        if inner.status_page.parent().is_none() {
-            inner.container.append(&inner.status_page);
+        if inner.empty_note.parent().is_none() {
+            inner.container.append(&inner.empty_note);
         }
         return;
     }
 
-    if inner.status_page.parent().is_some() {
-        inner.container.remove(&inner.status_page);
+    if inner.empty_note.parent().is_some() {
+        inner.container.remove(&inner.empty_note);
     }
     if inner.group.parent().is_none() {
         inner.container.append(&inner.group);
@@ -548,7 +569,7 @@ fn apply_close(inner: &Rc<Inner>, id: &str) {
     }
 }
 
-/// Replaces whatever `inner.container` was showing with `error_page`,
+/// Replaces whatever `inner.container` was showing with `error_note`,
 /// titled `title` and described by `message` -- the shared shape behind
 /// [`OpenNowSection::set_unreachable`] and [`OpenNowSection::set_errored`],
 /// which differ only in which title they pass. Clears `rows`/`rules` too:
@@ -565,17 +586,17 @@ fn apply_error(inner: &Rc<Inner>, title: &str, message: &str) {
     if inner.group.parent().is_some() {
         inner.container.remove(&inner.group);
     }
-    if inner.status_page.parent().is_some() {
-        inner.container.remove(&inner.status_page);
+    if inner.empty_note.parent().is_some() {
+        inner.container.remove(&inner.empty_note);
     }
-    if inner.loading_page.parent().is_some() {
-        inner.container.remove(&inner.loading_page);
+    if inner.loading_note.parent().is_some() {
+        inner.container.remove(&inner.loading_note);
     }
 
-    inner.error_page.set_title(title);
-    inner.error_page.set_description(Some(message));
-    if inner.error_page.parent().is_none() {
-        inner.container.append(&inner.error_page);
+    inner.error_note.set_title(title);
+    inner.error_note.set_description(message);
+    if !inner.error_note.is_showing() {
+        inner.container.append(inner.error_note.widget());
     }
 }
 
@@ -614,52 +635,45 @@ impl OpenNowSection {
         let group = adw::PreferencesGroup::builder().title("Open now").build();
 
         // "No ports open" is this machine's normal state, not a problem --
-        // a plain status page, no warning icon, no error styling. Presenting
-        // it as trouble would teach the user to ignore the one part of this
-        // window that should mean something.
-        let status_page = adw::StatusPage::builder()
-            .title("No ports open")
-            .description("Open a port below when you need one.")
-            .icon_name("network-wired-symbolic")
-            .build();
+        // one dim line, no icon, no error styling. Presenting it as trouble
+        // would teach the user to ignore the one part of this window that
+        // should mean something; presenting it at whole-window scale costs
+        // the rest of the window the room to be seen (see [`EMPTY_NOTE`]).
+        let empty_note = quiet_note(EMPTY_NOTE);
 
         // The other case an empty list can mean: porthole did not confirm
         // there is nothing open, it could not ask (or asked and the helper
-        // answered with an error). A
-        // `dialog-error-symbolic` icon and the `error` style class -- both
-        // absent from `status_page` above -- are what make
-        // `tests/open_now.rs`'s own test able to tell the two apart
-        // structurally, not just by title. See this module's own doc
-        // comment. The title itself is set per call by `apply_error`
+        // answered with an error). A `dialog-error-symbolic` icon and the
+        // `error` style class -- neither of which a bare `gtk::Label` has
+        // -- on a widget of a different type from `empty_note` above,
+        // which is what makes `tests/open_now.rs`'s own test able to tell
+        // the two apart structurally, not just by title. See this module's
+        // own doc comment. The title itself is set per call by `apply_error`
         // (`set_unreachable`/`set_errored` each pass their own); the one
         // given here at construction is only the default until either is
         // first called.
-        let error_page = adw::StatusPage::builder()
-            .title(UNREACHABLE_TITLE)
-            .icon_name("dialog-error-symbolic")
-            .css_classes(["error"])
-            .build();
+        let error_note = TroubleNote::new();
+        error_note.set_title(UNREACHABLE_TITLE);
 
         // Shown before any answer has arrived -- see this module's own
-        // doc comment on why the calm `status_page` above must not be the
+        // doc comment on why the calm `empty_note` above must not be the
         // default. Neutral: no error/warning styling, since not having
-        // heard back yet is not itself trouble.
-        let loading_page = adw::StatusPage::builder()
-            .title("Checking what's open…")
-            .icon_name("content-loading-symbolic")
-            .build();
+        // heard back yet is not itself trouble. Same scale as
+        // `empty_note`, so the section does not change height when one
+        // replaces the other.
+        let loading_note = quiet_note(LOADING_NOTE);
 
         let container = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .build();
-        container.append(&loading_page);
+        container.append(&loading_note);
 
         let inner = Rc::new(Inner {
             container,
             group,
-            status_page,
-            error_page,
-            loading_page,
+            empty_note,
+            error_note,
+            loading_note,
             rows: RefCell::new(Vec::new()),
             rules: RefCell::new(Vec::new()),
             listed_at: Cell::new(0),
@@ -773,12 +787,15 @@ impl OpenNowSection {
 
     /// `Some` only while the list is confirmed empty -- once there is a
     /// row, the helper could not be reached or answered with an error
-    /// ([`OpenNowSection::error_page`]), or no answer has arrived yet
-    /// ([`OpenNowSection::loading_page`]), this section shows something
+    /// ([`OpenNowSection::error_note`]), or no answer has arrived yet
+    /// ([`OpenNowSection::loading_note`]), this section shows something
     /// else instead.
-    pub fn status_page(&self) -> Option<adw::StatusPage> {
-        if self.inner.status_page.parent().is_some() {
-            Some(self.inner.status_page.clone())
+    ///
+    /// A `gtk::Label`, not an `adw::StatusPage`: this is one section of a
+    /// window, not a view of its own. See `quiet.rs`.
+    pub fn empty_note(&self) -> Option<gtk::Label> {
+        if self.inner.empty_note.parent().is_some() {
+            Some(self.inner.empty_note.clone())
         } else {
             None
         }
@@ -786,14 +803,14 @@ impl OpenNowSection {
 
     /// `Some` only while [`OpenNowSection::set_unreachable`]'s or
     /// [`OpenNowSection::set_errored`]'s state is showing -- a real,
-    /// distinct widget from [`OpenNowSection::status_page`], never both at
-    /// once. A test reads this (and its title, its icon, and its CSS
-    /// classes) rather than trusting that "the list is empty" and "the
-    /// helper could not be reached" render the same way just because both
-    /// start from zero rows.
-    pub fn error_page(&self) -> Option<adw::StatusPage> {
-        if self.inner.error_page.parent().is_some() {
-            Some(self.inner.error_page.clone())
+    /// distinct widget from [`OpenNowSection::empty_note`], of a different
+    /// type, never both at once. A test reads this (and its title, its
+    /// icon, and its CSS classes) rather than trusting that "the list is
+    /// empty" and "the helper could not be reached" render the same way
+    /// just because both start from zero rows.
+    pub fn error_note(&self) -> Option<TroubleNote> {
+        if self.inner.error_note.is_showing() {
+            Some(self.inner.error_note.clone())
         } else {
             None
         }
@@ -803,11 +820,11 @@ impl OpenNowSection {
     /// -- the very first widget a freshly constructed section shows, and
     /// gone for good the moment `set_rules`, `set_unreachable` or
     /// `set_errored` is called even once. See this module's own doc
-    /// comment for why the calm `status_page` must not be that first
-    /// widget instead.
-    pub fn loading_page(&self) -> Option<adw::StatusPage> {
-        if self.inner.loading_page.parent().is_some() {
-            Some(self.inner.loading_page.clone())
+    /// comment for why the calm [`OpenNowSection::empty_note`] must not be
+    /// that first widget instead.
+    pub fn loading_note(&self) -> Option<gtk::Label> {
+        if self.inner.loading_note.parent().is_some() {
+            Some(self.inner.loading_note.clone())
         } else {
             None
         }

@@ -728,7 +728,7 @@ fn load_devices() -> DeviceSnapshot {
 /// timeout of their own -- against a live-but-hung helper, an unbounded
 /// wait would leave both sections sitting on their own indeterminate "not
 /// answered yet" state (`OpenNowSection`'s and `ListeningSection`'s own
-/// `loading_page`) forever, rather than ever settling into a state a user
+/// `loading_note`) forever, rather than ever settling into a state a user
 /// can act on.
 const HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
