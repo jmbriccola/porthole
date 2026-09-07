@@ -74,14 +74,15 @@ act on.
 
 Everything above is also a window. `porthole-gui` shows what is open now with
 a live countdown, shows what is listening on this machine so you can open a
-port without typing a number, and opens one in two clicks. It talks to the
+port without typing a number, opens one in two clicks, and saves a device to
+open towards. It talks to the
 same privileged helper over the same D-Bus interface the CLI uses, so it
 inherits the 8-hour ceiling and the polkit prompts without restating either —
 nothing about *what* porthole will do changes depending on which one you run.
 A window has no exit code to inherit; a failed request shows the helper's own
 message in the GUI instead, the same wording the CLI would have printed.
 
-![The Porthole window: two rules under "Open now", one with a live countdown and one until reboot, and five services under "Listening", one of them already open and one reachable only over IPv6](docs/screenshot.png)
+![The Porthole window: two rules under "Open now", one with a live countdown and one until reboot, and six services under "Listening", one of them already open and one reachable only over IPv6](docs/screenshot.png)
 
 *Rendered by the app itself, under Xvfb, from invented example data — not a
 real machine's, which would either show nothing on a machine with no ports
@@ -236,6 +237,13 @@ getting an answer: make it talk to this machine — load something from it, or
 ping it — and run the command again. It saves a MAC and nothing else. A device
 named by hostname (`host = "printer.local"`, resolved through `getent`) is
 added by editing `~/.config/porthole/devices.toml` by hand.
+
+The GUI writes the same file, through **Saved Devices** in its menu or the
+button beside the open dialog's target list. It offers the same picker and
+adds a field for typing a MAC by hand, for a device that is switched off and
+so cannot be picked. Such a device is saved without being found: the dialog
+says at that moment that it did not resolve, and `open --to <name>` fails
+with exit code 6 until it does.
 
 That file is the whole address book, and it lives client-side. **The
 privileged helper never reads it**: `--to <name>` is resolved in the CLI, and
