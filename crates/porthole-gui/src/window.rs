@@ -102,6 +102,7 @@ use porthole_core::docker::Published;
 use porthole_core::ipc::{PortholeProxy, WireDockerPort, WireRule, WireStatus};
 use porthole_core::listening::RealProcFs;
 
+use crate::busy::BusyIndicator;
 use crate::listening_section::ListeningSection;
 use crate::open_dialog::{DeviceEntry, OpenDialog};
 use crate::open_now::OpenNowSection;
@@ -137,6 +138,10 @@ struct Sections {
     docker: Rc<RefCell<Option<Vec<Published>>>>,
     /// Whether a refresh is already scheduled -- see [`schedule_refresh`].
     refresh_pending: Rc<Cell<bool>>,
+    /// The header bar's own busy indication, held for as long as a helper
+    /// round trip is outstanding -- see [`refresh`], and `busy.rs` for what
+    /// it is allowed to mean.
+    busy: BusyIndicator,
 }
 
 /// The width, in CSS pixels, at or below which the narrow layout applies.
@@ -166,6 +171,7 @@ pub struct PortholeWindow {
     devices: Rc<RefCell<DeviceSnapshot>>,
     docker: Rc<RefCell<Option<Vec<Published>>>>,
     refresh_pending: Rc<Cell<bool>>,
+    busy: BusyIndicator,
 }
 
 impl Deref for PortholeWindow {
@@ -245,6 +251,17 @@ impl PortholeWindow {
             .build();
         let header_bar = adw::HeaderBar::new();
         header_bar.pack_start(&open_button);
+
+        // Where a refresh says it is still waiting. In the header bar
+        // rather than in either section: a refresh is a fact about the
+        // window as a whole, and both sections plus the status line are
+        // filled from the one round trip it makes. Hidden until
+        // `crate::busy::BUSY_DELAY` has gone by, so a refresh that comes
+        // straight back shows nothing -- see `busy.rs`.
+        let busy = BusyIndicator::new();
+        busy.spinner()
+            .set_tooltip_text(Some("Waiting for the porthole helper"));
+        header_bar.pack_end(busy.spinner());
 
         let toolbar_view = adw::ToolbarView::new();
         toolbar_view.add_top_bar(&header_bar);
@@ -326,6 +343,7 @@ impl PortholeWindow {
             devices: devices.clone(),
             docker: docker.clone(),
             refresh_pending: refresh_pending.clone(),
+            busy: busy.clone(),
         };
         open_button.connect_clicked(move |_| {
             present_open_dialog(&sections_for_open, &OpenDialog::new());
@@ -346,6 +364,7 @@ impl PortholeWindow {
             devices: devices.clone(),
             docker: docker.clone(),
             refresh_pending: refresh_pending.clone(),
+            busy: busy.clone(),
         };
         listening.connect_open_requested(move |port| {
             present_open_dialog(&sections_for_row, &OpenDialog::for_port(port));
@@ -387,6 +406,7 @@ impl PortholeWindow {
             devices,
             docker,
             refresh_pending,
+            busy,
         }
     }
 
@@ -403,6 +423,7 @@ impl PortholeWindow {
             devices: self.devices.clone(),
             docker: self.docker.clone(),
             refresh_pending: self.refresh_pending.clone(),
+            busy: self.busy.clone(),
         }
     }
 
@@ -456,6 +477,15 @@ impl PortholeWindow {
     /// keeps around.
     pub fn open_button(&self) -> &gtk::Button {
         &self.open_button
+    }
+
+    /// The header bar's own busy indication -- `is_busy()` for "a helper
+    /// round trip is outstanding", `is_showing()` for "and it has been
+    /// outstanding long enough to say so on screen". A test reads these to
+    /// check that a refresh clears them again however it ends: an answer,
+    /// a typed error, no helper at all, or [`HELPER_TIMEOUT`] running out.
+    pub fn busy(&self) -> &BusyIndicator {
+        &self.busy
     }
 
     /// Every widget this window currently has that a click can activate --
@@ -977,7 +1007,15 @@ fn refresh(sections: &Sections) {
         let open_now = sections.open_now.clone();
         let listening = sections.listening.clone();
         let status_bar = sections.status_bar.clone();
+        let busy = sections.busy.clone();
         glib::spawn_future_local(async move {
+            // The one read here that can take long enough to look like a
+            // stall. The `/proc` scan and the address book above are on
+            // GLib's I/O thread pool and come back in milliseconds; this
+            // one crosses a bus, and the helper behind it can be slow or
+            // absent. Held across the round trip and dropped on the way
+            // out of this block, whichever way that is -- see `busy.rs`.
+            let _busy = busy.begin();
             match with_timeout(fetch_helper_snapshot(), HELPER_TIMEOUT).await {
                 Some(Ok(snapshot)) => {
                     match snapshot.rules {

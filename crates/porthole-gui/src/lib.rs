@@ -6,6 +6,7 @@
 //! bin-only crate.
 
 pub mod app;
+pub mod busy;
 pub mod listening_section;
 pub mod open_dialog;
 pub mod open_now;

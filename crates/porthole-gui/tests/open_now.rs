@@ -49,6 +49,27 @@ fn activate<F: FnOnce(&adw::Application) + 'static>(app_id: &str, f: F) {
     app.run_with_args::<&str>(&[]);
 }
 
+/// Drains the main context until `condition` holds, or `timeout` elapses --
+/// the same bounded shape `tests/window.rs` and `tests/signals.rs` use, so
+/// a path that never settles fails the check rather than hanging the
+/// process. Only the close check below needs it: every other check here
+/// asserts on properties this section sets directly, with no round trip in
+/// between.
+fn pump_until(condition: impl Fn() -> bool, timeout: std::time::Duration) -> bool {
+    let context = gtk::glib::MainContext::default();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        while context.iteration(false) {}
+        if condition() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return condition();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// A fixed constant, never read from the real clock. Every test that cares
 /// about a specific countdown value builds its fixture and its
 /// `SharedClock` from this same constant, so there is exactly one source of
@@ -858,13 +879,80 @@ fn the_confirmed_empty_state_is_no_taller_than_one_rendered_rule() -> Result<(),
     Ok(())
 }
 
+/// A close pressed for real, with no helper anywhere to answer it: this
+/// container has no system bus at all (see `tests/window.rs`'s own
+/// unreachable check for why), so `close_by_id_over_dbus` fails at the
+/// connection. The row's busy indication is armed by that press and has to
+/// be gone once the attempt is over, with the button pressable again -- a
+/// row left spinning over a close that already failed is the same "the
+/// application looks stuck" defect the indication was added to repair,
+/// wearing the opposite costume.
+///
+/// The press is a real `emit_clicked` on the real button, not a call to
+/// anything this file could reach directly. What this check cannot see is
+/// the *middle* of that attempt: with no bus to connect to, the failure can
+/// land within a single turn of the main context, so there is no reliable
+/// moment at which to observe the indication switched on. `tests/busy.rs`
+/// is where the appearing half is pinned, and `tests/signals.rs` is where a
+/// helper slow enough to watch actually answers one.
+fn a_close_with_no_helper_to_answer_it_leaves_nothing_waiting() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenNowCloseUnreachable",
+        move |_app| {
+            let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
+            section.set_rules(&[wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 3600)]);
+            let Some(button) = section.close_button_for(0) else {
+                return;
+            };
+            let Some(busy) = section.close_busy_for(0) else {
+                return;
+            };
+            button.emit_clicked();
+            let settled = pump_until(|| !busy.is_busy(), std::time::Duration::from_secs(5));
+            *seen.borrow_mut() = Some((
+                settled,
+                busy.is_showing(),
+                button.is_sensitive(),
+                section.rows().len(),
+            ));
+        },
+    );
+    let (settled, showing, sensitive, rows) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if !settled {
+        return Err(
+            "the close never stopped reporting an outstanding operation, so nothing ever \
+             released the row's busy indication"
+                .to_string(),
+        );
+    }
+    if showing {
+        return Err("the row is still spinning over a close that already failed".to_string());
+    }
+    if !sensitive {
+        return Err(
+            "the close button never came back, so the port cannot be closed again without \
+             restarting porthole"
+                .to_string(),
+        );
+    }
+    if rows != 1 {
+        return Err(format!(
+            "a close that failed must leave its row exactly where it was, got {rows} rows"
+        ));
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below -- see `tests/window.rs`'s own
 /// `Case` alias for why this is a type alias rather than spelled out
 /// inline (the clippy finding that alias itself fixed there).
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 15] = [
+    let cases: [Case; 16] = [
         (
             "an_empty_list_is_a_calm_note_not_an_error",
             an_empty_list_is_a_calm_note_not_an_error,
@@ -924,6 +1012,10 @@ fn main() {
         (
             "the_confirmed_empty_state_is_no_taller_than_one_rendered_rule",
             the_confirmed_empty_state_is_no_taller_than_one_rendered_rule,
+        ),
+        (
+            "a_close_with_no_helper_to_answer_it_leaves_nothing_waiting",
+            a_close_with_no_helper_to_answer_it_leaves_nothing_waiting,
         ),
     ];
 

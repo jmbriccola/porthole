@@ -594,6 +594,59 @@ fn closing_a_port_brings_back_the_listening_rows_open_button() -> Result<(), Str
     Ok(())
 }
 
+/// A refresh that finds no helper at all must leave nothing waiting.
+///
+/// Same real failure this file's own unreachable check runs against -- the
+/// container has no system bus, so `refresh`'s round trip genuinely fails
+/// rather than being simulated. What is asserted here is the other half of
+/// it: the header bar's busy indication is armed by that round trip and has
+/// to be gone once the round trip is over, however it ended. A spinner
+/// still turning over a refresh that failed is the same "the application
+/// looks stuck" defect the indication was added to repair.
+///
+/// The settled error state is what proves the refresh actually finished, so
+/// this is not a check that happens to pass because nothing ever started.
+fn a_refresh_that_finds_no_helper_leaves_nothing_waiting() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.UnreachableBusy",
+        move |app| {
+            let win = PortholeWindow::new(app);
+            win.present();
+            let settled = pump_until(
+                || win.open_now().error_note().is_some(),
+                Duration::from_secs(5),
+            );
+            seen.replace(Some((
+                settled,
+                win.busy().is_busy(),
+                win.busy().is_showing(),
+            )));
+        },
+    );
+    let (settled, still_busy, still_showing) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if !settled {
+        return Err(
+            "the helper-unreachable state never settled within the timeout, so this check \
+             never saw a finished refresh at all"
+                .to_string(),
+        );
+    }
+    if still_busy {
+        return Err(
+            "the refresh is over -- its failure is on screen -- and the window still \
+             reports a helper round trip outstanding"
+                .to_string(),
+        );
+    }
+    if still_showing {
+        return Err("the header bar is still spinning over a refresh that failed".to_string());
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below. A type alias rather than spelling
 /// `(&str, fn() -> Result<(), String>)` out at the call site: clippy's
 /// `type_complexity` flagged the inline form (the actual finding from the
@@ -606,7 +659,7 @@ fn main() {
     // A plain array, not `vec![]`: the list is fixed at compile time and
     // never grows, so there is nothing a `Vec` buys here, independently of
     // what clippy does or does not flag.
-    let cases: [Case; 13] = [
+    let cases: [Case; 14] = [
         (
             "the_window_is_actually_realized_not_merely_constructed",
             the_window_is_actually_realized_not_merely_constructed,
@@ -646,6 +699,10 @@ fn main() {
         (
             "a_construction_with_an_unreachable_helper_does_not_show_the_calm_empty_state",
             a_construction_with_an_unreachable_helper_does_not_show_the_calm_empty_state,
+        ),
+        (
+            "a_refresh_that_finds_no_helper_leaves_nothing_waiting",
+            a_refresh_that_finds_no_helper_leaves_nothing_waiting,
         ),
         (
             "pressing_a_listening_rows_open_button_opens_the_dialog",

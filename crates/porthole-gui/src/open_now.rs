@@ -128,6 +128,7 @@ use gtk::glib;
 use porthole_core::clock::{Clock, SystemClock};
 use porthole_core::ipc::{PortholeProxy, WireRule};
 
+use crate::busy::BusyIndicator;
 use crate::quiet::{quiet_note, TroubleNote};
 
 /// What a caller registers through
@@ -161,6 +162,13 @@ struct Row {
     row: adw::ActionRow,
     countdown_label: gtk::Label,
     close_button: gtk::Button,
+    /// This row's own busy indication, for the close it can issue: its
+    /// spinner sits in the row, and its `disable_while_busy` holds
+    /// `close_button` insensitive so a second press cannot send a second
+    /// close while the first is unanswered. One per row, not one per
+    /// section: two rows can be closing at once and neither may speak for
+    /// the other.
+    close_busy: BusyIndicator,
     /// `Some` only for a rule open to anyone. [`OpenNowSection::is_marked_significant`]
     /// does not trust this field's mere `Some`-ness -- that would only
     /// prove an icon was *constructed*, not that it was ever actually
@@ -503,14 +511,30 @@ fn apply(inner: &Rc<Inner>, rules: &[WireRule], listed_at: u64) {
             .tooltip_text("Close this port")
             .css_classes(["flat"])
             .build();
+
+        // Between the countdown and the button, so the row says what it is
+        // waiting for right where the press happened. Hidden until
+        // `crate::busy::BUSY_DELAY` has gone by, and hidden again the
+        // moment the close resolves -- see `busy.rs` for why both.
+        let close_busy = BusyIndicator::new();
+        close_busy
+            .spinner()
+            .set_tooltip_text(Some("Waiting for the porthole helper"));
+        action_row.add_suffix(close_busy.spinner());
         action_row.add_suffix(&close_button);
+        close_busy.disable_while_busy(&close_button);
 
         let id_for_click = rule.id.clone();
         let inner_for_click = inner.clone();
+        let busy_for_click = close_busy.clone();
         close_button.connect_clicked(move |_| {
             let inner = inner_for_click.clone();
             let id = id_for_click.clone();
+            let busy = busy_for_click.clone();
             glib::spawn_future_local(async move {
+                // Held across the call and dropped on the way out of this
+                // block, whichever way that is -- see `busy.rs`.
+                let _busy = busy.begin();
                 match close_by_id_over_dbus(&id).await {
                     Ok(()) => apply_close(&inner, &id),
                     Err(message) => inner.show_toast(&message),
@@ -529,6 +553,7 @@ fn apply(inner: &Rc<Inner>, rules: &[WireRule], listed_at: u64) {
             row: action_row,
             countdown_label,
             close_button,
+            close_busy,
             significant_icon,
         });
     }
@@ -845,6 +870,19 @@ impl OpenNowSection {
             .borrow()
             .get(index)
             .map(|r| r.close_button.clone())
+    }
+
+    /// Row `index`'s own busy indication for the close its button issues --
+    /// `is_busy()` for "porthole is waiting for an answer about this rule",
+    /// `is_showing()` for "and it has been waiting long enough to say so on
+    /// screen". A test reads these to check that a close clears them again
+    /// however it ends.
+    pub fn close_busy_for(&self, index: usize) -> Option<BusyIndicator> {
+        self.inner
+            .rows
+            .borrow()
+            .get(index)
+            .map(|r| r.close_busy.clone())
     }
 
     /// Item 7: whether row `index` carries the "open to anyone" marking,

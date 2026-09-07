@@ -41,6 +41,7 @@ use adw::prelude::*;
 use porthole_core::ipc::{
     CloseReason, WireDockerPort, WireRule, WireStatus, INTERFACE, PATH, SERVICE,
 };
+use porthole_gui::open_dialog::OpenDialog;
 use porthole_gui::window::PortholeWindow;
 
 /// How long any of these will wait for something to cross the bus and reach
@@ -88,6 +89,34 @@ fn pump_until(condition: impl Fn() -> bool, timeout: Duration) -> bool {
 /// that changes them.
 type Rules = Arc<Mutex<Vec<WireRule>>>;
 
+/// What the stand-in does with an `open` or a `close_by_id`, set by
+/// whichever case is running.
+///
+/// `delay` stands in for the wait a real helper introduces -- a polkit
+/// prompt and a `firewall-cmd` run, which this project measured at up to
+/// roughly 28 seconds against firewalld's own polkit timeout. A case that
+/// wants to watch the busy indication appear sets it past
+/// `porthole_gui::busy::BUSY_DELAY`; a case that only cares how the
+/// indication ends leaves it at zero.
+#[derive(Clone)]
+struct Behaviour {
+    delay: Duration,
+    /// `Some` to answer with a typed error carrying this text, `None` to
+    /// answer successfully.
+    refuse: Option<String>,
+}
+
+impl Default for Behaviour {
+    fn default() -> Self {
+        Self {
+            delay: Duration::ZERO,
+            refuse: None,
+        }
+    }
+}
+
+type Shared = Arc<Mutex<Behaviour>>;
+
 /// A helper that answers the three reads the window makes and does nothing
 /// else. It never opens or closes anything: a test sets what `list` returns
 /// and then announces the change itself, which is exactly the situation
@@ -95,6 +124,7 @@ type Rules = Arc<Mutex<Vec<WireRule>>>;
 /// is open.
 struct StandInHelper {
     rules: Rules,
+    behaviour: Shared,
 }
 
 #[zbus::interface(name = "com.jacopobriccola.Porthole1")]
@@ -121,6 +151,49 @@ impl StandInHelper {
 
     async fn docker_ports(&self) -> Vec<WireDockerPort> {
         Vec::new()
+    }
+
+    /// Answers the two calls a *button* in this window makes, unlike the
+    /// three reads above -- which is what lets a case press one for real
+    /// and watch what the window does while the answer is outstanding.
+    ///
+    /// `std::thread::sleep`, not an async one: this stand-in serves one
+    /// call at a time on its own connection's executor, and the whole point
+    /// of the delay is that the client is left waiting for it.
+    async fn open(
+        &self,
+        port: u16,
+        _protocol: &str,
+        _scope: &str,
+        _seconds: u32,
+    ) -> zbus::fdo::Result<WireRule> {
+        let behaviour = self.behaviour.lock().expect("not poisoned").clone();
+        std::thread::sleep(behaviour.delay);
+        if let Some(message) = behaviour.refuse {
+            return Err(zbus::fdo::Error::Failed(message));
+        }
+        let rule = wire_rule(port);
+        self.rules.lock().expect("not poisoned").push(rule.clone());
+        Ok(rule)
+    }
+
+    async fn close_by_id(
+        &self,
+        id: &str,
+        _from_timer: bool,
+        _forget: bool,
+    ) -> zbus::fdo::Result<WireRule> {
+        let behaviour = self.behaviour.lock().expect("not poisoned").clone();
+        std::thread::sleep(behaviour.delay);
+        if let Some(message) = behaviour.refuse {
+            return Err(zbus::fdo::Error::Failed(message));
+        }
+        let mut rules = self.rules.lock().expect("not poisoned");
+        let index = rules
+            .iter()
+            .position(|r| r.id == id)
+            .ok_or_else(|| zbus::fdo::Error::Failed(format!("{id} is not open")))?;
+        Ok(rules.remove(index))
     }
 }
 
@@ -166,6 +239,7 @@ fn listening_row_for(win: &PortholeWindow, port: u16) -> Option<usize> {
 fn a_rule_closed_elsewhere_leaves_the_window_and_frees_its_listening_row(
     connection: &zbus::blocking::Connection,
     rules: &Rules,
+    _behaviour: &Shared,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(("0.0.0.0", 0)).map_err(|e| format!("no listener: {e}"))?;
     let port = listener
@@ -260,6 +334,7 @@ fn a_rule_closed_elsewhere_leaves_the_window_and_frees_its_listening_row(
 fn a_rule_opened_elsewhere_appears_without_the_window_asking(
     connection: &zbus::blocking::Connection,
     rules: &Rules,
+    _behaviour: &Shared,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(("0.0.0.0", 0)).map_err(|e| format!("no listener: {e}"))?;
     let port = listener
@@ -355,6 +430,7 @@ fn a_rule_opened_elsewhere_appears_without_the_window_asking(
 fn a_closed_window_stops_listening(
     connection: &zbus::blocking::Connection,
     rules: &Rules,
+    _behaviour: &Shared,
 ) -> Result<(), String> {
     /// Long enough for a refresh that was going to happen to have happened:
     /// the announcement is coalesced for 200ms and the round trip is to a
@@ -416,11 +492,323 @@ fn a_closed_window_stops_listening(
     Ok(())
 }
 
+/// How long the stand-in takes to answer in the cases that want to watch
+/// the busy indication appear -- comfortably past
+/// `porthole_gui::busy::BUSY_DELAY`, so the spinner is genuinely due
+/// rather than the check racing the timer that shows it.
+const A_SLOW_ANSWER: Duration = Duration::from_millis(900);
+
+/// Presses a real close button against a helper slow enough to watch, and
+/// checks both halves of what the press must produce: while the answer is
+/// outstanding the row says porthole is waiting and the button cannot be
+/// pressed again, and once the answer arrives neither is true any more.
+///
+/// This is the success path. A close that works takes its own row away, so
+/// the indication read afterwards is the one this case captured before the
+/// press -- the same object the row was using, not a lookalike.
+fn a_close_the_helper_answers_says_porthole_is_waiting_and_then_does_not(
+    _connection: &zbus::blocking::Connection,
+    rules: &Rules,
+    behaviour: &Shared,
+) -> Result<(), String> {
+    *rules.lock().expect("not poisoned") = vec![wire_rule(5173)];
+    *behaviour.lock().expect("not poisoned") = Behaviour {
+        delay: A_SLOW_ANSWER,
+        refuse: None,
+    };
+
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.CloseBusySucceeds",
+        move |app| {
+            let win = PortholeWindow::new(app);
+            win.present();
+            if !pump_until(|| win.open_now().rows().len() == 1, DEADLINE) {
+                return;
+            }
+            let button = win.open_now().close_button_for(0).expect("a rendered row");
+            let busy = win.open_now().close_busy_for(0).expect("a rendered row");
+
+            button.emit_clicked();
+            let showed = pump_until(|| busy.is_showing(), DEADLINE);
+            let pressable_while_waiting = button.is_sensitive();
+
+            let answered = pump_until(|| !busy.is_busy(), DEADLINE);
+            let gone = pump_until(|| win.open_now().rows().is_empty(), DEADLINE);
+            seen.replace(Some((
+                showed,
+                pressable_while_waiting,
+                answered,
+                busy.is_showing(),
+                gone,
+            )));
+            win.close();
+        },
+    );
+
+    let (showed, pressable_while_waiting, answered, still_showing, gone) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if !showed {
+        return Err(
+            "the row said nothing at all while the helper took most of a second to answer, \
+             which is the motionless window this indication exists to repair"
+                .to_string(),
+        );
+    }
+    if pressable_while_waiting {
+        return Err(
+            "the close button stayed pressable while its own close was unanswered, so a \
+             second press sends a second close"
+                .to_string(),
+        );
+    }
+    if !answered {
+        return Err("the close never stopped reporting an outstanding operation".to_string());
+    }
+    if still_showing {
+        return Err("the row went on spinning after the helper answered".to_string());
+    }
+    if !gone {
+        return Err("the helper answered the close and the row stayed on screen".to_string());
+    }
+    Ok(())
+}
+
+/// The same press, answered with a typed error instead. The row stays --
+/// nothing closed -- so this is where the button coming back matters: a
+/// close that failed and left its own button dead would need porthole
+/// restarted to try again.
+fn a_close_the_helper_refuses_gives_the_button_back(
+    _connection: &zbus::blocking::Connection,
+    rules: &Rules,
+    behaviour: &Shared,
+) -> Result<(), String> {
+    *rules.lock().expect("not poisoned") = vec![wire_rule(5173)];
+    *behaviour.lock().expect("not poisoned") = Behaviour {
+        delay: A_SLOW_ANSWER,
+        refuse: Some("5173/tcp is not open".to_string()),
+    };
+
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.CloseBusyRefused",
+        move |app| {
+            let win = PortholeWindow::new(app);
+            win.present();
+            if !pump_until(|| win.open_now().rows().len() == 1, DEADLINE) {
+                return;
+            }
+            let button = win.open_now().close_button_for(0).expect("a rendered row");
+            let busy = win.open_now().close_busy_for(0).expect("a rendered row");
+
+            button.emit_clicked();
+            let showed = pump_until(|| busy.is_showing(), DEADLINE);
+            let answered = pump_until(|| !busy.is_busy(), DEADLINE);
+            seen.replace(Some((
+                showed,
+                answered,
+                busy.is_showing(),
+                button.is_sensitive(),
+                win.open_now().rows().len(),
+            )));
+            win.close();
+        },
+    );
+
+    let (showed, answered, still_showing, pressable_after, rows) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if !showed {
+        return Err("the row said nothing while the helper took most of a second".to_string());
+    }
+    if !answered {
+        return Err(
+            "the refused close never stopped reporting an outstanding operation".to_string(),
+        );
+    }
+    if still_showing {
+        return Err("the row went on spinning after the helper refused".to_string());
+    }
+    if !pressable_after {
+        return Err(
+            "the close button never came back after a refusal, so the port cannot be closed \
+             again without restarting porthole"
+                .to_string(),
+        );
+    }
+    if rows != 1 {
+        return Err(format!(
+            "a refused close must leave its row exactly where it was, got {rows} rows"
+        ));
+    }
+    Ok(())
+}
+
+/// The exit path a `Drop` guard exists for: the dialog the press happened
+/// in is dismissed while the helper is still deciding.
+///
+/// Nothing about dismissing the dialog cancels the call -- it is a D-Bus
+/// round trip already on its way -- so the indication has to be released by
+/// the call resolving, not by anything the dismissal does. This presses
+/// Open against a helper slow enough to be dismissed underneath, waits
+/// until the dialog is visibly waiting, closes it, and then checks that
+/// once the answer lands nothing is left spinning and the button is not
+/// stuck insensitive.
+fn an_open_dismissed_while_it_is_in_flight_leaves_nothing_waiting(
+    _connection: &zbus::blocking::Connection,
+    rules: &Rules,
+    behaviour: &Shared,
+) -> Result<(), String> {
+    rules.lock().expect("not poisoned").clear();
+    *behaviour.lock().expect("not poisoned") = Behaviour {
+        delay: A_SLOW_ANSWER,
+        refuse: None,
+    };
+
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenDismissedMidFlight",
+        move |app| {
+            let win = PortholeWindow::new(app);
+            win.present();
+            if !pump_until(|| win.open_now().empty_note().is_some(), DEADLINE) {
+                return;
+            }
+
+            let dialog = OpenDialog::for_port(5173);
+            dialog.present(Some(&*win));
+            let submittable = dialog.can_submit();
+
+            dialog.open_button().emit_clicked();
+            let showed = pump_until(|| dialog.busy().is_showing(), DEADLINE);
+
+            // Dismissed with the call still outstanding.
+            dialog.dialog().close();
+
+            let answered = pump_until(|| !dialog.busy().is_busy(), DEADLINE);
+            seen.replace(Some((
+                submittable,
+                showed,
+                answered,
+                dialog.busy().is_showing(),
+                dialog.open_button().is_sensitive(),
+            )));
+            win.close();
+        },
+    );
+
+    let (submittable, showed, answered, still_showing, pressable_after) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if !submittable {
+        return Err(
+            "the dialog could not send anything as built, so this check never pressed Open \
+             for real"
+                .to_string(),
+        );
+    }
+    if !showed {
+        return Err(
+            "the dialog said nothing at all while the helper took most of a second to \
+             answer an open"
+                .to_string(),
+        );
+    }
+    if !answered {
+        return Err(
+            "the open never stopped reporting an outstanding operation after the dialog was \
+             dismissed"
+                .to_string(),
+        );
+    }
+    if still_showing {
+        return Err(
+            "the dismissed dialog is still spinning over a call that has since resolved"
+                .to_string(),
+        );
+    }
+    if !pressable_after {
+        return Err("the Open button is stuck insensitive after the call resolved".to_string());
+    }
+    Ok(())
+}
+
+/// The ordinary success path for the same button: a helper that answers at
+/// once. The dialog closes, nothing is left waiting, and the helper really
+/// was asked -- the stand-in only holds a rule for 5173 because an `open`
+/// reached it.
+///
+/// This is also what keeps the guard on that close honest. The dialog is
+/// only closed while it is still presented, and a check that never presses
+/// Open successfully would let that guard turn into "never closes at all"
+/// without anything noticing.
+fn an_open_the_helper_answers_closes_the_dialog_and_leaves_nothing_waiting(
+    _connection: &zbus::blocking::Connection,
+    rules: &Rules,
+    behaviour: &Shared,
+) -> Result<(), String> {
+    rules.lock().expect("not poisoned").clear();
+    *behaviour.lock().expect("not poisoned") = Behaviour::default();
+
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenBusySucceeds",
+        move |app| {
+            let win = PortholeWindow::new(app);
+            win.present();
+            if !pump_until(|| win.open_now().empty_note().is_some(), DEADLINE) {
+                return;
+            }
+
+            let dialog = OpenDialog::for_port(5173);
+            dialog.present(Some(&*win));
+            let presented = dialog.dialog().root().is_some();
+
+            dialog.open_button().emit_clicked();
+            let closed = pump_until(|| dialog.dialog().root().is_none(), DEADLINE);
+            seen.replace(Some((
+                presented,
+                closed,
+                dialog.busy().is_busy(),
+                dialog.busy().is_showing(),
+            )));
+            win.close();
+        },
+    );
+
+    let (presented, closed, still_busy, still_showing) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if !presented {
+        return Err("the dialog was never on screen, so this check pressed nothing".to_string());
+    }
+    if !closed {
+        return Err("the helper answered the open and the dialog stayed on screen".to_string());
+    }
+    if still_busy || still_showing {
+        return Err("the dialog is still reporting an outstanding open".to_string());
+    }
+    let opened = rules
+        .lock()
+        .expect("not poisoned")
+        .iter()
+        .any(|r| r.port == 5173);
+    if !opened {
+        return Err(
+            "no `open` ever reached the stand-in helper, so the dialog closed for some \
+             other reason"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` -- the same shape `tests/window.rs` uses,
 /// with the bus handles every case here needs threaded through.
 type Case = (
     &'static str,
-    fn(&zbus::blocking::Connection, &Rules) -> Result<(), String>,
+    fn(&zbus::blocking::Connection, &Rules, &Shared) -> Result<(), String>,
 );
 
 fn main() {
@@ -433,6 +821,7 @@ fn main() {
     std::env::set_var("DBUS_SYSTEM_BUS_ADDRESS", &address);
 
     let rules: Rules = Arc::new(Mutex::new(Vec::new()));
+    let behaviour: Shared = Arc::new(Mutex::new(Behaviour::default()));
     // One connection for the whole file: the well-known name can only be
     // owned once at a time, and a per-case connection would race its
     // successor for it.
@@ -444,13 +833,14 @@ fn main() {
             PATH,
             StandInHelper {
                 rules: rules.clone(),
+                behaviour: behaviour.clone(),
             },
         )
         .expect("a valid object path")
         .build()
         .expect("the stand-in helper can take the name");
 
-    let cases: [Case; 3] = [
+    let cases: [Case; 7] = [
         (
             "a_rule_closed_elsewhere_leaves_the_window_and_frees_its_listening_row",
             a_rule_closed_elsewhere_leaves_the_window_and_frees_its_listening_row,
@@ -463,11 +853,27 @@ fn main() {
             "a_closed_window_stops_listening",
             a_closed_window_stops_listening,
         ),
+        (
+            "a_close_the_helper_answers_says_porthole_is_waiting_and_then_does_not",
+            a_close_the_helper_answers_says_porthole_is_waiting_and_then_does_not,
+        ),
+        (
+            "a_close_the_helper_refuses_gives_the_button_back",
+            a_close_the_helper_refuses_gives_the_button_back,
+        ),
+        (
+            "an_open_dismissed_while_it_is_in_flight_leaves_nothing_waiting",
+            an_open_dismissed_while_it_is_in_flight_leaves_nothing_waiting,
+        ),
+        (
+            "an_open_the_helper_answers_closes_the_dialog_and_leaves_nothing_waiting",
+            an_open_the_helper_answers_closes_the_dialog_and_leaves_nothing_waiting,
+        ),
     ];
 
     let failed = Cell::new(false);
     for (name, case) in cases {
-        match case(&connection, &rules) {
+        match case(&connection, &rules, &behaviour) {
             Ok(()) => println!("test {name} ... ok"),
             Err(message) => {
                 println!("test {name} ... FAILED: {message}");

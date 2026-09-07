@@ -75,6 +75,15 @@ name = "signals"
 path = "tests/signals.rs"
 harness = false
 
+# Same reasoning again: `tests/busy.rs` is the busy-indication suite. Its
+# own target rather than cases added elsewhere for the usual reason, plus
+# one of its own: every check in it has to drain the main context across a
+# real `crate::busy::BUSY_DELAY`, which no other file here needs to do.
+[[test]]
+name = "busy"
+path = "tests/busy.rs"
+harness = false
+
 [dependencies]
 porthole-core = { path = "../porthole-core" }
 gtk = { package = "gtk4", version = "0.9" }

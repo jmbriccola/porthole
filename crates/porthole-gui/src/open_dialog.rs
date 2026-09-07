@@ -109,6 +109,8 @@ use porthole_core::docker::{advise, Published};
 use porthole_core::ipc::{PortholeProxy, WireRule};
 use porthole_core::model::{Lifetime, Protocol, ScopeSpec, DEFAULT_DURATION, MAX_DURATION};
 
+use crate::busy::BusyIndicator;
+
 /// What this dialog hands the client once the user presses Open: the same
 /// four things the CLI's `open` subcommand sends -- port, protocol,
 /// lifetime, scope -- never a composed firewall rule. The helper validates
@@ -398,6 +400,12 @@ struct Inner {
     /// answer, and only a checked answer can say a port is *not* Docker's.
     docker: RefCell<Option<Vec<Published>>>,
     open_button: gtk::Button,
+    /// This dialog's own busy indication for the `open` its button sends.
+    /// `refresh_submit_state` reads it as well as `disable_while_busy`
+    /// holding `open_button`: a keystroke in the port field while the
+    /// helper is still deciding would otherwise recompute the button
+    /// sensitive again mid-flight.
+    busy: BusyIndicator,
     on_opened: RefCell<Option<OpenedCallback>>,
 }
 
@@ -476,7 +484,7 @@ fn refresh_submit_state(inner: &Inner) {
 
     inner
         .open_button
-        .set_sensitive(build_request(inner).is_some());
+        .set_sensitive(!inner.busy.is_busy() && build_request(inner).is_some());
 }
 
 /// The scope of whichever target row is active, or `None` when no active
@@ -817,8 +825,22 @@ impl OpenDialog {
         content.append(&port_group);
         content.append(&protocol_group);
         content.append(&duration_group);
+        // The spinner sits beside the Open button, in the same row, so
+        // what is waiting is next to what was pressed. Hidden until
+        // `crate::busy::BUSY_DELAY` has gone by -- see `busy.rs`.
+        let busy = BusyIndicator::new();
+        busy.spinner()
+            .set_tooltip_text(Some("Waiting for the porthole helper"));
+        let actions = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
+            .halign(gtk::Align::End)
+            .build();
+        actions.append(busy.spinner());
+        actions.append(&open_button);
+
         content.append(&target_group);
-        content.append(&open_button);
+        content.append(&actions);
 
         // The dialog scrolls rather than being cut off. `adw::Dialog` puts
         // no scroller around its child, so whatever the child asks for is
@@ -862,8 +884,10 @@ impl OpenDialog {
             selected_target: RefCell::new(TargetKey::CurrentSubnet),
             docker: RefCell::new(None),
             open_button: open_button.clone(),
+            busy: busy.clone(),
             on_opened: RefCell::new(None),
         });
+        busy.disable_while_busy(&open_button);
 
         rebuild_targets(&inner);
 
@@ -901,14 +925,38 @@ impl OpenDialog {
                 let protocol = request.protocol.to_string();
                 let scope = scope_wire_string(&request.scope);
                 let seconds = lifetime_wire_seconds(request.lifetime);
-                match open_over_dbus(request.port, &protocol, &scope, seconds).await {
+                // Started here rather than at the press: the Docker
+                // explanation above is the user reading something, not
+                // porthole waiting for anything. Held across the call and
+                // dropped on the way out of this block, whichever way that
+                // is -- see `busy.rs`.
+                let busy = inner.busy.begin();
+                let outcome = open_over_dbus(request.port, &protocol, &scope, seconds).await;
+                drop(busy);
+                match outcome {
                     Ok(rule) => {
                         if let Some(f) = inner.on_opened.borrow().as_ref() {
                             f(&rule);
                         }
-                        inner.dialog.close();
+                        // Only if it is still on screen. An `open` is a
+                        // round trip nothing here can cancel, so the user
+                        // can dismiss this dialog while one is outstanding
+                        // and the reply still arrives -- and closing an
+                        // `adw::Dialog` that is no longer presented logs a
+                        // GTK critical. A presented dialog has a root; a
+                        // dismissed one does not.
+                        if inner.dialog.root().is_some() {
+                            inner.dialog.close();
+                        }
                     }
-                    Err(message) => inner.show_toast(&message),
+                    Err(message) => {
+                        // The dialog stays open on a failure, so the button
+                        // has to come back to whatever the form now
+                        // actually justifies -- `disable_while_busy` alone
+                        // would hand it back sensitive regardless.
+                        refresh_submit_state(&inner);
+                        inner.show_toast(&message);
+                    }
                 }
             });
         });
@@ -1178,6 +1226,15 @@ impl OpenDialog {
     /// [`OpenDialog::can_submit`].
     pub fn open_button(&self) -> &gtk::Button {
         &self.inner.open_button
+    }
+
+    /// This dialog's own busy indication for the `open` its button sends --
+    /// `is_busy()` for "porthole is waiting for an answer", `is_showing()`
+    /// for "and it has been waiting long enough to say so on screen". A
+    /// test reads these to check that an open clears them again however it
+    /// ends, the dialog being dismissed mid-flight included.
+    pub fn busy(&self) -> &BusyIndicator {
+        &self.inner.busy
     }
 
     /// Registers `f` to run with the [`WireRule`] a successful Open press
