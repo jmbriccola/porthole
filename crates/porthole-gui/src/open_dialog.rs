@@ -445,9 +445,9 @@ fn selected_lifetime_of(inner: &Inner) -> Option<Lifetime> {
 /// [`build_request`] itself rather than from the port alone.
 ///
 /// Called from every signal that can change any of those three -- the port
-/// entry, each chip, and the custom field. One function rather than one
-/// handler each, so a fourth thing that changes what `build_request`
-/// answers cannot be wired to two of the three.
+/// entry, each chip, and the custom field. One function rather than a
+/// handler each: a later signal has one place to be connected to, instead
+/// of three that would have to agree.
 fn refresh_submit_state(inner: &Inner) {
     let custom_active = inner
         .duration_chips
