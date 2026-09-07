@@ -285,8 +285,8 @@ fn wake_up_tracking(
     // state lock, a `backend::detect` and a close, which is only safe because
     // this whole function is synchronous and runs on a blocking thread --
     // there is no await here to hold it across. Poisoning is taken rather
-    // than panicked on: what is behind the lock is one `Option<Ipv4Net>` with
-    // no invariant of its own to be left half-updated, and a panic in one
+    // than panicked on: what is behind the lock is one `Vec<Ipv4Net>` with no
+    // invariant of its own to be left half-updated, and a panic in one
     // wake-up must not stop every later one -- `wake_up` already treats a
     // panicking check as survivable.
     let mut tracked = tracked.lock().unwrap_or_else(|e| e.into_inner());
@@ -301,7 +301,7 @@ fn wake_up_tracking(
     // Nothing recorded means nothing a network change could invalidate --
     // skip the two `ip` reads on every idle tick, not only the close itself.
     // This wake-up therefore observes no subnet, and says so by clearing the
-    // tracked one instead of leaving the last observation standing. Keeping
+    // tracked set instead of leaving the last observation standing. Keeping
     // it would let a subnet observed before the state file emptied be
     // compared against one resolved after it: a rule opened in between, on a
     // different network, towards a CIDR that stale value contains, would be

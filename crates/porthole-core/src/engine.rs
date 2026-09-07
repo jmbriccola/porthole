@@ -476,12 +476,10 @@ impl<'a> Engine<'a> {
     /// raised. [`Target::Anywhere`] is checked against nothing and always
     /// survives.
     ///
-    /// `lost` is a subnet that stopped being the observed one, not a subnet
-    /// proven unreachable. One subnet is observed at a time, resolved from a
-    /// single default route, so a machine with two networks up at once has
-    /// one of them described here and the other not: when the two swap
-    /// places -- a laptop on wifi docking into ethernet -- the wifi subnet
-    /// arrives here as `lost` and its rules close while wifi is still up.
+    /// `lost` is a subnet the caller has stopped finding, not a subnet proven
+    /// unreachable. What counts as stopping is the caller's judgement and is
+    /// stated where that judgement is made; nothing here re-examines it, and
+    /// nothing here reads the machine's interfaces at all.
     ///
     /// Reconciles first, exactly as [`Engine::close_all`] does: the same
     /// batch of rules is about to be inspected and possibly closed, so this

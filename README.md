@@ -234,11 +234,14 @@ belongs to it.
 
 It wakes on two things: NetworkManager's `StateChanged` signal, and a poll
 every 60 seconds that does not depend on NetworkManager at all. Every wake-up
-re-resolves the current subnet from the single default route and compares it
-with the subnet the previous wake-up saw.
+reads every subnet this machine currently holds on a non-virtual interface —
+wifi, ethernet, anything that is not a bridge, a container network or a VPN
+tunnel — and compares that whole set with the set the previous wake-up saw.
 
-- **The subnet changed.** Rules whose target lies *inside* the subnet just
-  left are closed. A rule towards a wider or unrelated range — a deliberate
+- **A subnet is gone.** A subnet counts as gone only when no non-virtual
+  interface still carries it — not when it merely stops being the one the
+  default route names. Rules whose target lies *inside* a subnet that is gone
+  are closed. A rule towards a wider or unrelated range — a deliberate
   `--to 10.0.0.0/8` — is left alone, and so is `--to any`.
 - **There is no usable network.** Every subnet-scoped rule closes. `--to any`
   survives.
@@ -251,14 +254,17 @@ What this does not cover, and you should not assume otherwise:
 - **Only subnets the helper observed itself.** The first wake-up after the
   helper starts records what it finds and closes nothing — there is nothing to
   compare against yet. A wake-up that finds nothing open skips the check and
-  forgets the subnet too, so the first rule opened after that also starts from
-  no baseline. A rule opened on a network the helper never saw is never closed
-  by a subnet change, however many wake-ups follow. It still ends at its
+  forgets what it had seen too, so the first rule opened after that also
+  starts from no baseline. A rule opened on a network the helper never saw is
+  never closed by a subnet change, however many wake-ups follow. It still ends at its
   expiry, at a `close`, or on a confirmed loss of every network.
-- **One subnet at a time, from one default route.** A machine with wifi and
-  ethernet both up has one of them described and the other not. Docking a
-  laptop so ethernet wins the route makes the wifi subnet look lost, and rules
-  aimed inside it close while wifi is still up.
+- **Docking closes nothing, and neither does any other change that leaves a
+  subnet in place.** A machine with wifi and ethernet both up holds both
+  subnets, and a subnet is gone only when no non-virtual interface still
+  carries it. So docking a laptop — ethernet takes the default route, wifi
+  stays up — leaves every rule aimed inside the wifi subnet open. Those rules
+  end when wifi itself goes down, at their expiry, or when you close them. Do
+  not read "the network changed" as having closed them for you.
 - **The monitor lives only as long as the helper process.** The helper is
   D-Bus activated and is not started at boot; if it is stopped or crashes,
   nothing restarts it until the next porthole command, and a network change in
@@ -333,10 +339,11 @@ never renumbered.
   report itself needs the privileged helper. See [Docker](#docker) above.
 - **A network change is noticed, not guaranteed to be.** The helper closes
   rules tied to a subnet the machine has left, but only for subnets it
-  observed itself, one subnet at a time, and only while the helper process is
-  running. A docked laptop can have rules closed for a network that is still
-  up. See [When the network changes](#when-the-network-changes) above for each
-  of those in full.
+  observed itself, and only while the helper process is running. A subnet
+  counts as left only when no non-virtual interface still carries it, so a
+  rule survives any change that leaves its own subnet in place — docking a
+  laptop with wifi still up is the ordinary case. See [When the network
+  changes](#when-the-network-changes) above for each of those in full.
 - **Reconciliation runs before every command, not continuously.** A
   `firewall-cmd --reload`, a reboot, or a rule removed by hand between two
   porthole commands is invisible until the next one runs — `porthole list`
