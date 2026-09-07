@@ -1,14 +1,18 @@
 // The clap command definition, and nothing else.
 //
-// `include!`d twice: by `src/cli.rs`, which is what `main` parses with, and
-// by `build.rs`, which renders the man page and the shell completions from
-// it. That is why this file is separate from `cli.rs` and why it names no
-// `porthole_core` type -- `build.rs` would otherwise need the whole core
-// crate as a build dependency. The parts of the command line that do need
-// core (`ToSpec`, `parse_to`) stay in `cli.rs`.
+// Read twice: as a `#[path]` module of `src/cli.rs`, which is what `main`
+// parses with, and `include!`d by `build.rs`, which renders the man page and
+// the shell completions from it. That is why this file is separate from
+// `cli.rs` and why it names no `porthole_core` type -- `build.rs` would
+// otherwise need the whole core crate as a build dependency. The parts of the
+// command line that do need core (`ToSpec`, `parse_to`) stay in `cli.rs`.
 //
-// `include!` rather than a shared crate because a build script cannot depend
-// on a library target of the package it belongs to.
+// A file of its own rather than a shared crate because a build script cannot
+// depend on a library target of the package it belongs to, and `include!` on
+// the build.rs side for the same reason. A module rather than a second
+// `include!` on the crate side because rustfmt walks `mod` declarations and
+// does not expand macros: as an `include!` this file was in no
+// `cargo fmt --all`.
 
 use clap::{Args, Parser, Subcommand};
 

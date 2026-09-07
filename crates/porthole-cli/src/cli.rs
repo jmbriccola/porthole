@@ -5,11 +5,20 @@
 //! reject the same things with the same words.
 //!
 //! The clap command itself lives one file over, in `cli_def.rs`, and is
-//! `include!`d below. `build.rs` includes that same file to render
+//! re-exported below. `build.rs` `include!`s that same file to render
 //! `porthole.1` and the shell completions, so the man page, the completions
 //! and `--help` are three renderings of one definition.
+//!
+//! A module with `#[path]` rather than an `include!` here, even though
+//! `build.rs` has to use `include!` (a build script cannot depend on a
+//! library target of its own package, and this one is a binary): rustfmt
+//! walks `mod` declarations and does not expand macros, so as an `include!`
+//! the whole clap definition was reached by no `cargo fmt --all --check`.
+//! The `#[path]` is what puts it back inside that gate.
 
-include!("cli_def.rs");
+#[path = "cli_def.rs"]
+mod cli_def;
+pub use cli_def::*;
 
 /// What `--to` named, before a saved device's name (if any) is resolved to
 /// an address.
