@@ -560,23 +560,31 @@ impl PortholeWindow {
 
     /// Every widget this window currently has that a click can activate --
     /// a structural readback, not a hand-maintained list: the header bar's
-    /// own "Open a port" button, plus every currently-rendered close
-    /// button in "Open now" and every currently-rendered Open button in
-    /// "Listening" (rows with neither -- an unopenable "Listening" row, an
-    /// unopened "Open now" list -- contribute nothing, since there is
-    /// nothing there to reach). `tests/window.rs`'s own keyboard-
-    /// reachability test checks `is_focusable()` on each of these: a GNOME
-    /// app that needs a mouse is not a GNOME app.
-    pub fn actionable_widgets(&self) -> Vec<gtk::Button> {
-        let mut widgets = vec![self.open_button.clone()];
+    /// own "Open a port" button and its main menu, plus every
+    /// currently-rendered close button in "Open now" and every
+    /// currently-rendered Open button in "Listening" (rows with neither --
+    /// an unopenable "Listening" row, an unopened "Open now" list --
+    /// contribute nothing, since there is nothing there to reach).
+    /// `tests/window.rs`'s own keyboard-reachability test checks
+    /// `is_focusable()` on each of these: a GNOME app that needs a mouse is
+    /// not a GNOME app.
+    ///
+    /// `gtk::Widget`, not `gtk::Button`: the main menu is a
+    /// `gtk::MenuButton`, and a list that could only hold buttons would
+    /// have left it out while still claiming to be every one of them.
+    pub fn actionable_widgets(&self) -> Vec<gtk::Widget> {
+        let mut widgets: Vec<gtk::Widget> = vec![
+            self.open_button.clone().upcast(),
+            self.menu_button.clone().upcast(),
+        ];
         for index in 0..self.open_now.rows().len() {
             if let Some(button) = self.open_now.close_button_for(index) {
-                widgets.push(button);
+                widgets.push(button.upcast());
             }
         }
         for index in 0..self.listening.rows().len() {
             if let Some(button) = self.listening.open_button_for(index) {
-                widgets.push(button);
+                widgets.push(button.upcast());
             }
         }
         widgets

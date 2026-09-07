@@ -262,6 +262,28 @@ fn the_window_has_an_open_button_that_is_reachable_from_the_keyboard() -> Result
     Ok(())
 }
 
+/// Whether `widget` can be reached with Tab: either it is focusable itself,
+/// or one of its descendants is.
+///
+/// The second case is not hypothetical and is why this is not a plain
+/// `is_focusable()` any more. A `gtk::MenuButton` -- the window's own main
+/// menu -- reads back as not focusable: it is a composite widget, and the
+/// focus belongs to the button inside it. Measured in this container, where
+/// the plain check failed on exactly that widget.
+fn keyboard_reachable(widget: &gtk::Widget) -> bool {
+    if widget.is_focusable() {
+        return true;
+    }
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        if keyboard_reachable(&current) {
+            return true;
+        }
+        child = current.next_sibling();
+    }
+    false
+}
+
 /// Task 6's own check: every action a click can reach must also be
 /// reachable from the keyboard -- a GNOME app that needs a mouse is not a
 /// GNOME app. Populates both sections with real fixture data first (via
@@ -281,18 +303,19 @@ fn every_action_is_reachable_from_the_keyboard() -> Result<(), String> {
         let flags: Vec<bool> = win
             .actionable_widgets()
             .iter()
-            .map(|w| w.is_focusable())
+            .map(keyboard_reachable)
             .collect();
         seen.replace(Some(flags));
     });
     let flags = result.borrow_mut().take().ok_or("activation never ran")?;
-    // The header button, one "Open now" close button, one "Listening" Open
-    // button: proof the fixtures above actually produced rows to check,
-    // not just the one widget an empty window would have had anyway.
-    if flags.len() < 3 {
+    // The header button, the main menu, one "Open now" close button, one
+    // "Listening" Open button: proof the fixtures above actually produced
+    // rows to check, not just the two widgets an empty window would have
+    // had anyway.
+    if flags.len() < 4 {
         return Err(format!(
-            "expected at least 3 actionable widgets (header button + one row from each \
-             section), got {}",
+            "expected at least 4 actionable widgets (header button, main menu, and one row \
+             from each section), got {}",
             flags.len()
         ));
     }
