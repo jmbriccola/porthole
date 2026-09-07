@@ -8,10 +8,12 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-# The path docs/installing.md installs it to by hand. A packaged install
-# that puts it in /usr/bin must change this line; the XDG autostart entry
-# beside this file needs no such edit, because a desktop entry's Exec= is
-# looked up on $PATH and this is not.
+# The path docs/installing.md installs it to by hand, and the path
+# crates/porthole-agent/tests/units.rs pins this line to. `make install`
+# rewrites it to $(BINDIR)/porthole-agent in the copy it puts down -- the
+# file here is unchanged -- so a PREFIX=/usr package's installed unit names
+# /usr/bin. The XDG autostart entry beside this file needs no such edit,
+# because a desktop entry's Exec= is looked up on $PATH and this is not.
 ExecStart=/usr/local/bin/porthole-agent
 # Restart=on-failure, and the exit statuses are what make it safe. The one
 # failure this binary must survive -- a session with no notification service

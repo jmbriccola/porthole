@@ -114,8 +114,28 @@ That gives you `porthole list`, `porthole status`, `porthole doctor`,
 helper installed; so does the Docker half of `porthole listen`, `porthole
 open` and `porthole doctor`, since reading Docker's own rules needs root. The
 same `cargo build --release` also produces `porthole-agent`, which is what
-turns a close nobody asked for into a desktop notification. See
-[docs/installing.md](docs/installing.md) for all three.
+turns a close nobody asked for into a desktop notification.
+
+For all of it at once — the three binaries, the polkit policy, the D-Bus
+files, the systemd units, the icons, the man pages and the shell completions
+— the `Makefile` installs the layout every package of this project uses:
+
+```bash
+make                                  # cargo build --release, plus the
+                                      # man pages and completions
+make build-gui                        # needs GTK4/libadwaita headers
+sudo make install PREFIX=/usr
+```
+
+`DESTDIR` is honoured by every rule, so a packager stages into one and never
+touches the live system: `make install DESTDIR=/tmp/stage PREFIX=/usr`.
+`make check-install` does exactly that into a throwaway directory and prints
+what landed. `WITH_GUI=0` leaves out the GUI binary, its desktop entry and
+its AppStream metainfo, for a machine with no desktop. `PREFIX` defaults to
+`/usr` rather than `/usr/local` because the D-Bus activation file names
+`/usr/libexec/porthole-helper` literally; see
+[docs/installing.md](docs/installing.md), which also covers installing each
+piece by hand.
 
 ## Usage
 

@@ -6,8 +6,32 @@
 privileged helper to act, and that helper has to be installed once, as root,
 before they work. This is that installation.
 
-There is no installer yet — porthole is not packaged for any distribution.
-Until it is, do the steps below by hand.
+porthole is not packaged for any distribution yet, but the repository's
+`Makefile` does install every piece into a `DESTDIR`:
+
+```bash
+make                                  # the CLI, the helper and the agent,
+                                      # plus the man pages and completions
+make build-gui                        # needs GTK4/libadwaita headers
+sudo make install PREFIX=/usr
+```
+
+`make check-install` stages the same layout into a throwaway directory and
+prints what landed, without root. `PREFIX` defaults to `/usr`, not
+`/usr/local`, because two of the files below name `/usr/libexec/porthole-helper`
+literally — `make install` refuses to run when `LIBEXECDIR` and those files
+disagree, so a `PREFIX=/usr/local` install needs `LIBEXECDIR=/usr/libexec`
+passed alongside it. `WITH_GUI=0` leaves out the GUI binary, its desktop entry
+and its AppStream metainfo.
+
+`make install` also rewrites one line it does not copy verbatim: the agent's
+user unit ships `ExecStart=/usr/local/bin/porthole-agent`, the path the
+by-hand steps below use, and the installed copy names `$(BINDIR)` instead. A
+systemd unit's `ExecStart=` is an absolute path and is never looked up on
+`$PATH`.
+
+The rest of this document is the by-hand equivalent — what each file is for
+and where it goes, one `install` command at a time.
 
 ## The pieces
 
