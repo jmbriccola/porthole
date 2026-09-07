@@ -429,15 +429,16 @@ pub fn run_dialog(path: &Path) -> gtk::glib::ExitCode {
         win.listening().set_docker_ports(&fixture_docker());
         win.status_bar().set_status(&fixture_status());
 
-        // Wider than [`run`]'s own window, on purpose. Measured in the
-        // container while writing this: this dialog asks for 606 px --
-        // with the device list empty, that is, so it is the dialog's own
-        // width, not the saved devices' -- and libadwaita renders it
-        // clipped, warning `AdwFloatingSheet exceeds AdwBreakpointBin
-        // width`, in any window narrower than that. A clipped image is not
-        // something to look at, so this flag's window is big enough to hold
-        // it whole.
-        win.set_default_size(700, 820);
+        // `PortholeWindow::build`'s own default width, deliberately: a
+        // dialog this flag renders in a window wider than the one a user
+        // gets is a picture of a layout nobody sees. It was 700 px wide
+        // while the dialog's minimum width was 606 and libadwaita clipped
+        // it -- warning `AdwFloatingSheet exceeds AdwBreakpointBin width` --
+        // in anything narrower. Measured in the container after the
+        // duration chips were made to reflow: that minimum is 160 px. Taller
+        // than the default, though, for the same reason [`run`]'s window is:
+        // this flag's fixture fills the window behind the dialog.
+        win.set_default_size(480, 820);
         win.present();
         pump_main_context();
 

@@ -29,6 +29,7 @@ use adw::prelude::*;
 use porthole_core::docker::Published;
 use porthole_core::model::{Lifetime, Protocol, ScopeSpec, DEFAULT_DURATION, MAX_DURATION};
 use porthole_gui::open_dialog::{DeviceEntry, OpenDialog, Request};
+use porthole_gui::window::PortholeWindow;
 
 /// Identical in shape to `tests/window.rs`, `tests/open_now.rs` and
 /// `tests/listening.rs`'s own `activate` helper: runs `f` inside a real
@@ -46,11 +47,13 @@ fn activate<F: FnOnce(&adw::Application) + 'static>(app_id: &str, f: F) {
     app.run_with_args::<&str>(&[]);
 }
 
-/// Not four, not six, and nothing between 8 hours and until-reboot. The
-/// ceiling is what makes porthole's promise true, and a chip offering 12
-/// hours would be refused by the helper -- an avoidable dead end put on
-/// screen by the app itself.
-fn the_duration_chips_are_exactly_the_five_the_spec_names() -> Result<(), String> {
+/// The five fixed chips the spec names, in order, and then "Custom".
+/// Nothing between 8 hours and until-reboot is offered as a fixed chip: a
+/// chip offering 12 hours would be refused by the helper, an avoidable dead
+/// end put on screen by the app itself. "Custom" offers no duration of its
+/// own -- it reveals a field, and what that field accepts is
+/// `porthole_core::validate::parse_duration`'s business.
+fn the_duration_chips_are_the_five_fixed_ones_and_a_custom_field() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
     activate(
@@ -61,7 +64,14 @@ fn the_duration_chips_are_exactly_the_five_the_spec_names() -> Result<(), String
         },
     );
     let labels = result.borrow_mut().take().ok_or("activation never ran")?;
-    let expected = vec!["15 minutes", "1 hour", "4 hours", "8 hours", "Until reboot"];
+    let expected = vec![
+        "15 minutes",
+        "1 hour",
+        "4 hours",
+        "8 hours",
+        "Until reboot",
+        "Custom",
+    ];
     if labels != expected {
         return Err(format!("expected {expected:?}, got {labels:?}"));
     }
@@ -79,9 +89,274 @@ fn one_hour_is_selected_when_the_dialog_opens() -> Result<(), String> {
         },
     );
     let lifetime = result.borrow_mut().take().ok_or("activation never ran")?;
-    let expected = Lifetime::For(Duration::from_secs(3600));
+    let expected = Some(Lifetime::For(Duration::from_secs(3600)));
     if lifetime != expected {
         return Err(format!("expected {expected:?}, got {lifetime:?}"));
+    }
+    Ok(())
+}
+
+/// The dialog has to fit in the window porthole opens by default, and it
+/// did not: the duration chips sat in one homogeneous "linked" row that
+/// could neither wrap nor ellipsize, so the whole dialog's minimum width
+/// was 606 px and libadwaita clipped it -- reported by the first person to
+/// run the application, who hit it within two minutes.
+///
+/// Measured against the real `PortholeWindow`'s own default size rather
+/// than against 480x560 written down here, so this cannot pass by agreeing
+/// with a number the window has since stopped using. The content is the
+/// widest and tallest this dialog can hold: a saved device whose name is
+/// arbitrary user text, another carrying a resolver sentence, and the
+/// custom-duration field showing the longest refusal
+/// `porthole_core::validate::parse_duration` produces.
+fn the_dialog_fits_the_window_porthole_opens_by_default() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate("com.jacopobriccola.Porthole.Test.DialogFits", move |app| {
+        let win = PortholeWindow::new_without_initial_load(app);
+        win.present();
+        let dialog = OpenDialog::for_port(9000);
+        dialog.set_current_network("10.10.10.0/24".parse().unwrap());
+        dialog.set_devices(&[
+            DeviceEntry {
+                name: "living room television (the big one)".to_string(),
+                resolved: Ok("10.10.10.31".parse().unwrap()),
+            },
+            DeviceEntry {
+                name: "laptop".to_string(),
+                resolved: Err(
+                    "`laptop` (bc:24:11:5e:1c:6e) is not on this network right now".to_string(),
+                ),
+            },
+        ]);
+        let outcome = custom_chip(&dialog).map(|b| {
+            b.emit_clicked();
+            dialog.set_custom_duration_text("9h");
+            dialog.present(Some(&*win));
+            let content = dialog.dialog().child().expect("the dialog has a child");
+            let (min_width, ..) = content.measure(gtk::Orientation::Horizontal, -1);
+            let (min_height, ..) = content.measure(gtk::Orientation::Vertical, -1);
+            (
+                min_width,
+                min_height,
+                win.default_width(),
+                win.default_height(),
+            )
+        });
+        *seen.borrow_mut() = Some(outcome);
+    });
+    let (min_width, min_height, window_width, window_height) =
+        result.borrow_mut().take().ok_or("activation never ran")??;
+    if min_width > window_width {
+        return Err(format!(
+            "the dialog cannot narrow below {min_width} px, and the window opens {window_width} px wide"
+        ));
+    }
+    if min_height > window_height {
+        return Err(format!(
+            "the dialog cannot shorten below {min_height} px, and the window opens {window_height} px tall"
+        ));
+    }
+    Ok(())
+}
+
+/// The index of the "Custom" chip, found by its own displayed label rather
+/// than written down as a number here -- the chip list is asserted
+/// literally above, and this must not need editing when it changes.
+fn custom_chip(dialog: &OpenDialog) -> Result<gtk::ToggleButton, String> {
+    let index = dialog
+        .duration_labels()
+        .iter()
+        .position(|l| l == "Custom")
+        .ok_or("no chip is labelled Custom")?;
+    dialog
+        .duration_button(index)
+        .ok_or_else(|| format!("no chip button at index {index}"))
+}
+
+/// The field is not on screen until the chip is actually pressed, and the
+/// press is a real `emit_clicked` on the real button -- not `set_active`,
+/// which would set the state a click sets and prove nothing about the click
+/// reaching anything.
+fn the_custom_field_appears_only_once_the_custom_chip_is_pressed() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.CustomReveal",
+        move |_app| {
+            let dialog = OpenDialog::for_port(5173);
+            let before = dialog.custom_duration_is_revealed();
+            let pressed = custom_chip(&dialog).map(|b| {
+                b.emit_clicked();
+                dialog.custom_duration_is_revealed()
+            });
+            *seen.borrow_mut() = Some((before, pressed));
+        },
+    );
+    let (before, pressed) = result.borrow_mut().take().ok_or("activation never ran")?;
+    if before {
+        return Err("the custom field must start hidden".to_string());
+    }
+    if !pressed? {
+        return Err("pressing the Custom chip must reveal the field".to_string());
+    }
+    Ok(())
+}
+
+/// The whole point of the field: a duration none of the fixed chips offers,
+/// reaching the request the client would send.
+fn a_typed_custom_duration_becomes_the_lifetime_that_would_be_sent() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.CustomAccepted",
+        move |_app| {
+            let dialog = OpenDialog::for_port(5173);
+            let outcome = custom_chip(&dialog).map(|b| {
+                b.emit_clicked();
+                dialog.set_custom_duration_text("20m");
+                (
+                    dialog.request(),
+                    dialog.open_button().is_sensitive(),
+                    dialog.custom_duration_error(),
+                )
+            });
+            *seen.borrow_mut() = Some(outcome);
+        },
+    );
+    let (request, sensitive, error) =
+        result.borrow_mut().take().ok_or("activation never ran")??;
+    let expected = Some(Request {
+        port: 5173,
+        protocol: Protocol::Tcp,
+        lifetime: Lifetime::For(Duration::from_secs(20 * 60)),
+        scope: ScopeSpec::CurrentSubnet,
+    });
+    if request != expected {
+        return Err(format!("expected {expected:?}, got {request:?}"));
+    }
+    if !sensitive {
+        return Err("the Open button must be sensitive for a duration the tool takes".to_string());
+    }
+    if let Some(message) = error {
+        return Err(format!(
+            "a valid duration must show no error, got {message:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Zero and anything over the ceiling: the refusal is said, and nothing is
+/// submittable. Not clamped to the nearest allowed value -- a user who
+/// asked for 9 hours and silently got 8 would not know.
+///
+/// The expected text is `porthole_core::validate::parse_duration`'s own,
+/// computed here from that function rather than written out, so this
+/// asserts the two are the same sentence rather than that this file's copy
+/// of it has not changed.
+fn a_refused_custom_duration_says_why_and_cannot_be_sent() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.CustomRefused",
+        move |_app| {
+            let dialog = OpenDialog::for_port(5173);
+            let outcome = custom_chip(&dialog).map(|b| {
+                b.emit_clicked();
+                let mut seen = Vec::new();
+                for text in ["0m", "9h", "20"] {
+                    dialog.set_custom_duration_text(text);
+                    seen.push((
+                        text,
+                        dialog.custom_duration_error(),
+                        dialog.open_button().is_sensitive(),
+                        dialog.request(),
+                    ));
+                }
+                seen
+            });
+            *seen.borrow_mut() = Some(outcome);
+        },
+    );
+    let cases = result.borrow_mut().take().ok_or("activation never ran")??;
+    for (text, error, sensitive, request) in cases {
+        let expected = porthole_core::validate::parse_duration(text)
+            .err()
+            .map(|e| e.to_string());
+        if error != expected {
+            return Err(format!(
+                "for {text:?}: expected {expected:?}, got {error:?}"
+            ));
+        }
+        if sensitive {
+            return Err(format!("{text:?} must leave the Open button insensitive"));
+        }
+        if request.is_some() {
+            return Err(format!("{text:?} must build no request, got {request:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// An empty field is not something to complain about, and is not a
+/// duration either: no message, nothing submittable. And going back to a
+/// fixed chip clears both, so a refused custom entry cannot leave the
+/// dialog stuck.
+fn an_empty_custom_field_says_nothing_and_a_fixed_chip_recovers() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.CustomEmpty",
+        move |_app| {
+            let dialog = OpenDialog::for_port(5173);
+            let outcome = custom_chip(&dialog).and_then(|custom| {
+                custom.emit_clicked();
+                let empty = (
+                    dialog.custom_duration_error(),
+                    dialog.open_button().is_sensitive(),
+                );
+                dialog.set_custom_duration_text("9h");
+                let refused = dialog.open_button().is_sensitive();
+                let first = dialog
+                    .duration_button(0)
+                    .ok_or_else(|| "no chip at index 0".to_string())?;
+                first.emit_clicked();
+                Ok((
+                    empty,
+                    refused,
+                    dialog.open_button().is_sensitive(),
+                    dialog.custom_duration_error(),
+                    dialog.custom_duration_is_revealed(),
+                    dialog.selected_lifetime(),
+                ))
+            });
+            *seen.borrow_mut() = Some(outcome);
+        },
+    );
+    let ((empty_error, empty_sensitive), refused, recovered, error_after, revealed, lifetime) =
+        result.borrow_mut().take().ok_or("activation never ran")??;
+    if let Some(message) = empty_error {
+        return Err(format!("an empty field must say nothing, got {message:?}"));
+    }
+    if empty_sensitive {
+        return Err("an empty custom field must not be submittable".to_string());
+    }
+    if refused {
+        return Err("9h must not be submittable".to_string());
+    }
+    if !recovered {
+        return Err("going back to a fixed chip must make Open sensitive again".to_string());
+    }
+    if let Some(message) = error_after {
+        return Err(format!(
+            "the refusal must go with the field, got {message:?}"
+        ));
+    }
+    if revealed {
+        return Err("the field must be hidden again once a fixed chip is chosen".to_string());
+    }
+    if lifetime != Some(Lifetime::For(Duration::from_secs(15 * 60))) {
+        return Err(format!("expected the 15-minute chip, got {lifetime:?}"));
     }
     Ok(())
 }
@@ -615,10 +890,30 @@ fn no_alert_for_a_port_docker_has_no_rule_for_or_could_not_be_checked() -> Resul
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 19] = [
+    let cases: [Case; 24] = [
         (
-            "the_duration_chips_are_exactly_the_five_the_spec_names",
-            the_duration_chips_are_exactly_the_five_the_spec_names,
+            "the_duration_chips_are_the_five_fixed_ones_and_a_custom_field",
+            the_duration_chips_are_the_five_fixed_ones_and_a_custom_field,
+        ),
+        (
+            "the_dialog_fits_the_window_porthole_opens_by_default",
+            the_dialog_fits_the_window_porthole_opens_by_default,
+        ),
+        (
+            "the_custom_field_appears_only_once_the_custom_chip_is_pressed",
+            the_custom_field_appears_only_once_the_custom_chip_is_pressed,
+        ),
+        (
+            "a_typed_custom_duration_becomes_the_lifetime_that_would_be_sent",
+            a_typed_custom_duration_becomes_the_lifetime_that_would_be_sent,
+        ),
+        (
+            "a_refused_custom_duration_says_why_and_cannot_be_sent",
+            a_refused_custom_duration_says_why_and_cannot_be_sent,
+        ),
+        (
+            "an_empty_custom_field_says_nothing_and_a_fixed_chip_recovers",
+            an_empty_custom_field_says_nothing_and_a_fixed_chip_recovers,
         ),
         (
             "one_hour_is_selected_when_the_dialog_opens",

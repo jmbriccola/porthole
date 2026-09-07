@@ -4,13 +4,25 @@
 //! Two of its choices are the project's central safety decisions, not
 //! preferences.
 //!
-//! **The duration ceiling.** The chips in [`duration_options`] are exactly
-//! the five the spec names -- 15 minutes, 1 hour (the default), 4 hours, 8
-//! hours, until reboot -- and nothing between 8 hours and until-reboot
-//! exists. [`porthole_core::model::MAX_DURATION`] is what makes porthole's
-//! "temporary" promise true; a sixth chip offering more than it would be
+//! **The duration ceiling.** [`duration_options`] holds the five fixed
+//! choices the spec names -- 15 minutes, 1 hour (the default), 4 hours, 8
+//! hours, until reboot -- none of them above
+//! [`porthole_core::model::MAX_DURATION`], which is what makes porthole's
+//! "temporary" promise true. A chip offering more than the ceiling would be
 //! refused by the helper, and refusing something the app itself put on
 //! screen is an avoidable dead end.
+//!
+//! A sixth chip, "Custom", reveals a field for any duration `porthole open
+//! --for` accepts, so this dialog is not narrower than the tool it fronts on
+//! the one axis the product is about. What that field's text means is
+//! decided by [`porthole_core::validate::parse_duration`] -- the same
+//! function the privileged side runs on what reaches it -- called here
+//! rather than restated, so the two cannot come to disagree about zero, the
+//! ceiling, or the grammar. The refusal is that function's. What this file
+//! does with it is narrower and worth stating exactly: it puts that error's
+//! own text on screen and leaves the Open button insensitive, so a duration
+//! the tool will not take is visible before anything is sent rather than
+//! after.
 //!
 //! **"Anyone".** [`build_targets`] always puts it last and marks it (an
 //! icon, not colour alone -- colour alone fails a colour-blind user and a
@@ -109,8 +121,11 @@ pub struct Request {
     pub scope: ScopeSpec,
 }
 
-/// The five duration chips, in this exact order and exactly these five --
-/// see this module's own doc comment for why the ceiling matters.
+/// The five fixed duration chips, in this exact order and exactly these
+/// five -- see this module's own doc comment for why the ceiling matters.
+/// The "Custom" chip beside them names no lifetime of its own and is not
+/// here; it stands for whatever [`parse_custom_duration`] makes of the
+/// field it reveals.
 ///
 /// The chip that *is* the ceiling is built from [`MAX_DURATION`] itself,
 /// not a second hardcoded `8 * 60 * 60`: that is what makes "no chip exceeds
@@ -274,10 +289,53 @@ fn lifetime_wire_seconds(lifetime: Lifetime) -> u32 {
     }
 }
 
-/// One duration chip: the lifetime it represents, and the real
-/// `gtk::ToggleButton` a test or a click reads back.
+/// The label on the chip that reveals the custom-duration field.
+const CUSTOM_DURATION_LABEL: &str = "Custom";
+
+/// What one duration chip stands for: either a lifetime fixed at build
+/// time, or whatever the custom field currently holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurationChoice {
+    Fixed(Lifetime),
+    Custom,
+}
+
+/// What the custom-duration field holds right now.
+enum CustomDuration {
+    /// Nothing typed. Not an error to put on screen -- a field the user has
+    /// only just revealed has not got anything wrong yet -- but not a
+    /// duration either, so nothing is submittable.
+    Empty,
+    /// [`porthole_core::validate::parse_duration`]'s own rendered error,
+    /// verbatim. Not reworded here: the same sentence is what the helper
+    /// answers a request the GUI failed to stop, and two wordings of one
+    /// refusal is how the interface and the tool start disagreeing.
+    Invalid(String),
+    Valid(Duration),
+}
+
+/// Reads `text` with [`porthole_core::validate::parse_duration`] -- zero,
+/// the ceiling and the one-value-one-unit grammar are all that function's
+/// rules, applied here to the field rather than described a second time.
+///
+/// Trimmed first, exactly as [`parse_port_for_submit`] trims: surrounding
+/// spaces are not something a person meant to type, and `parse_duration`
+/// rejects them.
+fn parse_custom_duration(text: &str) -> CustomDuration {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return CustomDuration::Empty;
+    }
+    match porthole_core::validate::parse_duration(trimmed) {
+        Ok(duration) => CustomDuration::Valid(duration),
+        Err(e) => CustomDuration::Invalid(e.to_string()),
+    }
+}
+
+/// One duration chip: what it stands for, and the real `gtk::ToggleButton`
+/// a test or a click reads back.
 struct DurationChip {
-    lifetime: Lifetime,
+    choice: DurationChoice,
     button: gtk::ToggleButton,
 }
 
@@ -314,6 +372,12 @@ struct Inner {
     /// Fixed for the dialog's whole lifetime -- unlike `target_rows`, no
     /// caller ever rebuilds the duration list, so this needs no `RefCell`.
     duration_chips: Vec<DurationChip>,
+    /// Shown only while the "Custom" chip is the active one.
+    custom_revealer: gtk::Revealer,
+    custom_row: adw::EntryRow,
+    /// [`CustomDuration::Invalid`]'s text, and hidden whenever there is
+    /// none. Hidden rather than emptied so nothing reserves a blank line.
+    custom_error: gtk::Label,
     target_group: adw::PreferencesGroup,
     /// Rebuilt by [`rebuild_targets`] whenever `set_current_network` learns
     /// a subnet or `set_devices` learns the saved devices.
@@ -351,13 +415,68 @@ fn selected_protocol_of(inner: &Inner) -> Protocol {
     }
 }
 
-fn selected_lifetime_of(inner: &Inner) -> Lifetime {
-    inner
+/// The lifetime pressing Open would send, or `None` when the active chip
+/// names none: "Custom" with a field that is empty, or one holding text
+/// [`parse_custom_duration`] refuses.
+///
+/// `None`, not a default, and for the same reason [`selected_scope_of`]
+/// answers `None`: every default available here is a duration the user did
+/// not ask for, and silently substituting one for a value the tool refuses
+/// is the clamping this field exists not to do. [`build_request`] returns
+/// `None` too, and the Open button sends nothing.
+fn selected_lifetime_of(inner: &Inner) -> Option<Lifetime> {
+    match inner
         .duration_chips
         .iter()
         .find(|c| c.button.is_active())
-        .map(|c| c.lifetime)
-        .unwrap_or(Lifetime::For(DEFAULT_DURATION))
+        .map(|c| c.choice)
+    {
+        Some(DurationChoice::Fixed(lifetime)) => Some(lifetime),
+        Some(DurationChoice::Custom) => match parse_custom_duration(&inner.custom_row.text()) {
+            CustomDuration::Valid(duration) => Some(Lifetime::For(duration)),
+            CustomDuration::Empty | CustomDuration::Invalid(_) => None,
+        },
+        None => None,
+    }
+}
+
+/// Puts the custom field into whatever state the chips and its own text
+/// currently ask for, and sets the Open button's sensitivity from
+/// [`build_request`] itself rather than from the port alone.
+///
+/// Called from every signal that can change any of those three -- the port
+/// entry, each chip, and the custom field. One function rather than one
+/// handler each, so a fourth thing that changes what `build_request`
+/// answers cannot be wired to two of the three.
+fn refresh_submit_state(inner: &Inner) {
+    let custom_active = inner
+        .duration_chips
+        .iter()
+        .any(|c| c.choice == DurationChoice::Custom && c.button.is_active());
+    inner.custom_revealer.set_reveal_child(custom_active);
+
+    let problem = match (
+        custom_active,
+        parse_custom_duration(&inner.custom_row.text()),
+    ) {
+        (true, CustomDuration::Invalid(message)) => Some(message),
+        _ => None,
+    };
+    match &problem {
+        Some(message) => {
+            inner.custom_error.set_text(message);
+            inner.custom_error.set_visible(true);
+            inner.custom_row.add_css_class("error");
+        }
+        None => {
+            inner.custom_error.set_visible(false);
+            inner.custom_row.remove_css_class("error");
+        }
+    }
+
+    inner
+        .open_button
+        .set_sensitive(build_request(inner).is_some());
 }
 
 /// The scope of whichever target row is active, or `None` when no active
@@ -385,7 +504,7 @@ fn build_request(inner: &Inner) -> Option<Request> {
     Some(Request {
         port: parse_port_for_submit(&inner.port_row.text())?,
         protocol: selected_protocol_of(inner),
-        lifetime: selected_lifetime_of(inner),
+        lifetime: selected_lifetime_of(inner)?,
         scope: selected_scope_of(inner)?,
     })
 }
@@ -585,29 +704,96 @@ impl OpenDialog {
         let protocol_group = adw::PreferencesGroup::builder().title("Protocol").build();
         protocol_group.add(&protocol_box);
 
-        let duration_box = gtk::Box::builder()
+        // A `gtk::FlowBox`, not the single homogeneous "linked" row this
+        // was: that row could not shrink at all, and was the whole of this
+        // dialog's minimum width. Its five chips did not wrap and did not
+        // ellipsize, so its minimum equalled its natural -- 570 px, measured
+        // in the container, which with this content box's own 18 px side
+        // margins is exactly the 606 px libadwaita then clipped in any
+        // narrower window. A `FlowBox` reflows instead: `min_children_per_
+        // line(1)` is what lets its minimum fall to one chip's width.
+        let duration_box = gtk::FlowBox::builder()
             .orientation(gtk::Orientation::Horizontal)
+            .selection_mode(gtk::SelectionMode::None)
             .homogeneous(true)
+            .min_children_per_line(1)
+            .max_children_per_line(3)
+            .row_spacing(6)
+            .column_spacing(6)
             .build();
-        duration_box.add_css_class("linked");
         let mut duration_chips = Vec::new();
         let mut first_duration_button: Option<gtk::ToggleButton> = None;
-        for (label, lifetime) in duration_options() {
+        let chips = duration_options()
+            .into_iter()
+            .map(|(label, lifetime)| (label, DurationChoice::Fixed(lifetime)))
+            .chain(std::iter::once((
+                CUSTOM_DURATION_LABEL,
+                DurationChoice::Custom,
+            )));
+        for (label, choice) in chips {
             let button = gtk::ToggleButton::builder().label(label).build();
             match &first_duration_button {
                 Some(first) => button.set_group(Some(first)),
                 None => first_duration_button = Some(button.clone()),
             }
-            if lifetime == Lifetime::For(DEFAULT_DURATION) {
+            if choice == DurationChoice::Fixed(Lifetime::For(DEFAULT_DURATION)) {
                 button.set_active(true);
             }
-            duration_box.append(&button);
-            duration_chips.push(DurationChip { lifetime, button });
+            // `insert(.., -1)` appends. `FlowBox::append` is gtk4-rs's
+            // `v4_6`-gated binding and this crate takes gtk4's default
+            // features; `gtk_flow_box_insert` has been there since 4.0.
+            duration_box.insert(&button, -1);
+            // The chip a click and a Tab both land on is the button. The
+            // `GtkFlowBoxChild` the line above wraps it in is focusable by
+            // default, which would put a second, empty stop in the dialog's
+            // keyboard order for every chip.
+            if let Some(cell) = button.parent() {
+                cell.set_focusable(false);
+            }
+            duration_chips.push(DurationChip { choice, button });
         }
+
+        let custom_row = adw::EntryRow::builder()
+            .title("Custom duration (for example 20m)")
+            .build();
+        let custom_list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .build();
+        // What gives a row outside an `AdwPreferencesGroup` the same
+        // rounded card the "Port" row above has.
+        custom_list.add_css_class("boxed-list");
+        custom_list.append(&custom_row);
+
+        let custom_error = gtk::Label::builder()
+            .wrap(true)
+            .xalign(0.0)
+            .visible(false)
+            .build();
+        custom_error.add_css_class("error");
+        custom_error.add_css_class("caption");
+
+        let custom_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .margin_top(6)
+            .build();
+        custom_box.append(&custom_list);
+        custom_box.append(&custom_error);
+        let custom_revealer = gtk::Revealer::builder()
+            .child(&custom_box)
+            .reveal_child(false)
+            .build();
+
+        let duration_container = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .build();
+        duration_container.append(&duration_box);
+        duration_container.append(&custom_revealer);
+
         let duration_group = adw::PreferencesGroup::builder()
             .title("For how long")
             .build();
-        duration_group.add(&duration_box);
+        duration_group.add(&duration_container);
 
         let target_group = adw::PreferencesGroup::builder()
             .title("Open towards")
@@ -634,8 +820,25 @@ impl OpenDialog {
         content.append(&target_group);
         content.append(&open_button);
 
+        // The dialog scrolls rather than being cut off. `adw::Dialog` puts
+        // no scroller around its child, so whatever the child asks for is
+        // what it asks the window for: measured in the container at the
+        // window's own default 480x560, this content asks for 750 px of
+        // height, libadwaita warns `AdwFloatingSheet exceeds
+        // AdwBreakpointBin height: requested 750 px, 550 px available`, and
+        // the Open button is simply not on screen -- with no scrollbar to
+        // reach it. `hscrollbar_policy(Never)` keeps the width side exactly
+        // as it was: the minimum still comes from the content, so nothing
+        // here can hide a widget that refuses to narrow.
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_width(true)
+            .propagate_natural_height(true)
+            .child(&content)
+            .build();
+
         let toast_overlay = adw::ToastOverlay::new();
-        toast_overlay.set_child(Some(&content));
+        toast_overlay.set_child(Some(&scroller));
 
         let dialog = adw::Dialog::builder()
             .title("Open a port")
@@ -649,6 +852,9 @@ impl OpenDialog {
             port_row: port_row.clone(),
             udp_toggle,
             duration_chips,
+            custom_revealer,
+            custom_row: custom_row.clone(),
+            custom_error,
             target_group,
             target_rows: RefCell::new(Vec::new()),
             current_network: Cell::new(None),
@@ -661,12 +867,19 @@ impl OpenDialog {
 
         rebuild_targets(&inner);
 
+        // Every signal that can change what `build_request` answers goes to
+        // the same function. The Open button's sensitivity is no longer the
+        // port's alone: a "Custom" chip over an empty or refused field makes
+        // a request unbuildable with a perfectly good port typed.
         let inner_for_change = inner.clone();
-        port_row.connect_changed(move |row| {
-            inner_for_change
-                .open_button
-                .set_sensitive(parse_port_for_submit(&row.text()).is_some());
-        });
+        port_row.connect_changed(move |_| refresh_submit_state(&inner_for_change));
+        let inner_for_custom = inner.clone();
+        custom_row.connect_changed(move |_| refresh_submit_state(&inner_for_custom));
+        for chip in &inner.duration_chips {
+            let inner_for_chip = inner.clone();
+            chip.button
+                .connect_toggled(move |_| refresh_submit_state(&inner_for_chip));
+        }
 
         let inner_for_click = inner.clone();
         open_button.connect_clicked(move |_| {
@@ -715,7 +928,7 @@ impl OpenDialog {
 
     /// The real duration chips' own displayed labels, read back from the
     /// actual `gtk::ToggleButton`s rather than recomputed independently of
-    /// them.
+    /// them. The five fixed choices, then "Custom".
     pub fn duration_labels(&self) -> Vec<String> {
         self.inner
             .duration_chips
@@ -724,18 +937,60 @@ impl OpenDialog {
             .collect()
     }
 
-    pub fn selected_lifetime(&self) -> Lifetime {
+    /// One real chip button, by index against
+    /// [`OpenDialog::duration_labels`], so a caller can press it
+    /// (`emit_clicked`) instead of setting state a click would have set.
+    pub fn duration_button(&self, index: usize) -> Option<gtk::ToggleButton> {
+        self.inner
+            .duration_chips
+            .get(index)
+            .map(|c| c.button.clone())
+    }
+
+    /// `None` when the active chip names no lifetime -- see
+    /// [`selected_lifetime_of`].
+    pub fn selected_lifetime(&self) -> Option<Lifetime> {
         selected_lifetime_of(&self.inner)
     }
 
-    /// Every duration chip's lifetime, in the same order as
-    /// [`OpenDialog::duration_labels`].
+    /// Every chip lifetime that is fixed at build time. The "Custom" chip
+    /// contributes none: what it stands for is whatever is typed into the
+    /// field it reveals, which is why it is checked against the ceiling by
+    /// [`parse_custom_duration`] on every keystroke rather than once here.
     pub fn all_lifetimes(&self) -> Vec<Lifetime> {
         self.inner
             .duration_chips
             .iter()
-            .map(|c| c.lifetime)
+            .filter_map(|c| match c.choice {
+                DurationChoice::Fixed(lifetime) => Some(lifetime),
+                DurationChoice::Custom => None,
+            })
             .collect()
+    }
+
+    /// Whether the custom-duration field is on screen right now, read from
+    /// the real `gtk::Revealer` rather than from which chip is active.
+    pub fn custom_duration_is_revealed(&self) -> bool {
+        self.inner.custom_revealer.reveals_child()
+    }
+
+    /// Types `text` into the real custom-duration field, the way a person
+    /// would -- the row's own `changed` signal fires, so everything that
+    /// signal drives runs.
+    pub fn set_custom_duration_text(&self, text: &str) {
+        self.inner.custom_row.set_text(text);
+    }
+
+    /// The message currently shown under the custom-duration field, or
+    /// `None` when none is. Read from the real label, including its own
+    /// visibility: a label holding stale text it is no longer showing must
+    /// not answer here.
+    pub fn custom_duration_error(&self) -> Option<String> {
+        let label = &self.inner.custom_error;
+        label
+            .is_visible()
+            .then(|| label.text().to_string())
+            .filter(|t| !t.is_empty())
     }
 
     /// Learns the actual subnet porthole would open towards by default, so
@@ -903,8 +1158,10 @@ impl OpenDialog {
     /// Whether pressing Open right now would send anything at all -- read
     /// from [`OpenDialog::request`] itself rather than from the port alone,
     /// so it cannot claim a request exists that `request` would decline to
-    /// build. In practice the port is the only thing that makes it `false`:
-    /// a duration chip and a selectable target are always active, by
+    /// build. Two things make it `false`: a port
+    /// `porthole_core::validate::parse_port` refuses, and a "Custom"
+    /// duration `porthole_core::validate::parse_duration` refuses (or has
+    /// not been given yet). A selectable target is always active, by
     /// construction.
     pub fn can_submit(&self) -> bool {
         self.request().is_some()
@@ -994,6 +1251,76 @@ mod tests {
             duration_options()[3],
             ("8 hours", Lifetime::For(MAX_DURATION))
         );
+    }
+
+    #[test]
+    fn a_custom_duration_the_helper_would_take_is_taken_here_too() {
+        for (text, secs) in [("20m", 1200u64), ("45s", 45), ("2h", 7200), (" 20m ", 1200)] {
+            match parse_custom_duration(text) {
+                CustomDuration::Valid(d) => assert_eq!(d, Duration::from_secs(secs), "{text}"),
+                CustomDuration::Empty => panic!("{text} read as empty"),
+                CustomDuration::Invalid(m) => panic!("{text} refused: {m}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_custom_duration_is_not_an_error_and_is_not_a_duration() {
+        // A field the user has only just revealed has not got anything
+        // wrong yet, so there is nothing to say about it -- but there is
+        // also nothing to send.
+        assert!(matches!(parse_custom_duration(""), CustomDuration::Empty));
+        assert!(matches!(
+            parse_custom_duration("   "),
+            CustomDuration::Empty
+        ));
+    }
+
+    #[test]
+    fn zero_and_anything_over_the_ceiling_are_refused_here() {
+        for bad in [
+            "0m", "0s", "9h", "481m", "28801s", "24h", "20", "1h30m", "-5m", "abc",
+        ] {
+            assert!(
+                matches!(parse_custom_duration(bad), CustomDuration::Invalid(_)),
+                "{bad} was not refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_shown_is_the_cores_own_sentence_not_a_second_wording() {
+        // The point of calling `parse_duration` rather than restating its
+        // rules: this asserts the *text* too, so a reworded copy in this
+        // file would fail here rather than drift quietly away from what the
+        // helper answers for the same input.
+        for bad in ["0m", "9h", "20"] {
+            let expected = porthole_core::validate::parse_duration(bad)
+                .unwrap_err()
+                .to_string();
+            match parse_custom_duration(bad) {
+                CustomDuration::Invalid(message) => assert_eq!(message, expected, "{bad}"),
+                _ => panic!("{bad} was not refused"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_ceiling_this_field_refuses_at_is_max_duration_itself() {
+        // Not "8h": `MAX_DURATION` in seconds, and one second past it. A
+        // future change to the constant moves both sides of this together,
+        // which is the property that makes the field and the helper agree
+        // without a second literal here.
+        let at_ceiling = format!("{}s", MAX_DURATION.as_secs());
+        let over = format!("{}s", MAX_DURATION.as_secs() + 1);
+        assert!(matches!(
+            parse_custom_duration(&at_ceiling),
+            CustomDuration::Valid(_)
+        ));
+        assert!(matches!(
+            parse_custom_duration(&over),
+            CustomDuration::Invalid(_)
+        ));
     }
 
     #[test]
