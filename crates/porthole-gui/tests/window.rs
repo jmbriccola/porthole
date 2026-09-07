@@ -435,6 +435,80 @@ fn a_construction_with_an_unreachable_helper_does_not_show_the_calm_empty_state(
     Ok(())
 }
 
+/// Presses a "Listening" row's own Open button -- `emit_clicked`, the real
+/// signal a pointer or the keyboard would emit -- and reads back the one
+/// thing pressing it is supposed to produce: the open dialog, on this
+/// window, as `AdwApplicationWindow::visible_dialog` reports it.
+///
+/// This crate's other checks on that button all stop at
+/// `open_button_for(index).is_some()` and `activate_open(index)`, which
+/// `listening_section.rs` documents as a pure lookup rather than a
+/// simulated click. Presence was covered; pressing was not, and a button
+/// with no handler passes every one of them. A user on Fedora
+/// Workstation found the difference: the button did nothing at all.
+fn pressing_a_listening_rows_open_button_opens_the_dialog() -> Result<(), String> {
+    let opened = Rc::new(Cell::new(false));
+    let seen = opened.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.RowOpenButtonClick",
+        move |app| {
+            let win = PortholeWindow::new(app);
+            win.present();
+            win.listening().set_services(&[listening_service_fixture()]);
+            let Some(button) = win.listening().open_button_for(0) else {
+                return;
+            };
+            button.emit_clicked();
+            pump_main_context();
+            seen.set(win.visible_dialog().is_some());
+        },
+    );
+    if opened.get() {
+        Ok(())
+    } else {
+        Err("pressing a Listening row's Open button presented no dialog".to_string())
+    }
+}
+
+/// The same press, after the answer about Docker has landed.
+///
+/// That answer arrives on every launch -- a list of published ports, or
+/// the fact that none could be had -- and it rebuilds this section's rows.
+/// A row's Open button therefore has to survive a rebuild that no part of
+/// the open flow asked for. It did not: the button was dead in every
+/// installed copy of porthole, because the handler was attached from
+/// outside the rebuild.
+fn a_rows_open_button_survives_the_docker_answer() -> Result<(), String> {
+    let opened = Rc::new(Cell::new(false));
+    let seen = opened.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.RowOpenButtonAfterDocker",
+        move |app| {
+            let win = PortholeWindow::new(app);
+            win.present();
+            win.listening().set_services(&[listening_service_fixture()]);
+            // Both ways that answer can come back, one after the other:
+            // neither may cost the row its button's handler.
+            win.listening().set_docker_ports(&[]);
+            win.listening().set_docker_unavailable();
+            let Some(button) = win.listening().open_button_for(0) else {
+                return;
+            };
+            button.emit_clicked();
+            pump_main_context();
+            seen.set(win.visible_dialog().is_some());
+        },
+    );
+    if opened.get() {
+        Ok(())
+    } else {
+        Err(
+            "pressing a Listening row's Open button after the Docker answer presented no dialog"
+                .to_string(),
+        )
+    }
+}
+
 /// One named check, run by `main` below. A type alias rather than spelling
 /// `(&str, fn() -> Result<(), String>)` out at the call site: clippy's
 /// `type_complexity` flagged the inline form (the actual finding from the
@@ -447,7 +521,7 @@ fn main() {
     // A plain array, not `vec![]`: the list is fixed at compile time and
     // never grows, so there is nothing a `Vec` buys here, independently of
     // what clippy does or does not flag.
-    let cases: [Case; 10] = [
+    let cases: [Case; 12] = [
         (
             "the_window_is_actually_realized_not_merely_constructed",
             the_window_is_actually_realized_not_merely_constructed,
@@ -487,6 +561,14 @@ fn main() {
         (
             "a_construction_with_an_unreachable_helper_does_not_show_the_calm_empty_state",
             a_construction_with_an_unreachable_helper_does_not_show_the_calm_empty_state,
+        ),
+        (
+            "pressing_a_listening_rows_open_button_opens_the_dialog",
+            pressing_a_listening_rows_open_button_opens_the_dialog,
+        ),
+        (
+            "a_rows_open_button_survives_the_docker_answer",
+            a_rows_open_button_survives_the_docker_answer,
         ),
     ];
 

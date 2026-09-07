@@ -300,6 +300,25 @@ impl PortholeWindow {
             present_open_dialog(&sections_for_open, &OpenDialog::new());
         });
 
+        // What a "Listening" row's own Open button does, registered once
+        // here and held by the section for as long as it exists. The
+        // section connects every button it builds to this as it builds it,
+        // so no caller of any setter has anything to reattach -- see
+        // `listening_section.rs`'s own doc comment. It is registered here,
+        // and not there, because that section knows nothing about
+        // `OpenDialog` or this window.
+        let sections_for_row = Sections {
+            window: window.clone(),
+            open_now: open_now.clone(),
+            listening: listening.clone(),
+            status_bar: status_bar.clone(),
+            devices: devices.clone(),
+            docker: docker.clone(),
+        };
+        listening.connect_open_requested(move |port| {
+            present_open_dialog(&sections_for_row, &OpenDialog::for_port(port));
+        });
+
         // No initial `refresh` here -- see `PortholeWindow::new` (the only
         // caller that wants one) and `PortholeWindow::new_without_initial_load`
         // (the one that deliberately does not) for where that call now
@@ -622,8 +641,8 @@ async fn with_timeout<F: std::future::Future>(
 /// `on_opened` hook -- task 5's own hook, left uncalled until this task,
 /// see this module's own doc comment -- to run [`refresh`] again on a
 /// successful open. Shared by the header bar's own "Open a port" button
-/// and every "Listening" row's pre-filled one (wired by
-/// `wire_listening_open_buttons`), so both paths refresh the same way.
+/// and every "Listening" row's pre-filled one, so both paths refresh the
+/// same way.
 fn present_open_dialog(sections: &Sections, dialog: &OpenDialog) {
     // Whatever the last `refresh` learned, handed over before the dialog is
     // ever on screen: the saved devices it offers as targets, and the ports
@@ -648,56 +667,17 @@ fn present_open_dialog(sections: &Sections, dialog: &OpenDialog) {
     dialog.present(Some(&sections.window));
 }
 
-/// Connects each "Listening" row's own Open button (if it has one -- see
-/// `listening_section.rs`'s own doc comment for which rows do not) to a
-/// dialog pre-filled with that row's port.
-///
-/// Every `set_services`/`set_open_ports` call that actually rebuilds rows
-/// (`listening_section.rs`'s own `apply` -- gated by `scanned`, see its own
-/// module doc) drops whatever click handler a previous call to this
-/// function had connected, since it discards the old `gtk::Button` objects
-/// entirely and builds new ones. This is called again immediately after
-/// each such rebuild so the buttons currently on screen are the ones with
-/// a handler. A call after `set_scan_failed` specifically is harmless, not
-/// merely avoided: `apply_scan_failed` clears `listening`'s rows outright
-/// (`tests/listening.rs`'s own `a_scan_failure_does_not_render_as_the_calm_
-/// empty_state` asserts exactly that), so `listening.rows()` reports none
-/// and this function's loop below simply does nothing -- there is no
-/// leftover button here for a second handler to stack onto. It lives here
-/// rather than inside `listening_section.rs` itself because that module
-/// renders what it is given and knows nothing about `OpenDialog` or this
-/// window.
-fn wire_listening_open_buttons(sections: &Sections) {
-    let listening = &sections.listening;
-    for index in 0..listening.rows().len() {
-        let (Some(button), Some(port)) = (
-            listening.open_button_for(index),
-            listening.activate_open(index),
-        ) else {
-            continue;
-        };
-        let sections = sections.clone();
-        button.connect_clicked(move |_| {
-            present_open_dialog(&sections, &OpenDialog::for_port(port));
-        });
-    }
-}
-
 /// Populates "Open now", "Listening" and the status line -- the initial
 /// load this crate lacked before this task (see this module's own doc
 /// comment), and the same thing a successful open re-runs through
 /// [`present_open_dialog`]'s `on_opened` hook.
 ///
 /// The `/proc` scan and the helper round trip run as two **independent**
-/// spawned futures below, not sequenced against each other. Each one wires
-/// its own rows (`wire_listening_open_buttons`) immediately after whichever
-/// of `listening`'s setters it just called -- so there is no shared "wire
-/// once, at the end" step left for the two to race over. An earlier draft
-/// of this function sequenced the scan before the helper fetch specifically
-/// to avoid that race (both eventually called `wire_listening_open_buttons`
-/// once, together, at the very end); that avoidance is no longer needed now
-/// that wiring happens right where each setter that could change the rows
-/// is actually called.
+/// spawned futures below, not sequenced against each other, and either may
+/// land first. Nothing here has to be ordered around a "Listening" row's
+/// Open button: that button is connected where it is built, by the section
+/// that builds it, so calling any of its setters in any order leaves every
+/// rendered button working. See `listening_section.rs`'s own doc comment.
 ///
 /// Neither read blocks the UI thread: the D-Bus round trip already yields
 /// at every `.await` (the same `glib::spawn_future_local` shape
@@ -728,7 +708,6 @@ fn refresh(sections: &Sections) {
             match scanned {
                 Ok(Ok(services)) => {
                     sections.listening.set_services(&services);
-                    wire_listening_open_buttons(&sections);
                 }
                 Ok(Err(e)) => {
                     sections
@@ -787,7 +766,6 @@ fn refresh(sections: &Sections) {
                                 .collect();
                             open_now.set_rules(&rules);
                             listening.set_open_ports(&open_ports);
-                            wire_listening_open_buttons(&sections);
                         }
                         Err(failure) => {
                             apply_failure_to_open_now(&open_now, &failure);

@@ -42,6 +42,26 @@
 //! `open` attempt would be refused by the helper for a reason nothing on
 //! this screen had suggested.
 //!
+//! ## The Open button's handler
+//!
+//! A row's Open button is connected as it is built, in `apply`, which is
+//! the only place in this crate that constructs one. What it is connected
+//! to is the callback [`ListeningSection::connect_open_requested`] stores
+//! on the section itself, which outlives every button. So the handler is
+//! not something a caller has to reattach after a rebuild: a rendered
+//! button is a connected button, and a setter that rebuilds rows cannot
+//! produce a row whose button does nothing.
+//!
+//! It was that, before: the connection was made from outside, after
+//! whichever setters the code that made it knew about. Two setters added
+//! later rebuilt rows the same way, and one of them runs on every launch,
+//! so the button never worked for anyone -- found by a person, not by the
+//! GUI checks here, which asked whether the button existed and never
+//! pressed it. `tests/window.rs` presses it now.
+//!
+//! The callback lives here and the dialog does not: this section renders
+//! what it is given, and knows nothing about `OpenDialog` or the window.
+//!
 //! ## Dual-stack rows
 //!
 //! `porthole listen`'s human output (`porthole-cli`) prints a dual-stack
@@ -120,6 +140,12 @@ use adw::prelude::*;
 use porthole_core::docker::Published;
 use porthole_core::listening::{Binding, Service};
 
+/// What a caller registers through
+/// [`ListeningSection::connect_open_requested`] to hear that a row's Open
+/// button was pressed, carrying that row's port. One slot, not a list:
+/// registering again replaces it.
+type OpenRequestedCallback = Rc<dyn Fn(u16)>;
+
 /// One rendered service: the widgets `Inner::rows` needs to update or
 /// remove later, plus the port a caller needs back from [`activate_open`]
 /// once the button (if any) is clicked.
@@ -185,6 +211,11 @@ struct Inner {
     /// the two apart -- see this module's own doc comment on the bug that
     /// produced.
     scanned: Cell<bool>,
+    /// Where every Open button's click goes. Held on the section rather
+    /// than on the buttons, so it outlives them: `apply` discards every
+    /// button it finds and builds new ones, and this is what the new ones
+    /// are connected to as they are built.
+    on_open_requested: RefCell<Option<OpenRequestedCallback>>,
 }
 
 /// `"node · 5173"` when the owning process is known, `"4000"` alone when it
@@ -496,6 +527,20 @@ fn apply(inner: &Rc<Inner>) {
                 .css_classes(["suggested-action"])
                 .tooltip_text(format!("Open port {}", service.port))
                 .build();
+            // Connected here, in the same statement that builds it: a
+            // button this section renders is a button this section has
+            // already wired. See this module's own doc comment.
+            let inner_for_click = Rc::clone(inner);
+            let port = service.port;
+            button.connect_clicked(move |_| {
+                // Cloned out of the cell before the call, so the callback
+                // is free to come back into this section -- opening a port
+                // ends in a refresh, and a refresh rebuilds these rows.
+                let callback = inner_for_click.on_open_requested.borrow().clone();
+                if let Some(callback) = callback {
+                    callback(port);
+                }
+            });
             action_row.add_suffix(&button);
             Some(button)
         } else {
@@ -629,6 +674,7 @@ impl ListeningSection {
             open_ports: RefCell::new(HashSet::new()),
             docker: RefCell::new(DockerPorts::NotChecked),
             scanned: Cell::new(false),
+            on_open_requested: RefCell::new(None),
         });
 
         Self { inner }
@@ -638,6 +684,17 @@ impl ListeningSection {
     /// contribution as.
     pub fn widget(&self) -> &gtk::Box {
         &self.inner.container
+    }
+
+    /// Registers what a row's Open button does, once, for the whole life
+    /// of this section: `f` is called with that row's port every time one
+    /// is pressed, however many times the rows have been rebuilt in
+    /// between. Registering again replaces it.
+    ///
+    /// This section renders what it is given and knows nothing about the
+    /// dialog `f` goes on to present -- see this module's own doc comment.
+    pub fn connect_open_requested(&self, f: impl Fn(u16) + 'static) {
+        self.inner.on_open_requested.replace(Some(Rc::new(f)));
     }
 
     /// The whole way a service list reaches this section -- see this
@@ -791,12 +848,15 @@ impl ListeningSection {
             .and_then(|r| r.open_button.clone())
     }
 
-    /// What pressing row `index`'s Open button carries: the port a future
-    /// "open a port" form should pre-fill. `None` when that row has no Open
-    /// button at all -- there is nothing to activate. A pure lookup, not a
-    /// simulated click: safe to call both from a test standing in for a
-    /// user's press, and from inside a real `connect_clicked` handler a
-    /// later task attaches to the button `open_button_for` returns.
+    /// What pressing row `index`'s Open button carries: the port
+    /// [`ListeningSection::connect_open_requested`]'s callback is handed.
+    /// `None` when that row has no Open button at all -- there is nothing
+    /// to activate.
+    ///
+    /// A pure lookup, not a simulated click. It reads back which port a
+    /// row would send; it does not prove the button sends anything. Only
+    /// emitting `clicked` on the button itself proves that, and
+    /// `tests/window.rs` is where that is done.
     pub fn activate_open(&self, index: usize) -> Option<u16> {
         self.inner.rows.borrow().get(index).and_then(|r| {
             if r.open_button.is_some() {
