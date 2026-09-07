@@ -24,9 +24,12 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::rc::Rc;
 
 use adw::prelude::*;
+use porthole_core::docker::Published;
 use porthole_core::listening::{Binding, Service};
 use porthole_core::model::Protocol;
-use porthole_gui::listening_section::ListeningSection;
+use porthole_gui::listening_section::{
+    ListeningSection, DOCKER_NOT_CHECKED_NOTE, DOCKER_UNAVAILABLE_NOTE,
+};
 
 /// Identical in shape to `tests/window.rs` and `tests/open_now.rs`'s own
 /// `activate` helper: runs `f` inside a real `adw::Application` activation,
@@ -632,13 +635,206 @@ fn the_loading_state_survives_a_set_open_ports_before_any_scan() -> Result<(), S
     Ok(())
 }
 
+fn published(port: u16, host_addr: Option<&str>) -> Published {
+    Published {
+        host_addr: host_addr.map(|a| a.parse().unwrap()),
+        host_port: port,
+        protocol: Protocol::Tcp,
+        container_addr: "172.17.0.2".parse().unwrap(),
+        container_port: 80,
+    }
+}
+
+/// The marker and the address, on the one row Docker's own list names --
+/// and on no other row, and no group-level caveat once the list has
+/// actually arrived.
+fn a_docker_published_row_carries_its_marker_and_address() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningDocker",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_services(&[
+                svc(8080, Some("docker-proxy"), Binding::AllInterfaces),
+                svc(4000, Some("node"), Binding::AllInterfaces),
+            ]);
+            section.set_docker_ports(&[published(8080, None)]);
+            let rows = section.rows();
+            let index = rows
+                .iter()
+                .position(|r| r.title().contains("8080"))
+                .expect("the 8080 row must exist");
+            let other = 1 - index;
+            *seen.borrow_mut() = Some((
+                rows[index].subtitle().map(|s| s.to_string()),
+                section.is_marked_docker(index),
+                section.is_marked_docker(other),
+                section.group_description(),
+            ));
+        },
+    );
+    let (subtitle, marked, other_marked, description) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    let subtitle = subtitle.ok_or("the row must have a subtitle")?;
+    if !subtitle.contains("docker: published on every interface") {
+        return Err(format!("expected the published address, got: {subtitle}"));
+    }
+    if !marked {
+        return Err("a published row must carry the marker".to_string());
+    }
+    if other_marked {
+        return Err("a row Docker does not publish must carry no marker".to_string());
+    }
+    if description.is_some() {
+        return Err(format!(
+            "a checked list needs no caveat, got: {description:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn a_row_published_on_one_address_names_that_address() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningDockerLoopback",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_services(&[svc(5432, Some("docker-proxy"), Binding::LoopbackOnly)]);
+            section.set_docker_ports(&[published(5432, Some("127.0.0.1"))]);
+            *seen.borrow_mut() = Some(section.rows()[0].subtitle().map(|s| s.to_string()));
+        },
+    );
+    let subtitle = result
+        .borrow_mut()
+        .take()
+        .ok_or("activation never ran")?
+        .ok_or("the row must have a subtitle")?;
+    if !subtitle.contains("docker: published on 127.0.0.1") {
+        return Err(format!("expected the published address, got: {subtitle}"));
+    }
+    Ok(())
+}
+
+/// A host port can carry more than one DNAT rule, and this row is where a
+/// user reads what Docker did with it. The lookup behind it used to return
+/// the first match only, so a second address was invisible on a row that
+/// read as the whole picture.
+fn a_row_with_two_docker_rules_names_both_addresses() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningDockerTwoRules",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_services(&[svc(5432, Some("docker-proxy"), Binding::AllInterfaces)]);
+            section.set_docker_ports(&[
+                published(5432, Some("127.0.0.1")),
+                published(5432, Some("10.0.0.5")),
+            ]);
+            *seen.borrow_mut() = Some((
+                section.rows()[0].subtitle().map(|s| s.to_string()),
+                section.is_marked_docker(0),
+            ));
+        },
+    );
+    let (subtitle, marked) = result.borrow_mut().take().ok_or("activation never ran")?;
+    let subtitle = subtitle.ok_or("the row must have a subtitle")?;
+    for address in ["127.0.0.1", "10.0.0.5"] {
+        if !subtitle.contains(address) {
+            return Err(format!("{address} is missing from the row: {subtitle}"));
+        }
+    }
+    if !marked {
+        return Err("a row with two published rules must still carry the marker".to_string());
+    }
+    Ok(())
+}
+
+/// All three things an unmarked row can mean, in the order a real session
+/// meets them: rows on screen with no Docker answer yet, then an answer,
+/// then an answer lost.
+fn the_group_note_tracks_all_three_docker_states() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningDockerStates",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_services(&[svc(8080, Some("node"), Binding::AllInterfaces)]);
+            let not_checked = (section.group_description(), section.is_marked_docker(0));
+
+            section.set_docker_ports(&[published(8080, None)]);
+            let checked = (section.group_description(), section.is_marked_docker(0));
+
+            section.set_docker_unavailable();
+            let unavailable = (section.group_description(), section.is_marked_docker(0));
+
+            *seen.borrow_mut() = Some((not_checked, checked, unavailable));
+        },
+    );
+    let (not_checked, checked, unavailable) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    // The state a real launch is in for as long as the helper takes: the
+    // `/proc` scan has landed and `docker_ports` has not. Nothing has
+    // failed, so nothing may say it has.
+    if not_checked.0.as_deref() != Some(DOCKER_NOT_CHECKED_NOTE) || not_checked.1 {
+        return Err(format!(
+            "rows with no Docker answer yet must say so, and carry no marker: {not_checked:?}"
+        ));
+    }
+    if checked.0.is_some() || !checked.1 {
+        return Err(format!(
+            "a checked list must mark and not caveat: {checked:?}"
+        ));
+    }
+    if unavailable.0.as_deref() != Some(DOCKER_UNAVAILABLE_NOTE) || unavailable.1 {
+        return Err(format!(
+            "losing the list must drop the marker and report the failure: {unavailable:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The defect this state exists for, stated as its own check: the notice a
+/// user reads while the helper is still answering must not be the one that
+/// says the helper failed.
+fn a_section_waiting_on_the_helper_does_not_report_a_failure() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningDockerPending",
+        move |_app| {
+            let section = ListeningSection::new();
+            // Exactly the order a launch produces: the `/proc` scan and the
+            // helper's `list` both land before `docker_ports` does.
+            section.set_services(&[svc(8080, Some("node"), Binding::AllInterfaces)]);
+            section.set_open_ports(&[]);
+            *seen.borrow_mut() = Some(section.group_description());
+        },
+    );
+    let description = result.borrow_mut().take().ok_or("activation never ran")?;
+    if description.as_deref() == Some(DOCKER_UNAVAILABLE_NOTE) {
+        return Err(
+            "a section still waiting on docker_ports must not claim the helper failed".to_string(),
+        );
+    }
+    if description.as_deref() != Some(DOCKER_NOT_CHECKED_NOTE) {
+        return Err(format!(
+            "expected the not-checked note, got {description:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below -- see `tests/window.rs`'s own
 /// `Case` alias for why this is a type alias rather than spelled out
 /// inline.
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 15] = [
+    let cases: [Case; 20] = [
         (
             "a_service_shows_its_name_and_port_the_way_the_spec_writes_it",
             a_service_shows_its_name_and_port_the_way_the_spec_writes_it,
@@ -698,6 +894,26 @@ fn main() {
         (
             "the_loading_state_survives_a_set_open_ports_before_any_scan",
             the_loading_state_survives_a_set_open_ports_before_any_scan,
+        ),
+        (
+            "a_docker_published_row_carries_its_marker_and_address",
+            a_docker_published_row_carries_its_marker_and_address,
+        ),
+        (
+            "a_row_published_on_one_address_names_that_address",
+            a_row_published_on_one_address_names_that_address,
+        ),
+        (
+            "a_row_with_two_docker_rules_names_both_addresses",
+            a_row_with_two_docker_rules_names_both_addresses,
+        ),
+        (
+            "the_group_note_tracks_all_three_docker_states",
+            the_group_note_tracks_all_three_docker_states,
+        ),
+        (
+            "a_section_waiting_on_the_helper_does_not_report_a_failure",
+            a_section_waiting_on_the_helper_does_not_report_a_failure,
         ),
     ];
 

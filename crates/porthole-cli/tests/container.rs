@@ -95,17 +95,19 @@
 //!
 //! # Environment this file assumes
 //!
-//! - `podman`, rootless, reachable on `$PATH`. Once `PORTHOLE_CONTAINER_TESTS`
-//!   is set, this is required, not merely hoped for: a broken `podman
-//!   --version` panics rather than skips.
+//! - An explicit opt-in. Every test here is `#[ignore]`d, so a plain `cargo
+//!   test` reports them as `ignored` by name rather than counting them
+//!   passed; `tests/container/run.sh` passes `--ignored` and sets
+//!   `PORTHOLE_CONTAINER_TESTS=1`. Nothing in this file skips.
+//! - `podman`, rootless, reachable on `$PATH`. Once opted in, this is
+//!   required, not merely hoped for: a broken `podman --version` panics.
 //! - The musl binaries already built: `cargo build --target
 //!   x86_64-unknown-linux-musl --bins`, and built recently enough to be
 //!   newer than every source file that went into them. Both are checked, and
-//!   both **panic** rather than skip if they do not hold. That asymmetry
-//!   with `container_tests_enabled()` itself (which does skip) is
-//!   deliberate: the env var is the caller's statement of intent to actually
-//!   run these tests, and once that statement has been made, a missing or
-//!   stale prerequisite is a bug in the run, not a reason to report success
+//!   both **panic** rather than skip if they do not hold. `--ignored` and
+//!   the env var are the caller's statement of intent to actually run these
+//!   tests, and once that statement has been made, a missing or stale
+//!   prerequisite is a bug in the run, not a reason to report success
 //!   anyway. This milestone already shipped the alternative once -- five
 //!   end-to-end tests silently skipped while `cargo test` reported the suite
 //!   green, and nobody noticed until an unrelated fix disabled them and the
@@ -145,17 +147,26 @@ fn podman_available() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// Skip loudly and return from the calling test if the caller never opted
-/// in, exactly as `helper_e2e.rs`'s `start_or_skip!` does -- a gated test
-/// nobody can tell ran is not a test. Once opted in, a broken `podman` is a
-/// hard failure, not a second skip: see the module docs on why that
-/// asymmetry is deliberate.
+/// Assert the environment these tests need. Nothing here skips: every test
+/// in this file carries `#[ignore]`, so opting out is what `cargo test`
+/// already does by default and reports as `ignored`, honestly and by name.
+/// Once a caller has said `--ignored`, a missing prerequisite is a broken
+/// invocation rather than a reason to report success -- the same asymmetry
+/// `require_musl_binaries!` applies, for the same reason.
+///
+/// This is the shape the earlier version got wrong: it printed `skipped:`
+/// and returned, and libtest counted the test `ok`. Ten of this workspace's
+/// tests reported success without running, which is the same hazard as a
+/// green gate that executed nothing -- and this file's own module doc calls
+/// that out ("a test nobody can tell ran is not a test") a few lines above
+/// where it used to happen.
 macro_rules! require_environment {
     () => {
-        if !container_tests_enabled() {
-            eprintln!("skipped: set PORTHOLE_CONTAINER_TESTS=1 and have podman to run this test");
-            return;
-        }
+        assert!(
+            container_tests_enabled(),
+            "these tests are opted into with PORTHOLE_CONTAINER_TESTS=1, which \
+             tests/container/run.sh sets for you along with everything else they need."
+        );
         assert!(
             podman_available(),
             "PORTHOLE_CONTAINER_TESTS=1 was set, so a working `podman` is required, not \
@@ -521,6 +532,7 @@ fn assert_container_ok(out: &Output, what: &str) {
 /// be seen by hand-editing the fix out of the tree is not covered by the
 /// suite that ships.
 #[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
 fn on_ufw_a_port_opened_before_a_reboot_is_closed_after_it() {
     require_environment!();
     let (cli, helper) = require_musl_binaries!();
@@ -719,6 +731,7 @@ check_reachable() {
 /// across a real veth to ask "is the port actually reachable", which is the
 /// only question this backend exists to answer correctly.
 #[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
 fn on_nftables_an_opened_port_is_actually_reachable() {
     require_environment!();
     let (cli, helper) = require_musl_binaries!();
@@ -845,6 +858,7 @@ fi
 /// as, and the only thing this container can prove that the unit test
 /// cannot.
 #[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
 fn firewalld_survives_several_sweeps_with_the_users_rule_intact() {
     require_environment!();
     let (cli, helper) = require_musl_binaries!();
@@ -895,6 +909,473 @@ source address=\"192.168.77.0/24\" port port=\"9999\" protocol=\"tcp\" accept'\n
     );
 }
 
+/// The one place `Porthole::open` and every client-requested close are driven
+/// all the way through to the signals they emit.
+///
+/// `crates/porthole-helper/tests/signals.rs` proves the declaration, the
+/// payload and the subscribe-and-receive path, but it emits through
+/// `announce_open`/`announce_close` directly: an `open` that gets far enough
+/// to announce anything has to have changed a real firewall, which the
+/// development host may not do. Here it can -- the container has its own
+/// firewalld in its own network namespace -- so this is what would catch a
+/// method that stopped calling its announcement at all, which no test on the
+/// host can.
+///
+/// `dbus-monitor` is the subscriber because it is the only one these images
+/// have (`dbus-tools` on Fedora). A monitor connection is exempt from D-Bus
+/// receive policy, so what this proves is that the signals are *emitted*,
+/// not that any particular policy would deliver them -- that is
+/// `signals.rs`'s `the_shipped_policy_is_what_lets_a_signal_reach_a_subscriber`,
+/// which uses an ordinary client and its own `dbus-daemon`.
+///
+/// `stdbuf -oL`: `dbus-monitor`'s stdout is a file here, so libc would buffer
+/// it in 4K blocks and the `kill` below would discard whatever had not
+/// filled a block -- a test that reported "no signals" for a reason that has
+/// nothing to do with porthole.
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn signals_reach_a_subscriber_when_a_port_is_opened_and_closed() {
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    ensure_image(FEDORA_IMAGE, "Containerfile.fedora");
+
+    let mut args: Vec<String> = vec!["--cap-add=NET_ADMIN".to_string()];
+    args.extend(cli_mounts(&cli, &helper));
+
+    let body = r#"
+stdbuf -oL dbus-monitor --session "type='signal',interface='com.jacopobriccola.Porthole1'"   > /tmp/signals.txt 2>&1 &
+MONPID=$!
+# dbus-monitor prints its own NameAcquired the moment it is connected, so a
+# non-empty file is a real readiness signal rather than a guessed-at sleep.
+for i in $(seq 1 100); do
+  if [ -s /tmp/signals.txt ]; then break; fi
+  sleep 0.1
+done
+# One of each close a client can ask for, so every reason a *request* can
+# produce is exercised against a real firewall: an ordinary close, the
+# expiry timer's own `--from-timer` close, and `close --all`.
+porthole --session open 5173 --until-reboot
+porthole --session close 5173
+
+ID=$(porthole --session open 6000 --until-reboot --json | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+if [ -z "$ID" ]; then echo "NO_RULE_ID_IN_OPEN_JSON" >&2; exit 95; fi
+porthole --session close --id "$ID" --from-timer
+
+porthole --session open 7000 --until-reboot
+porthole --session open 7001 --until-reboot
+porthole --session close --all
+
+sleep 1
+kill "$MONPID" 2>/dev/null || true
+"#;
+
+    let script = format!(
+        "set -e\n{FAKE_LAN_INTERFACE}\n{FIREWALLD_DAEMON_SETUP}\n{}\n{}\n",
+        with_helper(body),
+        marker_block("SIGNALS", "cat /tmp/signals.txt"),
+    );
+
+    eprintln!("== firewalld test: an open and a close reach a subscriber ==");
+    let out = podman_run(FEDORA_IMAGE, &args, &script);
+    eprintln!("{}", String::from_utf8_lossy(&out.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&out.stderr));
+    assert_container_ok(&out, "the firewalld signals container");
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let signals = extract_marker(&stdout, "SIGNALS");
+
+    assert!(
+        signals.contains("member=RuleOpened"),
+        "a real `porthole open` announced nothing: {signals}"
+    );
+    assert!(
+        signals.contains("member=RuleClosed"),
+        "a real `porthole close` announced nothing: {signals}"
+    );
+    assert!(
+        signals.contains(r#"string "requested""#),
+        "the close a person asked for must carry that reason: {signals}"
+    );
+    assert!(
+        signals.contains(r#"string "expired""#),
+        "the expiry timer's own close must not read as one a person asked \
+         for: {signals}"
+    );
+    for port in ["5173", "6000", "7000", "7001"] {
+        assert!(
+            signals.contains(&format!("uint16 {port}")),
+            "the signals must name port {port}: {signals}"
+        );
+    }
+    // Four opens, four closes, one signal each. A count rather than a
+    // presence check, because the defect this task exists to prevent is a
+    // close that announces nothing while its neighbours do -- which every
+    // `contains` above would still pass.
+    assert_eq!(
+        signals.matches("member=RuleOpened").count(),
+        4,
+        "one RuleOpened per open: {signals}"
+    );
+    assert_eq!(
+        signals.matches("member=RuleClosed").count(),
+        4,
+        "one RuleClosed per close, `close --all`'s two included: {signals}"
+    );
+    assert_eq!(
+        signals.matches(r#"string "requested""#).count(),
+        3,
+        "the ordinary close and `close --all`'s two, and nothing else: \
+         {signals}"
+    );
+    // `--to subnet` is the default, and the helper resolves it. The signal
+    // carries what the helper decided, so the fabricated LAN's own CIDR is
+    // what a subscriber sees -- never the word the client typed.
+    assert!(
+        signals.contains("10.10.10.0/24"),
+        "the signals must carry the resolved subnet: {signals}"
+    );
+    // The removal spec stays on the privileged side. A firewalld handle would
+    // show up here as the rich rule itself.
+    assert!(
+        !signals.contains("rule family"),
+        "a rich rule rode the broadcast: {signals}"
+    );
+}
+
+/// A record dropped by a *per-operation* sweep, with the helper never
+/// restarting, reaches the bus as `CloseReason::Reconciled`.
+///
+/// The realistic trigger, and the one no restart-based test covers: a
+/// `firewall-cmd --reload` while the helper is running. porthole's rules are
+/// runtime-only, so the reload throws them away; the state file survives; and
+/// the next operation's own reconciliation drops the record. That operation
+/// here is a `porthole close`, which then **fails** -- the record it was
+/// about to act on is the one that just went -- which is exactly the shape
+/// that would hide the drop from a subscriber if the announcement were tied
+/// to the operation succeeding.
+///
+/// The host-side counterpart
+/// (`porthole-helper/tests/signals.rs`'s
+/// `a_record_the_firewall_no_longer_has_is_announced_by_the_operation_that_finds_it`)
+/// synthesises the orphaned record; this one gets it from a real reload of a
+/// real firewalld.
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn a_reload_under_a_running_helper_announces_the_records_it_orphaned() {
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    ensure_image(FEDORA_IMAGE, "Containerfile.fedora");
+
+    let mut args: Vec<String> = vec!["--cap-add=NET_ADMIN".to_string()];
+    args.extend(cli_mounts(&cli, &helper));
+
+    let body = r#"
+stdbuf -oL dbus-monitor --session "type='signal',interface='com.jacopobriccola.Porthole1'" \
+  > /tmp/signals.txt 2>&1 &
+MONPID=$!
+for i in $(seq 1 100); do
+  if [ -s /tmp/signals.txt ]; then break; fi
+  sleep 0.1
+done
+
+porthole --session open 5173 --until-reboot
+
+# The firewall forgets. The helper does not restart, and porthole's state
+# file still has the record.
+firewall-cmd --reload
+echo '===PH_AFTER_RELOAD_START==='
+firewall-cmd --list-rich-rules
+echo '===PH_AFTER_RELOAD_END==='
+
+# Fails: this operation's own sweep drops the record before the close can
+# find it. The drop must be announced anyway.
+porthole --session close 5173 || true
+echo '===PH_AFTER_CLOSE_START==='
+porthole --session list --json
+echo '===PH_AFTER_CLOSE_END==='
+
+sleep 1
+kill "$MONPID" 2>/dev/null || true
+"#;
+
+    let script = format!(
+        "set -e\n{FAKE_LAN_INTERFACE}\n{FIREWALLD_DAEMON_SETUP}\n{}\n{}\n",
+        with_helper(body),
+        marker_block("SIGNALS", "cat /tmp/signals.txt"),
+    );
+
+    eprintln!("== firewalld test: a reload under a running helper is announced ==");
+    let out = podman_run(FEDORA_IMAGE, &args, &script);
+    eprintln!("{}", String::from_utf8_lossy(&out.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&out.stderr));
+    assert_container_ok(&out, "the firewalld reload container");
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+    let after_reload = extract_marker(&stdout, "AFTER_RELOAD");
+    assert!(
+        !after_reload.contains(r#"port="5173""#),
+        "the reload was supposed to leave the firewall without porthole's \
+         rule, so the next sweep has something to find: {after_reload}"
+    );
+    assert!(
+        extract_marker(&stdout, "AFTER_CLOSE").contains(r#""rules":[]"#),
+        "the record must be gone from state too: {}",
+        extract_marker(&stdout, "AFTER_CLOSE")
+    );
+
+    let signals = extract_marker(&stdout, "SIGNALS");
+    assert_eq!(
+        signals.matches("member=RuleClosed").count(),
+        1,
+        "exactly one RuleClosed, for the record the sweep dropped: {signals}"
+    );
+    assert!(
+        signals.contains(r#"string "reconciled""#),
+        "porthole did not close this one -- it found a record of a rule the \
+         firewall no longer had: {signals}"
+    );
+    assert!(
+        !signals.contains(r#"string "requested""#),
+        "the close failed, so nothing may claim a client asked for it: \
+         {signals}"
+    );
+    assert!(
+        signals.contains("uint16 5173"),
+        "the signal must name the record that was dropped: {signals}"
+    );
+}
+
+/// The start-up reconciliation sweep announces what it dropped, as
+/// `CloseReason::Reconciled`.
+///
+/// The condition is built inside one container rather than across a reboot:
+/// a rule opened, the helper stopped, `firewall-cmd --reload` throwing away
+/// every runtime rule (porthole never writes a permanent one), and a second
+/// helper started. That second helper's sweep is the one in
+/// `porthole-helper/src/main.rs`'s `reconcile_at_startup`, and the rule it
+/// finds in state and not in the firewall is exactly the "opened before the
+/// reboot" case.
+///
+/// This is the only test anywhere that shows the announcement happening at
+/// all: it is emitted after the bus name is claimed, from a code path with
+/// no client and no request behind it, and nothing on the development host
+/// can reach it. `dbus-monitor` is started before the second helper for the
+/// same reason -- a subscriber that connects afterwards has already missed
+/// it, which the emitting code says outright.
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn the_start_up_sweep_announces_what_it_dropped() {
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    ensure_image(FEDORA_IMAGE, "Containerfile.fedora");
+
+    let mut args: Vec<String> = vec!["--cap-add=NET_ADMIN".to_string()];
+    args.extend(cli_mounts(&cli, &helper));
+
+    // Not `with_helper`: this needs two helper lifetimes with a subscriber
+    // started between them, which that wrapper's single start/stop cannot
+    // express.
+    let inner = r#"
+set -e
+start_helper() {
+  porthole-helper --session >>/tmp/porthole-helper.log 2>&1 &
+  HPID=$!
+  for i in $(seq 1 100); do
+    if dbus-send --session --dest=com.jacopobriccola.Porthole --print-reply \
+         /com/jacopobriccola/Porthole org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1
+    then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "PORTHOLE_HELPER_NEVER_READY" >&2
+  cat /tmp/porthole-helper.log >&2
+  exit 97
+}
+
+start_helper
+porthole --session open 5173 --until-reboot
+kill "$HPID" 2>/dev/null || true
+wait "$HPID" 2>/dev/null || true
+
+# firewalld drops every runtime rule on reload, and porthole never writes a
+# permanent one -- so this is the firewall forgetting what porthole's state
+# file still remembers, which is what a reboot does to ufw.
+firewall-cmd --reload
+echo '===PH_AFTER_RELOAD_START==='
+firewall-cmd --list-rich-rules
+echo '===PH_AFTER_RELOAD_END==='
+
+stdbuf -oL dbus-monitor --session "type='signal',interface='com.jacopobriccola.Porthole1'" \
+  > /tmp/signals.txt 2>&1 &
+MONPID=$!
+for i in $(seq 1 100); do
+  if [ -s /tmp/signals.txt ]; then break; fi
+  sleep 0.1
+done
+
+start_helper
+sleep 1
+kill "$MONPID" 2>/dev/null || true
+kill "$HPID" 2>/dev/null || true
+wait "$HPID" 2>/dev/null || true
+"#;
+
+    let script = format!(
+        "set -e\n{FAKE_LAN_INTERFACE}\n{FIREWALLD_DAEMON_SETUP}\n\
+         cat > /tmp/porthole-reconcile.sh <<'PORTHOLE_INNER_EOF'\n{inner}\n\
+         PORTHOLE_INNER_EOF\n\
+         dbus-run-session -- bash /tmp/porthole-reconcile.sh\n{}\n",
+        marker_block("SIGNALS", "cat /tmp/signals.txt"),
+    );
+
+    eprintln!("== firewalld test: the start-up sweep announces what it dropped ==");
+    let out = podman_run(FEDORA_IMAGE, &args, &script);
+    eprintln!("{}", String::from_utf8_lossy(&out.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&out.stderr));
+    assert_container_ok(&out, "the firewalld reconciliation-signal container");
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+    // Without this the test could pass for the wrong reason -- or fail
+    // without saying which half broke.
+    let after_reload = extract_marker(&stdout, "AFTER_RELOAD");
+    assert!(
+        !after_reload.contains(r#"port="5173""#),
+        "the reload was supposed to leave the firewall without porthole's \
+         rule, so the second helper's sweep has something to find: \
+         {after_reload}"
+    );
+
+    let signals = extract_marker(&stdout, "SIGNALS");
+    assert!(
+        signals.contains("member=RuleClosed"),
+        "the start-up sweep dropped a rule and announced nothing: {signals}"
+    );
+    assert!(
+        signals.contains(r#"string "reconciled""#),
+        "the sweep did not close anything itself, so the reason must say so \
+         rather than claiming a close: {signals}"
+    );
+    assert!(
+        signals.contains("uint16 5173"),
+        "the signal must name the rule that was dropped: {signals}"
+    );
+}
+
+/// The network watcher announces the change and the closes it caused.
+///
+/// `-e PORTHOLE_NETMON=1` is what lets the watcher run at all here. It does
+/// not run under `--session` otherwise, because a `--session` helper started
+/// on a developer's own machine would be closing rules in that machine's real
+/// firewall off a timer; this container's firewall is its own and goes away
+/// with it, which is what the variable asserts. See
+/// `porthole_helper::netmon::should_run`.
+///
+/// Two waits of just over `netmon::POLL_INTERVAL` (60s), which is what makes
+/// this test take well over two minutes: the poll is the only wake-up source
+/// a container has -- `org.freedesktop.NetworkManager` is not on this bus --
+/// and the interval is a production constant, not something a test may
+/// shorten. Two polls are needed rather than one because `NetworkChanged`
+/// compares a look against the *previous* look: the first poll only records
+/// where the machine is, and it is the second, after the address has moved,
+/// that has something to compare against.
+///
+/// Nothing on the development host can reach this code: `netmon` closes
+/// rules in a real firewall, off its own timer, with no client involved.
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn a_subnet_the_machine_left_is_announced_along_with_the_rules_it_closed() {
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    ensure_image(FEDORA_IMAGE, "Containerfile.fedora");
+
+    let mut args: Vec<String> = vec![
+        "--cap-add=NET_ADMIN".to_string(),
+        "-e".to_string(),
+        "PORTHOLE_NETMON=1".to_string(),
+    ];
+    args.extend(cli_mounts(&cli, &helper));
+
+    let body = r#"
+stdbuf -oL dbus-monitor --session "type='signal',interface='com.jacopobriccola.Porthole1'" \
+  > /tmp/signals.txt 2>&1 &
+MONPID=$!
+for i in $(seq 1 100); do
+  if [ -s /tmp/signals.txt ]; then break; fi
+  sleep 0.1
+done
+
+porthole --session open 5173 --until-reboot
+
+# Long enough for one poll to have looked and recorded 10.10.10.0/24 while
+# the rule was still on it -- so nothing has closed yet, and there is a
+# previous look for the next one to differ from.
+sleep 70
+echo '===PH_BEFORE_MOVE_START==='
+porthole --session list --json
+echo '===PH_BEFORE_MOVE_END==='
+
+# The machine moves to a different subnet on the same interface: a new
+# access point, or a fresh DHCP lease.
+ip addr flush dev eth0
+ip addr add 192.168.5.50/24 dev eth0
+ip route add default via 192.168.5.1 dev eth0
+
+sleep 70
+echo '===PH_AFTER_MOVE_START==='
+porthole --session list --json
+echo '===PH_AFTER_MOVE_END==='
+kill "$MONPID" 2>/dev/null || true
+"#;
+
+    let script = format!(
+        "set -e\n{FAKE_LAN_INTERFACE}\n{FIREWALLD_DAEMON_SETUP}\n{}\n{}\n",
+        with_helper(body),
+        marker_block("SIGNALS", "cat /tmp/signals.txt"),
+    );
+
+    eprintln!("== firewalld test: leaving a subnet is announced (this one takes ~2.5 minutes) ==");
+    let out = podman_run(FEDORA_IMAGE, &args, &script);
+    eprintln!("{}", String::from_utf8_lossy(&out.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&out.stderr));
+    assert_container_ok(&out, "the firewalld network-change container");
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+    // Both listings, so a failure says which half broke: a rule that was
+    // never open in the first place would produce the same empty "after" as
+    // one the watcher closed.
+    assert!(
+        extract_marker(&stdout, "BEFORE_MOVE").contains("5173"),
+        "the rule must still be open while the machine is on its own subnet: {}",
+        extract_marker(&stdout, "BEFORE_MOVE")
+    );
+    assert!(
+        !extract_marker(&stdout, "AFTER_MOVE").contains("5173"),
+        "the rule must be gone once the machine has left that subnet: {}",
+        extract_marker(&stdout, "AFTER_MOVE")
+    );
+
+    let signals = extract_marker(&stdout, "SIGNALS");
+    assert!(
+        signals.contains("member=NetworkChanged"),
+        "the machine changed subnet and nothing said so: {signals}"
+    );
+    assert!(
+        signals.contains(r#"string "10.10.10.0/24""#)
+            && signals.contains(r#"string "192.168.5.0/24""#),
+        "NetworkChanged must name both the subnet left and the one arrived \
+         on: {signals}"
+    );
+    assert!(
+        signals.contains(r#"string "network-changed""#),
+        "the close the move caused must carry that reason, not `requested`: \
+         {signals}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Step 4: dry-run is byte-identical to reality, on all three backends.
 // ---------------------------------------------------------------------------
@@ -932,6 +1413,7 @@ fn parse_dry_run_open(json_text: &str) -> (String, Vec<String>) {
 /// itself as proof the two are talking about the same, single, would-be
 /// mutation.
 #[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
 fn dry_run_is_byte_identical_to_reality_on_ufw() {
     require_environment!();
     let (cli, _helper) = require_musl_binaries!();
@@ -980,6 +1462,7 @@ fn dry_run_is_byte_identical_to_reality_on_ufw() {
 }
 
 #[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
 fn dry_run_is_byte_identical_to_reality_on_firewalld() {
     require_environment!();
     let (cli, _helper) = require_musl_binaries!();
@@ -1035,6 +1518,7 @@ source address=\"192.168.77.0/24\" port port=\"9999\" protocol=\"tcp\" accept'\n
 }
 
 #[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
 fn dry_run_is_byte_identical_to_reality_on_nftables() {
     require_environment!();
     let (cli, _helper) = require_musl_binaries!();

@@ -6,12 +6,46 @@
 
 use porthole_core::backend::BackendId;
 use porthole_core::command::Command;
+use porthole_core::devices::{DeviceAddress, DeviceStatus};
+use porthole_core::docker::Published;
 use porthole_core::engine::Status;
 use porthole_core::error::Error;
 use porthole_core::listening::{Binding, Service};
-use porthole_core::model::Target;
+use porthole_core::model::{Protocol, Target};
 use porthole_core::state::ManagedRule;
 use serde_json::{json, Value};
+
+/// The Docker publish rule matching `port`/`protocol`, if any -- the lookup
+/// that keeps Docker's own facts out of [`Service`] and [`Binding`]
+/// entirely, rather than as a new field or variant on either. `Binding` is
+/// matched exhaustively, with no wildcard arm, by `porthole-gui`'s own
+/// `listening_section.rs` (`subtitle_for` and `group_rank`, plus a test
+/// helper) -- a new variant there is never silently dropped, which also
+/// means a Docker variant added there would need that crate updated and
+/// rebuilt to prove it still compiles, and this host cannot build
+/// `porthole-gui` at all. `Service` carries the same risk one level down: it
+/// is built as a whole-struct literal (`Service { .. }`) across this crate's
+/// and `porthole-gui`'s own tests, so an added field would need every one of
+/// those updated too. A third fact porthole-core itself has no opinion on
+/// belongs beside a `Service`, not inside one. See `docs/json-schema.md`'s
+/// `listen --json` section for the JSON shape this produces.
+fn docker_for(port: u16, protocol: Protocol, docker: &[Published]) -> Option<Published> {
+    // The most exposing match, not the first -- one host port can carry more
+    // than one DNAT rule, and `docs/json-schema.md` documents this field as a
+    // single object. Reporting the loopback rule of a port that is *also*
+    // published on every interface would tell a script the port is not
+    // reachable from the network when it is. Same ordering as
+    // `porthole_core::docker::advise`, and for the same reason.
+    docker
+        .iter()
+        .filter(|p| p.host_port == port && p.protocol == protocol)
+        .min_by_key(|p| match p.host_addr {
+            None => 0,
+            Some(addr) if !addr.is_loopback() => 1,
+            Some(_) => 2,
+        })
+        .copied()
+}
 
 /// The version of the `--json` output shape.
 pub const JSON_SCHEMA: u32 = 1;
@@ -164,16 +198,30 @@ pub fn print_rules(rules: &[ManagedRule], now: u64) {
     }
 }
 
-pub fn json_opened(rule: &ManagedRule, now: u64, dry_run: bool, commands: &[Command]) -> Value {
+/// `docker_note` is [`porthole_core::docker::advise`]'s own text -- `None`
+/// on almost every open, since Docker has an opinion about this exact
+/// port/protocol only rarely. It is a plain string here, not a structured
+/// object: a script that wants to *act* on this would need the same
+/// `Published` fact `porthole listen --json`'s own `docker` field already
+/// carries, and this is a one-line warning for the person reading `open`'s
+/// own output, not a second copy of that data.
+pub fn json_opened(
+    rule: &ManagedRule,
+    now: u64,
+    dry_run: bool,
+    commands: &[Command],
+    docker_note: Option<&str>,
+) -> Value {
     json!({
         "schema": JSON_SCHEMA,
         "dry_run": dry_run,
         "rule": rule_json(rule, now),
         "commands": commands.iter().map(Command::display).collect::<Vec<_>>(),
+        "docker_note": docker_note,
     })
 }
 
-pub fn print_opened(rule: &ManagedRule, now: u64) {
+pub fn print_opened(rule: &ManagedRule, now: u64, docker_note: Option<&str>) {
     println!(
         "Opened {}/{} towards {} · closes {}",
         rule.port,
@@ -181,6 +229,10 @@ pub fn print_opened(rule: &ManagedRule, now: u64) {
         rule.target,
         format_remaining(rule.expires_in(now))
     );
+    if let Some(note) = docker_note {
+        println!();
+        println!("{note}");
+    }
 }
 
 pub fn print_dry_run(commands: &[Command]) {
@@ -359,7 +411,14 @@ fn binding_tag(binding: &Binding) -> &'static str {
     }
 }
 
-fn service_json(service: &Service) -> Value {
+/// `docker` is `None` when Docker information could not be checked at all
+/// (the helper is absent, or the D-Bus call otherwise failed) -- see
+/// `json_listening`'s own `docker_checked` for the field that carries that
+/// fact, since this row-level shape alone cannot distinguish "checked, and
+/// Docker does not touch this port" from "not checked" and must not be read
+/// as claiming the latter.
+fn service_json(service: &Service, docker: Option<&[Published]>) -> Value {
+    let published = docker.and_then(|list| docker_for(service.port, service.protocol, list));
     json!({
         "port": service.port,
         "protocol": service.protocol.to_string(),
@@ -367,13 +426,26 @@ fn service_json(service: &Service) -> Value {
         "binding": binding_tag(&service.binding),
         "process": service.process,
         "pid": service.pid,
+        "docker": published.map(|p| json!({
+            "published_on": p.host_addr.map(|a| a.to_string()),
+        })),
     })
 }
 
-pub fn json_listening(services: &[Service]) -> Value {
+/// `docker` is `None` when it could not be checked at all -- the privileged
+/// helper is what can actually read Docker's own DNAT rules (see
+/// `porthole_core::docker`'s own module doc), and `listen` must keep working
+/// without it, the same way it already does without a firewall backend
+/// installed. `docker_checked` says which case this is; a script that reads
+/// `docker: null` on every row without also checking `docker_checked` would
+/// be unable to tell "Docker was checked and touches nothing here" from "not
+/// checked at all" -- exactly the silent claim of absence this field exists
+/// to rule out.
+pub fn json_listening(services: &[Service], docker: Option<&[Published]>) -> Value {
     json!({
         "schema": JSON_SCHEMA,
-        "services": services.iter().map(service_json).collect::<Vec<_>>(),
+        "docker_checked": docker.is_some(),
+        "services": services.iter().map(|s| service_json(s, docker)).collect::<Vec<_>>(),
     })
 }
 
@@ -393,15 +465,15 @@ pub fn json_listening(services: &[Service]) -> Value {
 ///   usually the majority of the list (see `milestone-4-verified-facts.md`),
 ///   and opening the firewall for one of them genuinely changes nothing,
 ///   since the process is not listening on a network interface at all.
-pub fn print_listening(services: &[Service]) {
-    print!("{}", render_listening(services));
+pub fn print_listening(services: &[Service], docker: Option<&[Published]>) {
+    print!("{}", render_listening(services, docker));
 }
 
 /// The text `print_listening` prints, built as a `String` rather than
 /// printed line-by-line so tests can assert on it directly -- see the
 /// `BeyondReach` tests below, which check a *property* of this text (it must
 /// never claim the service is unreachable), not a literal sentence.
-fn render_listening(services: &[Service]) -> String {
+fn render_listening(services: &[Service], docker: Option<&[Published]>) -> String {
     use std::fmt::Write as _;
     let w = "writing to a String cannot fail";
     let mut out = String::new();
@@ -456,6 +528,7 @@ fn render_listening(services: &[Service]) -> String {
         port_width,
         name_width,
         address_width,
+        docker,
     );
 
     if !beyond_reach.is_empty() {
@@ -474,6 +547,7 @@ fn render_listening(services: &[Service]) -> String {
             port_width,
             name_width,
             address_width,
+            docker,
         );
     }
 
@@ -486,7 +560,30 @@ fn render_listening(services: &[Service]) -> String {
             "Loopback only — opening the firewall for these changes nothing:"
         )
         .expect(w);
-        append_listening_rows(&mut out, &loopback, port_width, name_width, address_width);
+        append_listening_rows(
+            &mut out,
+            &loopback,
+            port_width,
+            name_width,
+            address_width,
+            docker,
+        );
+    }
+
+    // Silence here would read as "Docker was checked, and touches nothing on
+    // this machine" -- exactly the false-in-the-dangerous-direction claim
+    // `porthole_core::docker`'s own module doc exists to rule out. Said once,
+    // at the end, rather than per row: every row would otherwise need the
+    // same caveat repeated.
+    if docker.is_none() {
+        writeln!(out).expect(w);
+        writeln!(
+            out,
+            "Docker information unavailable — the porthole helper could not be reached, or \
+             answered with an error, so porthole cannot say whether any of these ports are \
+             already published by a container."
+        )
+        .expect(w);
     }
 
     out
@@ -497,12 +594,19 @@ fn render_listening(services: &[Service]) -> String {
 /// they read as two distinct sockets rather than one service printed twice.
 /// See this function's own caller for why the width is computed once, over
 /// every service, rather than per group.
+///
+/// `docker` is threaded through from `render_listening` rather than looked
+/// up once per group: the lookup is by port/protocol, not by group, and
+/// `None` (not checked) must stay `None` for every row rather than reading
+/// as "checked, and this row is not published" -- see `service_json`'s own
+/// doc comment for the same distinction on the `--json` side.
 fn append_listening_rows(
     out: &mut String,
     services: &[&Service],
     port_width: usize,
     name_width: usize,
     address_width: usize,
+    docker: Option<&[Published]>,
 ) {
     use std::fmt::Write as _;
     for service in services {
@@ -513,12 +617,114 @@ fn append_listening_rows(
             .pid
             .map(|p| p.to_string())
             .unwrap_or_else(|| "unknown".to_string());
+        let published = docker.and_then(|list| docker_for(service.port, service.protocol, list));
+        let docker_suffix = match published {
+            Some(p) => match p.host_addr {
+                Some(addr) => format!("  docker: published on {addr}"),
+                None => "  docker: published on every interface".to_string(),
+            },
+            None => String::new(),
+        };
         writeln!(
             out,
-            "  {port_proto:port_width$}  {process:name_width$}  {address:address_width$}  pid {pid}"
+            "  {port_proto:port_width$}  {process:name_width$}  {address:address_width$}  \
+             pid {pid}{docker_suffix}"
         )
         .expect("writing to a String cannot fail");
     }
+}
+
+fn device_address_string(address: &DeviceAddress) -> String {
+    match address {
+        DeviceAddress::Mac(mac) => mac.clone(),
+        DeviceAddress::Host(host) => host.clone(),
+    }
+}
+
+fn device_json(row: &DeviceStatus) -> Value {
+    let (kind, address) = match &row.device.address {
+        DeviceAddress::Mac(mac) => ("mac", mac.clone()),
+        DeviceAddress::Host(host) => ("host", host.clone()),
+    };
+    json!({
+        "name": row.device.name,
+        "kind": kind,
+        "address": address,
+        "resolvable": row.resolved.is_some(),
+        "resolved_address": row.resolved.map(|a| a.to_string()),
+    })
+}
+
+/// What `devices add` and `devices rm` print under `--json`.
+///
+/// Deliberately not [`device_json`]'s shape: that one carries `resolvable`
+/// and `resolved_address`, which are a live lookup `devices list` performs
+/// and neither of these commands does. Reporting them here would mean either
+/// resolving a device nobody asked to resolve, or printing two fields whose
+/// value says nothing.
+///
+/// `action` is `"added"` or `"forgotten"`, so one parser can read both.
+pub fn json_device_changed(action: &str, name: &str, address: Option<&DeviceAddress>) -> Value {
+    let (kind, addr) = match address {
+        Some(DeviceAddress::Mac(mac)) => (Some("mac"), Some(mac.clone())),
+        Some(DeviceAddress::Host(host)) => (Some("host"), Some(host.clone())),
+        None => (None, None),
+    };
+    json!({
+        "schema": JSON_SCHEMA,
+        "action": action,
+        "device": {
+            "name": name,
+            "kind": kind,
+            "address": addr,
+        },
+    })
+}
+
+pub fn json_devices(rows: &[DeviceStatus]) -> Value {
+    json!({
+        "schema": JSON_SCHEMA,
+        "devices": rows.iter().map(device_json).collect::<Vec<_>>(),
+    })
+}
+
+pub fn print_devices(rows: &[DeviceStatus]) {
+    print!("{}", render_devices(rows));
+}
+
+/// The text `print_devices` prints, built as a `String` so tests can assert
+/// on it directly -- the same split `render_listening` uses, for the same
+/// reason.
+fn render_devices(rows: &[DeviceStatus]) -> String {
+    use std::fmt::Write as _;
+    let w = "writing to a String cannot fail";
+    let mut out = String::new();
+
+    if rows.is_empty() {
+        writeln!(out, "No saved devices.").expect(w);
+        return out;
+    }
+
+    let name_width = rows.iter().map(|r| r.device.name.len()).max().unwrap_or(0);
+    let address_width = rows
+        .iter()
+        .map(|r| device_address_string(&r.device.address).len())
+        .max()
+        .unwrap_or(0);
+    for row in rows {
+        let address = device_address_string(&row.device.address);
+        let status = match row.resolved {
+            Some(addr) => format!("resolves to {addr}"),
+            None => "not on this network right now".to_string(),
+        };
+        writeln!(
+            out,
+            "{:name_width$}  {address:address_width$}  {status}",
+            row.device.name
+        )
+        .expect(w);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -585,6 +791,27 @@ mod tests {
         let json = json_rules(&[forever], 1_757_000_000);
         assert!(json["rules"][0]["expires_at"].is_null());
         assert!(json["rules"][0]["expires_in_seconds"].is_null());
+    }
+
+    #[test]
+    fn json_opened_carries_a_null_docker_note_on_the_ordinary_open() {
+        let json = json_opened(&rule(), 1_757_000_000, false, &[], None);
+        assert!(json["docker_note"].is_null());
+    }
+
+    #[test]
+    fn json_opened_carries_dockers_own_warning_when_there_is_one() {
+        let json = json_opened(
+            &rule(),
+            1_757_000_000,
+            false,
+            &[],
+            Some("Docker already publishes 5173/tcp on every interface (0.0.0.0)"),
+        );
+        assert_eq!(
+            json["docker_note"],
+            "Docker already publishes 5173/tcp on every interface (0.0.0.0)"
+        );
     }
 
     #[test]
@@ -865,7 +1092,7 @@ mod tests {
             Some("node"),
             Some(12043),
         )];
-        let json = json_listening(&services);
+        let json = json_listening(&services, None);
         assert_eq!(json["schema"], 1);
         let svc = &json["services"][0];
         assert_eq!(svc["port"], 5173);
@@ -882,7 +1109,7 @@ mod tests {
         // "the process is actually named that" -- a literal "unknown" string
         // would erase exactly that distinction.
         let services = vec![service(53, Binding::LoopbackOnly, None, None)];
-        let json = json_listening(&services);
+        let json = json_listening(&services, None);
         assert!(json["services"][0]["process"].is_null());
         assert!(json["services"][0]["pid"].is_null());
     }
@@ -895,15 +1122,104 @@ mod tests {
             None,
             None,
         )];
-        let json = json_listening(&services);
+        let json = json_listening(&services, None);
         assert_eq!(json["services"][0]["binding"], "specific");
         assert_eq!(json["services"][0]["address"], "10.10.10.5");
     }
 
     #[test]
     fn the_empty_listening_list_is_an_empty_array_not_a_missing_key() {
-        let json = json_listening(&[]);
+        let json = json_listening(&[], None);
         assert_eq!(json["services"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn docker_not_checked_is_a_top_level_fact_not_folded_into_every_row() {
+        // `docker: null` on a row must not, by itself, be read as "Docker
+        // does not touch this port" -- it also means "not checked at all"
+        // when the helper could not be reached. `docker_checked` is the
+        // field that tells the two apart.
+        let services = vec![service(5173, Binding::AllInterfaces, None, None)];
+        let json = json_listening(&services, None);
+        assert_eq!(json["docker_checked"], false);
+        assert!(json["services"][0]["docker"].is_null());
+    }
+
+    #[test]
+    fn a_docker_published_row_carries_the_address_it_was_published_on() {
+        let services = vec![
+            service(8080, Binding::AllInterfaces, None, None),
+            service(5432, Binding::LoopbackOnly, None, None),
+        ];
+        let published = vec![
+            Published {
+                host_addr: None,
+                host_port: 8080,
+                protocol: Protocol::Tcp,
+                container_addr: "172.17.0.2".parse().unwrap(),
+                container_port: 80,
+            },
+            Published {
+                host_addr: Some("127.0.0.1".parse().unwrap()),
+                host_port: 5432,
+                protocol: Protocol::Tcp,
+                container_addr: "172.17.0.3".parse().unwrap(),
+                container_port: 80,
+            },
+        ];
+        let json = json_listening(&services, Some(&published));
+        assert_eq!(json["docker_checked"], true);
+        assert!(json["services"][0]["docker"]["published_on"].is_null());
+        assert_eq!(json["services"][1]["docker"]["published_on"], "127.0.0.1");
+    }
+
+    #[test]
+    fn a_port_docker_does_not_publish_is_null_even_though_docker_was_checked() {
+        let services = vec![service(5173, Binding::AllInterfaces, None, None)];
+        let json = json_listening(&services, Some(&[]));
+        assert_eq!(json["docker_checked"], true);
+        assert!(json["services"][0]["docker"].is_null());
+    }
+
+    #[test]
+    fn the_human_listing_marks_a_docker_published_row_with_its_address() {
+        let services = vec![service(8080, Binding::AllInterfaces, Some("node"), Some(1))];
+        let published = vec![Published {
+            host_addr: None,
+            host_port: 8080,
+            protocol: Protocol::Tcp,
+            container_addr: "172.17.0.2".parse().unwrap(),
+            container_port: 80,
+        }];
+        let text = render_listening(&services, Some(&published));
+        assert!(
+            text.contains("docker: published on every interface"),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn the_human_listing_says_so_when_docker_could_not_be_checked() {
+        let services = vec![service(5173, Binding::AllInterfaces, None, None)];
+        let text = render_listening(&services, None);
+        assert!(
+            text.contains("Docker information unavailable"),
+            "must not silently read as \"Docker touches nothing here\": {text}"
+        );
+    }
+
+    #[test]
+    fn the_human_listing_says_nothing_about_docker_when_it_was_checked_and_found_nothing() {
+        // The unavailable note is specifically about not having checked --
+        // it must not appear once porthole actually confirmed there is
+        // nothing to report.
+        let services = vec![service(5173, Binding::AllInterfaces, None, None)];
+        let text = render_listening(&services, Some(&[]));
+        assert!(
+            !text.contains("Docker information unavailable"),
+            "got: {text}"
+        );
+        assert!(!text.contains("docker:"), "got: {text}");
     }
 
     #[test]
@@ -914,7 +1230,7 @@ mod tests {
             None,
             None,
         )];
-        let json = json_listening(&services);
+        let json = json_listening(&services, None);
         assert_eq!(json["services"][0]["binding"], "beyond_reach");
         assert_eq!(json["services"][0]["address"], "2001:db8::1");
     }
@@ -936,7 +1252,7 @@ mod tests {
             None,
             None,
         )];
-        let text = render_listening(&services);
+        let text = render_listening(&services, None);
         let lower = text.to_lowercase();
         assert!(
             !lower.contains("changes nothing"),
@@ -953,7 +1269,7 @@ mod tests {
         // The other half of the same guard: fixing BeyondReach must not
         // water down the (true, for loopback) claim this heading makes.
         let services = vec![service(53, Binding::LoopbackOnly, None, None)];
-        let text = render_listening(&services);
+        let text = render_listening(&services, None);
         assert!(text.contains("Loopback only — opening the firewall for these changes nothing:"));
     }
 
@@ -985,7 +1301,7 @@ mod tests {
             process: Some("dnsmasq".to_string()),
             pid: Some(100),
         };
-        let text = render_listening(&[v4, v6]);
+        let text = render_listening(&[v4, v6], None);
         let rows: Vec<&str> = text.lines().filter(|l| l.contains("53/tcp")).collect();
         assert_eq!(rows.len(), 2, "expected both rows, got: {text}");
         assert_ne!(
@@ -994,5 +1310,93 @@ mod tests {
         );
         assert!(rows[0].contains("0.0.0.0"), "got: {text}");
         assert!(rows[1].contains("::"), "got: {text}");
+    }
+
+    fn device_status(name: &str, address: DeviceAddress, resolved: Option<&str>) -> DeviceStatus {
+        use porthole_core::devices::Device;
+        DeviceStatus {
+            device: Device {
+                name: name.to_string(),
+                address,
+            },
+            resolved: resolved.map(|a| a.parse().unwrap()),
+        }
+    }
+
+    #[test]
+    fn json_devices_has_the_documented_shape() {
+        let rows = vec![device_status(
+            "phone",
+            DeviceAddress::Mac("bc:24:11:5e:1c:6e".to_string()),
+            Some("10.10.10.245"),
+        )];
+        let json = json_devices(&rows);
+        assert_eq!(json["schema"], 1);
+        let d = &json["devices"][0];
+        assert_eq!(d["name"], "phone");
+        assert_eq!(d["kind"], "mac");
+        assert_eq!(d["address"], "bc:24:11:5e:1c:6e");
+        assert_eq!(d["resolvable"], true);
+        assert_eq!(d["resolved_address"], "10.10.10.245");
+    }
+
+    #[test]
+    fn an_unresolvable_device_reports_resolvable_false_and_a_null_address() {
+        let rows = vec![device_status(
+            "tablet",
+            DeviceAddress::Mac("aa:bb:cc:dd:ee:ff".to_string()),
+            None,
+        )];
+        let json = json_devices(&rows);
+        assert_eq!(json["devices"][0]["resolvable"], false);
+        assert!(json["devices"][0]["resolved_address"].is_null());
+    }
+
+    #[test]
+    fn a_host_device_reports_the_host_kind() {
+        let rows = vec![device_status(
+            "printer",
+            DeviceAddress::Host("printer.local".to_string()),
+            Some("10.10.10.55"),
+        )];
+        let json = json_devices(&rows);
+        assert_eq!(json["devices"][0]["kind"], "host");
+        assert_eq!(json["devices"][0]["address"], "printer.local");
+    }
+
+    #[test]
+    fn the_empty_device_list_is_an_empty_array_not_a_missing_key() {
+        let json = json_devices(&[]);
+        assert_eq!(json["devices"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn render_devices_says_nothing_saved_when_the_book_is_empty() {
+        assert_eq!(render_devices(&[]), "No saved devices.\n");
+    }
+
+    #[test]
+    fn render_devices_shows_the_resolved_address_or_says_it_is_absent() {
+        let rows = vec![
+            device_status(
+                "phone",
+                DeviceAddress::Mac("bc:24:11:5e:1c:6e".to_string()),
+                Some("10.10.10.245"),
+            ),
+            device_status(
+                "tablet",
+                DeviceAddress::Mac("aa:bb:cc:dd:ee:ff".to_string()),
+                None,
+            ),
+        ];
+        let text = render_devices(&rows);
+        assert!(
+            text.contains("phone") && text.contains("resolves to 10.10.10.245"),
+            "got: {text}"
+        );
+        assert!(
+            text.contains("tablet") && text.contains("not on this network right now"),
+            "got: {text}"
+        );
     }
 }

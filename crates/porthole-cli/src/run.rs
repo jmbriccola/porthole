@@ -6,10 +6,11 @@ use crate::output;
 use porthole_core::backend::{self, BackendHealth, BackendId, FirewallBackend};
 use porthole_core::clock::{Clock, SystemClock};
 use porthole_core::command::{CommandRunner, DryRunRunner, RealRunner};
+use porthole_core::devices;
 use porthole_core::engine::{Engine, Status};
 use porthole_core::error::{Error, ExitCode, Result};
 use porthole_core::listening::{self, RealProcFs};
-use porthole_core::model::{Lifetime, DEFAULT_DURATION};
+use porthole_core::model::{Lifetime, ScopeSpec, DEFAULT_DURATION};
 use porthole_core::net;
 use porthole_core::state::StateStore;
 use porthole_core::validate;
@@ -115,17 +116,25 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
             })
         }
         // Unprivileged and read-only, like `list`: nothing here needs the
-        // helper or a firewall backend at all, so it works even when neither
-        // is installed.
+        // helper or a firewall backend at all, so it still completes with no
+        // firewall installed. Docker information is the one exception: it is
+        // privileged (`porthole_core::docker`'s own module doc says why),
+        // and asking for it is a best-effort extra, never a reason to fail
+        // `listen` outright -- a helper that is absent, or that answers with
+        // an error, is reported to the renderers as "not checked"
+        // (`docker: None`), not silently folded into "Docker touches
+        // nothing here".
         Commands::Listen => {
             let services = listening::scan(&RealProcFs)?;
+            let docker = client::docker_ports(cli.session).ok();
             if cli.json {
-                println!("{}", output::json_listening(&services));
+                println!("{}", output::json_listening(&services, docker.as_deref()));
             } else {
-                output::print_listening(&services);
+                output::print_listening(&services, docker.as_deref());
             }
             Ok(ExitCode::Success)
         }
+        Commands::Devices { command } => devices_command(cli, command),
     }
 }
 
@@ -135,7 +144,7 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
     // that opening means a polkit prompt — no authentication prompt either.
     let port = validate::parse_port(&args.port)?;
     let protocol = validate::parse_protocol(&args.proto)?;
-    let scope = validate::parse_scope(&args.to)?;
+
     let lifetime = match (&args.duration, args.until_reboot) {
         (Some(raw), false) => Lifetime::For(validate::parse_duration(raw)?),
         (None, true) => Lifetime::UntilReboot,
@@ -148,11 +157,47 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
         }
     };
 
+    // `--to` may name a saved device instead of an ordinary scope.
+    // Resolution happens here, client-side: the helper (and, under
+    // --dry-run, the local engine below) must only ever see an
+    // already-resolved IP -- see `porthole_core::devices`'s own module doc
+    // for why. `wire_to` is what actually crosses the bus for a real (non
+    // dry-run) open; for anything but a device it is `args.to` unchanged.
+    //
+    // Below the duration, deliberately: resolving a device spawns `ip -4
+    // neigh show` or `getent`, and `--for 999h` must be refused without
+    // running either.
+    let (scope, wire_to): (ScopeSpec, String) = match crate::cli::parse_to(&args.to) {
+        crate::cli::ToSpec::Scope(scope) => (scope, args.to.clone()),
+        crate::cli::ToSpec::Invalid(err) => return Err(err),
+        crate::cli::ToSpec::Device(name) => {
+            let book = devices::Book::load(&devices::default_path())?;
+            let runner = make_runner(cli);
+            let addr = devices::resolve(&book, &name, runner.as_ref())?;
+            (ScopeSpec::Host(addr), addr.to_string())
+        }
+    };
+
+    // A best-effort, read-only look at whether Docker already has an
+    // opinion about this exact port/protocol -- see `porthole_core::docker`'s
+    // own module doc for the two ways a user is misled if this stays silent.
+    // Unlike every value resolved above, this never changes what `open`
+    // itself does: a helper that cannot be reached, or that errors, leaves
+    // `docker_note` at `None` rather than failing `open` outright -- `open`
+    // has never needed the helper for anything but the real work, and a
+    // missing bonus warning is not a reason to stop doing that work.
+    let docker_note = client::docker_ports(cli.session)
+        .ok()
+        .and_then(|published| porthole_core::docker::advise(port, protocol, &published));
+
     if cli.dry_run {
-        // Unchanged: local, unprivileged, no helper needed. Seeing what
-        // porthole would do is what earns a user's trust, and asking for a
-        // password — or reaching for a helper that may not even be installed
-        // — first would defeat that.
+        // The engine path below is unchanged: local, unprivileged, no helper
+        // needed. Seeing what porthole would do is what earns a user's
+        // trust, and asking for a password — or reaching for a helper that
+        // may not even be installed — first would defeat that. `docker_note`
+        // above is the one exception: it does attempt the helper, even under
+        // `--dry-run`, since it only ever reads and is swallowed on failure
+        // exactly as it is for a real open.
         let runner = make_runner(cli);
         let backend = backend::detect(runner.as_ref())?;
         let mut engine = make_engine(backend.as_ref(), runner.as_ref())?;
@@ -167,7 +212,7 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
         if cli.json {
             println!(
                 "{}",
-                output::json_opened(&rule, now, true, &runner.recorded())
+                output::json_opened(&rule, now, true, &runner.recorded(), docker_note.as_deref())
             );
         } else {
             println!(
@@ -178,6 +223,10 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
                 output::format_remaining(rule.expires_in(now))
             );
             output::print_dry_run(&runner.recorded());
+            if let Some(note) = &docker_note {
+                println!();
+                println!("{note}");
+            }
         }
         Ok(ExitCode::Success)
     } else {
@@ -188,13 +237,16 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
         // No engine, no runner, no local audit line: the helper does the work
         // and, being a system service, its own journal entry is the audit
         // trail now — in every case, not just under the expiry timer.
-        let rule = client::open(cli.session, port, &args.proto, &args.to, seconds)?;
+        let rule = client::open(cli.session, port, &args.proto, &wire_to, seconds)?;
         let now = rule.opened_at;
 
         if cli.json {
-            println!("{}", output::json_opened(&rule, now, false, &[]));
+            println!(
+                "{}",
+                output::json_opened(&rule, now, false, &[], docker_note.as_deref())
+            );
         } else {
-            output::print_opened(&rule, now);
+            output::print_opened(&rule, now, docker_note.as_deref());
         }
         Ok(ExitCode::Success)
     }
@@ -333,6 +385,115 @@ fn close(cli: &Cli, args: &crate::cli::CloseArgs) -> Result<ExitCode> {
             None => Ok(ExitCode::Success),
         }
     }
+}
+
+/// `porthole devices <list|add|rm>`. Unprivileged and local, like `list` and
+/// `status`: the address book lives client-side, and nothing here ever
+/// touches the helper or a firewall backend.
+fn devices_command(cli: &Cli, command: &crate::cli::DevicesCommand) -> Result<ExitCode> {
+    let path = devices::default_path();
+    match command {
+        crate::cli::DevicesCommand::List => {
+            let book = devices::Book::load(&path)?;
+            let runner = make_runner(cli);
+            let rows = devices::list_status(&book, runner.as_ref())?;
+            if cli.json {
+                println!("{}", output::json_devices(&rows));
+            } else {
+                output::print_devices(&rows);
+            }
+            Ok(ExitCode::Success)
+        }
+        crate::cli::DevicesCommand::Add => add_device(cli, &path),
+        crate::cli::DevicesCommand::Rm { name } => {
+            let mut book = devices::Book::load(&path)?;
+            if !book.remove(name) {
+                return Err(Error::InvalidArgument(format!(
+                    "no saved device named `{name}`"
+                )));
+            }
+            book.save(&path)?;
+            if cli.json {
+                println!("{}", output::json_device_changed("forgotten", name, None));
+            } else {
+                println!("Forgot `{name}`.");
+            }
+            Ok(ExitCode::Success)
+        }
+    }
+}
+
+/// `porthole devices add`: presents the neighbours currently seen on this
+/// network and lets the user pick one, rather than typing a MAC address by
+/// hand -- typing one is exactly what saved devices exist to avoid.
+fn add_device(cli: &Cli, path: &std::path::Path) -> Result<ExitCode> {
+    use std::io::Write as _;
+
+    let mut book = devices::Book::load(path)?;
+    let runner = make_runner(cli);
+    let neighbours = net::neighbours(runner.as_ref())?;
+    // `Err`, not `Ok(ExitCode::Failure)`: `main` renders an `Err` as the
+    // `--json` error object when `--json` was asked for, and prints the
+    // message on stderr when it was not. Returning the code directly printed
+    // prose either way, so `porthole --json devices add` exited 1 with an
+    // empty stdout -- the one thing `docs/json-schema.md` promises no failure
+    // does. The other way this same command fails (`net::neighbours` cannot
+    // run `ip` at all) has always taken the `Err` path; both now report the
+    // same way.
+    if neighbours.is_empty() {
+        return Err(Error::NothingToOffer(format!(
+            "nothing seen on this network yet to pick from -- make sure the device has \
+             talked to this machine recently, or add it by hand in {}",
+            path.display()
+        )));
+    }
+
+    // The picker is a prompt, not output: it goes to stderr so that stdout
+    // carries only the result, and `--json` has a stdout worth parsing. A
+    // person at a terminal sees no difference.
+    eprintln!("Seen on this network:");
+    for (i, n) in neighbours.iter().enumerate() {
+        eprintln!("  {}) {}  {}  ({})", i + 1, n.mac, n.address, n.interface);
+    }
+    eprint!("Pick a number: ");
+    std::io::stderr().flush().ok();
+    let choice = read_line()?;
+    let index: usize = choice.parse().map_err(|_| {
+        Error::InvalidArgument(format!("`{choice}` is not one of the numbers above"))
+    })?;
+    let chosen = index
+        .checked_sub(1)
+        .and_then(|i| neighbours.get(i))
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!("{index} is not one of the numbers above"))
+        })?;
+
+    eprint!("Name this device: ");
+    std::io::stderr().flush().ok();
+    let name = read_line()?;
+    devices::validate_device_name(&name)?;
+
+    let address = devices::DeviceAddress::Mac(chosen.mac.clone());
+    book.add(devices::Device {
+        name: name.clone(),
+        address: address.clone(),
+    });
+    book.save(path)?;
+    if cli.json {
+        println!(
+            "{}",
+            output::json_device_changed("added", &name, Some(&address))
+        );
+    } else {
+        println!("Saved `{name}` as {}.", chosen.mac);
+    }
+    Ok(ExitCode::Success)
+}
+
+fn read_line() -> Result<String> {
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).map_err(Error::Io)?;
+    Ok(line.trim().to_string())
 }
 
 fn make_runner(cli: &Cli) -> Box<dyn CommandRunner> {

@@ -1,21 +1,22 @@
 [package]
-name = "porthole-core"
+name = "porthole-agent"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Core library for porthole: models, firewall backends, state and validation."
+description = "Session agent that turns porthole's bus signals into desktop notifications."
+
+[[bin]]
+name = "porthole-agent"
+path = "src/main.rs"
 
 [dependencies]
-ipnet.workspace = true
+porthole-core = { path = "../porthole-core" }
+futures-util.workspace = true
 libc.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-toml.workspace = true
-uuid.workspace = true
+tokio.workspace = true
 zbus.workspace = true
 
 [dev-dependencies]

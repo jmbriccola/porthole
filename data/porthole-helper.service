@@ -23,11 +23,22 @@ RuntimeDirectoryPreserve=yes
 ProtectHome=yes
 PrivateTmp=yes
 NoNewPrivileges=yes
-# No Restart=: this unit has no WantedBy=, so nothing depends on it staying
-# up between calls -- D-Bus activation already starts it again the next time
-# `open`, `close` or `list` addresses the bus name, which is the same
-# self-healing path a crash takes as a clean stop. Restart=on-failure would
-# race that mechanism with a second one, and would turn a startup failure
-# (no safe CLI binary found, a corrupt state file) into a tight crash loop
-# against systemd's start-limit instead of a helper that just waits to be
-# asked again.
+# No Restart=: this unit has no WantedBy=, so an open/close/list call still
+# self-heals through D-Bus activation the next time one addresses the bus
+# name -- the same path a crash takes as a clean stop. Restart=on-failure
+# would race that mechanism with a second one, and would turn a startup
+# failure (no safe CLI binary found, a corrupt state file) into a tight
+# crash loop against systemd's start-limit instead of a helper that just
+# waits to be asked again.
+#
+# This is no longer the whole story once a rule is open: the network-change
+# monitor (porthole_helper::netmon) runs inside this same process, unlike an
+# opened rule's automatic close, which is its own systemd transient timer
+# outside this process (porthole_core::expiry) and so survives a helper
+# restart. A crash, an OOM kill, a plain `systemctl stop`, or a package
+# try-restart leaves this helper down -- RuntimeDirectoryPreserve=yes above
+# keeps the state file and the firewall keeps every rule regardless -- and
+# nothing notices a subnet change during that window, nor restarts the
+# helper on its own, until a client next addresses the bus name. Left as is
+# here: changing Restart= in light of that is a packaging-milestone decision
+# with its own review, not a side effect of adding the monitor.

@@ -958,6 +958,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "porthole-agent"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "libc",
+ "porthole-core",
+ "tempfile",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "porthole-cli"
 version = "0.1.0"
 dependencies = [
@@ -980,6 +992,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "toml",
  "uuid",
  "zbus",
 ]
@@ -1001,6 +1014,8 @@ name = "porthole-helper"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
+ "ipnet",
  "libc",
  "porthole-core",
  "tempfile",

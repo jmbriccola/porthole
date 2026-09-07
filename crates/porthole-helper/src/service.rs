@@ -14,6 +14,42 @@
 //!    stall every other writer for that whole time.
 //! 5. **Log to the journal with the requesting uid**, which comes from the bus
 //!    daemon rather than from the client.
+//! 6. **Announce it on the bus**, so a desktop agent can say something. Steps
+//!    5 and 6 are one call ([`Porthole::announce_open`],
+//!    [`Porthole::announce_close`]) rather than two statements per call site:
+//!    the journal line and the signal are then built from the same
+//!    [`CloseReason`] value, and there is exactly one place a close could go
+//!    unannounced instead of one per method.
+//!
+//! A rule can also stop being open without any client asking. Every method
+//! that takes the exclusive lock reconciles first, and that sweep drops from
+//! state whatever the firewall no longer has -- a `firewall-cmd --reload`
+//! while the helper is running is enough. Those drops come back from
+//! [`Engine::take_reconciled`] and are announced through
+//! [`Porthole::announce_reconciled`] **before** the method's own signal and
+//! regardless of whether the method itself succeeded, because a `close`
+//! whose rule the sweep just dropped fails, and that is precisely when a
+//! subscriber would otherwise be left showing a port as open forever.
+//!
+//! # Where the announcements are actually tested
+//!
+//! Nothing on the development host can reach an `announce_*` call from a
+//! method: a `close` that gets that far has to have removed a rule from a
+//! real firewall, and an `open` has to have added one. What runs here
+//! instead is the other half -- `crates/porthole-helper/tests/signals.rs`
+//! drives the real `close` and `close_by_id` over a real bus and checks that
+//! the paths which close nothing announce nothing, and drives the
+//! `announce_*` functions themselves against a subscriber to check the
+//! declaration and the payload.
+//!
+//! The emissions themselves are measured in
+//! `crates/porthole-cli/tests/container.rs`, against a real firewalld inside
+//! a container, gated behind `PORTHOLE_CONTAINER_TESTS=1`: an open, an
+//! ordinary close, the expiry timer's own close and `close --all`
+//! (`signals_reach_a_subscriber_when_a_port_is_opened_and_closed`), the
+//! start-up sweep (`the_start_up_sweep_announces_what_it_dropped`) and
+//! [`crate::netmon`]'s network-change closes
+//! (`a_subnet_the_machine_left_is_announced_along_with_the_rules_it_closed`).
 
 use crate::authz::{caller_uid, Action, Authorizer, Details};
 use crate::error::HelperError;
@@ -22,12 +58,13 @@ use porthole_core::clock::SystemClock;
 use porthole_core::command::RealRunner;
 use porthole_core::engine::{is_open_any, resolve_scope, Engine, Status};
 use porthole_core::error::Error;
-use porthole_core::ipc::{WireError, WireRule, WireStatus};
+use porthole_core::ipc::{CloseReason, WireDockerPort, WireError, WireRule, WireStatus};
 use porthole_core::model::Lifetime;
 use porthole_core::net;
 use porthole_core::state::StateStore;
 use porthole_core::validate;
 use std::path::PathBuf;
+use zbus::object_server::SignalEmitter;
 
 static SYSTEM_CLOCK: SystemClock = SystemClock;
 
@@ -68,6 +105,7 @@ impl Porthole {
         scope: &str,
         seconds: u32,
         #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> Result<WireRule, HelperError> {
         // 1. Validate. Nothing the client sent is trusted.
         if port == 0 {
@@ -118,30 +156,35 @@ impl Porthole {
             .map_err(HelperError::from)?;
 
         // 4. Only now take the lock and act.
-        let backend = backend::detect(&runner).map_err(HelperError::from)?;
-        let state = StateStore::open_exclusive(&self.state_path).map_err(HelperError::from)?;
-        let mut engine = Engine::new(
-            backend.as_ref(),
-            &runner,
-            &SYSTEM_CLOCK,
-            state,
-            self.executable.clone(),
-        );
-        let rule = engine
-            .open(port, protocol, &spec, lifetime, uid)
-            .map_err(HelperError::from)?;
+        // Scoped so the `Engine` -- which borrows `&dyn CommandRunner` and
+        // `&dyn Clock`, neither of them `Sync` -- is dropped before the
+        // `.await` below: a zbus interface method's future has to be `Send`.
+        // It also drops the exclusive state lock before the announcement
+        // rather than after it, which is the right order regardless.
+        //
+        // The engine's own result and what its reconciliation dropped come
+        // out separately, and the drops are announced first and
+        // unconditionally: an operation that fails *because* the sweep just
+        // dropped its rule is exactly the case where the drop most needs
+        // saying (see `Engine::take_reconciled`).
+        let (opened, reconciled) = {
+            let backend = backend::detect(&runner).map_err(HelperError::from)?;
+            let state = StateStore::open_exclusive(&self.state_path).map_err(HelperError::from)?;
+            let mut engine = Engine::new(
+                backend.as_ref(),
+                &runner,
+                &SYSTEM_CLOCK,
+                state,
+                self.executable.clone(),
+            );
+            let opened = engine.open(port, protocol, &spec, lifetime, uid);
+            (opened, engine.take_reconciled())
+        };
 
-        // 5. The journal. The helper is a system service, so stderr lands there.
-        eprintln!(
-            "porthole: uid={} opened {}/{} towards {} until {}",
-            rule.uid,
-            rule.port,
-            rule.protocol,
-            rule.target,
-            rule.expires_at
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| "reboot".to_string())
-        );
+        // 5 and 6. The journal, then the bus.
+        Self::announce_reconciled(Some(&emitter), &reconciled).await;
+        let rule = opened.map_err(HelperError::from)?;
+        Self::announce_open(&emitter, &rule).await;
 
         Ok(WireRule::from_rule(&rule))
     }
@@ -151,6 +194,7 @@ impl Porthole {
         port: u16,
         protocol: &str,
         #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> Result<WireRule, HelperError> {
         let protocol = validate::parse_protocol(protocol).map_err(HelperError::from)?;
         self.authorizer
@@ -167,20 +211,34 @@ impl Porthole {
             .await
             .map_err(HelperError::from)?;
 
-        let runner = RealRunner;
-        let backend = backend::detect(&runner).map_err(HelperError::from)?;
-        let state = StateStore::open_exclusive(&self.state_path).map_err(HelperError::from)?;
-        let mut engine = Engine::new(
-            backend.as_ref(),
-            &runner,
-            &SYSTEM_CLOCK,
-            state,
-            self.executable.clone(),
-        );
-        let rule = engine
-            .close_by_port(port, protocol, false)
-            .map_err(HelperError::from)?;
-        Self::log_close(&rule, closed_by, false);
+        // Scoped so the `Engine` -- which borrows `&dyn CommandRunner` and
+        // `&dyn Clock`, neither of them `Sync` -- is dropped before the
+        // `.await` below: a zbus interface method's future has to be `Send`.
+        // It also drops the exclusive state lock before the announcement
+        // rather than after it, which is the right order regardless.
+        //
+        // The engine's own result and what its reconciliation dropped come
+        // out separately, and the drops are announced first and
+        // unconditionally: an operation that fails *because* the sweep just
+        // dropped its rule is exactly the case where the drop most needs
+        // saying (see `Engine::take_reconciled`).
+        let (closed, reconciled) = {
+            let runner = RealRunner;
+            let backend = backend::detect(&runner).map_err(HelperError::from)?;
+            let state = StateStore::open_exclusive(&self.state_path).map_err(HelperError::from)?;
+            let mut engine = Engine::new(
+                backend.as_ref(),
+                &runner,
+                &SYSTEM_CLOCK,
+                state,
+                self.executable.clone(),
+            );
+            let closed = engine.close_by_port(port, protocol, false);
+            (closed, engine.take_reconciled())
+        };
+        Self::announce_reconciled(Some(&emitter), &reconciled).await;
+        let rule = closed.map_err(HelperError::from)?;
+        Self::announce_close(&emitter, &rule, closed_by, CloseReason::Requested).await;
         Ok(WireRule::from_rule(&rule))
     }
 
@@ -200,6 +258,7 @@ impl Porthole {
         from_timer: bool,
         forget: bool,
         #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> Result<WireRule, HelperError> {
         self.authorizer
             .check(Action::Close, &Details::new(), &header)
@@ -210,27 +269,59 @@ impl Porthole {
             .await
             .map_err(HelperError::from)?;
 
-        let runner = RealRunner;
-        let backend = backend::detect(&runner).map_err(HelperError::from)?;
-        let state = StateStore::open_exclusive(&self.state_path).map_err(HelperError::from)?;
-        let mut engine = Engine::new(
-            backend.as_ref(),
-            &runner,
-            &SYSTEM_CLOCK,
-            state,
-            self.executable.clone(),
-        );
-        let rule = engine
-            .close_by_id(id, from_timer, forget)
-            .map_err(HelperError::from)?;
+        // Scoped so the `Engine` -- which borrows `&dyn CommandRunner` and
+        // `&dyn Clock`, neither of them `Sync` -- is dropped before the
+        // `.await` below: a zbus interface method's future has to be `Send`.
+        // It also drops the exclusive state lock before the announcement
+        // rather than after it, which is the right order regardless.
+        //
+        // The engine's own result and what its reconciliation dropped come
+        // out separately, and the drops are announced first and
+        // unconditionally: an operation that fails *because* the sweep just
+        // dropped its rule is exactly the case where the drop most needs
+        // saying (see `Engine::take_reconciled`).
+        let (closed, reconciled) = {
+            let runner = RealRunner;
+            let backend = backend::detect(&runner).map_err(HelperError::from)?;
+            let state = StateStore::open_exclusive(&self.state_path).map_err(HelperError::from)?;
+            let mut engine = Engine::new(
+                backend.as_ref(),
+                &runner,
+                &SYSTEM_CLOCK,
+                state,
+                self.executable.clone(),
+            );
+            let closed = engine.close_by_id(id, from_timer, forget);
+            (closed, engine.take_reconciled())
+        };
+        Self::announce_reconciled(Some(&emitter), &reconciled).await;
+        let rule = closed.map_err(HelperError::from)?;
         // `forget` never touched any firewall -- `Engine::forget_rule`
         // refuses it for anything a real close could still reach -- so the
         // journal must not say "closed", which `format_close_log` always
         // does. A different, explicit line for a different, explicit action.
+        //
+        // And no `RuleClosed` either, for the same reason: none of the four
+        // reasons a `RuleClosed` can carry is true of a forget, and a
+        // subscriber told "closed" would tell someone a port had stopped
+        // being reachable when porthole did not touch any firewall and does
+        // not know whether it did.
+        //
+        // The cost is real and is disclosed where the people who need it
+        // read it: `porthole_core::ipc`'s own `rule_closed` doc says that a
+        // rule can leave `list` with no `RuleClosed` behind it, so an agent
+        // that keeps its view from signals alone would go on showing a
+        // forgotten rule as open. Inventing a fifth reason, or reusing
+        // `requested`, would trade that for a worse claim.
         if forget {
             Self::log_forget(&rule, closed_by);
         } else {
-            Self::log_close(&rule, closed_by, from_timer);
+            let reason = if from_timer {
+                CloseReason::Expired
+            } else {
+                CloseReason::Requested
+            };
+            Self::announce_close(&emitter, &rule, closed_by, reason).await;
         }
         Ok(WireRule::from_rule(&rule))
     }
@@ -240,6 +331,7 @@ impl Porthole {
     async fn close_all(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> Result<(Vec<WireRule>, Vec<WireError>), HelperError> {
         self.authorizer
             .check(Action::Close, &Details::new(), &header)
@@ -250,22 +342,37 @@ impl Porthole {
             .await
             .map_err(HelperError::from)?;
 
-        let runner = RealRunner;
-        let backend = backend::detect(&runner).map_err(HelperError::from)?;
-        let state = StateStore::open_exclusive(&self.state_path).map_err(HelperError::from)?;
-        let mut engine = Engine::new(
-            backend.as_ref(),
-            &runner,
-            &SYSTEM_CLOCK,
-            state,
-            self.executable.clone(),
-        );
-        // `close --all` is never what the expiry timer invokes -- it always
-        // closes a single rule by id -- so there is no `from_timer` to thread
-        // through here.
-        let (closed, errors) = engine.close_all(false);
+        // Scoped so the `Engine` -- which borrows `&dyn CommandRunner` and
+        // `&dyn Clock`, neither of them `Sync` -- is dropped before the
+        // `.await` below: a zbus interface method's future has to be `Send`.
+        // It also drops the exclusive state lock before the announcement
+        // rather than after it, which is the right order regardless.
+        //
+        // The engine's own result and what its reconciliation dropped come
+        // out separately, and the drops are announced first and
+        // unconditionally: an operation that fails *because* the sweep just
+        // dropped its rule is exactly the case where the drop most needs
+        // saying (see `Engine::take_reconciled`).
+        let (closed, errors, reconciled) = {
+            let runner = RealRunner;
+            let backend = backend::detect(&runner).map_err(HelperError::from)?;
+            let state = StateStore::open_exclusive(&self.state_path).map_err(HelperError::from)?;
+            let mut engine = Engine::new(
+                backend.as_ref(),
+                &runner,
+                &SYSTEM_CLOCK,
+                state,
+                self.executable.clone(),
+            );
+            // `close --all` is never what the expiry timer invokes -- it
+            // always closes a single rule by id -- so there is no
+            // `from_timer` to thread through here.
+            let (closed, errors) = engine.close_all(false);
+            (closed, errors, engine.take_reconciled())
+        };
+        Self::announce_reconciled(Some(&emitter), &reconciled).await;
         for rule in &closed {
-            Self::log_close(rule, closed_by, false);
+            Self::announce_close(&emitter, rule, closed_by, CloseReason::Requested).await;
         }
         Ok((
             closed.iter().map(WireRule::from_rule).collect(),
@@ -351,17 +458,161 @@ impl Porthole {
         };
         Ok(WireStatus::from_status(&status))
     }
+
+    /// Every port Docker currently has published, read from the `DOCKER`
+    /// chain in the `nat` table -- see `porthole_core::docker`'s own module
+    /// doc for why this needs to live behind the helper at all: reading the
+    /// `nat` table needs root, which an unprivileged CLI process does not
+    /// have. Gated on `Action::List`, exactly as unprivileged a read as
+    /// `list`/`status` already are -- there is nothing here a caller could
+    /// use to change anything.
+    async fn docker_ports(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<Vec<WireDockerPort>, HelperError> {
+        self.authorizer
+            .check(Action::List, &Details::new(), &header)
+            .await
+            .map_err(HelperError::from)?;
+
+        let runner = RealRunner;
+        let published = porthole_core::docker::published(&runner).map_err(HelperError::from)?;
+        Ok(published
+            .iter()
+            .map(WireDockerPort::from_published)
+            .collect())
+    }
+
+    // --- Signals ---------------------------------------------------------
+    //
+    // Broadcast, so nothing here may carry anything a bystander should not
+    // see. `WireRule` is exactly what `list` already returns to every local
+    // user (the polkit `list` action is `yes` for everyone), and it is the
+    // wire type precisely because it leaves the `RuleHandle` -- the spec that
+    // would let a caller remove a rule it never created -- on this side of
+    // the bus. It does carry the opening uid, which is what lets an agent
+    // decide whether a notification is for the person looking at the screen.
+
+    /// The rule the helper just created -- not the request it came from.
+    /// The id, the resolved target and the expiry are all decided here.
+    #[zbus(signal)]
+    async fn rule_opened(emitter: &SignalEmitter<'_>, rule: WireRule) -> zbus::Result<()>;
+
+    /// A rule that has stopped being open, and why.
+    #[zbus(signal)]
+    async fn rule_closed(
+        emitter: &SignalEmitter<'_>,
+        rule: WireRule,
+        reason: CloseReason,
+    ) -> zbus::Result<()>;
+
+    /// The machine's own subnet changed. Both CIDRs are empty for "no usable
+    /// network" -- D-Bus has no optional types. Emitted by
+    /// [`crate::netmon`], which is the only thing that looks.
+    #[zbus(signal)]
+    async fn network_changed(
+        emitter: &SignalEmitter<'_>,
+        old_cidr: &str,
+        new_cidr: &str,
+    ) -> zbus::Result<()>;
 }
 
 impl Porthole {
+    /// The journal line and the `RuleOpened` signal, in that order.
+    ///
+    /// One function rather than two statements at the call site, for the same
+    /// reason [`Porthole::announce_close`] is: an announcement that only half
+    /// happened is the failure this whole task exists to prevent.
+    pub async fn announce_open(
+        emitter: &SignalEmitter<'_>,
+        rule: &porthole_core::state::ManagedRule,
+    ) {
+        // The helper is a system service, so stderr lands in the journal.
+        eprintln!("{}", format_open_log(rule));
+        if let Err(e) = Self::rule_opened(emitter, WireRule::from_rule(rule)).await {
+            // The rule is open and recorded either way; a bus that would not
+            // take the announcement is not a reason to fail the request or to
+            // leave the port open with no record of it.
+            eprintln!("porthole: could not announce the open on the bus, continuing: {e}");
+        }
+    }
+
+    /// The journal line and the `RuleClosed` signal, in that order.
+    ///
     /// `closed_by` is the uid that asked for *this* close — not necessarily
-    /// `rule.uid`, since any local user may close any rule. `from_timer`
-    /// controls only the trailing `, expired` marker: milestone 1 added it so
-    /// a timer-triggered close reads differently in the journal from one a
-    /// person asked for, and it must survive the request now crossing the bus
-    /// rather than being handled in-process.
-    fn log_close(rule: &porthole_core::state::ManagedRule, closed_by: u32, from_timer: bool) {
-        eprintln!("{}", format_close_log(rule, closed_by, from_timer));
+    /// `rule.uid`, since any local user may close any rule. `reason` is the
+    /// single value both halves are built from: milestone 1's `from_timer`
+    /// flag was the only distinction the journal line could make, and
+    /// [`CloseReason`] supersedes it, so the marker in the journal and the
+    /// slug on the bus cannot say different things about the same close.
+    pub async fn announce_close(
+        emitter: &SignalEmitter<'_>,
+        rule: &porthole_core::state::ManagedRule,
+        closed_by: u32,
+        reason: CloseReason,
+    ) {
+        eprintln!("{}", format_close_log(rule, closed_by, reason));
+        if let Err(e) = Self::rule_closed(emitter, WireRule::from_rule(rule), reason).await {
+            eprintln!("porthole: could not announce the close on the bus, continuing: {e}");
+        }
+    }
+
+    /// A close nobody asked for: the journal line and the `RuleClosed`
+    /// signal, in that order, for the two paths where there is no requesting
+    /// uid to name -- [`crate::netmon`]'s network-change closes and the
+    /// start-up reconciliation sweep.
+    ///
+    /// Separate from [`Porthole::announce_close`] because that line's
+    /// "closed by uid=" would have to invent a requester for a close no
+    /// client ever made.
+    ///
+    /// `emitter` is `None` when `SignalEmitter::new` failed. The journal line
+    /// is the audit trail and is written either way, which is why the
+    /// `Option` lives in here rather than at the call sites: there is no
+    /// arrangement of them that can log without announcing or announce
+    /// without logging.
+    pub async fn announce_autoclose(
+        emitter: Option<&SignalEmitter<'_>>,
+        rule: &porthole_core::state::ManagedRule,
+        reason: CloseReason,
+    ) {
+        eprintln!("{}", format_autoclose_log(rule, reason));
+        let Some(emitter) = emitter else { return };
+        if let Err(e) = Self::rule_closed(emitter, WireRule::from_rule(rule), reason).await {
+            eprintln!("porthole: could not announce the close on the bus, continuing: {e}");
+        }
+    }
+
+    /// Every record reconciliation dropped from state, announced as
+    /// [`CloseReason::Reconciled`].
+    ///
+    /// One function for all of them -- the helper's start-up sweep, every
+    /// interface method's own per-operation sweep, and the network monitor's
+    /// -- so `Reconciled` means the same thing and reads the same way
+    /// wherever it comes from. Usually empty, and cheap when it is.
+    pub async fn announce_reconciled(
+        emitter: Option<&SignalEmitter<'_>>,
+        rules: &[porthole_core::state::ManagedRule],
+    ) {
+        for rule in rules {
+            Self::announce_autoclose(emitter, rule, CloseReason::Reconciled).await;
+        }
+    }
+
+    /// [`Porthole::network_changed`] for callers outside an interface method
+    /// -- [`crate::netmon`], which is the only thing that ever looks at the
+    /// network on its own. Empty string for "no usable network"; see the
+    /// signal's own declaration.
+    pub async fn announce_network_change(
+        emitter: &SignalEmitter<'_>,
+        old_cidr: &str,
+        new_cidr: &str,
+    ) {
+        if let Err(e) = Self::network_changed(emitter, old_cidr, new_cidr).await {
+            eprintln!(
+                "porthole: could not announce the network change on the bus, continuing: {e}"
+            );
+        }
     }
 
     /// The `--forget` audit line: distinct from [`Porthole::log_close`]
@@ -415,12 +666,59 @@ fn status_for_undetected_backend(
     }
 }
 
-/// Split out from [`Porthole::log_close`] so the line itself is testable
+/// Split out from [`Porthole::announce_open`] so the line itself is testable
 /// without capturing stderr from a live process.
+fn format_open_log(rule: &porthole_core::state::ManagedRule) -> String {
+    format!(
+        "porthole: uid={} opened {}/{} towards {} until {}",
+        rule.uid,
+        rule.port,
+        rule.protocol,
+        rule.target,
+        rule.expires_at
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "reboot".to_string())
+    )
+}
+
+/// The journal line for a close nobody asked for -- see
+/// [`Porthole::announce_autoclose`]. Split out for the same reason
+/// [`format_close_log`] is.
+///
+/// `Reconciled` gets its own sentence rather than the "closed" one: nothing
+/// was removed from any firewall for it. The firewall had already stopped
+/// holding the rule by the time porthole looked, and all porthole did was
+/// notice and drop its own record -- saying "closed" would claim porthole
+/// did something it did not do, and would date the close to the moment of
+/// the sweep rather than to whenever the rule actually vanished.
+fn format_autoclose_log(rule: &porthole_core::state::ManagedRule, reason: CloseReason) -> String {
+    match reason {
+        CloseReason::Reconciled => format!(
+            "porthole: dropped {}/{} towards {} from state (opened by uid={}) -- the firewall \
+             no longer had it, {reason}",
+            rule.port, rule.protocol, rule.target, rule.uid
+        ),
+        _ => format!(
+            "porthole: closed {}/{} towards {} (opened by uid={}) -- porthole closed this \
+             itself, nobody asked, {reason}",
+            rule.port, rule.protocol, rule.target, rule.uid
+        ),
+    }
+}
+
+/// Split out from [`Porthole::announce_close`] so the line itself is testable
+/// without capturing stderr from a live process.
+///
+/// The trailing marker is [`CloseReason::as_str`] for every reason except
+/// `Requested`, which is the unremarkable case and stays bare exactly as it
+/// read before reason codes existed. It is the *same value* the `RuleClosed`
+/// signal carries, so the journal and the bus cannot disagree about what a
+/// close was -- which they could while `from_timer: bool` was the only thing
+/// either had to go on.
 fn format_close_log(
     rule: &porthole_core::state::ManagedRule,
     closed_by: u32,
-    from_timer: bool,
+    reason: CloseReason,
 ) -> String {
     format!(
         "porthole: closed {}/{} towards {} (opened by uid={}, closed by uid={}){}",
@@ -429,7 +727,10 @@ fn format_close_log(
         rule.target,
         rule.uid,
         closed_by,
-        if from_timer { ", expired" } else { "" }
+        match reason {
+            CloseReason::Requested => String::new(),
+            other => format!(", {other}"),
+        }
     )
 }
 
@@ -479,7 +780,7 @@ mod tests {
         // for the close, separately from who *opened* the rule — a test
         // where the two happen to be the same value would pass even if the
         // closer's uid were never wired in at all.
-        let line = format_close_log(&rule(1000), 1001, false);
+        let line = format_close_log(&rule(1000), 1001, CloseReason::Requested);
         assert!(line.contains("opened by uid=1000"), "got: {line}");
         assert!(line.contains("closed by uid=1001"), "got: {line}");
     }
@@ -490,14 +791,84 @@ mod tests {
         // differently in the journal from one a person asked for. I2 wires
         // `from_timer` back across the bus so this survives the move to the
         // helper.
-        let line = format_close_log(&rule(1000), 1000, true);
+        let line = format_close_log(&rule(1000), 1000, CloseReason::Expired);
         assert!(line.ends_with(", expired"), "got: {line}");
     }
 
     #[test]
     fn a_human_initiated_close_carries_no_expired_marker() {
-        let line = format_close_log(&rule(1000), 1000, false);
+        let line = format_close_log(&rule(1000), 1000, CloseReason::Requested);
         assert!(!line.contains("expired"), "got: {line}");
+    }
+
+    #[test]
+    fn the_journal_marker_is_the_same_slug_the_signal_carries() {
+        // The whole point of `announce_close` taking one `CloseReason` is
+        // that the line a person reads in the journal and the string an
+        // agent matches on cannot describe the same close differently.
+        // `Requested` is the deliberate exception: it is the unremarkable
+        // case and stays bare, exactly as it read before reason codes
+        // existed.
+        for reason in [
+            CloseReason::Expired,
+            CloseReason::NetworkChanged,
+            CloseReason::Reconciled,
+        ] {
+            let line = format_close_log(&rule(1000), 0, reason);
+            assert!(
+                line.ends_with(&format!(", {}", reason.as_str())),
+                "{reason:?} logged as: {line}"
+            );
+        }
+        assert!(
+            !format_close_log(&rule(1000), 0, CloseReason::Requested).contains("requested"),
+            "an ordinary close keeps the bare line it always had"
+        );
+    }
+
+    #[test]
+    fn a_close_nobody_asked_for_names_no_requester() {
+        // `format_close_log`'s "closed by uid=" would have to invent one.
+        // Both lines still name who *opened* the rule, which is the uid a
+        // person reading the journal actually needs.
+        let line = format_autoclose_log(&rule(1000), CloseReason::NetworkChanged);
+        assert!(line.contains("opened by uid=1000"), "got: {line}");
+        assert!(!line.contains("closed by uid"), "got: {line}");
+        assert!(line.contains("nobody asked"), "got: {line}");
+        assert!(line.ends_with("network-changed"), "got: {line}");
+    }
+
+    #[test]
+    fn reconciliation_does_not_log_a_close_it_did_not_perform() {
+        // The firewall had already stopped holding the rule; porthole found
+        // its own record of it and dropped the record. Saying "closed" would
+        // claim porthole did something it did not do, and would date the
+        // close to the sweep rather than to whenever the rule vanished.
+        let line = format_autoclose_log(&rule(1000), CloseReason::Reconciled);
+        assert!(!line.contains("closed"), "got: {line}");
+        assert!(
+            line.contains("the firewall no longer had it"),
+            "got: {line}"
+        );
+        assert!(line.ends_with("reconciled"), "got: {line}");
+    }
+
+    #[test]
+    fn the_open_line_says_what_the_helper_decided_not_what_was_asked_for() {
+        // The expiry in the journal is the absolute time the helper chose,
+        // never the duration a client sent -- the same distinction
+        // `RuleOpened` carries, built from the same `ManagedRule`.
+        let mut r = rule(1000);
+        r.expires_at = Some(1_757_003_600);
+        let line = format_open_log(&r);
+        assert!(line.contains("uid=1000 opened 5173/tcp"), "got: {line}");
+        assert!(line.contains("towards 10.10.10.0/24"), "got: {line}");
+        assert!(line.ends_with("until 1757003600"), "got: {line}");
+        assert!(
+            format_open_log(&rule(1000)).ends_with("until reboot"),
+            "got: {}",
+            format_open_log(&rule(1000))
+        );
     }
 
     #[test]

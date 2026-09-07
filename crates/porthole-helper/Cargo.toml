@@ -18,6 +18,8 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait.workspace = true
+futures-util.workspace = true
+ipnet.workspace = true
 porthole-core = { path = "../porthole-core" }
 zbus.workspace = true
 zbus_polkit.workspace = true

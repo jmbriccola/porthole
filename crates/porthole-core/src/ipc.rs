@@ -61,6 +61,66 @@ impl WireRule {
     }
 }
 
+/// Why a rule stopped being open, as it crosses the bus in `RuleClosed`.
+///
+/// A single undifferentiated "closed" would force every subscriber to guess:
+/// a rule that ran out its own clock, one a person asked to close, one the
+/// helper closed because the machine left the network it was scoped to, and
+/// one that was already gone from the firewall by the time porthole looked
+/// are four different things to tell a user about. The slug is spelled twice:
+/// the wire form comes from serde's `rename_all` below, the journal form from
+/// the `match` in [`CloseReason::as_str`]. Nothing in the type system makes
+/// those agree — `every_close_carries_why` checks both halves for every
+/// variant, which is the only reason they cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[zvariant(signature = "s")]
+#[serde(rename_all = "kebab-case")]
+pub enum CloseReason {
+    /// The rule's own lifetime ran out and the expiry timer closed it.
+    Expired,
+    /// Somebody asked: `close`, `close --id`, or `close --all`.
+    Requested,
+    /// The rule was scoped to a subnet the machine is no longer on -- see
+    /// `porthole_core::engine::Engine::close_rules_outside`.
+    NetworkChanged,
+    /// Reconciliation found porthole's record of a rule the firewall no
+    /// longer has, and dropped the record. Nothing was removed from any
+    /// firewall for this one: the port had already stopped being open, and
+    /// this is porthole noticing.
+    ///
+    /// Not only at helper start-up. A `firewall-cmd --reload` (or a `ufw
+    /// reload`) while the helper is running produces this on the next
+    /// operation whose sweep both finds the record and saves without it --
+    /// including one that then fails because the rule it was about to act on
+    /// is the one that had gone. A read produces none: `list` and `status`
+    /// never save, so the record is still in the state file and the next
+    /// operation that does write is where it is dropped for real.
+    Reconciled,
+}
+
+impl CloseReason {
+    /// The slug the journal line is built from. It is not what serde puts on
+    /// the wire -- `rename_all` above derives that from the variant name
+    /// independently -- so the two are held equal by `every_close_carries_why`
+    /// rather than by construction. Kept next to the enum all the same, so
+    /// that the four spellings are in one place rather than at each call
+    /// site.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CloseReason::Expired => "expired",
+            CloseReason::Requested => "requested",
+            CloseReason::NetworkChanged => "network-changed",
+            CloseReason::Reconciled => "reconciled",
+        }
+    }
+}
+
+impl std::fmt::Display for CloseReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One failure from `close_all`, carried structurally rather than as a bare
 /// rendered string.
 ///
@@ -160,6 +220,33 @@ impl WireStatus {
     }
 }
 
+/// One port Docker has published, as [`crate::docker::Published`] crosses
+/// the bus. D-Bus has no optional types (the same reason [`WireRule`]'s
+/// `expires_at` uses `0` as a sentinel): `host_addr` is empty for "no `-d`",
+/// i.e. published on every interface, and otherwise the address itself,
+/// which can never be the empty string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct WireDockerPort {
+    /// Empty means every interface (no `-d` on the rule).
+    pub host_addr: String,
+    pub host_port: u16,
+    pub protocol: String,
+    pub container_addr: String,
+    pub container_port: u16,
+}
+
+impl WireDockerPort {
+    pub fn from_published(p: &crate::docker::Published) -> Self {
+        WireDockerPort {
+            host_addr: p.host_addr.map(|a| a.to_string()).unwrap_or_default(),
+            host_port: p.host_port,
+            protocol: p.protocol.to_string(),
+            container_addr: p.container_addr.to_string(),
+            container_port: p.container_port,
+        }
+    }
+}
+
 /// The client side of the helper's interface.
 ///
 /// `scope` is passed as the user typed it — `subnet`, `any`, a CIDR, an IP —
@@ -204,6 +291,60 @@ pub trait Porthole {
     async fn list(&self) -> zbus::Result<Vec<WireRule>>;
 
     async fn status(&self) -> zbus::Result<WireStatus>;
+
+    /// Every port Docker currently has published, read from the `DOCKER`
+    /// chain in the `nat` table — see `crate::docker`'s own module doc for
+    /// why this needs root, and never asks Docker itself anything. Gated on
+    /// the same `list` polkit action as `list`/`status`: it is exactly as
+    /// unprivileged a read as either.
+    async fn docker_ports(&self) -> zbus::Result<Vec<WireDockerPort>>;
+
+    /// A rule the helper just created. **The rule, not the request**: the id,
+    /// the resolved target and the expiry are all decided by the helper, so a
+    /// subscriber that reconstructed them from what a client asked for would
+    /// be showing something else.
+    #[zbus(signal)]
+    fn rule_opened(&self, rule: WireRule) -> zbus::Result<()>;
+
+    /// A rule that has stopped being open, and why -- see [`CloseReason`].
+    ///
+    /// **`list` is the authority; these signals are notifications.** Three
+    /// things a subscriber that keeps its whole view from `RuleOpened` and
+    /// `RuleClosed` alone would get wrong:
+    ///
+    /// - A rule can leave `list` with no `RuleClosed` behind it.
+    ///   `close --id <id> --forget` drops porthole's record of a rule
+    ///   recorded under a backend this machine no longer has, without
+    ///   touching any firewall — so none of the four reasons is true of it
+    ///   and none is sent. A client that only listens goes on showing that
+    ///   rule as open.
+    /// - Signals are emitted after the state lock is released, so two
+    ///   clients acting at once can put a `RuleClosed` on the bus ahead of
+    ///   the `RuleOpened` for a different rule. Per-message ordering from one
+    ///   sender is preserved; the order two *operations* completed in is not.
+    /// - A signal sent before a client subscribed is simply gone. The
+    ///   helper's start-up sweep announces what it dropped as soon as it owns
+    ///   the bus name: a client whose match rule is already installed by then
+    ///   receives those, and a client that subscribes to a helper already
+    ///   running has missed them. The helper is D-Bus activated, so a client
+    ///   that subscribes and only then calls it is in the first case.
+    ///
+    /// So: subscribe, and also call `list` — at start-up, and whenever the
+    /// view has to be right rather than merely current.
+    #[zbus(signal)]
+    fn rule_closed(&self, rule: WireRule, reason: CloseReason) -> zbus::Result<()>;
+
+    /// The machine's own subnet, as porthole last resolved it, changed.
+    ///
+    /// Both arguments are CIDRs, or **empty for "no usable network"** --
+    /// D-Bus has no optional types, the same reason [`WireRule::expires_at`]
+    /// uses `0` as its sentinel, and the empty string can never be a CIDR.
+    /// `old_cidr` is what the previous check saw, not necessarily what was
+    /// true an instant before this one: the helper only looks when it wakes
+    /// up (see `porthole_helper::netmon`), so the two values are porthole's
+    /// last two observations and nothing finer.
+    #[zbus(signal)]
+    fn network_changed(&self, old_cidr: &str, new_cidr: &str) -> zbus::Result<()>;
 }
 
 #[cfg(test)]
@@ -384,5 +525,83 @@ mod tests {
         assert_eq!(json["kind"], "command_failed");
         assert_eq!(json["code"], 1);
         assert!(json["message"].as_str().unwrap().contains("firewall-cmd"));
+    }
+
+    #[test]
+    fn a_docker_port_published_everywhere_crosses_the_wire_with_an_empty_host_addr() {
+        // No `-d` on the rule means every interface -- see this module's own
+        // `WireDockerPort::from_published`. Empty, not the address `"0.0.0.0"`
+        // itself, since porthole never actually parses that literal out of
+        // the rule -- it only ever infers "no restriction" from `-d`'s
+        // absence.
+        let p = crate::docker::Published {
+            host_addr: None,
+            host_port: 8080,
+            protocol: Protocol::Tcp,
+            container_addr: "172.17.0.2".parse().unwrap(),
+            container_port: 80,
+        };
+        let wire = WireDockerPort::from_published(&p);
+        assert_eq!(wire.host_addr, "");
+        assert_eq!(wire.host_port, 8080);
+        assert_eq!(wire.container_addr, "172.17.0.2");
+        assert_eq!(wire.container_port, 80);
+    }
+
+    #[test]
+    fn every_close_carries_why() {
+        // "expired", "requested", "network-changed", "reconciled". The
+        // notification says something different for each, and a single
+        // undifferentiated ClosedSignal would force the agent to guess.
+        //
+        // Both halves are checked for every variant: the slug `as_str`
+        // returns (what the journal line is built from) and the string that
+        // actually crosses the bus (what a subscriber matches on). They are
+        // produced by different machinery -- a `match` and serde's
+        // `rename_all` -- so a test that checked only one would let the two
+        // drift apart silently, which is exactly the failure a reason code
+        // exists to prevent.
+        use zbus::zvariant::{serialized::Context, to_bytes, LE};
+
+        for (reason, expected) in [
+            (CloseReason::Expired, "expired"),
+            (CloseReason::Requested, "requested"),
+            (CloseReason::NetworkChanged, "network-changed"),
+            (CloseReason::Reconciled, "reconciled"),
+        ] {
+            assert_eq!(reason.as_str(), expected);
+            assert_eq!(reason.to_string(), expected);
+
+            let encoded = to_bytes(Context::new_dbus(LE, 0), &reason).unwrap();
+            let on_the_wire: String = encoded.deserialize().unwrap().0;
+            assert_eq!(
+                on_the_wire, expected,
+                "{reason:?} crosses the bus as {on_the_wire:?}, not as its own slug"
+            );
+
+            let back: CloseReason = encoded.deserialize().unwrap().0;
+            assert_eq!(back, reason, "a subscriber must be able to read it back");
+        }
+    }
+
+    #[test]
+    fn the_close_reason_is_a_plain_string_on_the_wire() {
+        // A subscriber written against the published signature -- and the
+        // `dbus-monitor` output the container suite greps -- both depend on
+        // this being `s` and not the `u` a bare unit enum would default to.
+        assert_eq!(CloseReason::SIGNATURE, "s");
+    }
+
+    #[test]
+    fn a_docker_port_published_on_loopback_carries_that_address_on_the_wire() {
+        let p = crate::docker::Published {
+            host_addr: Some("127.0.0.1".parse().unwrap()),
+            host_port: 5432,
+            protocol: Protocol::Tcp,
+            container_addr: "172.17.0.3".parse().unwrap(),
+            container_port: 80,
+        };
+        let wire = WireDockerPort::from_published(&p);
+        assert_eq!(wire.host_addr, "127.0.0.1");
     }
 }

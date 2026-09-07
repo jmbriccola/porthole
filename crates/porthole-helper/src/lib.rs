@@ -2,5 +2,6 @@
 
 pub mod authz;
 pub mod error;
+pub mod netmon;
 pub mod polkit;
 pub mod service;

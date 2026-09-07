@@ -13,8 +13,9 @@ use porthole_core::cli_path;
 use porthole_core::command::RealRunner;
 use porthole_core::ipc::{PATH, SERVICE};
 use porthole_core::reconcile::{self, SweepMode};
-use porthole_core::state::StateStore;
+use porthole_core::state::{ManagedRule, StateStore};
 use porthole_helper::authz::{AlwaysAllow, Authorizer};
+use porthole_helper::netmon;
 use porthole_helper::polkit::PolkitAuthorizer;
 use porthole_helper::service::Porthole;
 
@@ -53,7 +54,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // acceptance test is "open a port on ufw, reboot, verify it is closed",
     // and only a start-up sweep, not the per-operation one, is what makes
     // that true.
-    reconcile_at_startup();
+    //
+    // What it dropped is announced further down, once there is a bus to
+    // announce it on -- the sweep itself still runs first, before anything
+    // can reach the name.
+    let reconciled = reconcile_at_startup();
 
     let (bus, serving) = if session {
         eprintln!("porthole-helper: session bus, authorization disabled — tests only");
@@ -76,15 +81,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(PolkitAuthorizer::new(&bus).await?)
     };
 
-    let service = Porthole::new(authorizer, bus, StateStore::default_path(), cli);
+    let state_path = StateStore::default_path();
+    let service = Porthole::new(authorizer, bus, state_path.clone(), cli.clone());
 
-    let _conn = serving
+    let conn = serving
         .name(SERVICE)?
         .serve_at(PATH, service)?
         .build()
         .await?;
 
     eprintln!("porthole-helper: serving {SERVICE}");
+
+    // Only now: the start-up sweep ran before the bus name existed, on
+    // purpose (see `reconcile_at_startup`), and a signal emitted before that
+    // has no sender name for a subscriber to match on. Announced here
+    // instead, which does mean a client that connects after this line has
+    // already missed them -- `list` is what such a client reads to find out
+    // what is open, and these rules are exactly the ones that are not in it.
+    announce_reconciled(&conn, &reconciled).await;
+
+    // The monitor closes rules in whatever firewall this machine has, on its
+    // own timer, with no client asking -- so it runs on the system bus, and
+    // under `--session` only when `PORTHOLE_NETMON` says the firewall is
+    // disposable. `netmon::should_run` holds the whole rule and the reasons
+    // for it.
+    //
+    // Its own connection, not the one just moved into `service`: that one is
+    // already spoken for (`Porthole` uses it to ask the bus daemon who a
+    // caller is).
+    if netmon::should_run(session) {
+        tokio::spawn(netmon::run(conn.clone(), state_path, cli));
+    }
+
     tokio::signal::ctrl_c().await?;
     Ok(())
 }
@@ -116,13 +144,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// by any more than that bound. The helper still starts and still serves the
 /// bus; only the extra staleness-shortening this sweep would have bought is
 /// lost, and the per-operation sweep catches up on the next request.
-fn reconcile_at_startup() {
+fn reconcile_at_startup() -> Vec<ManagedRule> {
     let runner = RealRunner;
     let backend = match backend::detect(&runner) {
         Ok(backend) => backend,
         Err(e) => {
             eprintln!("porthole-helper: start-up reconciliation skipped, no firewall backend: {e}");
-            return;
+            return Vec::new();
         }
     };
     let mut state = match StateStore::open_exclusive(StateStore::default_path()) {
@@ -132,7 +160,7 @@ fn reconcile_at_startup() {
                 "porthole-helper: start-up reconciliation skipped, could not take the state \
                  lock: {e}"
             );
-            return;
+            return Vec::new();
         }
     };
     let backend_id = backend.id();
@@ -163,9 +191,44 @@ fn reconcile_at_startup() {
                     rule.port, rule.protocol, rule.backend,
                 );
             }
+            // The state entries whose rule the firewall no longer had. Not
+            // logged here: `announce_reconciled` writes the journal line and
+            // the signal together, so neither can happen without the other.
+            report.dropped_from_state
         }
         Err(e) => {
             eprintln!("porthole-helper: start-up reconciliation failed, continuing anyway: {e}");
+            Vec::new()
         }
     }
+}
+
+/// Say what the start-up sweep dropped, on the journal and on the bus.
+///
+/// [`CloseReason::Reconciled`] rather than any of the other three: porthole
+/// did not close these, and does not know when they stopped being open. It
+/// found its own record of a rule the firewall no longer had, and dropped
+/// the record -- which is a real thing to tell someone who opened a port
+/// before the last reboot, and a different thing from "your port has just
+/// been closed".
+///
+/// This sweep is not the only one that can drop a record: every operation
+/// reconciles too, and those drops reach the bus the same way, through
+/// `Porthole::announce_reconciled`. Only the emitter differs -- this one is
+/// built here because there is no client request to have supplied one.
+async fn announce_reconciled(conn: &zbus::Connection, rules: &[ManagedRule]) {
+    if rules.is_empty() {
+        return;
+    }
+    let emitter = match zbus::object_server::SignalEmitter::new(conn, PATH) {
+        Ok(emitter) => Some(emitter),
+        Err(e) => {
+            eprintln!(
+                "porthole-helper: no signal emitter, what the start-up sweep dropped will go \
+                 unannounced (the journal below still records it): {e}"
+            );
+            None
+        }
+    };
+    Porthole::announce_reconciled(emitter.as_ref(), rules).await;
 }

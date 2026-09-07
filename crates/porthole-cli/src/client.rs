@@ -1,11 +1,26 @@
 //! Talking to the privileged helper.
 //!
 //! The CLI holds no privilege of its own any more. It asks, polkit decides,
-//! and the helper acts. Reads — `list`, `status` — and `--dry-run` stay local
-//! and never touch the bus, so they keep working when the helper is absent.
+//! and the helper acts.
+//!
+//! `list` and `status` stay local: both read the state file and neither
+//! calls anything here. `--dry-run` builds its own engine instead of asking
+//! the helper to act, so no rule is ever opened over the bus by one.
+//!
+//! [`docker_ports`] is the exception, and it is not confined to writes.
+//! `listen` calls it, `doctor` calls it, and `open` calls it before the
+//! `--dry-run` branch is reached -- so a dry run does touch the bus, once,
+//! read-only. There is no local path to the same answer: Docker's rules live
+//! in the `nat` table, which an unprivileged process cannot read at all (see
+//! `porthole_core::docker`'s own module doc).
+//!
+//! What survives an absent helper is every one of those callers: each
+//! swallows the failure with `.ok()`, so what is lost is the Docker warning,
+//! never the command.
 
+use porthole_core::docker::Published;
 use porthole_core::error::{Error, ExitCode, Result};
-use porthole_core::ipc::{PortholeProxy, WireError, WireRule};
+use porthole_core::ipc::{PortholeProxy, WireDockerPort, WireError, WireRule};
 use porthole_core::state::ManagedRule;
 
 /// One small runtime per invocation. The CLI is a short-lived process that
@@ -220,6 +235,52 @@ pub fn close_all(session: bool) -> Result<(Vec<ManagedRule>, Vec<Error>)> {
         let (closed, errors) = p.close_all().await.map_err(from_dbus)?;
         let rules = closed.iter().map(to_local).collect::<Result<Vec<_>>>()?;
         Ok((rules, errors.into_iter().map(wire_error_to_local).collect()))
+    })
+}
+
+/// A wire Docker port as the local type. `host_addr` empty means "no `-d`",
+/// i.e. every interface -- see `WireDockerPort`'s own doc comment. Unlike
+/// [`to_local`], a malformed address here is a bug in the helper's own
+/// encoding, not untrusted client input, so it is treated as `Unexpected`
+/// rather than any more specific variant.
+fn docker_port_to_local(wire: &WireDockerPort) -> Result<Published> {
+    let host_addr = if wire.host_addr.is_empty() {
+        None
+    } else {
+        Some(wire.host_addr.parse().map_err(|_| {
+            Error::Unexpected(format!(
+                "the helper sent `{}` as a Docker host address",
+                wire.host_addr
+            ))
+        })?)
+    };
+    Ok(Published {
+        host_addr,
+        host_port: wire.host_port,
+        protocol: porthole_core::validate::parse_protocol(&wire.protocol)?,
+        container_addr: wire.container_addr.parse().map_err(|_| {
+            Error::Unexpected(format!(
+                "the helper sent `{}` as a Docker container address",
+                wire.container_addr
+            ))
+        })?,
+        container_port: wire.container_port,
+    })
+}
+
+/// Every port Docker currently has published, from the privileged helper.
+/// Callers that cannot reach the helper at all (it is not installed, or the
+/// bus is unreachable) get that `Err` back exactly like every other call
+/// here -- neither `run::open` nor `run`'s `Commands::Listen` arm fails
+/// outright on it: `open` silently omits its own Docker warning for this one
+/// invocation, and `listen` marks every row as not checked (`docker_checked:
+/// false` in `--json`, one explanatory line in the human output) instead.
+/// Neither command needs the helper for anything else it does.
+pub fn docker_ports(session: bool) -> Result<Vec<Published>> {
+    block_on(async {
+        let p = proxy(session).await?;
+        let wire = p.docker_ports().await.map_err(from_dbus)?;
+        wire.iter().map(docker_port_to_local).collect()
     })
 }
 

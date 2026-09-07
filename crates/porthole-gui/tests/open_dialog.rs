@@ -26,8 +26,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use adw::prelude::*;
+use porthole_core::docker::Published;
 use porthole_core::model::{Lifetime, Protocol, ScopeSpec, DEFAULT_DURATION, MAX_DURATION};
-use porthole_gui::open_dialog::{OpenDialog, Request};
+use porthole_gui::open_dialog::{DeviceEntry, OpenDialog, Request};
 
 /// Identical in shape to `tests/window.rs`, `tests/open_now.rs` and
 /// `tests/listening.rs`'s own `activate` helper: runs `f` inside a real
@@ -120,7 +121,9 @@ fn this_network_is_the_default_target_and_names_the_actual_subnet() -> Result<()
             let dialog = OpenDialog::new();
             dialog.set_current_network("192.168.177.0/24".parse().unwrap());
             let label = dialog.target_labels()[0].clone();
-            let scope = dialog.selected_scope();
+            let scope = dialog
+                .selected_scope()
+                .expect("a target is always selected");
             *seen.borrow_mut() = Some((label, scope));
         },
     );
@@ -145,8 +148,10 @@ fn anyone_is_last_marked_and_never_preselected() -> Result<(), String> {
             let dialog = OpenDialog::new();
             let labels = dialog.target_labels();
             let last_is_anyone = labels.last().map(|s| s.as_str()) == Some("Anyone");
-            let marked = dialog.is_marked_significant("Anyone");
-            let scope = dialog.selected_scope();
+            let marked = dialog.is_marked_significant(labels.len() - 1);
+            let scope = dialog
+                .selected_scope()
+                .expect("a target is always selected");
             *seen.borrow_mut() = Some((last_is_anyone, marked, scope));
         },
     );
@@ -160,6 +165,41 @@ fn anyone_is_last_marked_and_never_preselected() -> Result<(), String> {
     }
     if scope == ScopeSpec::Anywhere {
         return Err("\"Anyone\" must not be preselected".to_string());
+    }
+    Ok(())
+}
+
+/// A saved device can be called anything, "Anyone" included, and then the
+/// target list has two rows with one title. The marking belongs to the last
+/// row and to no other -- which a lookup by title could not tell, since the
+/// device sorts ahead of it.
+fn a_device_named_anyone_does_not_take_the_real_anyones_marking() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.DeviceNamedAnyone",
+        move |_app| {
+            let dialog = OpenDialog::new();
+            dialog.set_devices(&[resolved("Anyone", "10.10.10.245")]);
+            let labels = dialog.target_labels();
+            *seen.borrow_mut() = Some((
+                labels.clone(),
+                // Index 1 is the device, index 2 the real "Anyone".
+                dialog.is_marked_significant(1),
+                dialog.is_marked_significant(labels.len() - 1),
+            ));
+        },
+    );
+    let (labels, device_marked, anyone_marked) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if labels != vec!["This network", "Anyone", "Anyone"] {
+        return Err(format!("expected two rows titled Anyone, got {labels:?}"));
+    }
+    if device_marked {
+        return Err("a device must not carry the significant-choice marking".to_string());
+    }
+    if !anyone_marked {
+        return Err("the real \"Anyone\" must still carry it".to_string());
     }
     Ok(())
 }
@@ -278,13 +318,304 @@ fn a_ready_dialog_produces_the_request_the_client_would_send() -> Result<(), Str
     Ok(())
 }
 
+fn resolved(name: &str, addr: &str) -> DeviceEntry {
+    DeviceEntry {
+        name: name.to_string(),
+        resolved: Ok(addr.parse().unwrap()),
+    }
+}
+
+fn unresolved(name: &str, reason: &str) -> DeviceEntry {
+    DeviceEntry {
+        name: name.to_string(),
+        resolved: Err(reason.to_string()),
+    }
+}
+
+fn published_on_all(port: u16) -> Published {
+    Published {
+        host_addr: None,
+        host_port: port,
+        protocol: Protocol::Tcp,
+        container_addr: "172.17.0.2".parse().unwrap(),
+        container_port: 80,
+    }
+}
+
+/// The spec's own order, on the real rows rather than on `build_targets`'s
+/// return value (which `src/open_dialog.rs`'s own unit tests already pin).
+fn saved_devices_are_rows_between_this_network_and_anyone() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate("com.jacopobriccola.Porthole.Test.DeviceRows", move |_app| {
+        let dialog = OpenDialog::new();
+        dialog.set_devices(&[
+            resolved("phone", "10.10.10.245"),
+            resolved("laptop", "10.10.10.17"),
+        ]);
+        *seen.borrow_mut() = Some(dialog.target_labels());
+    });
+    let labels = result.borrow_mut().take().ok_or("activation never ran")?;
+    let expected = vec!["This network", "phone", "laptop", "Anyone"];
+    if labels != expected {
+        return Err(format!("expected {expected:?}, got {labels:?}"));
+    }
+    Ok(())
+}
+
+/// Shown, so it does not read as deleted; insensitive, so it cannot be
+/// chosen; carrying the resolver's own sentence, so the user knows which of
+/// the two it is.
+fn an_unresolvable_device_is_shown_unselectable_with_its_reason() -> Result<(), String> {
+    let reason = "`phone` (bc:24:11:5e:1c:6e) is not on this network right now";
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.DeviceAbsent",
+        move |_app| {
+            let dialog = OpenDialog::new();
+            dialog.set_devices(&[unresolved("phone", reason)]);
+            // Index 1 by construction: "This network" is always 0, and the
+            // one device follows it. `target_labels` is asserted below, so
+            // a wrong index cannot pass quietly.
+            *seen.borrow_mut() = Some((
+                dialog.target_labels(),
+                dialog.target_subtitles(),
+                dialog.is_target_selectable(1),
+                dialog.select_target(1),
+                dialog.selected_scope(),
+            ));
+        },
+    );
+    let (labels, subtitles, selectable, selected, scope) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if !labels.contains(&"phone".to_string()) {
+        return Err(format!("the row must still be listed, got {labels:?}"));
+    }
+    if !subtitles.contains(&reason.to_string()) {
+        return Err(format!("the reason must be on the row, got {subtitles:?}"));
+    }
+    if selectable {
+        return Err("an unresolvable device must not be selectable".to_string());
+    }
+    if selected {
+        return Err("selecting an unresolvable device must not succeed".to_string());
+    }
+    if scope != Some(ScopeSpec::CurrentSubnet) {
+        return Err(format!("the selection must not have moved, got {scope:?}"));
+    }
+    Ok(())
+}
+
+/// What choosing a device actually sends: that device's own address, as an
+/// ordinary host scope -- never a device name, which the helper has never
+/// heard of.
+fn choosing_a_device_opens_towards_the_address_it_resolved_to() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.DeviceScope",
+        move |_app| {
+            let dialog = OpenDialog::for_port(5173);
+            dialog.set_devices(&[resolved("phone", "10.10.10.245")]);
+            let chosen = dialog.select_target(1);
+            *seen.borrow_mut() = Some((chosen, dialog.request()));
+        },
+    );
+    let (chosen, request) = result.borrow_mut().take().ok_or("activation never ran")?;
+    if !chosen {
+        return Err("a resolved device must be selectable".to_string());
+    }
+    let expected = Some(Request {
+        port: 5173,
+        protocol: Protocol::Tcp,
+        lifetime: Lifetime::For(DEFAULT_DURATION),
+        scope: ScopeSpec::Host("10.10.10.245".parse().unwrap()),
+    });
+    if request != expected {
+        return Err(format!("expected {expected:?}, got {request:?}"));
+    }
+    Ok(())
+}
+
+/// Devices reach the dialog from a cache a background read fills, so they
+/// can land after the user has already chosen something. Inserting them
+/// moves "Anyone" down the list; the choice must move with it.
+fn a_device_list_arriving_later_does_not_move_the_users_choice() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.DeviceLateArrival",
+        move |_app| {
+            let dialog = OpenDialog::new();
+            // "Anyone" is index 1 while there are no devices, and index 3
+            // once two arrive -- which is the whole point of this check.
+            dialog.select_target(1);
+            dialog.set_devices(&[
+                resolved("phone", "10.10.10.245"),
+                resolved("laptop", "10.10.10.17"),
+            ]);
+            *seen.borrow_mut() = Some(dialog.selected_scope());
+        },
+    );
+    let scope = result.borrow_mut().take().ok_or("activation never ran")?;
+    if scope != Some(ScopeSpec::Anywhere) {
+        return Err(format!("expected Anywhere, got {scope:?}"));
+    }
+    Ok(())
+}
+
+/// The other half of the same property, and the one the first review found
+/// untested: a device can leave the list too -- forgotten with `porthole
+/// devices remove`, or simply gone by the next refresh -- and the row that
+/// was selected then no longer exists. Nothing may inherit its position.
+fn a_device_that_disappears_takes_the_selection_back_to_this_network() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.DeviceRemoved",
+        move |_app| {
+            let dialog = OpenDialog::new();
+            dialog.set_devices(&[
+                resolved("phone", "10.10.10.245"),
+                resolved("laptop", "10.10.10.17"),
+            ]);
+            // Index 2 is "laptop": This network, phone, laptop, Anyone.
+            let chosen = dialog.select_target(2);
+            let before = dialog.selected_scope();
+
+            dialog.set_devices(&[resolved("phone", "10.10.10.245")]);
+            let after = dialog.selected_scope();
+
+            *seen.borrow_mut() = Some((chosen, before, after, dialog.target_labels()));
+        },
+    );
+    let (chosen, before, after, labels) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if !chosen || before != Some(ScopeSpec::Host("10.10.10.17".parse().unwrap())) {
+        return Err(format!(
+            "the laptop must have been selected first: {before:?}"
+        ));
+    }
+    if labels != vec!["This network", "phone", "Anyone"] {
+        return Err(format!("the removed device must be gone: {labels:?}"));
+    }
+    // Not the phone, which now sits where the laptop sat, and not "Anyone",
+    // which is the widest thing on the list.
+    if after != Some(ScopeSpec::CurrentSubnet) {
+        return Err(format!(
+            "a removed device's selection must fall back to This network, got {after:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// "The address book could not be read" is not "there are no saved
+/// devices", and the dialog says which one it is.
+fn an_unreadable_address_book_is_not_an_empty_device_list() -> Result<(), String> {
+    let reason = "could not read /home/u/.config/porthole/devices.toml: permission denied";
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.DeviceBookUnreadable",
+        move |_app| {
+            let dialog = OpenDialog::new();
+            dialog.set_devices_unreadable(reason);
+            *seen.borrow_mut() = Some((dialog.target_labels(), dialog.target_group_description()));
+        },
+    );
+    let (labels, description) = result.borrow_mut().take().ok_or("activation never ran")?;
+    if labels != vec!["This network".to_string(), "Anyone".to_string()] {
+        return Err(format!("no device rows should have been built: {labels:?}"));
+    }
+    if description.as_deref() != Some(reason) {
+        return Err(format!(
+            "expected the reason on screen, got {description:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// An explanation, not a prohibition: the alert exists, says what Docker
+/// already did, and carries a real way through.
+fn a_docker_managed_port_is_explained_with_a_way_through() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.DockerAlert",
+        move |_app| {
+            let dialog = OpenDialog::for_port(8080);
+            dialog.set_docker_ports(&[published_on_all(8080)]);
+            let alert = dialog.docker_alert();
+            *seen.borrow_mut() = Some(alert.map(|a| {
+                (
+                    a.body().to_string(),
+                    a.has_response("open-anyway"),
+                    a.has_response("cancel"),
+                    a.close_response().to_string(),
+                    a.default_response().map(|r| r.to_string()),
+                )
+            }));
+        },
+    );
+    let alert = result
+        .borrow_mut()
+        .take()
+        .ok_or("activation never ran")?
+        .ok_or("a Docker-published port must produce an explanation")?;
+    let (body, has_open, has_cancel, close, default) = alert;
+    if !body.contains("Docker already publishes 8080/tcp") {
+        return Err(format!("the body must be the advice itself, got: {body}"));
+    }
+    if !has_open || !has_cancel {
+        return Err("the alert needs both a way through and a way out".to_string());
+    }
+    if close != "cancel" || default.as_deref() != Some("cancel") {
+        return Err(format!(
+            "dismissing the alert must not open: close={close}, default={default:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Silence in the ordinary case is what makes the warning worth reading --
+/// and "porthole could not check" is silence here too, exactly as
+/// `porthole-cli`'s own `open` treats it.
+fn no_alert_for_a_port_docker_has_no_rule_for_or_could_not_be_checked() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.DockerNoAlert",
+        move |_app| {
+            let checked = OpenDialog::for_port(5173);
+            checked.set_docker_ports(&[published_on_all(8080)]);
+
+            let unchecked = OpenDialog::for_port(8080);
+            unchecked.set_docker_unknown();
+
+            *seen.borrow_mut() = Some((
+                checked.docker_alert().is_some(),
+                unchecked.docker_alert().is_some(),
+            ));
+        },
+    );
+    let (checked, unchecked) = result.borrow_mut().take().ok_or("activation never ran")?;
+    if checked {
+        return Err("a port Docker does not publish must produce no alert".to_string());
+    }
+    if unchecked {
+        return Err("an unchecked Docker list must produce no alert".to_string());
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below -- see `tests/window.rs`'s own
 /// `Case` alias for why this is a type alias rather than spelled out
 /// inline.
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 10] = [
+    let cases: [Case; 19] = [
         (
             "the_duration_chips_are_exactly_the_five_the_spec_names",
             the_duration_chips_are_exactly_the_five_the_spec_names,
@@ -306,6 +637,10 @@ fn main() {
             anyone_is_last_marked_and_never_preselected,
         ),
         (
+            "a_device_named_anyone_does_not_take_the_real_anyones_marking",
+            a_device_named_anyone_does_not_take_the_real_anyones_marking,
+        ),
+        (
             "the_note_on_anyone_is_one_dry_sentence_with_no_scolding",
             the_note_on_anyone_is_one_dry_sentence_with_no_scolding,
         ),
@@ -324,6 +659,38 @@ fn main() {
         (
             "a_ready_dialog_produces_the_request_the_client_would_send",
             a_ready_dialog_produces_the_request_the_client_would_send,
+        ),
+        (
+            "saved_devices_are_rows_between_this_network_and_anyone",
+            saved_devices_are_rows_between_this_network_and_anyone,
+        ),
+        (
+            "an_unresolvable_device_is_shown_unselectable_with_its_reason",
+            an_unresolvable_device_is_shown_unselectable_with_its_reason,
+        ),
+        (
+            "choosing_a_device_opens_towards_the_address_it_resolved_to",
+            choosing_a_device_opens_towards_the_address_it_resolved_to,
+        ),
+        (
+            "a_device_list_arriving_later_does_not_move_the_users_choice",
+            a_device_list_arriving_later_does_not_move_the_users_choice,
+        ),
+        (
+            "a_device_that_disappears_takes_the_selection_back_to_this_network",
+            a_device_that_disappears_takes_the_selection_back_to_this_network,
+        ),
+        (
+            "an_unreadable_address_book_is_not_an_empty_device_list",
+            an_unreadable_address_book_is_not_an_empty_device_list,
+        ),
+        (
+            "a_docker_managed_port_is_explained_with_a_way_through",
+            a_docker_managed_port_is_explained_with_a_way_through,
+        ),
+        (
+            "no_alert_for_a_port_docker_has_no_rule_for_or_could_not_be_checked",
+            no_alert_for_a_port_docker_has_no_rule_for_or_could_not_be_checked,
         ),
     ];
 

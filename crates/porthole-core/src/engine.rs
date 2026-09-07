@@ -20,6 +20,7 @@ use crate::net::{self, LocalNetwork};
 use crate::reconcile;
 use crate::state::{ManagedRule, StateStore};
 use crate::validate;
+use ipnet::Ipv4Net;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -90,6 +91,10 @@ pub struct Engine<'a> {
     state: StateStore,
     /// The porthole binary the expiry timer will invoke.
     executable: PathBuf,
+    /// Records this engine's own reconciliation has dropped, waiting to be
+    /// collected by [`Engine::take_reconciled`]. See that method for why they
+    /// are accumulated rather than logged here.
+    reconciled: Vec<ManagedRule>,
 }
 
 impl<'a> Engine<'a> {
@@ -106,6 +111,7 @@ impl<'a> Engine<'a> {
             clock,
             state,
             executable,
+            reconciled: Vec::new(),
         }
     }
 
@@ -118,6 +124,38 @@ impl<'a> Engine<'a> {
     pub fn rules(&mut self) -> &[ManagedRule] {
         self.reconcile_read_only();
         self.state.rules()
+    }
+
+    /// Take the records this engine's reconciliation has dropped from state
+    /// so far, leaving none behind.
+    ///
+    /// A dropped record is a rule the firewall no longer has: the port had
+    /// already stopped being open, and reconciliation is porthole noticing.
+    /// It is the same event the helper's start-up sweep already announces as
+    /// `CloseReason::Reconciled`, and it happens for the same reasons at any
+    /// other moment -- a `firewall-cmd --reload`, a `ufw reload` -- while the
+    /// helper is running. Left uncollected it is invisible: nothing else in
+    /// this crate logs it, and a client that learns what is open from the
+    /// helper's signals alone would go on showing that port as open.
+    ///
+    /// Accumulated here rather than reported by [`Engine::run_sweep`] because
+    /// the two callers that can act on it are outside this crate (the
+    /// privileged helper's interface methods and its network monitor), and
+    /// because a caller must be able to collect them **whether or not the
+    /// operation it asked for succeeded** -- a `close` whose rule the sweep
+    /// had just dropped fails with `RuleNotFound`, and that is exactly the
+    /// case where the drop most needs announcing.
+    ///
+    /// Only [`crate::reconcile::SweepMode::Apply`] sweeps that actually
+    /// persist contribute. A read path's sweep
+    /// ([`crate::reconcile::SweepMode::ReadOnly`], what `status` and `rules`
+    /// use) reflects the drop in memory and never saves it, so the record is
+    /// still in the state file and the next writing operation will drop it
+    /// for real; announcing from a read would announce the same close on
+    /// every `list`. A dry run does not contribute either: nothing was
+    /// written, so nothing was dropped.
+    pub fn take_reconciled(&mut self) -> Vec<ManagedRule> {
+        std::mem::take(&mut self.reconciled)
     }
 
     /// Turn what the user asked for into the network a backend can use.
@@ -165,6 +203,10 @@ impl<'a> Engine<'a> {
     /// tidy up, and refusing that because an unrelated stale rule would not
     /// delete is a worse outcome than a rule left behind.
     ///
+    /// What the sweep *dropped from state* is not a "went wrong" and is not
+    /// logged here: it is collected for [`Engine::take_reconciled`], whose
+    /// caller announces it. See that method.
+    ///
     /// Several distinct kinds of "went wrong", all logged: `sweep` itself
     /// returning `Err` (a failure to list rules, or to save); a successful
     /// sweep whose `Report::failures` is non-empty (an individual orphan
@@ -179,6 +221,14 @@ impl<'a> Engine<'a> {
     fn run_sweep(&mut self, mode: reconcile::SweepMode) {
         match reconcile::sweep(self.backend, &mut self.state, mode) {
             Ok(report) => {
+                // Not logged here: [`Engine::take_reconciled`]'s caller
+                // writes the journal line and emits the signal together, so
+                // logging it here as well would say it twice in the one
+                // process that does both.
+                if matches!(mode, reconcile::SweepMode::Apply { dry_run: false }) {
+                    self.reconciled
+                        .extend(report.dropped_from_state.iter().cloned());
+                }
                 for failure in &report.failures {
                     eprintln!(
                         "porthole: reconciliation could not remove one orphaned rule, \
@@ -410,6 +460,89 @@ impl<'a> Engine<'a> {
         (closed, errors)
     }
 
+    /// Close every rule whose stored CIDR is inside `lost` -- the subnet the
+    /// caller last observed, now that it is observing a different one.
+    ///
+    /// `ManagedRule` records only the resolved `Target`, never the
+    /// `ScopeSpec` that produced it, so there is no stored fact anywhere
+    /// distinguishing "opened towards whatever subnet I'm on" from "opened
+    /// towards this exact CIDR, deliberately, wherever I am". The predicate
+    /// below is chosen so it does not need that distinction: a rule closes
+    /// when its own CIDR sits inside `lost`, whichever `ScopeSpec` produced
+    /// it. A rule whose CIDR is disjoint from `lost`, or broader than it (a
+    /// deliberate `--to 10.0.0.0/8` on a `10.10.10.0/24` machine, say), was
+    /// never a claim about `lost` specifically and survives -- closing it
+    /// would be answering a question the machine leaving `lost` never
+    /// raised. [`Target::Anywhere`] is checked against nothing and always
+    /// survives.
+    ///
+    /// `lost` is a subnet the caller has stopped finding, not a subnet proven
+    /// unreachable. What counts as stopping is the caller's judgement and is
+    /// stated where that judgement is made; nothing here re-examines it, and
+    /// nothing here reads the machine's interfaces at all.
+    ///
+    /// Reconciles first, exactly as [`Engine::close_all`] does: the same
+    /// batch of rules is about to be inspected and possibly closed, so this
+    /// should not cost a separate listing command per rule the way looping
+    /// [`Engine::close_by_id`] naively would. Keeps going after a failure for
+    /// the same reason `close_all` does -- one rule that will not close must
+    /// not leave the others open on a network they no longer belong to.
+    pub fn close_rules_outside(&mut self, lost: Ipv4Net) -> Vec<ManagedRule> {
+        self.reconcile();
+        let ids: Vec<String> = self
+            .state
+            .rules()
+            .iter()
+            .filter(|r| match r.target {
+                Target::Anywhere => false,
+                Target::Network { cidr } => lost.contains(&cidr),
+            })
+            .map(|r| r.id.clone())
+            .collect();
+        self.close_ids_after_network_change(ids)
+    }
+
+    /// Close every subnet-scoped rule because the machine has no usable
+    /// network at all right now.
+    ///
+    /// With no current subnet to compare a rule's stored CIDR against, there
+    /// is no way to say any subnet-scoped rule is still honestly reachable,
+    /// so every one of them closes. [`Target::Anywhere`] survives, for the
+    /// same reason [`Engine::close_rules_outside`] leaves it alone.
+    pub fn close_rules_on_network_loss(&mut self) -> Vec<ManagedRule> {
+        self.reconcile();
+        let ids: Vec<String> = self
+            .state
+            .rules()
+            .iter()
+            .filter(|r| matches!(r.target, Target::Network { .. }))
+            .map(|r| r.id.clone())
+            .collect();
+        self.close_ids_after_network_change(ids)
+    }
+
+    /// Shared by [`Engine::close_rules_outside`] and
+    /// [`Engine::close_rules_on_network_loss`]: close each id, logging and
+    /// skipping whatever will not close rather than letting one stuck rule
+    /// stop the rest. No separate error list the way [`Engine::close_all`]
+    /// keeps one, on purpose -- nothing downstream of a network change reads
+    /// which rule failed and why, only that the ones that could close are
+    /// gone.
+    fn close_ids_after_network_change(&mut self, ids: Vec<String>) -> Vec<ManagedRule> {
+        let mut closed = Vec::new();
+        for id in ids {
+            match self.close_by_id_unreconciled(&id, false, false) {
+                Ok(rule) => closed.push(rule),
+                Err(e) => {
+                    eprintln!(
+                        "porthole: network change could not close rule {id}, continuing: {e}"
+                    );
+                }
+            }
+        }
+        closed
+    }
+
     /// Close a rule the currently detected backend actually created.
     ///
     /// I1 (a previous wave): a state entry recorded under a backend that is
@@ -608,6 +741,112 @@ mod tests {
             store,
             std::path::PathBuf::from("/usr/bin/porthole"),
         )
+    }
+
+    /// A state entry the backend has never heard of: exactly what a
+    /// `firewall-cmd --reload` leaves behind, since porthole's rules are
+    /// runtime-only and its state file is not.
+    fn orphaned_record(id: &str) -> ManagedRule {
+        ManagedRule {
+            id: id.to_string(),
+            port: 5173,
+            protocol: Protocol::Tcp,
+            target: Target::Network {
+                cidr: "10.10.10.0/24".parse().unwrap(),
+            },
+            // FakeBackend reports itself as Firewalld, so this is *this*
+            // backend's own record rather than a foreign-backend one, which
+            // the sweep would skip instead of dropping.
+            backend: BackendId::Firewalld,
+            opened_at: NOW,
+            expires_at: None,
+            uid: 1000,
+            handle: RuleHandle::Firewalld {
+                zone: "FedoraWorkstation".to_string(),
+                rich_rule: "a rule the firewall no longer has".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn a_record_the_firewall_no_longer_has_is_collectable_even_when_the_operation_fails() {
+        // The reload case, which needs no restart: the firewall forgets,
+        // porthole's state file does not, and the very next operation's
+        // sweep drops the record. Before `take_reconciled` that drop was
+        // invisible -- nothing logged it and nothing announced it -- so a
+        // client watching the helper's signals kept showing the port as
+        // open. It has to survive a *failed* operation in particular,
+        // because the operation that fails is most often the close of the
+        // rule that just went.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+
+        let mut store = harness.store();
+        store.insert(orphaned_record("gone"));
+        store.save().unwrap();
+
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+        let closed = engine.close_by_id("gone", false, false);
+        assert!(
+            closed.is_err(),
+            "the sweep dropped it first, so the close has nothing to find"
+        );
+
+        let reconciled = engine.take_reconciled();
+        assert_eq!(reconciled.len(), 1, "the drop must still be collectable");
+        assert_eq!(reconciled[0].id, "gone");
+        assert_eq!(reconciled[0].port, 5173);
+        assert!(
+            engine.take_reconciled().is_empty(),
+            "taking must drain, or the next operation would announce it again"
+        );
+    }
+
+    #[test]
+    fn a_read_path_never_produces_a_record_to_announce() {
+        // `rules` and `status` reconcile read-only: the drop is reflected in
+        // memory and never saved, so the record is still in the state file
+        // and a later writing operation will drop it for real. Collecting it
+        // here would announce the same close on every `porthole list`.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+
+        let mut store = harness.store();
+        store.insert(orphaned_record("gone"));
+        store.save().unwrap();
+
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+        assert!(engine.rules().is_empty(), "read-only still hides it");
+        assert!(engine.take_reconciled().is_empty());
+
+        let still_there = StateStore::open(&harness.path).unwrap();
+        assert_eq!(
+            still_there.rules().len(),
+            1,
+            "a read path must not have written the drop"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_produces_no_record_to_announce_either() {
+        // Nothing was written, so nothing was dropped -- announcing a close
+        // from a dry run would be the plainest kind of false statement.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = DryRunRunner::new(Box::new(RecordingRunner::new()));
+        let clock = FixedClock(NOW);
+
+        let mut store = harness.store();
+        store.insert(orphaned_record("gone"));
+        store.save().unwrap();
+
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+        let _ = engine.close_by_id("gone", false, false);
+        assert!(engine.take_reconciled().is_empty());
     }
 
     #[test]
@@ -1442,6 +1681,179 @@ mod tests {
         // must not pretend it did.
         assert_eq!(engine.rules().len(), 1);
         assert_eq!(engine.rules()[0].id, "stale");
+    }
+
+    #[test]
+    fn close_rules_outside_closes_a_rule_for_exactly_the_subnet_that_was_lost() {
+        // The intent was "let my phone reach this, on this network". The
+        // network changed, so the intent no longer holds: closed, not
+        // re-aimed at the new network, not left listed as if still valid.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::Network("10.10.10.0/24".parse().unwrap()),
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        let closed = engine.close_rules_outside("10.10.10.0/24".parse().unwrap());
+        assert_eq!(closed.len(), 1);
+        assert!(engine.rules().is_empty());
+        assert!(
+            backend.handles().is_empty(),
+            "the firewall rule must really be gone, not just the state entry"
+        );
+    }
+
+    #[test]
+    fn close_rules_outside_closes_a_narrower_rule_still_inside_the_lost_subnet() {
+        // A single device on the subnet that was lost is exactly as
+        // unreachable as the subnet itself.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::Host("10.10.10.42".parse().unwrap()),
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        let closed = engine.close_rules_outside("10.10.10.0/24".parse().unwrap());
+        assert_eq!(closed.len(), 1);
+        assert!(engine.rules().is_empty());
+    }
+
+    #[test]
+    fn close_rules_outside_leaves_a_rule_towards_anywhere_alone() {
+        // "Anyone" was never tied to a subnet, so nothing about it became
+        // false when the network did.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::Anywhere,
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        let closed = engine.close_rules_outside("10.10.10.0/24".parse().unwrap());
+        assert!(closed.is_empty());
+        assert_eq!(engine.rules().len(), 1);
+    }
+
+    #[test]
+    fn close_rules_outside_leaves_a_rule_for_a_disjoint_subnet_alone() {
+        // A rule deliberately aimed at a different subnet than the one lost
+        // never made any claim about the one that was lost.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::Network("192.168.5.0/24".parse().unwrap()),
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        assert!(engine
+            .close_rules_outside("10.10.10.0/24".parse().unwrap())
+            .is_empty());
+        assert_eq!(engine.rules().len(), 1);
+    }
+
+    #[test]
+    fn close_rules_outside_leaves_a_rule_broader_than_the_lost_subnet_alone() {
+        // C1: `porthole open 5173 --to 10.0.0.0/8` on a 10.10.10.0/24 machine
+        // is a deliberate, wider peer-subnet rule, not a claim about
+        // 10.10.10.0/24 specifically. `10.0.0.0/8` is not a subset of the
+        // 10.10.10.0/24 that was lost -- `lost.contains(&cidr)` is false --
+        // so it must survive. The predicate this replaced (`!current.
+        // contains(&cidr)`, checked against the *new* subnet) closed this
+        // rule on every poll tick even though nothing about it had changed.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::Network("10.0.0.0/8".parse().unwrap()),
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        let closed = engine.close_rules_outside("10.10.10.0/24".parse().unwrap());
+        assert!(closed.is_empty(), "must survive, got closed: {closed:?}");
+        assert_eq!(engine.rules().len(), 1);
+    }
+
+    #[test]
+    fn close_rules_on_network_loss_closes_every_subnet_rule_but_not_anywhere() {
+        // No network at all means every subnet-scoped rule is meaningless --
+        // there is nothing left to compare its CIDR against -- but a rule
+        // towards Anywhere was never tied to a subnet in the first place.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::new();
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::Network("10.10.10.0/24".parse().unwrap()),
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+        engine
+            .open(
+                5432,
+                Protocol::Tcp,
+                &ScopeSpec::Anywhere,
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        let closed = engine.close_rules_on_network_loss();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].port, 5173);
+        assert_eq!(engine.rules().len(), 1);
+        assert_eq!(engine.rules()[0].port, 5432);
     }
 
     #[test]
