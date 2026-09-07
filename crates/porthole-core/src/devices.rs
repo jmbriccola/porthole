@@ -228,12 +228,15 @@ fn device_name_problem(name: &str) -> Option<String> {
     }
     if crate::validate::parse_scope(name).is_ok() {
         return Some(format!(
-            "`{name}` is already a scope, so `--to {name}` opens towards that scope and              never looks for a saved device; pick a different name"
+            "`{name}` is already a scope, so `--to {name}` opens towards that scope and \
+             never looks for a saved device; pick a different name"
         ));
     }
     if name.contains('/') || name.contains(':') {
         return Some(format!(
-            "device name `{name}` contains `/` or `:`, which `--to` reads as a network or              an IP address rather than a name, so the device could never be reached; pick              a different name"
+            "device name `{name}` contains `/` or `:`, which `--to` reads as a network \
+             or an IP address rather than a name, so the device could never be reached; \
+             pick a different name"
         ));
     }
     None

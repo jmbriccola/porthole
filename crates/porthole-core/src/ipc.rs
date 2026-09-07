@@ -67,10 +67,11 @@ impl WireRule {
 /// a rule that ran out its own clock, one a person asked to close, one the
 /// helper closed because the machine left the network it was scoped to, and
 /// one that was already gone from the firewall by the time porthole looked
-/// are four different things to tell a user about. The wire form is the slug
-/// [`CloseReason::as_str`] returns — one source of truth for the string,
-/// which the journal line and the signal both derive from, so neither can
-/// drift from the other.
+/// are four different things to tell a user about. The slug is spelled twice:
+/// the wire form comes from serde's `rename_all` below, the journal form from
+/// the `match` in [`CloseReason::as_str`]. Nothing in the type system makes
+/// those agree — `every_close_carries_why` checks both halves for every
+/// variant, which is the only reason they cannot drift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[zvariant(signature = "s")]
 #[serde(rename_all = "kebab-case")]
@@ -98,9 +99,12 @@ pub enum CloseReason {
 }
 
 impl CloseReason {
-    /// The exact slug that crosses the bus. Kept next to the enum rather
-    /// than spelled out at each call site so the journal and the signal
-    /// cannot disagree about what a close was.
+    /// The slug the journal line is built from. It is not what serde puts on
+    /// the wire -- `rename_all` above derives that from the variant name
+    /// independently -- so the two are held equal by `every_close_carries_why`
+    /// rather than by construction. Kept next to the enum all the same, so
+    /// that the four spellings are in one place rather than at each call
+    /// site.
     pub fn as_str(self) -> &'static str {
         match self {
             CloseReason::Expired => "expired",
