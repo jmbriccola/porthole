@@ -95,17 +95,19 @@
 //!
 //! # Environment this file assumes
 //!
-//! - `podman`, rootless, reachable on `$PATH`. Once `PORTHOLE_CONTAINER_TESTS`
-//!   is set, this is required, not merely hoped for: a broken `podman
-//!   --version` panics rather than skips.
+//! - An explicit opt-in. Every test here is `#[ignore]`d, so a plain `cargo
+//!   test` reports them as `ignored` by name rather than counting them
+//!   passed; `tests/container/run.sh` passes `--ignored` and sets
+//!   `PORTHOLE_CONTAINER_TESTS=1`. Nothing in this file skips.
+//! - `podman`, rootless, reachable on `$PATH`. Once opted in, this is
+//!   required, not merely hoped for: a broken `podman --version` panics.
 //! - The musl binaries already built: `cargo build --target
 //!   x86_64-unknown-linux-musl --bins`, and built recently enough to be
 //!   newer than every source file that went into them. Both are checked, and
-//!   both **panic** rather than skip if they do not hold. That asymmetry
-//!   with `container_tests_enabled()` itself (which does skip) is
-//!   deliberate: the env var is the caller's statement of intent to actually
-//!   run these tests, and once that statement has been made, a missing or
-//!   stale prerequisite is a bug in the run, not a reason to report success
+//!   both **panic** rather than skip if they do not hold. `--ignored` and
+//!   the env var are the caller's statement of intent to actually run these
+//!   tests, and once that statement has been made, a missing or stale
+//!   prerequisite is a bug in the run, not a reason to report success
 //!   anyway. This milestone already shipped the alternative once -- five
 //!   end-to-end tests silently skipped while `cargo test` reported the suite
 //!   green, and nobody noticed until an unrelated fix disabled them and the
@@ -145,17 +147,26 @@ fn podman_available() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// Skip loudly and return from the calling test if the caller never opted
-/// in, exactly as `helper_e2e.rs`'s `start_or_skip!` does -- a gated test
-/// nobody can tell ran is not a test. Once opted in, a broken `podman` is a
-/// hard failure, not a second skip: see the module docs on why that
-/// asymmetry is deliberate.
+/// Assert the environment these tests need. Nothing here skips: every test
+/// in this file carries `#[ignore]`, so opting out is what `cargo test`
+/// already does by default and reports as `ignored`, honestly and by name.
+/// Once a caller has said `--ignored`, a missing prerequisite is a broken
+/// invocation rather than a reason to report success -- the same asymmetry
+/// `require_musl_binaries!` applies, for the same reason.
+///
+/// This is the shape the earlier version got wrong: it printed `skipped:`
+/// and returned, and libtest counted the test `ok`. Ten of this workspace's
+/// tests reported success without running, which is the same hazard as a
+/// green gate that executed nothing -- and this file's own module doc calls
+/// that out ("a test nobody can tell ran is not a test") a few lines above
+/// where it used to happen.
 macro_rules! require_environment {
     () => {
-        if !container_tests_enabled() {
-            eprintln!("skipped: set PORTHOLE_CONTAINER_TESTS=1 and have podman to run this test");
-            return;
-        }
+        assert!(
+            container_tests_enabled(),
+            "these tests are opted into with PORTHOLE_CONTAINER_TESTS=1, which \
+             tests/container/run.sh sets for you along with everything else they need."
+        );
         assert!(
             podman_available(),
             "PORTHOLE_CONTAINER_TESTS=1 was set, so a working `podman` is required, not \
@@ -521,6 +532,7 @@ fn assert_container_ok(out: &Output, what: &str) {
 /// be seen by hand-editing the fix out of the tree is not covered by the
 /// suite that ships.
 #[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
 fn on_ufw_a_port_opened_before_a_reboot_is_closed_after_it() {
     require_environment!();
     let (cli, helper) = require_musl_binaries!();
@@ -719,6 +731,7 @@ check_reachable() {
 /// across a real veth to ask "is the port actually reachable", which is the
 /// only question this backend exists to answer correctly.
 #[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
 fn on_nftables_an_opened_port_is_actually_reachable() {
     require_environment!();
     let (cli, helper) = require_musl_binaries!();
@@ -845,6 +858,7 @@ fi
 /// as, and the only thing this container can prove that the unit test
 /// cannot.
 #[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
 fn firewalld_survives_several_sweeps_with_the_users_rule_intact() {
     require_environment!();
     let (cli, helper) = require_musl_binaries!();
@@ -919,6 +933,7 @@ source address=\"192.168.77.0/24\" port port=\"9999\" protocol=\"tcp\" accept'\n
 /// filled a block -- a test that reported "no signals" for a reason that has
 /// nothing to do with porthole.
 #[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
 fn signals_reach_a_subscriber_when_a_port_is_opened_and_closed() {
     require_environment!();
     let (cli, helper) = require_musl_binaries!();
@@ -1045,6 +1060,7 @@ kill "$MONPID" 2>/dev/null || true
 /// synthesises the orphaned record; this one gets it from a real reload of a
 /// real firewalld.
 #[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
 fn a_reload_under_a_running_helper_announces_the_records_it_orphaned() {
     require_environment!();
     let (cli, helper) = require_musl_binaries!();
@@ -1148,6 +1164,7 @@ kill "$MONPID" 2>/dev/null || true
 /// same reason -- a subscriber that connects afterwards has already missed
 /// it, which the emitting code says outright.
 #[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
 fn the_start_up_sweep_announces_what_it_dropped() {
     require_environment!();
     let (cli, helper) = require_musl_binaries!();
@@ -1268,6 +1285,7 @@ wait "$HPID" 2>/dev/null || true
 /// Nothing on the development host can reach this code: `netmon` closes
 /// rules in a real firewall, off its own timer, with no client involved.
 #[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
 fn a_subnet_the_machine_left_is_announced_along_with_the_rules_it_closed() {
     require_environment!();
     let (cli, helper) = require_musl_binaries!();
@@ -1395,6 +1413,7 @@ fn parse_dry_run_open(json_text: &str) -> (String, Vec<String>) {
 /// itself as proof the two are talking about the same, single, would-be
 /// mutation.
 #[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
 fn dry_run_is_byte_identical_to_reality_on_ufw() {
     require_environment!();
     let (cli, _helper) = require_musl_binaries!();
@@ -1443,6 +1462,7 @@ fn dry_run_is_byte_identical_to_reality_on_ufw() {
 }
 
 #[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
 fn dry_run_is_byte_identical_to_reality_on_firewalld() {
     require_environment!();
     let (cli, _helper) = require_musl_binaries!();
@@ -1498,6 +1518,7 @@ source address=\"192.168.77.0/24\" port port=\"9999\" protocol=\"tcp\" accept'\n
 }
 
 #[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
 fn dry_run_is_byte_identical_to_reality_on_nftables() {
     require_environment!();
     let (cli, _helper) = require_musl_binaries!();
