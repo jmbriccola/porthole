@@ -61,18 +61,23 @@
 //! published it on -- the same two facts `porthole listen`'s own trailing
 //! `docker:` column prints, worded the same way. Nothing enforces that: the
 //! two are separate strings in separate crates. porthole never touches
-//! Docker's rules; the
-//! marker says what is there, and `porthole_core::docker`'s own module doc
-//! is where the consequences are spelled out.
+//! Docker's rules -- the marker says what is there, and
+//! `porthole_core::docker`'s own module doc is where the consequences are
+//! spelled out.
 //!
-//! **"Not published" and "not checked" are two different facts**, and only
-//! one of them may render as an unmarked row. Reading the `DOCKER` chain
-//! needs root, so this section learns about it from the helper, over a call
-//! that can fail like any other; [`ListeningSection::set_docker_unknown`] is
-//! that failure's own state and puts [`DOCKER_UNKNOWN_NOTE`] under the
-//! group's title. Said once for the whole list, not per row -- every row
-//! would otherwise repeat the identical caveat -- which mirrors what
-//! `porthole-cli`'s own `render_listening` does with the same fact.
+//! An unmarked row means one of three things: Docker was asked and does not
+//! publish this port, Docker was asked and could not answer, or Docker has
+//! not been asked yet. A row carries no way to tell them apart. The group's
+//! own description line is where the difference is said, once for the whole
+//! list rather than per row -- which mirrors what `porthole-cli`'s own
+//! `render_listening` does with the same fact -- and it has all three
+//! states, [`DockerPorts`], not two.
+//!
+//! The third one is why: the list this section reads comes from the helper,
+//! and the `/proc` scan that fills these rows lands first (measured; see
+//! below). A section that reported a failure from its own initial state
+//! would report one at every launch, in the window before the helper had
+//! answered anything at all.
 //!
 //! ## A scan failure is not "nothing is listening"
 //!
@@ -166,11 +171,9 @@ struct Inner {
     services: RefCell<Vec<Service>>,
     /// Ports `set_open_ports` was last given, as a set for cheap lookup.
     open_ports: RefCell<HashSet<u16>>,
-    /// Every port Docker currently publishes, or `None` for "porthole could
-    /// not check". `None` is not an empty list: an empty list is a checked
-    /// answer, and only a checked answer lets an unmarked row mean "Docker
-    /// does not publish this". See this module's own doc comment.
-    docker: RefCell<Option<Vec<Published>>>,
+    /// What this section knows about Docker -- three states, see
+    /// [`DockerPorts`].
+    docker: RefCell<DockerPorts>,
     /// Whether `services` is a confirmed scan result right now -- `true`
     /// only between a `set_services` call and the next `set_scan_failed`
     /// (which clears it again). `apply` reads this, not
@@ -207,13 +210,63 @@ const LOOPBACK_SUBTITLE: &str = "listening only on this machine — the firewall
 const BEYOND_REACH_SUBTITLE: &str = "reachable over IPv6 — porthole manages IPv4 rules only and \
      cannot open or close it. Run `porthole doctor` to check your IPv6 exposure.";
 
-/// What this section says when it was never told which ports Docker
-/// publishes. Under the group's title, once, rather than on every row --
-/// see this module's own doc comment. Makes the same claim
+/// What this section says once a `docker_ports` call has actually come back
+/// without an answer. Under the group's title, once, rather than on every
+/// row -- see this module's own doc comment. Makes the same claim
 /// `porthole-cli`'s own `render_listening` prints for the identical fact.
-pub const DOCKER_UNKNOWN_NOTE: &str = "Docker information unavailable — the porthole helper \
+pub const DOCKER_UNAVAILABLE_NOTE: &str = "Docker information unavailable — the porthole helper \
      could not be reached, or answered with an error, so porthole cannot say whether any of \
      these ports are already published by a container.";
+
+/// What this section says before any `docker_ports` call has come back at
+/// all. Claims nothing about the helper, because there is nothing to
+/// claim: in this state no call has failed, and whether one is in flight is
+/// not something this section is told.
+pub const DOCKER_NOT_CHECKED_NOTE: &str = "Docker information not checked yet — porthole cannot \
+     yet say whether any of these ports are already published by a container.";
+
+/// What this section knows about Docker's published ports.
+///
+/// Three states, not two. [`DockerPorts::NotChecked`] is the state a
+/// freshly constructed section is in, and it is **not**
+/// [`DockerPorts::Unavailable`]: nothing has failed yet. Collapsing the two
+/// puts a failure on screen at every launch, during the window in which the
+/// `/proc` scan has landed and the helper round trip has not -- which is
+/// the ordinary order, not an edge case; see `apply`'s own doc comment for
+/// where that ordering was measured.
+#[derive(Debug, Clone)]
+enum DockerPorts {
+    /// No `docker_ports` call has come back yet.
+    NotChecked,
+    /// A `docker_ports` call came back with no answer -- no bus, a typed
+    /// error, or a timeout. Only this one earns [`DOCKER_UNAVAILABLE_NOTE`].
+    Unavailable,
+    /// The checked list. Empty means Docker publishes nothing, which is an
+    /// answer.
+    Known(Vec<Published>),
+}
+
+impl DockerPorts {
+    /// The list to look a row's port up in, or `None` when there is no
+    /// checked list -- in either of the two ways there can fail to be one.
+    fn checked(&self) -> Option<&[Published]> {
+        match self {
+            DockerPorts::Known(list) => Some(list),
+            DockerPorts::NotChecked | DockerPorts::Unavailable => None,
+        }
+    }
+
+    /// The group's description line for this state: the two that carry no
+    /// list each say which one they are, and a checked list needs no line
+    /// at all.
+    fn note(&self) -> Option<&'static str> {
+        match self {
+            DockerPorts::Known(_) => None,
+            DockerPorts::NotChecked => Some(DOCKER_NOT_CHECKED_NOTE),
+            DockerPorts::Unavailable => Some(DOCKER_UNAVAILABLE_NOTE),
+        }
+    }
+}
 
 /// The port Docker publishes at `port`/`protocol`, if it publishes one at
 /// all. `published` is the whole checked list; a caller with no list at all
@@ -371,13 +424,9 @@ fn apply(inner: &Rc<Inner>) {
         inner.container.append(&inner.group);
     }
 
-    // Present exactly while Docker is unchecked: an unmarked row is only
-    // allowed to read as "Docker does not publish this" once there is a
-    // list that says so. See this module's own doc comment.
-    match docker {
-        Some(_) => inner.group.set_description(None),
-        None => inner.group.set_description(Some(DOCKER_UNKNOWN_NOTE)),
-    }
+    // Which of the three things an unmarked row means, said once for the
+    // whole list -- see this module's own doc comment, and `DockerPorts`.
+    inner.group.set_description(docker.note());
 
     let mut ordered: Vec<&Service> = services.iter().collect();
     ordered.sort_by_key(|s| group_rank(&s.binding));
@@ -390,14 +439,14 @@ fn apply(inner: &Rc<Inner>) {
         // as Pango markup by default.
         let action_row = adw::ActionRow::builder()
             .title(title_for(service))
-            .subtitle(subtitle_for(service, &open_ports, docker.as_deref()))
+            .subtitle(subtitle_for(service, &open_ports, docker.checked()))
             .use_markup(false)
             .build();
 
         // The marker the module doc describes: an icon, not colour, and
         // only ever on a row a checked list actually names.
         let docker_icon = docker
-            .as_deref()
+            .checked()
             .and_then(|list| docker_for(service.port, service.protocol, list))
             .map(|published| {
                 let icon = gtk::Image::from_icon_name("package-x-generic-symbolic");
@@ -545,7 +594,7 @@ impl ListeningSection {
             rows: RefCell::new(Vec::new()),
             services: RefCell::new(Vec::new()),
             open_ports: RefCell::new(HashSet::new()),
-            docker: RefCell::new(None),
+            docker: RefCell::new(DockerPorts::NotChecked),
             scanned: Cell::new(false),
         });
 
@@ -596,19 +645,26 @@ impl ListeningSection {
     /// Re-renders immediately against whatever the other setters last
     /// stored, in any call order.
     pub fn set_docker_ports(&self, published: &[Published]) {
-        self.inner.docker.replace(Some(published.to_vec()));
+        self.inner
+            .docker
+            .replace(DockerPorts::Known(published.to_vec()));
         apply(&self.inner);
     }
 
     /// The failure counterpart to [`ListeningSection::set_docker_ports`]:
-    /// the helper could not say which ports Docker publishes, which is not
-    /// the same fact as it saying none. Drops whatever list was last known
+    /// a `docker_ports` call came back without an answer, which is not the
+    /// same fact as it answering "none". Drops whatever list was last known
     /// -- a marker left standing would keep claiming something porthole can
-    /// no longer stand behind -- and puts [`DOCKER_UNKNOWN_NOTE`] under the
-    /// group's title instead. The state a freshly constructed section is
-    /// already in.
-    pub fn set_docker_unknown(&self) {
-        self.inner.docker.replace(None);
+    /// no longer stand behind -- and puts [`DOCKER_UNAVAILABLE_NOTE`] under
+    /// the group's title.
+    ///
+    /// **Not** the state a freshly constructed section is in. That one is
+    /// [`DockerPorts::NotChecked`], and this method is the only way to
+    /// reach this one: a caller that has not called `docker_ports` yet must
+    /// not call this, or the section reports a failure nobody has had. See
+    /// this module's own doc comment.
+    pub fn set_docker_unavailable(&self) {
+        self.inner.docker.replace(DockerPorts::Unavailable);
         apply(&self.inner);
     }
 
@@ -667,8 +723,10 @@ impl ListeningSection {
             .collect()
     }
 
-    /// The group's own description line -- [`DOCKER_UNKNOWN_NOTE`] while
-    /// Docker could not be checked, `None` once it could.
+    /// The group's own description line: [`DOCKER_NOT_CHECKED_NOTE`] before
+    /// any `docker_ports` call has come back, [`DOCKER_UNAVAILABLE_NOTE`]
+    /// once one came back without an answer, `None` once one brought a
+    /// list.
     pub fn group_description(&self) -> Option<String> {
         self.inner
             .group
@@ -941,19 +999,44 @@ mod tests {
     }
 
     #[test]
-    fn an_unchecked_docker_list_leaves_every_row_exactly_as_it_was() {
-        // The distinction the module doc calls out: "not published" and
-        // "not checked" must not render the same way *per row*. They do
-        // render the same way per row -- both unmarked -- which is why the
-        // group-level note exists, and why this test pins that the row text
-        // itself is untouched rather than pretending the row can carry the
-        // difference.
+    fn a_row_carries_no_docker_text_when_there_is_no_checked_list() {
+        // Both no-list states leave a row's own text exactly as the scan
+        // alone would render it, which is the whole reason the difference
+        // between them is said at group level instead.
         let open = HashSet::new();
         let service = svc(8080, Some("node"), Binding::AllInterfaces);
+        for state in [DockerPorts::NotChecked, DockerPorts::Unavailable] {
+            assert_eq!(
+                subtitle_for(&service, &open, state.checked()),
+                subtitle_without_docker(&service, &open),
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_section_nobody_has_asked_about_docker_yet_reports_no_failure() {
+        // The defect this state exists for: the `/proc` scan lands before
+        // the helper round trip, so a section whose initial state was
+        // `Unavailable` would put "the helper could not be reached" on
+        // screen at every launch, before anything had failed.
         assert_eq!(
-            subtitle_for(&service, &open, None),
-            subtitle_without_docker(&service, &open)
+            DockerPorts::NotChecked.note(),
+            Some(DOCKER_NOT_CHECKED_NOTE)
         );
+        assert_eq!(
+            DockerPorts::Unavailable.note(),
+            Some(DOCKER_UNAVAILABLE_NOTE)
+        );
+        assert_eq!(DockerPorts::Known(Vec::new()).note(), None);
+
+        let not_checked = DOCKER_NOT_CHECKED_NOTE.to_lowercase();
+        for failure_word in ["could not be reached", "unavailable", "error"] {
+            assert!(
+                !not_checked.contains(failure_word),
+                "the not-checked note must not report a failure: {DOCKER_NOT_CHECKED_NOTE}"
+            );
+        }
     }
 
     #[test]
@@ -965,9 +1048,9 @@ mod tests {
     }
 
     #[test]
-    fn the_unknown_note_says_porthole_could_not_check_not_that_there_is_nothing() {
-        let note = DOCKER_UNKNOWN_NOTE.to_lowercase();
-        assert!(note.contains("unavailable"), "{DOCKER_UNKNOWN_NOTE}");
-        assert!(note.contains("cannot say"), "{DOCKER_UNKNOWN_NOTE}");
+    fn the_unavailable_note_says_porthole_could_not_check_not_that_there_is_nothing() {
+        let note = DOCKER_UNAVAILABLE_NOTE.to_lowercase();
+        assert!(note.contains("unavailable"), "{DOCKER_UNAVAILABLE_NOTE}");
+        assert!(note.contains("cannot say"), "{DOCKER_UNAVAILABLE_NOTE}");
     }
 }

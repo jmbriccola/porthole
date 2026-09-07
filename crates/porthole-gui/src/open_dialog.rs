@@ -66,17 +66,15 @@
 //! actually exercises: the presented alert's own two responses are answered
 //! by a person, not by CI.
 //!
-//! ## `on_opened`: left uncalled here, wired by task 6
+//! ## `on_opened`
 //!
-//! [`OpenDialog::on_opened`] is a hook a caller can register to learn a
-//! request actually succeeded (the new [`WireRule`] the helper returned).
-//! This task left it uncalled, because refreshing "Open now" belongs with
-//! whatever later gives this window a real, repeatable refresh action, not
-//! with the dialog that merely triggered one open -- and task 6 is that
-//! later task: `window.rs`'s header-bar button and each of the "Listening"
-//! section's own per-row Open buttons now register it, so a successful
-//! open re-populates both sections and the status line from the helper and
-//! `/proc` again, the same refresh construction itself already runs.
+//! [`OpenDialog::on_opened`] is a hook a caller registers to learn a request
+//! actually succeeded (the new [`WireRule`] the helper returned).
+//! `window.rs` registers it on every dialog it presents -- from the header
+//! bar's button and from each "Listening" row's own pre-filled one -- so a
+//! successful open re-populates both sections and the status line from the
+//! helper and `/proc` again, the same refresh construction itself already
+//! runs.
 //!
 //! And, like [`crate::open_now::OpenNowSection`]'s close button before it,
 //! the "Open" button's real D-Bus round trip has no automated test: the
@@ -362,14 +360,25 @@ fn selected_lifetime_of(inner: &Inner) -> Lifetime {
         .unwrap_or(Lifetime::For(DEFAULT_DURATION))
 }
 
-fn selected_scope_of(inner: &Inner) -> ScopeSpec {
+/// The scope of whichever target row is active, or `None` when no active
+/// row names one.
+///
+/// `None`, not a default. Every default available here is *wider* than what
+/// a row that failed to produce one might have meant -- `CurrentSubnet` is
+/// a whole subnet where the row may have been a single host -- and a
+/// fallback in this application has to narrow. `None` narrows all the way:
+/// [`build_request`] returns `None` too, and the Open button sends nothing.
+///
+/// Unreachable as this dialog is built: row 0 is "This network", always
+/// present, always selectable, and always what a rebuild falls back to. It
+/// is a `None` rather than a default so that stops being load-bearing.
+fn selected_scope_of(inner: &Inner) -> Option<ScopeSpec> {
     inner
         .target_rows
         .borrow()
         .iter()
         .find(|r| r.check.is_active())
         .and_then(|r| r.scope.clone())
-        .unwrap_or(ScopeSpec::CurrentSubnet)
 }
 
 fn build_request(inner: &Inner) -> Option<Request> {
@@ -377,7 +386,7 @@ fn build_request(inner: &Inner) -> Option<Request> {
         port: parse_port_for_submit(&inner.port_row.text())?,
         protocol: selected_protocol_of(inner),
         lifetime: selected_lifetime_of(inner),
-        scope: selected_scope_of(inner),
+        scope: selected_scope_of(inner)?,
     })
 }
 
@@ -804,27 +813,29 @@ impl OpenDialog {
             .collect()
     }
 
-    /// Whether the target row titled `label` can be chosen at all, read
-    /// back from the real widget's own sensitivity rather than from the data
-    /// it was built from.
-    pub fn is_target_selectable(&self, label: &str) -> bool {
+    /// Whether target row `index` can be chosen at all, read back from the
+    /// real widget's own sensitivity rather than from the data it was built
+    /// from.
+    ///
+    /// By index, not by title, and so is [`OpenDialog::select_target`]: a
+    /// device's name is arbitrary user text, so two rows can share a title
+    /// -- a device named "Anyone" is enough -- and a title lookup would
+    /// silently answer for whichever came first. Index against
+    /// [`OpenDialog::target_labels`], which is in the same order.
+    pub fn is_target_selectable(&self, index: usize) -> bool {
         self.inner
             .target_rows
             .borrow()
-            .iter()
-            .find(|r| r.row.title() == label)
+            .get(index)
             .is_some_and(|r| r.row.is_sensitive() && r.check.is_sensitive())
     }
 
-    /// Chooses the target row titled `label`, the way a click on it would.
-    /// `false` -- and nothing selected -- when there is no such row, or when
-    /// it is one that cannot be chosen.
-    pub fn select_target(&self, label: &str) -> bool {
+    /// Chooses target row `index`, the way a click on it would. `false` --
+    /// and nothing selected -- when there is no such row, or when it is one
+    /// that cannot be chosen.
+    pub fn select_target(&self, index: usize) -> bool {
         let rows = self.inner.target_rows.borrow();
-        let Some(row) = rows
-            .iter()
-            .find(|r| r.row.title() == label && r.check.is_sensitive())
-        else {
+        let Some(row) = rows.get(index).filter(|r| r.check.is_sensitive()) else {
             return false;
         };
         row.check.set_active(true);
@@ -841,7 +852,10 @@ impl OpenDialog {
             .filter(|s| !s.is_empty())
     }
 
-    pub fn selected_scope(&self) -> ScopeSpec {
+    /// The scope pressing Open would send, or `None` when no selectable
+    /// target is active -- see [`selected_scope_of`] for why that is not a
+    /// default.
+    pub fn selected_scope(&self) -> Option<ScopeSpec> {
         selected_scope_of(&self.inner)
     }
 
@@ -884,11 +898,14 @@ impl OpenDialog {
         selected_protocol_of(&self.inner)
     }
 
-    /// Whether pressing Open right now would send anything at all. Only the
-    /// port can make this `false`: a duration chip and a target are always
-    /// selected, by construction.
+    /// Whether pressing Open right now would send anything at all -- read
+    /// from [`OpenDialog::request`] itself rather than from the port alone,
+    /// so it cannot claim a request exists that `request` would decline to
+    /// build. In practice the port is the only thing that makes it `false`:
+    /// a duration chip and a selectable target are always active, by
+    /// construction.
     pub fn can_submit(&self) -> bool {
-        self.port().is_some()
+        self.request().is_some()
     }
 
     /// The request pressing Open would send, or `None` under the same
@@ -911,6 +928,13 @@ impl OpenDialog {
     /// through here.
     pub fn on_opened(&self, f: impl Fn(&WireRule) + 'static) {
         *self.inner.on_opened.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// The real `adw::Dialog` this wraps -- the parent anything presented
+    /// *over* this dialog needs, which is what the Open button presents its
+    /// own Docker explanation over.
+    pub fn dialog(&self) -> &adw::Dialog {
+        &self.inner.dialog
     }
 
     /// Presents the real `adw::Dialog`, transient for `parent`.

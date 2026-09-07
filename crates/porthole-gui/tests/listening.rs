@@ -27,7 +27,9 @@ use adw::prelude::*;
 use porthole_core::docker::Published;
 use porthole_core::listening::{Binding, Service};
 use porthole_core::model::Protocol;
-use porthole_gui::listening_section::{ListeningSection, DOCKER_UNKNOWN_NOTE};
+use porthole_gui::listening_section::{
+    ListeningSection, DOCKER_NOT_CHECKED_NOTE, DOCKER_UNAVAILABLE_NOTE,
+};
 
 /// Identical in shape to `tests/window.rs` and `tests/open_now.rs`'s own
 /// `activate` helper: runs `f` inside a real `adw::Application` activation,
@@ -715,33 +717,36 @@ fn a_row_published_on_one_address_names_that_address() -> Result<(), String> {
     Ok(())
 }
 
-/// "Not published" and "not checked" both leave a row unmarked, so the
-/// difference has to be said somewhere else -- once, under the group's
-/// title. Without it, an unchecked list would read as a checked one that
-/// found nothing.
-fn an_unchecked_docker_list_says_so_under_the_group() -> Result<(), String> {
+/// All three things an unmarked row can mean, in the order a real session
+/// meets them: rows on screen with no Docker answer yet, then an answer,
+/// then an answer lost.
+fn the_group_note_tracks_all_three_docker_states() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
     activate(
-        "com.jacopobriccola.Porthole.Test.ListeningDockerUnknown",
+        "com.jacopobriccola.Porthole.Test.ListeningDockerStates",
         move |_app| {
             let section = ListeningSection::new();
             section.set_services(&[svc(8080, Some("node"), Binding::AllInterfaces)]);
-            let before = section.group_description();
+            let not_checked = (section.group_description(), section.is_marked_docker(0));
 
             section.set_docker_ports(&[published(8080, None)]);
             let checked = (section.group_description(), section.is_marked_docker(0));
 
-            section.set_docker_unknown();
-            let after = (section.group_description(), section.is_marked_docker(0));
+            section.set_docker_unavailable();
+            let unavailable = (section.group_description(), section.is_marked_docker(0));
 
-            *seen.borrow_mut() = Some((before, checked, after));
+            *seen.borrow_mut() = Some((not_checked, checked, unavailable));
         },
     );
-    let (before, checked, after) = result.borrow_mut().take().ok_or("activation never ran")?;
-    if before.as_deref() != Some(DOCKER_UNKNOWN_NOTE) {
+    let (not_checked, checked, unavailable) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    // The state a real launch is in for as long as the helper takes: the
+    // `/proc` scan has landed and `docker_ports` has not. Nothing has
+    // failed, so nothing may say it has.
+    if not_checked.0.as_deref() != Some(DOCKER_NOT_CHECKED_NOTE) || not_checked.1 {
         return Err(format!(
-            "a section nobody has told about Docker must say so, got {before:?}"
+            "rows with no Docker answer yet must say so, and carry no marker: {not_checked:?}"
         ));
     }
     if checked.0.is_some() || !checked.1 {
@@ -749,9 +754,40 @@ fn an_unchecked_docker_list_says_so_under_the_group() -> Result<(), String> {
             "a checked list must mark and not caveat: {checked:?}"
         ));
     }
-    if after.0.as_deref() != Some(DOCKER_UNKNOWN_NOTE) || after.1 {
+    if unavailable.0.as_deref() != Some(DOCKER_UNAVAILABLE_NOTE) || unavailable.1 {
         return Err(format!(
-            "losing the list must drop the marker and restore the caveat: {after:?}"
+            "losing the list must drop the marker and report the failure: {unavailable:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The defect this state exists for, stated as its own check: the notice a
+/// user reads while the helper is still answering must not be the one that
+/// says the helper failed.
+fn a_section_waiting_on_the_helper_does_not_report_a_failure() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningDockerPending",
+        move |_app| {
+            let section = ListeningSection::new();
+            // Exactly the order a launch produces: the `/proc` scan and the
+            // helper's `list` both land before `docker_ports` does.
+            section.set_services(&[svc(8080, Some("node"), Binding::AllInterfaces)]);
+            section.set_open_ports(&[]);
+            *seen.borrow_mut() = Some(section.group_description());
+        },
+    );
+    let description = result.borrow_mut().take().ok_or("activation never ran")?;
+    if description.as_deref() == Some(DOCKER_UNAVAILABLE_NOTE) {
+        return Err(
+            "a section still waiting on docker_ports must not claim the helper failed".to_string(),
+        );
+    }
+    if description.as_deref() != Some(DOCKER_NOT_CHECKED_NOTE) {
+        return Err(format!(
+            "expected the not-checked note, got {description:?}"
         ));
     }
     Ok(())
@@ -763,7 +799,7 @@ fn an_unchecked_docker_list_says_so_under_the_group() -> Result<(), String> {
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 18] = [
+    let cases: [Case; 19] = [
         (
             "a_service_shows_its_name_and_port_the_way_the_spec_writes_it",
             a_service_shows_its_name_and_port_the_way_the_spec_writes_it,
@@ -833,8 +869,12 @@ fn main() {
             a_row_published_on_one_address_names_that_address,
         ),
         (
-            "an_unchecked_docker_list_says_so_under_the_group",
-            an_unchecked_docker_list_says_so_under_the_group,
+            "the_group_note_tracks_all_three_docker_states",
+            the_group_note_tracks_all_three_docker_states,
+        ),
+        (
+            "a_section_waiting_on_the_helper_does_not_report_a_failure",
+            a_section_waiting_on_the_helper_does_not_report_a_failure,
         ),
     ];
 

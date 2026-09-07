@@ -51,22 +51,21 @@
 //!
 //! ## The saved devices and Docker's own ports
 //!
-//! Two more things `refresh` reads, and neither belongs to a section that
-//! is on screen when it lands: the saved devices (the address book, plus
-//! one resolution attempt per device -- subprocesses, so on the same I/O
+//! Two more things `refresh` reads: the saved devices (the address book,
+//! plus a resolution attempt per device -- subprocesses, so on the same I/O
 //! thread pool the `/proc` scan uses) and the ports Docker publishes (the
-//! helper's own `docker_ports`, the only one of the three helper calls that
-//! needs root to answer at all). Both go into [`Sections`]'s own caches, and
+//! helper's own `docker_ports`, authorized by the same polkit action
+//! `list` and `status` are). Both go into [`Sections`]'s own caches, and
 //! [`present_open_dialog`] hands them to each [`OpenDialog`] it opens: the
 //! devices become target rows, and the Docker list is what lets pressing
 //! Open explain a Docker-managed port before sending anything.
 //!
 //! The Docker list additionally reaches the "Listening" section, which
-//! marks the rows it names. That is the one of the two that has a "could
-//! not check" state visible on screen -- `listening_section.rs`'s own group
-//! note -- because an unmarked row is otherwise indistinguishable from a
-//! checked, unpublished one. porthole never touches Docker's rules; every
-//! one of these surfaces only ever reads and explains.
+//! marks the rows it names, and which says under its own group title which
+//! of the three things an unmarked row means. The devices have their own
+//! such state, the open dialog's group description. porthole never touches
+//! Docker's rules; every one of these surfaces only ever reads and
+//! explains.
 
 use std::cell::RefCell;
 use std::ops::Deref;
@@ -106,9 +105,13 @@ struct Sections {
     /// [`present_open_dialog`] when a dialog is actually opened -- the
     /// dialog never resolves a device itself, and never blocks on one.
     devices: Rc<RefCell<DeviceSnapshot>>,
-    /// Every port Docker publishes, or `None` for "the helper could not
-    /// say". Not an empty `Vec`: only a list that arrived can tell a port
-    /// Docker does not publish from one nobody checked.
+    /// Every port Docker publishes, or `None` for "there is no checked
+    /// list" -- whether because nothing has come back yet or because what
+    /// came back had no answer. Not an empty `Vec`: only a list that
+    /// arrived can tell a port Docker does not publish from one nobody
+    /// checked. The [`OpenDialog`] this feeds explains nothing about Docker
+    /// in either `None` case, so it needs no finer distinction than this;
+    /// the "Listening" section does, and keeps its own.
     docker: Rc<RefCell<Option<Vec<Published>>>>,
 }
 
@@ -273,9 +276,14 @@ impl PortholeWindow {
         let listening = ListeningSection::new();
         content.append(listening.widget());
 
-        // Both start out saying "porthole has not looked yet", which is
-        // what they in fact mean until `refresh` resolves -- neither is an
-        // empty answer. See `DeviceSnapshot` and `Sections::docker`.
+        // The device cache starts out holding the reason there is nothing
+        // in it, not an empty list of devices. The Docker cache has no such
+        // distinction to make and needs none: the open dialog it feeds says
+        // nothing about Docker whether the list is missing because nobody
+        // asked or because the helper could not answer. The section that
+        // *does* have to tell those two apart keeps its own state -- see
+        // `listening_section::DockerPorts`, and `apply_docker` below for
+        // why this constructor must not put it in the failed one.
         let devices: Rc<RefCell<DeviceSnapshot>> =
             Rc::new(RefCell::new(Err(DEVICES_NOT_READ_YET.to_string())));
         let docker: Rc<RefCell<Option<Vec<Published>>>> = Rc::new(RefCell::new(None));
@@ -816,13 +824,17 @@ fn refresh(sections: &Sections) {
     }
 }
 
-/// Hands one `docker_ports` outcome to both places that need it: the
-/// "Listening" section, which marks the rows it names, and the cache an
-/// [`OpenDialog`] opened later reads. `None` is every way that call did not
-/// produce a list -- no bus, a typed error, the timeout, a `Published` the
-/// helper encoded wrongly -- and reaches both as the same "could not check"
-/// state, which is what `listening_section.rs`'s own group note describes
-/// and what keeps an unmarked row from claiming Docker was consulted.
+/// Hands one **completed** `docker_ports` outcome to both places that need
+/// it: the "Listening" section, which marks the rows it names, and the
+/// cache an [`OpenDialog`] opened later reads. `None` is every way that
+/// call came back without a list -- no bus, a typed error, the timeout, a
+/// `Published` the helper encoded wrongly.
+///
+/// Only called once a call has actually come back. That is what
+/// `ListeningSection::set_docker_unavailable`'s own doc comment requires:
+/// calling it before then would put "the porthole helper could not be
+/// reached" on screen at every launch, since the `/proc` scan that fills
+/// that section's rows lands well before this round trip does.
 fn apply_docker(sections: &Sections, published: Option<Vec<Published>>) {
     match published {
         Some(list) => {
@@ -830,7 +842,7 @@ fn apply_docker(sections: &Sections, published: Option<Vec<Published>>) {
             sections.docker.replace(Some(list));
         }
         None => {
-            sections.listening.set_docker_unknown();
+            sections.listening.set_docker_unavailable();
             sections.docker.replace(None);
         }
     }

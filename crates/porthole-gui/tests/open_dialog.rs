@@ -121,7 +121,9 @@ fn this_network_is_the_default_target_and_names_the_actual_subnet() -> Result<()
             let dialog = OpenDialog::new();
             dialog.set_current_network("192.168.177.0/24".parse().unwrap());
             let label = dialog.target_labels()[0].clone();
-            let scope = dialog.selected_scope();
+            let scope = dialog
+                .selected_scope()
+                .expect("a target is always selected");
             *seen.borrow_mut() = Some((label, scope));
         },
     );
@@ -147,7 +149,9 @@ fn anyone_is_last_marked_and_never_preselected() -> Result<(), String> {
             let labels = dialog.target_labels();
             let last_is_anyone = labels.last().map(|s| s.as_str()) == Some("Anyone");
             let marked = dialog.is_marked_significant("Anyone");
-            let scope = dialog.selected_scope();
+            let scope = dialog
+                .selected_scope()
+                .expect("a target is always selected");
             *seen.borrow_mut() = Some((last_is_anyone, marked, scope));
         },
     );
@@ -336,11 +340,14 @@ fn an_unresolvable_device_is_shown_unselectable_with_its_reason() -> Result<(), 
         move |_app| {
             let dialog = OpenDialog::new();
             dialog.set_devices(&[unresolved("phone", reason)]);
+            // Index 1 by construction: "This network" is always 0, and the
+            // one device follows it. `target_labels` is asserted below, so
+            // a wrong index cannot pass quietly.
             *seen.borrow_mut() = Some((
                 dialog.target_labels(),
                 dialog.target_subtitles(),
-                dialog.is_target_selectable("phone"),
-                dialog.select_target("phone"),
+                dialog.is_target_selectable(1),
+                dialog.select_target(1),
                 dialog.selected_scope(),
             ));
         },
@@ -359,7 +366,7 @@ fn an_unresolvable_device_is_shown_unselectable_with_its_reason() -> Result<(), 
     if selected {
         return Err("selecting an unresolvable device must not succeed".to_string());
     }
-    if scope != ScopeSpec::CurrentSubnet {
+    if scope != Some(ScopeSpec::CurrentSubnet) {
         return Err(format!("the selection must not have moved, got {scope:?}"));
     }
     Ok(())
@@ -376,7 +383,7 @@ fn choosing_a_device_opens_towards_the_address_it_resolved_to() -> Result<(), St
         move |_app| {
             let dialog = OpenDialog::for_port(5173);
             dialog.set_devices(&[resolved("phone", "10.10.10.245")]);
-            let chosen = dialog.select_target("phone");
+            let chosen = dialog.select_target(1);
             *seen.borrow_mut() = Some((chosen, dialog.request()));
         },
     );
@@ -406,7 +413,9 @@ fn a_device_list_arriving_later_does_not_move_the_users_choice() -> Result<(), S
         "com.jacopobriccola.Porthole.Test.DeviceLateArrival",
         move |_app| {
             let dialog = OpenDialog::new();
-            dialog.select_target("Anyone");
+            // "Anyone" is index 1 while there are no devices, and index 3
+            // once two arrive -- which is the whole point of this check.
+            dialog.select_target(1);
             dialog.set_devices(&[
                 resolved("phone", "10.10.10.245"),
                 resolved("laptop", "10.10.10.17"),
@@ -415,8 +424,53 @@ fn a_device_list_arriving_later_does_not_move_the_users_choice() -> Result<(), S
         },
     );
     let scope = result.borrow_mut().take().ok_or("activation never ran")?;
-    if scope != ScopeSpec::Anywhere {
+    if scope != Some(ScopeSpec::Anywhere) {
         return Err(format!("expected Anywhere, got {scope:?}"));
+    }
+    Ok(())
+}
+
+/// The other half of the same property, and the one the first review found
+/// untested: a device can leave the list too -- forgotten with `porthole
+/// devices remove`, or simply gone by the next refresh -- and the row that
+/// was selected then no longer exists. Nothing may inherit its position.
+fn a_device_that_disappears_takes_the_selection_back_to_this_network() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.DeviceRemoved",
+        move |_app| {
+            let dialog = OpenDialog::new();
+            dialog.set_devices(&[
+                resolved("phone", "10.10.10.245"),
+                resolved("laptop", "10.10.10.17"),
+            ]);
+            // Index 2 is "laptop": This network, phone, laptop, Anyone.
+            let chosen = dialog.select_target(2);
+            let before = dialog.selected_scope();
+
+            dialog.set_devices(&[resolved("phone", "10.10.10.245")]);
+            let after = dialog.selected_scope();
+
+            *seen.borrow_mut() = Some((chosen, before, after, dialog.target_labels()));
+        },
+    );
+    let (chosen, before, after, labels) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if !chosen || before != Some(ScopeSpec::Host("10.10.10.17".parse().unwrap())) {
+        return Err(format!(
+            "the laptop must have been selected first: {before:?}"
+        ));
+    }
+    if labels != vec!["This network", "phone", "Anyone"] {
+        return Err(format!("the removed device must be gone: {labels:?}"));
+    }
+    // Not the phone, which now sits where the laptop sat, and not "Anyone",
+    // which is the widest thing on the list.
+    if after != Some(ScopeSpec::CurrentSubnet) {
+        return Err(format!(
+            "a removed device's selection must fall back to This network, got {after:?}"
+        ));
     }
     Ok(())
 }
@@ -526,7 +580,7 @@ fn no_alert_for_a_port_docker_has_no_rule_for_or_could_not_be_checked() -> Resul
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 17] = [
+    let cases: [Case; 18] = [
         (
             "the_duration_chips_are_exactly_the_five_the_spec_names",
             the_duration_chips_are_exactly_the_five_the_spec_names,
@@ -582,6 +636,10 @@ fn main() {
         (
             "a_device_list_arriving_later_does_not_move_the_users_choice",
             a_device_list_arriving_later_does_not_move_the_users_choice,
+        ),
+        (
+            "a_device_that_disappears_takes_the_selection_back_to_this_network",
+            a_device_that_disappears_takes_the_selection_back_to_this_network,
         ),
         (
             "an_unreadable_address_book_is_not_an_empty_device_list",

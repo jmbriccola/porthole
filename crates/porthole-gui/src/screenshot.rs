@@ -464,7 +464,10 @@ pub fn run_dialog(path: &Path) -> gtk::glib::ExitCode {
         // here.
         let alert_ok = match dialog.docker_alert() {
             Some(alert) => {
-                alert.present(Some(&*win));
+                // Over the open dialog, which is what the Open button's own
+                // handler presents it over -- not over the window, which
+                // would place it somewhere no user ever sees it.
+                alert.present(Some(dialog.dialog()));
                 settle();
                 let alert_path = alert_path(&path);
                 match capture_with_dialogs(&win, &alert_path) {
