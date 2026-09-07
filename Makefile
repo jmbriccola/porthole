@@ -30,9 +30,10 @@ WITH_GUI ?= 1
 # /usr, not /usr/local: data/com.jacopobriccola.Porthole.service and
 # data/porthole-helper.service both name /usr/libexec/porthole-helper
 # literally, and the D-Bus daemon reads that path out of the installed file
-# rather than from anything this Makefile can tell it. `install-helper`
-# refuses to run when LIBEXECDIR and those two files disagree, so a
-# PREFIX=/usr/local install needs LIBEXECDIR=/usr/libexec passed with it.
+# rather than from anything this Makefile can tell it. The check further down
+# refuses an install whose LIBEXECDIR disagrees with those two files -- while
+# this Makefile is being read, before any recipe runs -- so a PREFIX=/usr/local
+# install needs LIBEXECDIR=/usr/libexec passed with it.
 PREFIX  ?= /usr
 DESTDIR ?=
 
@@ -43,8 +44,9 @@ MANDIR     ?= $(DATADIR)/man
 SYSCONFDIR ?= /etc
 
 # `$(PREFIX)/lib/systemd`, not `/lib/systemd`: systemd reads unit files from
-# /usr/local/lib/systemd/{system,user} as well as /usr/lib/systemd, so a
-# non-/usr PREFIX still lands somewhere systemd looks.
+# /usr/local/lib/systemd/{system,user} as well as /usr/lib/systemd, so
+# PREFIX=/usr/local still lands somewhere systemd looks. It reads no other
+# prefix -- PREFIX=/opt/porthole writes units systemd never looks at.
 UNITDIR     ?= $(PREFIX)/lib/systemd/system
 USERUNITDIR ?= $(PREFIX)/lib/systemd/user
 
@@ -114,19 +116,35 @@ install-cli: install-man install-completions
 # The two files below name /usr/libexec/porthole-helper literally, and the
 # D-Bus daemon and systemd read the path out of them rather than from this
 # Makefile. Installing the binary somewhere they do not name produces an
-# activation that fails at the moment someone first opens a port, so this
-# stops instead.
+# activation that fails at the moment someone first opens a port.
+#
+# Checked here rather than inside install-helper's recipe, because a recipe
+# runs after its prerequisites: install-helper is `install`'s second one, and
+# a check there exits with the CLI, the man pages and the completions already
+# on disk -- a root-owned CLI with no helper, no polkit policy and no D-Bus
+# files. $(error) is raised while this file is being read, so a disagreeing
+# LIBEXECDIR stops make with nothing installed at all.
+#
+# Only for the goals that reach install-helper. `install-cli` and the rest
+# read no path out of these files, and `make clean PREFIX=/opt` has no reason
+# to fail. `check-install` recurses with `install` on the sub-make's command
+# line, so that sub-make is checked here in its turn.
+ifneq (,$(filter install install-helper,$(MAKECMDGOALS)))
+ifneq (ok,$(shell grep -qx 'Exec=$(LIBEXECDIR)/porthole-helper' \
+                    data/com.jacopobriccola.Porthole.service && echo ok))
+$(error LIBEXECDIR=$(LIBEXECDIR) does not match the Exec= line in \
+        data/com.jacopobriccola.Porthole.service. Pass LIBEXECDIR=/usr/libexec, \
+        or change that file. Nothing has been installed)
+endif
+ifneq (ok,$(shell grep -qx 'ExecStart=$(LIBEXECDIR)/porthole-helper' \
+                    data/porthole-helper.service && echo ok))
+$(error LIBEXECDIR=$(LIBEXECDIR) does not match the ExecStart= line in \
+        data/porthole-helper.service. Pass LIBEXECDIR=/usr/libexec, or change \
+        that file. Nothing has been installed)
+endif
+endif
+
 install-helper:
-	@grep -qx 'Exec=$(LIBEXECDIR)/porthole-helper' \
-	  data/com.jacopobriccola.Porthole.service || { \
-	  echo 'make: LIBEXECDIR=$(LIBEXECDIR) does not match the Exec= line in'; \
-	  echo '      data/com.jacopobriccola.Porthole.service. Pass'; \
-	  echo '      LIBEXECDIR=/usr/libexec, or change that file.'; exit 1; }
-	@grep -qx 'ExecStart=$(LIBEXECDIR)/porthole-helper' \
-	  data/porthole-helper.service || { \
-	  echo 'make: LIBEXECDIR=$(LIBEXECDIR) does not match the ExecStart= line'; \
-	  echo '      in data/porthole-helper.service. Pass'; \
-	  echo '      LIBEXECDIR=/usr/libexec, or change that file.'; exit 1; }
 	$(INSTALL_PROGRAM) $(BINSRC)/porthole-helper \
 	  $(DESTDIR)$(LIBEXECDIR)/porthole-helper
 	$(INSTALL_DATA) data/com.jacopobriccola.Porthole.policy \
