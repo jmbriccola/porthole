@@ -396,7 +396,7 @@ fn devices_command(cli: &Cli, command: &crate::cli::DevicesCommand) -> Result<Ex
         crate::cli::DevicesCommand::List => {
             let book = devices::Book::load(&path)?;
             let runner = make_runner(cli);
-            let rows = devices::list_status(&book, runner.as_ref());
+            let rows = devices::list_status(&book, runner.as_ref())?;
             if cli.json {
                 println!("{}", output::json_devices(&rows));
             } else {

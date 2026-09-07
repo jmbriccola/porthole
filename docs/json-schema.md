@@ -399,10 +399,14 @@ whichever interface currently carries the default route; a MAC on two
 interfaces where neither is that one reports `resolvable: false`, the same as
 a MAC that is not there at all.
 
-Read both values narrowly. `false` means the lookup found nothing here and
-now -- the neighbour table only holds what has spoken to this machine
-recently -- not "no such device". `true` means the kernel has a mapping
-recorded for that MAC and has not disproved it, and no more than that.
+Read both values narrowly. `false` means the lookup ran and found nothing
+here and now -- the neighbour table only holds what has spoken to this
+machine recently -- not "no such device", and never "porthole could not find
+out". A lookup that could not be made at all -- no `ip` or `getent` to run,
+or either of them exiting non-zero -- fails the whole command with the error
+object below, rather than reporting `false` for a row it never checked.
+`true` means the kernel has a mapping recorded for that MAC and has not
+disproved it, and no more than that.
 
 Two neighbour states are rejected outright: `INCOMPLETE`, which has no
 link-layer address at all because resolution is still in flight, and

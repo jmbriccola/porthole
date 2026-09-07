@@ -304,12 +304,34 @@ pub fn resolve(book: &Book, name: &str, runner: &dyn CommandRunner) -> Result<Ip
 
 /// Every saved device, each with its current resolution attempted -- what
 /// `porthole devices list` actually shows.
-pub fn list_status(book: &Book, runner: &dyn CommandRunner) -> Vec<DeviceStatus> {
+///
+/// Only [`Error::DeviceUnreachable`] becomes `resolved: None`. A lookup that
+/// could not be made at all -- `ip` or `getent` that would not spawn or that
+/// exited non-zero, or no default route to settle a duplicate MAC with --
+/// returns the error instead. Discarding those with `.ok()` folded "there is
+/// no such device here right now" together with "porthole could not find
+/// out", and `docs/json-schema.md` reads `resolvable: false` narrowly as the
+/// first of the two. `listen --json` spends a whole field (`docker_checked`)
+/// keeping exactly this pair apart; the cheaper way to keep the promise here
+/// is not to make the claim when it was not checked.
+///
+/// Each of those conditions belongs to the machine rather than to the device,
+/// and `resolve` reports the same ones to `porthole open --to <name>`, which
+/// has always failed on them. The cost is that one of them ends the listing
+/// rather than annotating a row.
+pub fn list_status(book: &Book, runner: &dyn CommandRunner) -> Result<Vec<DeviceStatus>> {
     book.devices()
         .iter()
-        .map(|d| DeviceStatus {
-            device: d.clone(),
-            resolved: resolve(book, &d.name, runner).ok(),
+        .map(|d| {
+            let resolved = match resolve(book, &d.name, runner) {
+                Ok(address) => Some(address),
+                Err(Error::DeviceUnreachable(_)) => None,
+                Err(e) => return Err(e),
+            };
+            Ok(DeviceStatus {
+                device: d.clone(),
+                resolved,
+            })
         })
         .collect()
 }
@@ -631,13 +653,29 @@ mod tests {
             Output::stdout(IP_NEIGH),
             Output::stdout(IP_NEIGH),
         ]);
-        let rows = list_status(&book, &runner);
+        let rows = list_status(&book, &runner).expect("both lookups ran");
         assert_eq!(rows.len(), 2);
         assert_eq!(
             rows[0].resolved,
             Some("10.10.10.245".parse::<Ipv4Addr>().unwrap())
         );
         assert_eq!(rows[1].resolved, None);
+    }
+
+    #[test]
+    fn list_status_reports_a_lookup_it_could_not_make_rather_than_calling_it_absent() {
+        // `resolvable: false` is documented as "the lookup found nothing here
+        // and now". An `ip` that would not run found nothing of the sort, and
+        // saying `false` for it would put two different facts behind one
+        // value -- the hazard `listen --json`'s `docker_checked` exists for.
+        let book = book_with("phone", "bc:24:11:5e:1c:6e");
+        let runner = RecordingRunner::with_responses(vec![Output::failure("ip: not found")]);
+
+        let err = list_status(&book, &runner).expect_err("the lookup could not be made");
+        assert!(
+            matches!(err, Error::CommandFailed { .. }),
+            "the command's own failure, not a device verdict: {err:?}"
+        );
     }
 
     #[test]
