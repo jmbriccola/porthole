@@ -420,9 +420,13 @@ ordinary condition of an idle device rather than a sign anything is wrong.
 The consequence is that a device that has just left still resolves until the
 kernel drops or rewrites its entry, and on a small network that can take a
 while: the table is garbage-collected only above `gc_thresh1` entries, 128 by
-default. Usually the correction arrives on its own -- whatever takes the
-address next announces itself by ARP, the kernel rewrites that row, and the
-saved MAC stops mapping to it.
+default. **Within that window the address may already belong to something
+else**: a DHCP lease that expired can be handed to the next machine that
+asks, so a rule opened towards a saved device can end up aimed at a stranger
+on the same network. Usually the correction arrives on its own -- whatever
+takes the address next announces itself by ARP, the kernel rewrites that row,
+and the saved MAC stops mapping to it -- but "usually" and "on its own" are
+not "before the rule was written".
 
 Requiring `REACHABLE` instead would narrow that window without closing it,
 for a reason that has nothing to do with neighbour states: a rule outlives

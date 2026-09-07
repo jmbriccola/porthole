@@ -7,13 +7,13 @@
 //! different subnet on the same interface -- a new access point, or a fresh
 //! DHCP lease -- which is exactly the case porthole's CIDR-scoped rules are
 //! exposed to. So the signal here is only ever a prompt to look again: every
-//! wake-up re-resolves the current subnet and compares it against the subnet
-//! this module last saw. Two wake-up sources feed the same check, so a
-//! machine with no NetworkManager is still covered: `StateChanged` when
-//! NetworkManager answers on the bus, and a fixed-interval poll that does not
-//! depend on NetworkManager at all.
+//! wake-up re-reads every subnet this machine holds and compares that set
+//! against the set this module last saw. Two wake-up sources feed the same
+//! check, so a machine with no NetworkManager is still covered:
+//! `StateChanged` when NetworkManager answers on the bus, and a
+//! fixed-interval poll that does not depend on NetworkManager at all.
 //!
-//! # What "the subnet this module last saw" means, and what it does not
+//! # What "the subnets this module last saw" means, and what it does not
 //!
 //! `ManagedRule` records the resolved `Target` a rule was opened towards, not
 //! the `ScopeSpec` that produced it -- there is no stored fact distinguishing
@@ -196,14 +196,14 @@ struct CheckOutcome {
 ///
 /// A resolution failure other than [`Error::NoNetwork`] (a spawned `ip` that
 /// could not run, a non-zero exit, a malformed JSON body) leaves `previous`
-/// and every rule untouched: the current subnet is simply unknown for this
-/// one wake-up, not confirmed absent, and treating every such failure as
-/// "no network" would close every subnet-scoped rule on a parse error alone.
-/// Only [`Error::NoNetwork`] -- porthole's own confirmed "no default route"
-/// or "no global address" -- means there is genuinely no network right now,
-/// and that closes every subnet-scoped rule regardless of `previous`: unlike
-/// "the subnet changed", "there is no network" needs no prior observation to
-/// be true.
+/// and every rule untouched: which subnets this machine holds is simply
+/// unknown for this one wake-up, not confirmed absent, and treating every
+/// such failure as "no network" would close every subnet-scoped rule on a
+/// parse error alone. Only [`Error::NoNetwork`] -- porthole's own confirmed
+/// "no default route" or "no global address" -- means there is genuinely no
+/// network right now, and that closes every subnet-scoped rule regardless of
+/// `previous`: unlike "a subnet is gone", "there is no network" needs no
+/// prior observation to be true.
 fn check_network(
     engine: &mut Engine<'_>,
     runner: &dyn CommandRunner,
