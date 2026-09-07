@@ -644,6 +644,32 @@ fn device_json(row: &DeviceStatus) -> Value {
     })
 }
 
+/// What `devices add` and `devices rm` print under `--json`.
+///
+/// Deliberately not [`device_json`]'s shape: that one carries `resolvable`
+/// and `resolved_address`, which are a live lookup `devices list` performs
+/// and neither of these commands does. Reporting them here would mean either
+/// resolving a device nobody asked to resolve, or printing two fields whose
+/// value says nothing.
+///
+/// `action` is `"added"` or `"forgotten"`, so one parser can read both.
+pub fn json_device_changed(action: &str, name: &str, address: Option<&DeviceAddress>) -> Value {
+    let (kind, addr) = match address {
+        Some(DeviceAddress::Mac(mac)) => (Some("mac"), Some(mac.clone())),
+        Some(DeviceAddress::Host(host)) => (Some("host"), Some(host.clone())),
+        None => (None, None),
+    };
+    json!({
+        "schema": JSON_SCHEMA,
+        "action": action,
+        "device": {
+            "name": name,
+            "kind": kind,
+            "address": addr,
+        },
+    })
+}
+
 pub fn json_devices(rows: &[DeviceStatus]) -> Value {
     json!({
         "schema": JSON_SCHEMA,

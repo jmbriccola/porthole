@@ -1,10 +1,13 @@
 # `--json` output
 
 Every command accepts `--json`, and every failure honours it — see
-[Errors](#errors). Two commands accept the flag and then ignore it, because
-neither has a result to report: `porthole devices add` is an interactive
-prompt, and `porthole devices rm` confirms in prose. Everything else
-documented below prints one JSON object on stdout.
+[Errors](#errors). Each prints one JSON object on stdout.
+
+`porthole devices add` is interactive, and its prompts are not output: the
+list of neighbours and the two questions go to **stderr**, so stdout carries
+only the object below. That does not make the command scriptable — something
+still has to answer the prompts — but it does mean a caller that answers them
+can parse the result.
 
 The shape is versioned by the top-level `schema` field, currently `1`. Fields
 are added, never renamed or removed.
@@ -417,6 +420,29 @@ to make one.
 A malformed `devices.toml` is a different failure from an unresolvable device
 and does not appear in this shape at all: it exits `2` with the
 `invalid_argument` error object below, naming the offending device.
+
+## `porthole devices add --json` and `porthole devices rm --json`
+
+```json
+{
+  "schema": 1,
+  "action": "added",
+  "device": {
+    "name": "phone",
+    "kind": "mac",
+    "address": "bc:24:11:5e:1c:6e"
+  }
+}
+```
+
+`action` is `"added"` or `"forgotten"`. `name` is the saved name; `kind` and
+`address` are as in `devices list` above, and both are `null` for
+`"forgotten"`, which names the device it removed and reports nothing about an
+address it no longer holds.
+
+Neither object carries `resolvable` or `resolved_address`. Those are a live
+lookup `devices list` performs and neither of these commands does, so
+reporting them would mean resolving a device nobody asked to resolve.
 
 ## `porthole doctor --json`
 

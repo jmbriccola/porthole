@@ -1,8 +1,22 @@
 //! Talking to the privileged helper.
 //!
 //! The CLI holds no privilege of its own any more. It asks, polkit decides,
-//! and the helper acts. Reads — `list`, `status` — and `--dry-run` stay local
-//! and never touch the bus, so they keep working when the helper is absent.
+//! and the helper acts.
+//!
+//! `list` and `status` stay local: both read the state file and neither
+//! calls anything here. `--dry-run` builds its own engine instead of asking
+//! the helper to act, so no rule is ever opened over the bus by one.
+//!
+//! [`docker_ports`] is the exception, and it is not confined to writes.
+//! `listen` calls it, `doctor` calls it, and `open` calls it before the
+//! `--dry-run` branch is reached -- so a dry run does touch the bus, once,
+//! read-only. There is no local path to the same answer: Docker's rules live
+//! in the `nat` table, which an unprivileged process cannot read at all (see
+//! `porthole_core::docker`'s own module doc).
+//!
+//! What survives an absent helper is every one of those callers: each
+//! swallows the failure with `.ok()`, so what is lost is the Docker warning,
+//! never the command.
 
 use porthole_core::docker::Published;
 use porthole_core::error::{Error, ExitCode, Result};

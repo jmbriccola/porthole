@@ -408,7 +408,11 @@ fn devices_command(cli: &Cli, command: &crate::cli::DevicesCommand) -> Result<Ex
                 )));
             }
             book.save(&path)?;
-            println!("Forgot `{name}`.");
+            if cli.json {
+                println!("{}", output::json_device_changed("forgotten", name, None));
+            } else {
+                println!("Forgot `{name}`.");
+            }
             Ok(ExitCode::Success)
         }
     }
@@ -432,12 +436,15 @@ fn add_device(cli: &Cli, path: &std::path::Path) -> Result<ExitCode> {
         return Ok(ExitCode::Failure);
     }
 
-    println!("Seen on this network:");
+    // The picker is a prompt, not output: it goes to stderr so that stdout
+    // carries only the result, and `--json` has a stdout worth parsing. A
+    // person at a terminal sees no difference.
+    eprintln!("Seen on this network:");
     for (i, n) in neighbours.iter().enumerate() {
-        println!("  {}) {}  {}  ({})", i + 1, n.mac, n.address, n.interface);
+        eprintln!("  {}) {}  {}  ({})", i + 1, n.mac, n.address, n.interface);
     }
-    print!("Pick a number: ");
-    std::io::stdout().flush().ok();
+    eprint!("Pick a number: ");
+    std::io::stderr().flush().ok();
     let choice = read_line()?;
     let index: usize = choice.parse().map_err(|_| {
         Error::InvalidArgument(format!("`{choice}` is not one of the numbers above"))
@@ -449,19 +456,25 @@ fn add_device(cli: &Cli, path: &std::path::Path) -> Result<ExitCode> {
             Error::InvalidArgument(format!("{index} is not one of the numbers above"))
         })?;
 
-    print!("Name this device: ");
-    std::io::stdout().flush().ok();
+    eprint!("Name this device: ");
+    std::io::stderr().flush().ok();
     let name = read_line()?;
-    if name.is_empty() {
-        return Err(Error::InvalidArgument("a device needs a name".to_string()));
-    }
+    devices::validate_device_name(&name)?;
 
+    let address = devices::DeviceAddress::Mac(chosen.mac.clone());
     book.add(devices::Device {
         name: name.clone(),
-        address: devices::DeviceAddress::Mac(chosen.mac.clone()),
+        address: address.clone(),
     });
     book.save(path)?;
-    println!("Saved `{name}` as {}.", chosen.mac);
+    if cli.json {
+        println!(
+            "{}",
+            output::json_device_changed("added", &name, Some(&address))
+        );
+    } else {
+        println!("Saved `{name}` as {}.", chosen.mac);
+    }
     Ok(ExitCode::Success)
 }
 

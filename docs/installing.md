@@ -130,10 +130,17 @@ your desktop starts XDG autostart entries and not user units, the
 target (GNOME does). `--now` above sidesteps the question for the session you
 are in. `PartOf=graphical-session.target` stops it again with the session:
 this exists to put a notification on a screen, and after the session there is
-no screen. There is deliberately no `Restart=` — every reason this binary
-stops is one a restart would meet again immediately, and the one failure it
-must survive (a session with no notification service) it survives by carrying
-on rather than by exiting.
+no screen.
+
+`Restart=on-failure` covers exactly one case: the system bus connection
+ending while the agent is running. The agent cannot rebuild it, so closes
+would otherwise stop being announced with nothing to show anything had gone
+wrong. Every other reason the agent stops exits 0 on purpose — no session
+bus, no system bus at start-up, no notification service, or a second agent
+already holding the bus name — so the unit stays stopped rather than looping,
+and a headless login does not fight systemd's start limit. That also bounds
+the restart itself: a replacement agent that still finds no system bus fails
+during start-up, which exits 0, and `on-failure` does not restart a success.
 
 Verify:
 

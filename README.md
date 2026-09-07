@@ -133,9 +133,9 @@ this machine, so you can pick a port instead of typing one.
 Global flags:
 
 - `--json` — machine-readable output. Every command that reports something
-  honours it, and so does every failure; the two exceptions are `devices add`,
-  which is an interactive prompt, and `devices rm`, which confirms in prose
-  either way. See [docs/json-schema.md](docs/json-schema.md).
+  honours it, and so does every failure. `devices add` is interactive, so its
+  prompts go to stderr and stdout carries only the device it saved. See
+  [docs/json-schema.md](docs/json-schema.md).
 - `--dry-run` — print the commands porthole would run, and change nothing. Needs
   no privileges.
 
@@ -180,8 +180,11 @@ and nothing porthole stores remembers that you asked for `phone`.
 
 A few narrow edges worth knowing before you hit them:
 
-- `subnet` and `any` are read as scopes, not as names, so a device called
-  either of those cannot be reached with `--to`. Rename it.
+- A device name that `--to` would read as a scope is refused when you save
+  it, and refused again when the book is read back: `subnet`, `any`, an IP
+  address or a CIDR, and any name containing `/` or `:`. Each of those would
+  be taken as a scope rather than looked up, leaving the device saved and
+  unreachable.
 - A device that does not resolve right now is not an error in `devices list`,
   which says so per row. It is one for `open`, which fails with `device
   unreachable` and exit code 6 rather than opening towards a guess.

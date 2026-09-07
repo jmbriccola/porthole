@@ -13,15 +13,30 @@ Type=simple
 # beside this file needs no such edit, because a desktop entry's Exec= is
 # looked up on $PATH and this is not.
 ExecStart=/usr/local/bin/porthole-agent
-# No Restart=. The one failure this binary must survive -- a session with no
-# notification service -- it survives by carrying on rather than by exiting,
-# so a restart could only ever repeat a start-up that stopped for a reason
-# restarting cannot change: no session bus, no system bus, or a second agent
-# already holding com.jacopobriccola.PortholeAgent. Each of those says why
-# and exits 0, so the unit stays stopped and is never marked failed. Adding
-# Restart=on-failure here would turn a headless login into a loop against
-# systemd's start limit.
+# Restart=on-failure, and the exit statuses are what make it safe. The one
+# failure this binary must survive -- a session with no notification service
+# -- it survives by carrying on rather than by exiting. Every reason it stops
+# at start-up exits 0: no session bus, no system bus, no notification
+# interface, or a second agent already holding
+# com.jacopobriccola.PortholeAgent. The unit therefore stays stopped and is
+# never marked failed, and a headless login does not loop.
 #
+# The single non-zero exit is the system bus connection ending while the
+# agent is running. It cannot rebuild that connection from inside its own
+# loop, so what is left is a process nothing will ever wake again: closes
+# stop being announced with no sign anything is wrong, which is the one way
+# a notification agent's failure must not look.
+#
+# That cannot loop either, and for a reason worth stating rather than
+# trusting to the start limit: the replacement agent tries the system bus
+# during start-up. If it is still gone, that start-up failure exits 0, and
+# on-failure does not restart a success. So this buys exactly one retry per
+# loss, which is what a transient dbus-daemon restart needs.
+Restart=on-failure
+# Long enough not to hammer a bus that has genuinely gone, short enough that
+# a user is not left without notifications for long.
+RestartSec=5s
+
 # porthole also ships data/porthole-agent.desktop, because desktops differ in
 # which of the two they honour. A desktop that honours both starts two
 # agents; the second finds the bus name taken, says so, and exits, so this

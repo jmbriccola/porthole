@@ -18,7 +18,7 @@ fn directives(unit: &str) -> Vec<&str> {
 }
 
 #[test]
-fn the_user_unit_is_started_by_the_graphical_session_and_never_restarted() {
+fn the_user_unit_is_started_by_the_graphical_session_and_restarted_only_on_failure() {
     let unit = data("porthole-agent.service");
     let directives = directives(&unit);
 
@@ -30,12 +30,27 @@ fn the_user_unit_is_started_by_the_graphical_session_and_never_restarted() {
     );
     assert!(directives.contains(&"PartOf=graphical-session.target"));
 
-    // No Restart=. A session with no notification service is survived by
-    // carrying on, and every reason this binary does stop is one a restart
-    // would hit again immediately.
+    // Losing the system bus leaves an agent nothing will ever wake again,
+    // and notifications stop with no sign anything is wrong. That is the
+    // one exit worth restarting, and `main` gives it the only non-zero
+    // status the binary produces.
     assert!(
-        !directives.iter().any(|d| d.starts_with("Restart=")),
-        "a Restart= here turns a headless login into a loop: {directives:?}"
+        directives.contains(&"Restart=on-failure"),
+        "a lost system bus must bring a new agent: {directives:?}"
+    );
+    assert!(
+        directives.iter().any(|d| d.starts_with("RestartSec=")),
+        "an unpaced restart hammers a bus that has genuinely gone: {directives:?}"
+    );
+
+    // Never `Restart=always`. Every start-up failure exits 0 on purpose --
+    // no session bus, no system bus, a second agent already holding the
+    // name -- so that the unit stays stopped instead of looping. `always`
+    // would restart those too, which is exactly the headless-login loop the
+    // exit statuses are arranged to avoid.
+    assert!(
+        !directives.contains(&"Restart=always"),
+        "`always` restarts the exits that are deliberately 0: {directives:?}"
     );
 }
 

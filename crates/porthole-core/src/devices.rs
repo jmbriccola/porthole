@@ -85,8 +85,9 @@ impl Book {
 
     /// Load the book, or start empty if the file does not exist yet.
     ///
-    /// Validates every entry at load time: exactly one of `mac`/`host` per
-    /// device, and a `mac` that actually looks like one. `devices.toml` is
+    /// Validates every entry at load time: a name `--to` can actually reach
+    /// ([`device_name_problem`]), exactly one of `mac`/`host` per device,
+    /// and a `mac` that actually looks like one. `devices.toml` is
     /// hand-editable, and failing here -- naming the device -- beats failing
     /// later at resolution time with an error that reads as "the device is
     /// merely absent" when the real problem is the file.
@@ -106,6 +107,12 @@ impl Book {
 
         let mut devices = Vec::with_capacity(raw.device.len());
         for entry in raw.device {
+            if let Some(problem) = device_name_problem(&entry.name) {
+                return Err(Error::InvalidArgument(format!(
+                    "{}: {problem}",
+                    path.display()
+                )));
+            }
             let address = match (entry.mac, entry.host) {
                 (Some(mac), None) => DeviceAddress::Mac(normalize_mac(&entry.name, &mac)?),
                 (None, Some(host)) => DeviceAddress::Host(host),
@@ -201,6 +208,44 @@ fn normalize_mac(device_name: &str, raw: &str) -> Result<String> {
         )));
     }
     Ok(raw.to_ascii_lowercase())
+}
+
+/// Why this name cannot be used, or `None` when it can.
+///
+/// `--to` reads the scope grammar first and consults the address book only
+/// when that grammar rejects the string. So a name the grammar *accepts* --
+/// `subnet`, `any`, an IP address, a CIDR -- is taken as a scope, and the
+/// saved device behind it is never looked for. A name containing `/` or `:`
+/// is read as a failed attempt at that same grammar and reported as one,
+/// in words about networks and IPv6 that never mention devices.
+///
+/// Either way the device is saveable and then permanently unusable, which
+/// is why both are refused where a name is chosen ([`validate_device_name`])
+/// and where one is read back ([`Book::load`]).
+fn device_name_problem(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("a device needs a name".to_string());
+    }
+    if crate::validate::parse_scope(name).is_ok() {
+        return Some(format!(
+            "`{name}` is already a scope, so `--to {name}` opens towards that scope and              never looks for a saved device; pick a different name"
+        ));
+    }
+    if name.contains('/') || name.contains(':') {
+        return Some(format!(
+            "device name `{name}` contains `/` or `:`, which `--to` reads as a network or              an IP address rather than a name, so the device could never be reached; pick              a different name"
+        ));
+    }
+    None
+}
+
+/// Reject a device name that `--to` could never reach -- see
+/// [`device_name_problem`] for which names those are and why.
+pub fn validate_device_name(name: &str) -> Result<()> {
+    match device_name_problem(name) {
+        Some(problem) => Err(Error::InvalidArgument(problem)),
+        None => Ok(()),
+    }
 }
 
 /// Where the book lives by default: `~/.config/porthole/devices.toml`
@@ -587,5 +632,70 @@ mod tests {
             ),
             PathBuf::from("/tmp/porthole-test/devices.toml")
         );
+    }
+
+    #[test]
+    fn a_name_the_scope_grammar_would_swallow_is_refused() {
+        // Each of these reaches `--to` before the address book does, so a
+        // device saved under one could never be opened towards.
+        for name in ["subnet", "any", "10.0.0.5", "10.0.0.0/24"] {
+            let err = validate_device_name(name).unwrap_err();
+            assert!(
+                err.to_string().contains("scope"),
+                "{name} should be refused as a scope, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_containing_a_slash_or_a_colon_is_refused() {
+        // The reproduction from the review: `office:pc` saved cleanly, then
+        // `open --to office:pc` died with "not a network, an IP address,
+        // `subnet` or `any`" -- an error that never mentions devices.
+        for name in ["office:pc", "home/laptop", "fe80::1"] {
+            let err = validate_device_name(name).unwrap_err();
+            assert!(
+                err.to_string().contains(name),
+                "the offending name must be named, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_name_is_accepted() {
+        for name in ["phone", "office pc", "Jacopo's laptop", "printer-2"] {
+            validate_device_name(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_hand_edited_book_with_an_unreachable_name_fails_at_load_naming_it() {
+        // `devices.toml` is hand-editable, so the save-time check is not the
+        // only way such a name can arrive. Failing here, naming the device
+        // and the file, beats resolving it and reporting "device not found".
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("devices.toml");
+        fs::write(
+            &path,
+            "[[device]]\nname = \"office:pc\"\nmac = \"bc:24:11:5e:1c:6e\"\n",
+        )
+        .unwrap();
+
+        let err = Book::load(&path).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("office:pc"), "got: {text}");
+        assert!(text.contains("devices.toml"), "got: {text}");
+    }
+
+    #[test]
+    fn an_ordinary_book_still_loads() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("devices.toml");
+        fs::write(
+            &path,
+            "[[device]]\nname = \"phone\"\nmac = \"bc:24:11:5e:1c:6e\"\n",
+        )
+        .unwrap();
+        assert_eq!(Book::load(&path).unwrap().devices().len(), 1);
     }
 }

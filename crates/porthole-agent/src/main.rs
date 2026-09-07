@@ -45,6 +45,13 @@
 //! their stand-in helper up before the agent, so none of them exercises an
 //! agent whose subscription is what the helper is started into, and nothing
 //! here would fail if that ordering were reversed.
+//!
+//! Nor is the exit status after a lost bus covered end to end. That harness
+//! points both bus addresses at one private daemon, so taking it down ends
+//! the system and the session streams together, and which of them reports it
+//! first varies between runs -- measured, not assumed. A real agent holds two
+//! separate connections and loses one at a time, but no test here can produce
+//! that. What is covered is the decision itself, as a unit test on [`Ended`].
 
 mod notify;
 
@@ -86,35 +93,86 @@ const MAX_PENDING: usize = 32;
 /// fails to fire.
 type Pending = Vec<(u32, WireRule)>;
 
+/// Which signal stream ended, and therefore why this process is stopping.
+///
+/// The distinction decides the exit status, and through it whether anything
+/// starts a new agent -- see [`main`]'s own doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    /// The system bus went away. Nothing will wake this agent again.
+    SystemBus,
+    /// The session bus went away, which is the session itself ending.
+    SessionBus,
+}
+
+impl Ended {
+    /// `1` for a lost system bus, `0` for a lost session bus.
+    ///
+    /// These must not collapse to one value: `Restart=on-failure` in
+    /// `data/porthole-agent.service` is what brings a new agent after a lost
+    /// system bus, and it can only tell the two apart by this number.
+    fn exit_code(self) -> u8 {
+        match self {
+            Ended::SystemBus => 1,
+            Ended::SessionBus => 0,
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Ended::SystemBus => {
+                "the system bus connection ended; stopping with a failure status so the \
+                 service manager starts a new agent"
+            }
+            Ended::SessionBus => "the session bus connection ended; stopping",
+        }
+    }
+}
+
+/// Exit status, and what a service manager should make of it.
+///
+/// Every start-up failure below exits `SUCCESS`. None of them is a
+/// condition a restart could change -- no session bus, no system bus, no
+/// notification interface, or a second agent already holding
+/// [`AGENT_SERVICE`] -- so the unit stays stopped rather than looping. The
+/// same goes for the session bus ending: that is the session itself going
+/// away, and there is no screen left to notify.
+///
+/// Losing the **system** bus mid-run is the one case that exits `FAILURE`.
+/// The agent cannot rebuild that connection from inside its own loop, and
+/// what remains is a process that will never be woken again -- so it stops
+/// and says so with a status a service manager can act on. That is what
+/// `Restart=on-failure` in `data/porthole-agent.service` is for, and why
+/// the two cases must not share an exit status.
 #[tokio::main(flavor = "current_thread")]
-async fn main() {
+async fn main() -> std::process::ExitCode {
     let uid = current_uid();
 
     let session = match zbus::Connection::session().await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("porthole-agent: no session bus, so nothing to notify on: {e}");
-            return;
+            return std::process::ExitCode::SUCCESS;
         }
     };
     // First, and before anything is woken or subscribed to: a second agent
     // in one session would show every close twice.
     if !claim_session(&session).await {
-        return;
+        return std::process::ExitCode::SUCCESS;
     }
 
     let system = match zbus::Connection::system().await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("porthole-agent: no system bus, so nothing to listen to: {e}");
-            return;
+            return std::process::ExitCode::SUCCESS;
         }
     };
     let porthole = match PortholeProxy::new(&system).await {
         Ok(p) => p,
         Err(e) => {
             eprintln!("porthole-agent: could not bind the helper's interface: {e}");
-            return;
+            return std::process::ExitCode::SUCCESS;
         }
     };
     // Awaited here, before the `list` below: this is the call that installs
@@ -123,7 +181,7 @@ async fn main() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("porthole-agent: could not subscribe to the helper's signals: {e}");
-            return;
+            return std::process::ExitCode::SUCCESS;
         }
     };
 
@@ -131,7 +189,7 @@ async fn main() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("porthole-agent: could not bind the notification interface: {e}");
-            return;
+            return std::process::ExitCode::SUCCESS;
         }
     };
     let (mut actions, mut dismissals) = match (
@@ -142,7 +200,7 @@ async fn main() {
         (a, d) => {
             let e = a.err().or(d.err()).expect("one of the two failed");
             eprintln!("porthole-agent: could not subscribe to notification actions: {e}");
-            return;
+            return std::process::ExitCode::SUCCESS;
         }
     };
 
@@ -152,7 +210,7 @@ async fn main() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("porthole-agent: could not watch the notification service's owner: {e}");
-            return;
+            return std::process::ExitCode::SUCCESS;
         }
     };
 
@@ -171,11 +229,12 @@ async fn main() {
     // connection can be rebuilt from inside this loop, so the end of any of
     // the three signal streams ends the process rather than leaving it
     // running with one half of its job -- an agent that has lost the system
-    // bus is a process nothing will ever wake again. Nothing restarts it:
-    // `data/porthole-agent.service` sets no `Restart=`, so this is a stop
-    // and not a bounce, and the line it prints is the only record of why.
+    // bus is a process nothing will ever wake again.
+    //
+    // Which bus ended decides the exit status, and therefore whether
+    // anything starts a new agent: see [`main`]'s own doc comment.
     let mut pending: Pending = Vec::new();
-    loop {
+    let ended = loop {
         tokio::select! {
             biased;
             // First on purpose. An owner change and a close can be ready in
@@ -205,30 +264,30 @@ async fn main() {
             }
             close = closes.next() => {
                 let Some(signal) = close else {
-                    eprintln!("porthole-agent: the system bus connection ended; stopping");
-                    break;
+                    break Ended::SystemBus;
                 };
                 let Ok(args) = signal.args() else { continue };
                 on_close(&notifications, &mut pending, args.rule(), *args.reason(), uid).await;
             }
             action = actions.next() => {
                 let Some(signal) = action else {
-                    eprintln!("porthole-agent: the session bus connection ended; stopping");
-                    break;
+                    break Ended::SessionBus;
                 };
                 let Ok(args) = signal.args() else { continue };
                 on_action(&porthole, &notifications, &pending, args.id, args.action_key);
             }
             dismissal = dismissals.next() => {
                 let Some(signal) = dismissal else {
-                    eprintln!("porthole-agent: the session bus connection ended; stopping");
-                    break;
+                    break Ended::SessionBus;
                 };
                 let Ok(args) = signal.args() else { continue };
                 pending.retain(|(id, _)| *id != args.id);
             }
         }
-    }
+    };
+
+    eprintln!("porthole-agent: {}", ended.reason());
+    std::process::ExitCode::from(ended.exit_code())
 }
 
 /// The rule behind the notification with this id, newest first.
@@ -420,6 +479,24 @@ fn current_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lost_system_bus_and_a_lost_session_bus_do_not_share_an_exit_status() {
+        // `Restart=on-failure` in data/porthole-agent.service brings a new
+        // agent after a lost system bus and leaves a closing session alone.
+        // It can only tell those apart by this number, so collapsing the two
+        // would either strand the user without notifications or restart an
+        // agent every time they log out.
+        assert_eq!(Ended::SystemBus.exit_code(), 1);
+        assert_eq!(Ended::SessionBus.exit_code(), 0);
+    }
+
+    #[test]
+    fn each_stopping_reason_says_which_bus_it_lost() {
+        // The journal line is the only record of why an agent stopped.
+        assert!(Ended::SystemBus.reason().contains("system bus"));
+        assert!(Ended::SessionBus.reason().contains("session bus"));
+    }
 
     fn rule(scope: &str, target: &str, opened_at: u64, expires_at: u64) -> WireRule {
         WireRule {

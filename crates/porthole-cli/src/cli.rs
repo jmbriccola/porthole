@@ -101,10 +101,14 @@ pub enum ToSpec {
 /// than a name -- containing a `/` or a `:` (a CIDR or an IPv6 address, e.g.
 /// `fe80::1`), or being empty -- and keeps `parse_scope`'s own error for
 /// that case, since it is far more specific than "no such device" (naming
-/// IPv6 explicitly, for instance). A device name is never going to contain
-/// any of those, so anything else is treated as a candidate saved-device
-/// name instead -- `porthole_core::devices::resolve` is what actually
-/// decides whether that name exists.
+/// IPv6 explicitly, for instance). Anything else is treated as a candidate
+/// saved-device name instead -- `porthole_core::devices::resolve` is what
+/// actually decides whether that name exists.
+///
+/// A name this branch keeps for `parse_scope`, and a name `parse_scope`
+/// accepts outright, can never reach a saved device through `--to`. Both are
+/// refused when a device is named and when the book is read back, by
+/// `porthole_core::devices::validate_device_name` and `Book::load`.
 pub fn parse_to(raw: &str) -> ToSpec {
     match porthole_core::validate::parse_scope(raw) {
         Ok(scope) => ToSpec::Scope(scope),
