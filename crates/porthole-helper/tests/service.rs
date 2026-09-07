@@ -1,6 +1,13 @@
 //! Drives the real service object over a real session bus with a fake
-//! authorizer, so every method is exercised end to end without root, without
-//! polkit, and without touching the firewall.
+//! authorizer, so every method is exercised end to end without root and
+//! without polkit.
+//!
+//! Nothing here asks a firewall to change. The reads that reach one are
+//! `backend::detect`'s (`firewall-cmd --version` and `--state`, or their
+//! ufw/nftables equivalents) and, below, one `iptables -t nat -S DOCKER`.
+//! What an open a firewall performs, and one it refuses, actually do is in
+//! `crates/porthole-cli/tests/container.rs`, where the firewall goes away
+//! with its container.
 
 use porthole_core::cli_path::CLI_CANDIDATES;
 use porthole_core::ipc::{PortholeProxy, PATH};
@@ -60,28 +67,40 @@ async fn list_is_empty_before_anything_is_opened() {
     assert!(proxy.list().await.unwrap().is_empty());
 }
 
-/// This test drives the *real* engine against the *real* `firewall-cmd`,
-/// relying on firewalld's own polkit refusing an unprivileged caller so
-/// nothing is actually added. Under root that assumption is false: the open
-/// would genuinely succeed, and the temp state directory vanishing at the end
-/// of the test would leave a real rule in the firewall with nothing able to
-/// close it. `cli.rs` already guards its own real-firewall tests the same way.
-fn is_root() -> bool {
-    // SAFETY: geteuid takes no arguments and cannot fail.
-    unsafe { libc::geteuid() == 0 }
+/// The typed refusals that can only come from `Porthole::open` *before* it
+/// builds an `Engine`: `backend::detect` finding no firewall at all, and the
+/// exclusive state lock refusing to open. Nothing past either of them is
+/// reached, and every `firewall-cmd` that could change something is past both.
+fn stopped_before_the_engine(err: &zbus::Error) -> bool {
+    match err {
+        zbus::Error::MethodError(name, _, _) => {
+            name.as_str().ends_with("State") || name.as_str().ends_with("BackendUnavailable")
+        }
+        _ => false,
+    }
 }
 
 #[tokio::test]
 async fn opening_towards_everyone_asks_for_the_stronger_action() {
-    if is_root() {
-        eprintln!("skipped: running as root, where firewalld would not refuse this open");
-        return;
-    }
     // `--to any` and `--to 0.0.0.0/0` produce identical exposure, so both must
     // reach open-any. A client must not get the weaker authorization by
     // spelling "everyone" as a CIDR.
+    //
+    // The action is chosen and checked before the state lock is taken, and
+    // the state lock is taken before an `Engine` exists — so a state path
+    // whose parent is a regular file rather than a directory ends each
+    // request there, with the authorization already recorded and no
+    // firewall command that could change anything ever run. This test used
+    // to let both opens run all the way through to a real
+    // `firewall-cmd --add-rich-rule` against whatever firewall the machine
+    // running the suite has, which on firewalld put two polkit password
+    // prompts on the developer's screen every time it ran. What is under
+    // test here is which action was asked for, which nothing downstream of
+    // that point can change.
     let dir = TempDir::new().unwrap();
-    let (_server, authz, name) = serve("Any", &dir.path().join("state.json")).await;
+    let not_a_directory = dir.path().join("not-a-directory");
+    std::fs::write(&not_a_directory, "").expect("the temp dir is writable");
+    let (_server, authz, name) = serve("Any", &not_a_directory.join("state.json")).await;
 
     let client = zbus::Connection::session().await.unwrap();
     let proxy = PortholeProxy::builder(&client)
@@ -91,10 +110,10 @@ async fn opening_towards_everyone_asks_for_the_stronger_action() {
         .await
         .unwrap();
 
-    // The firewall is not touched: this environment has firewalld, so the open
-    // may fail at the backend — what matters is which action was checked
-    // first, which happens before any firewall call.
-    let _ = proxy.open(15173, "tcp", "0.0.0.0/0", 60).await;
+    let any = proxy
+        .open(15173, "tcp", "0.0.0.0/0", 60)
+        .await
+        .expect_err("the state path is unusable, so this cannot succeed");
 
     // I4's classifier (`is_open_any`) also treats a half of the address space
     // as open-any — 0.0.0.0/1 and 128.0.0.0/1 together are total exposure,
@@ -103,7 +122,20 @@ async fn opening_towards_everyone_asks_for_the_stronger_action() {
     // `splitting_the_whole_address_space_in_half_does_not_hide_it_from_open_any`).
     // Nothing exercised it through the service, which is where the action is
     // actually chosen, until this call.
-    let _ = proxy.open(25173, "tcp", "0.0.0.0/1", 60).await;
+    let half = proxy
+        .open(25173, "tcp", "0.0.0.0/1", 60)
+        .await
+        .expect_err("the state path is unusable, so this cannot succeed");
+
+    // Not decoration: this is what shows each request ended where the comment
+    // above says it did, rather than having gone on to ask a real firewall
+    // for something.
+    for err in [&any, &half] {
+        assert!(
+            stopped_before_the_engine(err),
+            "the open must end before an engine exists, got: {err}"
+        );
+    }
 
     let asked: Vec<String> = authz.asked().into_iter().map(|(a, _)| a).collect();
     assert_eq!(
@@ -125,11 +157,10 @@ async fn opening_towards_everyone_asks_for_the_stronger_action() {
 /// denied here (exit 4, `iptables(8)`'s own resource-problem code) whether
 /// or not Docker is installed, and `porthole_core::docker::published`
 /// propagates that as a real error rather than reading it as "no ports" --
-/// see its own doc comment -- so this call is expected to fail, the same
-/// reasoning `opening_towards_everyone_asks_for_the_stronger_action`,
-/// above, already applies to firewalld refusing an unprivileged caller. The
+/// see its own doc comment -- so this call is expected to fail. The
 /// production helper always runs as root, where this permission error never
-/// happens.
+/// happens. `iptables -S` is a listing either way: there is no argument here
+/// that could change a rule, whatever privilege the process has.
 #[tokio::test]
 async fn docker_ports_is_reachable_and_authorized_like_list() {
     let dir = TempDir::new().unwrap();
