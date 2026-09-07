@@ -1,0 +1,22 @@
+# No ITP bug to close: this packaging is built from the source tree, not
+# uploaded to the Debian archive.
+porthole: initial-upload-closes-no-bugs
+
+# The eleven man pages this package ships are rendered by
+# crates/porthole-cli/build.rs from the clap command `porthole --help` prints,
+# one per node of that command tree. porthole-agent is not a node of it: it is
+# a notification daemon with no subcommands and no options to document, run
+# from a systemd user unit or an XDG autostart entry rather than by hand.
+porthole: no-manual-page [usr/bin/porthole-agent]
+
+# porthole-helper.service is Type=dbus with BusName=, started by the bus when
+# a client first addresses com.jacopobriccola.Porthole and reached through
+# /usr/share/dbus-1/system-services/com.jacopobriccola.Porthole.service. An
+# [Install] section would offer a `systemctl enable` that has nothing to link.
+porthole: systemd-service-file-missing-install-key [usr/lib/systemd/system/porthole-helper.service]
+
+# _FORTIFY_SOURCE is a glibc/gcc feature and rustc emits no calls to the
+# fortified variants. All three binaries here are Rust.
+porthole: hardening-no-fortify-functions [usr/bin/porthole]
+porthole: hardening-no-fortify-functions [usr/bin/porthole-agent]
+porthole: hardening-no-fortify-functions [usr/libexec/porthole-helper]

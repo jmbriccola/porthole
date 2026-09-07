@@ -1,0 +1,238 @@
+# Maintainer: Jacopo Maria Briccola <jmbriccola@gmail.com>
+
+# porthole opens one firewall port toward the local network, for a bounded
+# time, and closes it again by itself. A privileged D-Bus helper owns the
+# firewall; the CLI, the GTK4 GUI and the desktop notification agent are its
+# clients.
+#
+# Nothing here lists a file. The install layout lives in the repository's
+# Makefile and only there, and `make install DESTDIR="$pkgdir" PREFIX=/usr`
+# is what puts it down. crates/porthole-cli/tests/install_layout.rs stages
+# real `make install WITH_GUI=0` and `make install-gui` runs on every
+# `cargo test` and compares what those two calls produce against a
+# written-out list of paths: equal in union, and sharing none.
+
+pkgbase=porthole
+pkgname=('porthole' 'porthole-gui')
+pkgver=0.1.0
+pkgrel=1
+arch=('x86_64' 'aarch64')
+url='https://github.com/jmbriccola/porthole'
+license=('GPL-3.0-or-later')
+
+# `cargo` rather than `rust`: both the rust package and rustup declare
+# `provides=cargo`, so either satisfies this. gtk4 and libadwaita are here and not in the base package's
+# depends because only the porthole-gui binary links them; see the split note
+# below.
+#
+# The workspace sets rust-version = "1.87". Arch ships a newer rustc, so the
+# floor never binds on this distribution -- which is not a reason to lower it.
+# It was chosen against a security trade-off: staying below 1.87 would mean
+# pinning zbus and the crates around it to older releases, freezing the D-Bus
+# library that a root-owned helper links against out of reach of its security
+# updates.
+makedepends=('cargo' 'gtk4' 'libadwaita')
+
+# The base package's runtime dependencies, global rather than inside
+# package_porthole(), which inherits them: namcap's splitpkgmakedeps rule
+# requires every dependency of a subpackage to be covered by the global
+# depends or makedepends of a split PKGBUILD, and iproute2 and polkit are
+# covered by nothing else here.
+#
+# Only gcc-libs and glibc are linked libraries. namcap reads ELF headers and
+# reports dbus, iproute2, polkit and systemd as "may not be needed" because
+# nothing links them; what they are for is:
+#   iproute2  `ip route/addr/neigh show`, which network and saved-device
+#             discovery run
+#   systemd   `systemd-run`, which schedules the transient timer that closes
+#             an opening when its time is up
+#   dbus      the system bus the helper is activated on
+#   polkit    the daemon that authorizes each call against the installed
+#             policy
+# hicolor-icon-theme owns the icon hierarchy the two icons go into; namcap
+# asks for that one by name.
+depends=(
+	'dbus'
+	'gcc-libs'
+	'glibc'
+	'hicolor-icon-theme'
+	'iproute2'
+	'polkit'
+	'systemd'
+)
+
+# The tag v0.1.0 is not published yet, so there is no upstream tarball to
+# checksum and this is 'SKIP'. Before submitting to the AUR: push the tag,
+# then run `updpkgsums` here and regenerate .SRCINFO with
+# `makepkg --printsrcinfo > .SRCINFO`.
+source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+# Two packages out of one source tree. porthole-gui is the only part that
+# links GTK4 and libadwaita, and a headless machine -- a server, a container
+# host -- runs the CLI and the helper and never opens a window. Arch has no
+# weak dependencies, so one combined package would put gtk4 and libadwaita in
+# the runtime dependency tree of every installation, headless ones included.
+# Splitting keeps them in makedepends instead, where a clean chroot or
+# `makepkg -r` drops them again after the build.
+#
+# The Makefile's WITH_GUI=0 is what makes the split possible without either
+# package listing files of its own: WITH_GUI=0 installs everything but the
+# three GUI rows, and `install-gui` installs exactly those three. The icons
+# stay with the base package in both cases, because the agent's autostart
+# entry names the same icon.
+
+# No .install scriptlet for porthole-gui, and none of porthole's own is about
+# *installing*. The post-install work this layout needs is done by pacman
+# hooks other packages already ship, each with a Target that covers a
+# directory installed into here:
+#   systemd  30-systemd-daemon-reload-system.hook  usr/lib/systemd/system/*
+#   systemd  30-systemd-daemon-reload-user.hook    usr/lib/systemd/user/*
+#   dbus     dbus-reload.hook                      usr/share/dbus-1/system.d/*.conf
+#                                                  usr/share/dbus-1/system-services/*.service
+#   gtk-update-icon-cache
+#            gtk-update-icon-cache.hook            usr/share/icons/*/
+#   desktop-file-utils
+#            update-desktop-database.hook          usr/share/applications/*.desktop
+# The systemd and dbus hooks are in the base image; the other two run only
+# where their package is installed. polkit ships no hook at all, and keeps no
+# cache under usr/share/polkit-1/actions.
+#
+# Nothing here enables a unit either: porthole-helper.service is D-Bus
+# activated and has no [Install] section, and porthole-agent.service is a user
+# unit a user enables for their own session.
+#
+# What porthole.install does carry -- see package_porthole()'s install= below
+# -- is a pre_remove, and only that: removing this package has to close the
+# ports porthole still has open, because after the removal nothing is left
+# that could. A hook could have done it too (`Operation = Remove`,
+# `When = PreTransaction`, `Target = usr/bin/porthole`); it would ship an
+# installed file of its own to do what a scriptlet does with none, and would
+# put the remove/upgrade split in a Trigger clause instead of in the name of
+# the function that runs. porthole.install says the rest.
+
+prepare() {
+	cd "$pkgbase-$pkgver"
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+	cd "$pkgbase-$pkgver"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	export CARGO_NET_OFFLINE=true
+
+	# cargo's release profile carries debug = false, so without this the
+	# binaries reach makepkg with a symbol table and no DWARF, and the
+	# porthole-debug package split out of them holds a .debug file with no
+	# debug information in it -- four namcap errors, plus
+	# `W: Directory (usr/src/debug/porthole) is empty`. This is cargo's
+	# setting rather than makepkg's, and debian/rules exports the same one
+	# for the same reason. debug = 1 is line tables, which is what makes that
+	# package worth the space it takes; makepkg's own strip moves it out of
+	# the shipped binaries either way. `options=(!debug)` is the other answer
+	# and was not taken: a backtrace from a root-owned helper is worth having.
+	export CARGO_PROFILE_RELEASE_DEBUG=1
+
+	# `make` builds the CLI, the helper and the agent, and renders the eleven
+	# man pages and the three completion files as part of it. porthole-gui is
+	# not a workspace default-member, so it needs its own target.
+	make
+	make build-gui
+}
+
+check() {
+	cd "$pkgbase-$pkgver"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	export CARGO_NET_OFFLINE=true
+
+	# porthole-core only, and the rest of the workspace deliberately not.
+	# porthole-core's suite passes in a container holding nothing beyond
+	# base-devel, rust and the GUI's build dependencies. porthole-cli's does
+	# not: five of its tests fail there, for two reasons. Its `doctor` tests
+	# assert on what the Helper check reports, and with no bus at all doctor
+	# reports something else; and four others redirect the state file and the
+	# device book through PORTHOLE_STATE_FILE and PORTHOLE_DEVICES_FILE, which
+	# are honoured in debug builds only -- a release binary is not to take
+	# those paths from the environment. porthole-gui's tests construct real
+	# GTK widgets and need a display.
+	cargo test --release --locked -p porthole-core
+}
+
+package_porthole() {
+	pkgdesc='Open a port to your local network, temporarily and on purpose.'
+
+	# Base package only. porthole-gui ships no helper, holds no firewall
+	# rule and has nothing to close on its way out.
+	install=porthole.install
+
+	# /etc/xdg/autostart/porthole-agent.desktop is the one file here a user
+	# has a reason to edit: `Hidden=true` in it is how you stop the agent
+	# autostarting without uninstalling anything. dpkg records it as a
+	# conffile on its own; pacman records nothing unless it is named here,
+	# and would overwrite that edit on upgrade with no .pacnew beside it.
+	backup=('etc/xdg/autostart/porthole-agent.desktop')
+
+	# Arch has no rich dependencies -- there is no way to write "firewalld or
+	# ufw or nftables" in depends=. porthole drives whichever of the three is
+	# installed, needs none of them present to install, and does not install
+	# or enable a firewall itself. With none of them found, `porthole doctor`
+	# reports the Firewall check as failed, names all three, and says to
+	# install one. That is why they are optdepends and why depends= names no
+	# firewall at all: it is a decision, not an omission.
+	optdepends=(
+		'firewalld: firewall backend, preferred when installed'
+		'ufw: firewall backend, used when firewalld is absent'
+		'nftables: firewall backend, used when firewalld and ufw are absent'
+	)
+
+	cd "$pkgbase-$pkgver"
+
+	# PREFIX=/usr puts the helper at /usr/libexec/porthole-helper. Arch's own
+	# packages use /usr/lib for private helpers, and this one cannot follow
+	# that: data/com.jacopobriccola.Porthole.service (Exec=) and
+	# data/porthole-helper.service (ExecStart=) both name
+	# /usr/libexec/porthole-helper literally, and dbus-daemon and systemd read
+	# the path out of those installed files rather than from any build
+	# variable. The Makefile greps both files while it is being read and
+	# stops there when LIBEXECDIR disagrees with them, so LIBEXECDIR=/usr/lib
+	# does not install a helper the bus cannot activate -- it installs
+	# nothing at all.
+	# namcap reports this as `E: ELF file ('usr/libexec/porthole-helper')
+	# outside of a valid path`, plus two non-standard-directory warnings for
+	# usr/libexec/ and the binary in it. That error is the only one namcap
+	# raises against the built package.
+	#
+	# PREFIX=/usr is also what porthole_core::cli_path expects: the helper
+	# re-executes the CLI from /usr/bin/porthole or /usr/local/bin/porthole
+	# and nowhere else.
+	make install WITH_GUI=0 DESTDIR="$pkgdir" PREFIX=/usr
+}
+
+package_porthole-gui() {
+	pkgdesc='GTK4/libadwaita front end for porthole'
+
+	# The helper, the polkit policy and the icons all belong to the base
+	# package, and the GUI is a client of the helper over the system bus, so
+	# the dependency is on the exact build of it.
+	#
+	# libadwaita 1.5 is the floor the source requires (adw::Dialog); gtk4 4.x
+	# through the gtk4 0.9 bindings. Left unversioned because Arch is rolling
+	# and both are far past those. glib2 and pango are named rather than left
+	# to gtk4 to pull in: the binary's own DT_NEEDED lists libglib-2.0,
+	# libgobject-2.0, libgio-2.0 and libpango-1.0, which namcap reports as
+	# implicitly satisfied when they are not listed.
+	depends=(
+		"porthole=$pkgver-$pkgrel"
+		'gcc-libs'
+		'glib2'
+		'glibc'
+		'gtk4'
+		'libadwaita'
+		'pango'
+	)
+
+	cd "$pkgbase-$pkgver"
+	make install-gui DESTDIR="$pkgdir" PREFIX=/usr
+}

@@ -1,0 +1,78 @@
+#!/bin/sh
+set -e
+
+# Removal has to close what porthole opened, because nothing else will.
+#
+# Every other way a porthole rule ends needs porthole to still be installed:
+# the expiry timer re-executes /usr/bin/porthole, `close` and the
+# network-change monitor go through the helper, and reconciliation runs
+# inside an operation. Removing the package ends all of them at once and
+# leaves the firewall rule enforced, with the state file that names it on a
+# tmpfs and nothing left that can act on it. So the close happens here, while
+# the binaries are still on disk.
+#
+# `remove` only. dpkg also calls this prerm with `upgrade`, `deconfigure` and
+# `failed-upgrade`, and none of those is a removal: closing every open port
+# on an upgrade would take away access the user arranged, silently, as the
+# price of a version bump. (`dpkg --purge` of an installed package runs
+# `prerm remove` first, so purge is covered by this same branch.)
+#
+# The guards are the ones debhelper's own prerm-systemd-restart template
+# uses: DPKG_ROOT for a chroot install, /run/systemd/system for a machine
+# actually running systemd.
+if [ -z "$DPKG_ROOT" ] && [ "$1" = remove ] && [ -d /run/systemd/system ] ; then
+
+	# `porthole close --all` rather than any shell that guesses at rules:
+	# the helper owns the firewall and holds the record of what it opened,
+	# and it also cancels each opening's transient expiry timer as it closes
+	# -- a timer that would otherwise fire, after this removal, into a
+	# /usr/bin/porthole that is no longer there.
+	#
+	# Never fatal. An un-removable package is a worse failure than a port
+	# left open, and this call can fail for reasons that have nothing to do
+	# with the firewall: no system bus (a container, an image build), polkit
+	# not running, a helper left broken by an earlier failed upgrade. On any
+	# of those the removal continues and the warning below is what the user
+	# gets. Closing is not authenticated -- the polkit action
+	# com.jacopobriccola.Porthole.close is `yes` for allow_any, allow_active
+	# and allow_inactive -- so there is nothing here for a non-interactive
+	# removal to be prompted by.
+	#
+	# The timeout is a bound on how long a removal can sit here: the call
+	# reaches a root D-Bus service that drives the firewall, and a bus that
+	# never answers must not hang dpkg indefinitely.
+	if [ -x /usr/bin/porthole ] ; then
+		echo 'porthole: closing every port porthole still has open, before removing it.' >&2
+		rc=0
+		timeout 60 /usr/bin/porthole close --all >&2 || rc=$?
+		if [ "$rc" -ne 0 ] ; then
+			cat >&2 <<-WARNING
+				porthole: WARNING: \`porthole close --all\` failed (exit $rc).
+				porthole: Any port porthole had open is still open, and removing this
+				porthole: package leaves nothing behind that would close it. Check with
+				porthole: \`firewall-cmd --list-rich-rules\`, \`ufw status numbered\` or
+				porthole: \`nft list ruleset\` and remove what is left by hand.
+			WARNING
+		fi
+	fi
+
+	# After the close, not before: stopping first would leave the close to
+	# D-Bus-activate the helper again, and a helper started after the stop
+	# would still be running -- from a deleted binary -- when dpkg finishes.
+	#
+	# dh_installsystemd emits this same stop itself, but only `unless
+	# NO_START`, and debian/rules passes --no-start because
+	# porthole-helper.service is D-Bus activated and nothing should start it
+	# at install time. Without the line below, removing the package leaves a
+	# root daemon running from a deleted binary, still holding
+	# com.jacopobriccola.Porthole and still able to open ports.
+	#
+	# The upgrade case is dh_installsystemd's: it puts its own
+	# `deb-systemd-invoke stop` in preinst, and the next client call
+	# re-activates the helper on the new binary.
+	deb-systemd-invoke stop porthole-helper.service >/dev/null || true
+fi
+
+#DEBHELPER#
+
+exit 0

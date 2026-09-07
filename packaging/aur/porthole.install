@@ -1,0 +1,82 @@
+# porthole -- pacman install scriptlet for the base package.
+#
+# One function, and it exists for one reason: removal has to close what
+# porthole opened, because nothing else will.
+#
+# Every other way a porthole rule ends needs porthole to still be installed:
+# the expiry timer re-executes /usr/bin/porthole, `close` and the
+# network-change monitor go through the helper, and reconciliation runs
+# inside an operation. Removing the package ends all of them at once and
+# leaves the firewall rule enforced, with the state file that names it on a
+# tmpfs and nothing left that can act on it.
+#
+# Why a scriptlet at all, given the PKGBUILD's own note that this package
+# needs none: install scripts are uncommon here -- 10 of the 137 packages in
+# the archlinux:latest base image ship one, and 2 of those 10 define a removal
+# hook (p11-kit disables its systemd units in pre_remove; systemd edits
+# etc/shells in post_remove) -- and the *post-install* work this layout needs
+# really is covered by pacman hooks other packages already ship. This is not
+# that work. A pacman hook could have carried it (`Operation = Remove`,
+# `When = PreTransaction`, `Target = usr/bin/porthole` fires on exactly this
+# package's removal, before its files go); pre_remove was taken instead
+# because it ships no installed file to do it, and because the distinction
+# that has to be made -- an upgrade must close nothing, or it takes away the
+# access the user arranged as the price of a version bump -- is then the name
+# of the function rather than a Trigger clause. There is no pre_upgrade here,
+# so an upgrade closes nothing.
+
+pre_remove() {
+	# Relative paths: pacman runs an install scriptlet with the install root
+	# as its working directory, so `usr/bin/porthole` is this package's own
+	# binary. The systemd and dbus-broker scriptlets in the base image are
+	# written the same way.
+	#
+	# run/systemd/system is the "booted with systemd" test. porthole's
+	# helper is a systemd unit and its automatic closes are transient
+	# systemd timers; with no systemd running there is nothing this could
+	# have opened.
+	[[ -d run/systemd/system ]] || return 0
+	[[ -x usr/bin/porthole ]] || return 0
+
+	# `porthole close --all` rather than any shell that guesses at rules:
+	# the helper owns the firewall and holds the record of what it opened,
+	# and it also cancels each opening's transient expiry timer as it closes
+	# -- a timer that would otherwise fire, after this removal, into a
+	# /usr/bin/porthole that is no longer there.
+	#
+	# Never fatal. An un-removable package is a worse failure than a port
+	# left open, and this call can fail for reasons that have nothing to do
+	# with the firewall: no system bus (a container, an image build), polkit
+	# not running, a helper left broken by an earlier failed upgrade. On any
+	# of those the removal continues and the warning below is what the user
+	# gets. Closing is not authenticated -- the polkit action
+	# com.jacopobriccola.Porthole.close is `yes` for allow_any, allow_active
+	# and allow_inactive -- so there is nothing here for a non-interactive
+	# removal to be prompted by.
+	#
+	# The timeout is a bound on how long a removal can sit here: the call
+	# reaches a root D-Bus service that drives the firewall, and a bus that
+	# never answers must not hang pacman indefinitely.
+	echo 'porthole: closing every port porthole still has open, before removing it.' >&2
+	local rc=0
+	timeout 60 usr/bin/porthole close --all >&2 || rc=$?
+	if (( rc != 0 )); then
+		cat >&2 <<-WARNING
+			porthole: WARNING: \`porthole close --all\` failed (exit $rc).
+			porthole: Any port porthole had open is still open, and removing this
+			porthole: package leaves nothing behind that would close it. Check with
+			porthole: \`firewall-cmd --list-rich-rules\`, \`ufw status numbered\` or
+			porthole: \`nft list ruleset\` and remove what is left by hand.
+		WARNING
+	fi
+
+	# After the close, not before: stopping first would leave the close to
+	# D-Bus-activate the helper again. Arch has no scriptlet stopping this
+	# unit otherwise -- the systemd pacman hook only reloads the manager --
+	# so without this line removal leaves a root daemon running from a
+	# deleted binary, still holding com.jacopobriccola.Porthole.
+	systemctl stop porthole-helper.service >/dev/null 2>&1 || true
+	return 0
+}
+
+# vim:set ft=sh ts=4 sw=4 noet:

@@ -4,3 +4,24 @@
 # Internal working documents: Italian, not part of the published project.
 /docs/superpowers/
 /INITIAL_PROMPT.md
+
+# dpkg-buildpackage's working files. `dh` builds each binary package inside
+# debian/<package>/ and leaves its bookkeeping beside it; debian/cargo-home is
+# where debian/rules points CARGO_HOME so a package build does not write into
+# the build user's ~/.cargo.
+/debian/porthole/
+/debian/porthole-gui/
+/debian/tmp/
+/debian/cargo-home/
+/debian/files
+/debian/.debhelper/
+/debian/debhelper-build-stamp
+/debian/*.substvars
+/debian/*.debhelper
+/debian/*.log
+
+# The reference policy's makefile expands the .te through m4 into selinux/tmp/
+# and leaves the compiled module beside the sources. Both are build output;
+# selinux/{porthole.te,porthole.fc,porthole.if} are the sources.
+/selinux/tmp/
+/selinux/*.pp

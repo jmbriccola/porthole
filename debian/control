@@ -1,0 +1,78 @@
+Source: porthole
+Section: net
+Priority: optional
+Maintainer: Jacopo Maria Briccola <jmbriccola@gmail.com>
+# rustc/cargo >= 1.87: porthole's MSRV. Debian 13's own rustc is 1.85.0, so
+# this dependency is satisfied from trixie-backports (1.94.1+dfsg1-1~bpo13+3
+# at the time of writing) and not from trixie itself -- debian/README.source
+# says how to make apt pick it and why the floor is not lowered instead.
+#
+# The GUI's build-dependencies are behind a build profile so a host with no
+# GTK4 headers can still produce the porthole binary package:
+#   DEB_BUILD_PROFILES=pkg.porthole.nogui dpkg-buildpackage -b
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo (>= 1.87),
+ rustc (>= 1.87),
+ pkgconf,
+ libgtk-4-dev <!pkg.porthole.nogui>,
+ libadwaita-1-dev <!pkg.porthole.nogui>,
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+Homepage: https://github.com/jmbriccola/porthole
+Vcs-Git: https://github.com/jmbriccola/porthole.git
+Vcs-Browser: https://github.com/jmbriccola/porthole
+
+Package: porthole
+Architecture: any
+# firewalld | ufw | nftables: porthole drives whichever of the three the
+# machine already has and installs none of them itself. firewalld is first
+# because it is the one this alternation should pull in on a machine that has
+# no firewall at all.
+#
+# systemd is not optional here. An opening's automatic close is a transient
+# systemd timer created with systemd-run, and the helper unit is Type=dbus
+# with a SystemdService= line in its D-Bus activation file.
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ firewalld | ufw | nftables,
+ polkitd,
+ default-dbus-system-bus,
+ systemd,
+Suggests: porthole-gui
+Description: open a firewall port to your local network, temporarily
+ porthole opens a single port towards the network this machine is on right
+ now, for a bounded amount of time, and closes it again by itself. Nothing it
+ opens survives a reboot: it writes no permanent firewall rule, and no timed
+ opening can last longer than eight hours.
+ .
+ It is not a firewall manager. It does no zones, services, NAT, port
+ forwarding or permanent rules; for those, use firewall-config, ufw or nft
+ directly. It drives firewalld, ufw or nftables -- whichever this machine
+ already has.
+ .
+ Opening and closing do not need root. A privileged helper does the work as a
+ system D-Bus service authorised by polkit: opening towards your own subnet
+ authenticates once per session, opening towards every network this machine
+ can reach asks every time, and closing never asks.
+ .
+ This package contains the command-line tool, the privileged helper with its
+ polkit policy and D-Bus configuration, and the desktop notification agent.
+
+Package: porthole-gui
+Architecture: any
+Build-Profiles: <!pkg.porthole.nogui>
+# Its own package because it links GTK4 and libadwaita, and a headless server
+# that wants `porthole open` has no use for either.
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ porthole (= ${binary:Version}),
+Description: open a firewall port to your local network, temporarily (GTK4 GUI)
+ porthole opens a single port towards the network this machine is on right
+ now, for a bounded amount of time, and closes it again by itself.
+ .
+ This package contains the GTK4/libadwaita application: the ports that are
+ open now, what is listening on this machine, and the dialogue that opens one.
+ It is a client of the same privileged helper the command-line tool uses.

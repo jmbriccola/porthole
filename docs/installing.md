@@ -6,8 +6,39 @@
 privileged helper to act, and that helper has to be installed once, as root,
 before they work. This is that installation.
 
-There is no installer yet — porthole is not packaged for any distribution.
-Until it is, do the steps below by hand.
+porthole is in no distribution's repositories yet, and there is no release to
+download. What the repository does carry is the packaging for three formats,
+each building from this source tree and each installing through the `Makefile`
+below rather than listing files of its own: a Debian package under `debian/`,
+an Arch `PKGBUILD` under `packaging/aur/`, and an RPM spec under
+`packaging/rpm/`. Until one of them is published — and on any distribution
+none of them covers — the `Makefile` installs every piece into a `DESTDIR`:
+
+```bash
+make                                  # the CLI, the helper and the agent,
+                                      # plus the man pages and completions
+make build-gui                        # needs GTK4/libadwaita headers
+sudo make install PREFIX=/usr
+```
+
+`make check-install` stages the same layout into a throwaway directory and
+prints what landed, without root. `PREFIX` defaults to `/usr`, not
+`/usr/local`, because two of the files below name `/usr/libexec/porthole-helper`
+literally. The `Makefile` compares `LIBEXECDIR` against those two files while
+it is being read, before any recipe runs, and stops there when they disagree —
+so a wrong `PREFIX` leaves nothing at all installed rather than half of it, and
+a `PREFIX=/usr/local` install needs `LIBEXECDIR=/usr/libexec` passed alongside
+it. `WITH_GUI=0` leaves out the GUI binary, its desktop entry and its AppStream
+metainfo.
+
+`make install` also rewrites one line it does not copy verbatim: the agent's
+user unit ships `ExecStart=/usr/local/bin/porthole-agent`, the path the
+by-hand steps below use, and the installed copy names `$(BINDIR)` instead. A
+systemd unit's `ExecStart=` is an absolute path and is never looked up on
+`$PATH`.
+
+The rest of this document is the by-hand equivalent — what each file is for
+and where it goes, one `install` command at a time.
 
 ## The pieces
 
@@ -197,6 +228,39 @@ would inside the container this project builds and tests it in. A software
 centre that reads AppStream metadata (GNOME Software, KDE Discover) should
 show the summary and description from the `.metainfo.xml` file once you find
 the app there, not just a bare name.
+
+## Uninstalling: what closes the ports, and when it does not
+
+The three packages each close every port porthole has open before their files
+go, and only on a real removal — `%preun` guarded by `$1 -eq 0` (RPM),
+`prerm remove` (Debian), `pre_remove` (Arch). An upgrade closes nothing; the
+same scripts run, and each distinguishes the two cases the way its packaging
+system provides for.
+
+What each of them runs is `porthole close --all`, not a shell that guesses at
+rules. The helper owns the firewall and holds the record of what it opened,
+and closing through it also cancels each opening's transient `systemd-run`
+timer — the timer that would otherwise fire after the removal into a
+`/usr/bin/porthole` no longer on disk. Nothing authenticates: the
+`com.jacopobriccola.Porthole.close` polkit action is `yes` for `allow_any`,
+`allow_active` and `allow_inactive`, so a non-interactive removal is never
+prompted.
+
+The close happens **before** the helper is stopped. Stopping it first would
+leave the close to D-Bus-activate it again, and the helper started that way
+would still be running, from a deleted binary, when the removal finished.
+
+None of it can fail the removal. An un-removable package is a worse problem
+than an open port, so a `close --all` that does not succeed — no system bus,
+polkit not running, a helper left broken by an earlier failed upgrade — prints
+a warning naming the three commands that list what is left, and the removal
+continues. Those ports stay open, and after the removal nothing is left that
+would close them. `porthole close --all`, run yourself before uninstalling, is
+the way not to depend on any of this.
+
+An installation made by `make install` has none of this: the `Makefile`
+installs files and nothing else, and `make uninstall` removes files and
+nothing else. Close first.
 
 ## Why there is no Flatpak, and there will not be one
 

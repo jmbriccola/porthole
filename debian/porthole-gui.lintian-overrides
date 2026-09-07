@@ -1,0 +1,12 @@
+# No ITP bug to close: this packaging is built from the source tree, not
+# uploaded to the Debian archive.
+porthole-gui: initial-upload-closes-no-bugs
+
+# porthole-gui takes no arguments worth a page: it is a GTK4 window, launched
+# from com.jacopobriccola.Porthole.desktop. What porthole does and how it does
+# it is porthole(1), in the package this one depends on.
+porthole-gui: no-manual-page [usr/bin/porthole-gui]
+
+# _FORTIFY_SOURCE is a glibc/gcc feature and rustc emits no calls to the
+# fortified variants.
+porthole-gui: hardening-no-fortify-functions [usr/bin/porthole-gui]

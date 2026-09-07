@@ -12,6 +12,17 @@ description = "Command-line interface for porthole."
 name = "porthole"
 path = "src/main.rs"
 
+[build-dependencies]
+# The man page and the shell completions are rendered from `src/cli_def.rs`
+# by `build.rs`; see that file. clap is here as well as in [dependencies]
+# because a build script's dependencies are a separate set. `string` is what
+# lets `Command::name` take the owned `porthole-<subcommand>` page names this
+# script builds; resolver 2 keeps build-dependency features out of the
+# `[dependencies]` clap the binary links.
+clap = { workspace = true, features = ["string"] }
+clap_complete = "4"
+clap_mangen = "0.2"
+
 [dependencies]
 porthole-core = { path = "../porthole-core" }
 clap.workspace = true

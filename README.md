@@ -114,8 +114,67 @@ That gives you `porthole list`, `porthole status`, `porthole doctor`,
 helper installed; so does the Docker half of `porthole listen`, `porthole
 open` and `porthole doctor`, since reading Docker's own rules needs root. The
 same `cargo build --release` also produces `porthole-agent`, which is what
-turns a close nobody asked for into a desktop notification. See
-[docs/installing.md](docs/installing.md) for all three.
+turns a close nobody asked for into a desktop notification.
+
+For all of it at once — the three binaries, the polkit policy, the D-Bus
+files, the systemd units, the icons, the man pages and the shell completions
+— the `Makefile` installs the layout every package of this project uses:
+
+```bash
+make                                  # cargo build --release, plus the
+                                      # man pages and completions
+make build-gui                        # needs GTK4/libadwaita headers
+sudo make install PREFIX=/usr
+```
+
+`DESTDIR` is honoured by every rule, so a packager stages into one and never
+touches the live system: `make install DESTDIR=/tmp/stage PREFIX=/usr`.
+`make check-install` does exactly that into a throwaway directory and prints
+what landed. `WITH_GUI=0` leaves out the GUI binary, its desktop entry and
+its AppStream metainfo, for a machine with no desktop. `PREFIX` defaults to
+`/usr` rather than `/usr/local` because the D-Bus activation file names
+`/usr/libexec/porthole-helper` literally; see
+[docs/installing.md](docs/installing.md), which also covers installing each
+piece by hand.
+
+### Removing it
+
+Removing the package closes every port porthole still has open, first. That is
+not a courtesy: uninstalling is the one action that ends every other way a
+porthole rule could close. The timer that would have closed it re-executes
+`/usr/bin/porthole`; `close`, the network-change monitor and reconciliation
+all go through the helper. Take those away and the rule stays in the firewall,
+with the record of it on a tmpfs and nothing left that can act on it.
+
+So each of the three packages runs `porthole close --all` on the way out, and
+only on the way out: `%preun` when `$1` is 0 (RPM), `prerm remove` (Debian),
+`pre_remove` (Arch). An **upgrade** closes nothing — losing the access you
+arranged would be a bad way to learn a new version had shipped.
+
+It is best effort, and it says so when it fails. A removal must not fail
+because a port could not be closed, so if the helper cannot be reached — no
+system bus, polkit not running, a helper left broken by an earlier failed
+upgrade — the removal continues and prints:
+
+```
+porthole: WARNING: `porthole close --all` failed (exit 1).
+porthole: Any port porthole had open is still open, and removing this
+porthole: package leaves nothing behind that would close it. Check with
+porthole: `firewall-cmd --list-rich-rules`, `ufw status numbered` or
+porthole: `nft list ruleset` and remove what is left by hand.
+```
+
+That warning is the residual gap, and it is a real one. On firewalld and
+nftables the rule porthole added is a runtime rule, so a reboot is the last
+thing left that will close it. On ufw not even that: `ufw allow` writes into
+`/etc/ufw/user.rules` and `ufw.service` reloads that file at every boot, and
+the reconciliation that would otherwise sweep the rule runs inside a
+`porthole` command there will never be another of. If you would rather not
+depend on the removal reaching the helper, run `porthole close --all`
+yourself first.
+
+A `make install` installation has no scriptlets at all, and `make uninstall`
+closes nothing — close first, by hand.
 
 ## Usage
 
