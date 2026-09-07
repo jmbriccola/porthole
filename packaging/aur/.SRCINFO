@@ -1,0 +1,35 @@
+pkgbase = porthole
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/jmbriccola/porthole
+	arch = x86_64
+	arch = aarch64
+	license = GPL-3.0-or-later
+	makedepends = cargo
+	makedepends = gtk4
+	makedepends = libadwaita
+	depends = dbus
+	depends = gcc-libs
+	depends = glibc
+	depends = hicolor-icon-theme
+	depends = iproute2
+	depends = polkit
+	depends = systemd
+	source = porthole-0.1.0.tar.gz::https://github.com/jmbriccola/porthole/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = SKIP
+
+pkgname = porthole
+	pkgdesc = Open a port to your local network, temporarily and on purpose.
+	optdepends = firewalld: firewall backend, preferred when installed
+	optdepends = ufw: firewall backend, used when firewalld is absent
+	optdepends = nftables: firewall backend, used when firewalld and ufw are absent
+
+pkgname = porthole-gui
+	pkgdesc = GTK4/libadwaita front end for porthole
+	depends = porthole=0.1.0-1
+	depends = gcc-libs
+	depends = glib2
+	depends = glibc
+	depends = gtk4
+	depends = libadwaita
+	depends = pango
