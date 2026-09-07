@@ -219,10 +219,7 @@ mod tests {
             "invalid_argument"
         );
         assert_eq!(Error::NoNetwork("x".into()).kind(), "no_network");
-        assert_eq!(
-            Error::NothingToOffer("x".into()).kind(),
-            "nothing_to_offer"
-        );
+        assert_eq!(Error::NothingToOffer("x".into()).kind(), "nothing_to_offer");
     }
 
     #[test]
