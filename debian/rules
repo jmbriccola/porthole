@@ -1,9 +1,12 @@
 #!/usr/bin/make -f
 # The install layout lives in the Makefile at the top of the source tree and
-# nowhere else. Nothing here lists a file: `make install` puts down the base
-# package's 25 files and `make install-gui` the GUI package's 3, so the .deb
-# contents and what crates/porthole-cli/tests/install_layout.rs compares for
-# equality on every `cargo test` are two readings of one table.
+# nowhere else. Nothing here lists a file: `make install WITH_GUI=0` puts down
+# the base package's 25 files and `make install-gui` the GUI package's 3, and
+# crates/porthole-cli/tests/install_layout.rs stages those same two calls on
+# every `cargo test` and compares what they produce against a written-out list
+# of paths. What lands in the .deb is that, plus dpkg's own post-processing:
+# the eleven man pages gzipped by dh_compress, and usr/share/doc/ and
+# usr/share/lintian/overrides/ added.
 #
 # That is also why there are no debian/*.install files. Splitting the two
 # packages out of a single debian/tmp would mean writing the file list a
@@ -32,8 +35,6 @@ ifneq (,$(filter pkg.porthole.nogui,$(DEB_BUILD_PROFILES)))
 WITH_GUI := 0
 endif
 
-CARGO_FLAGS := --release --locked
-
 %:
 	dh $@
 
@@ -41,14 +42,17 @@ CARGO_FLAGS := --release --locked
 # whose dh_auto_configure would run ./configure if one existed. There is none.
 override_dh_auto_configure:
 
-# The workspace's default-members leave porthole-gui out, so the first line
-# builds the CLI, the helper and the agent -- and, through
+# The Makefile's own targets rather than the `cargo build --release --locked`
+# they expand to: the same one place the install layout lives, so a change to
+# how this tree is built happens once. `build` is the workspace's
+# default-members -- the CLI, the helper and the agent -- and, through
 # crates/porthole-cli/build.rs, the eleven man pages and the three completion
-# files that `make install` then installs.
+# files that `make install` then installs. porthole-gui is not a
+# default-member, so `build-gui` is separate.
 override_dh_auto_build:
-	cargo build $(CARGO_FLAGS)
+	$(MAKE) build
 ifeq ($(WITH_GUI),1)
-	cargo build $(CARGO_FLAGS) -p porthole-gui
+	$(MAKE) build-gui
 endif
 
 # No test run here, and the reason is not that the suite is slow.
@@ -71,10 +75,20 @@ override_dh_auto_test:
 
 # PREFIX=/usr, not the Makefile's own default being taken on trust:
 # data/com.jacopobriccola.Porthole.service and data/porthole-helper.service
-# both name /usr/libexec/porthole-helper literally, and `make install-helper`
-# stops when LIBEXECDIR and those two files disagree.
+# both name /usr/libexec/porthole-helper literally, and the Makefile stops
+# while it is being read -- before installing anything -- when LIBEXECDIR and
+# those two files disagree.
+#
+# ZSHCOMPDIR is the one directory Debian places differently from the
+# Makefile's default: vendor-completions is where a package that is not zsh
+# itself puts a completion, and the Makefile provides the override for this.
+# Both directories are on the default fpath, so this is convention rather
+# than function.
+ZSHCOMPDIR := /usr/share/zsh/vendor-completions
+
 override_dh_auto_install:
-	$(MAKE) install DESTDIR=$(CURDIR)/debian/porthole PREFIX=/usr WITH_GUI=0
+	$(MAKE) install DESTDIR=$(CURDIR)/debian/porthole PREFIX=/usr WITH_GUI=0 \
+	  ZSHCOMPDIR=$(ZSHCOMPDIR)
 ifeq ($(WITH_GUI),1)
 	$(MAKE) install-gui DESTDIR=$(CURDIR)/debian/porthole-gui PREFIX=/usr
 endif
