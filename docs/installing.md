@@ -229,6 +229,39 @@ centre that reads AppStream metadata (GNOME Software, KDE Discover) should
 show the summary and description from the `.metainfo.xml` file once you find
 the app there, not just a bare name.
 
+## Uninstalling: what closes the ports, and when it does not
+
+The three packages each close every port porthole has open before their files
+go, and only on a real removal — `%preun` guarded by `$1 -eq 0` (RPM),
+`prerm remove` (Debian), `pre_remove` (Arch). An upgrade closes nothing; the
+same scripts run, and each distinguishes the two cases the way its packaging
+system provides for.
+
+What each of them runs is `porthole close --all`, not a shell that guesses at
+rules. The helper owns the firewall and holds the record of what it opened,
+and closing through it also cancels each opening's transient `systemd-run`
+timer — the timer that would otherwise fire after the removal into a
+`/usr/bin/porthole` no longer on disk. Nothing authenticates: the
+`com.jacopobriccola.Porthole.close` polkit action is `yes` for `allow_any`,
+`allow_active` and `allow_inactive`, so a non-interactive removal is never
+prompted.
+
+The close happens **before** the helper is stopped. Stopping it first would
+leave the close to D-Bus-activate it again, and the helper started that way
+would still be running, from a deleted binary, when the removal finished.
+
+None of it can fail the removal. An un-removable package is a worse problem
+than an open port, so a `close --all` that does not succeed — no system bus,
+polkit not running, a helper left broken by an earlier failed upgrade — prints
+a warning naming the three commands that list what is left, and the removal
+continues. Those ports stay open, and after the removal nothing is left that
+would close them. `porthole close --all`, run yourself before uninstalling, is
+the way not to depend on any of this.
+
+An installation made by `make install` has none of this: the `Makefile`
+installs files and nothing else, and `make uninstall` removes files and
+nothing else. Close first.
+
 ## Why there is no Flatpak, and there will not be one
 
 A Flatpak sandbox has no mechanism to install a polkit `.policy` file into
