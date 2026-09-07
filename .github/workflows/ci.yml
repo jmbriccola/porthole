@@ -1,0 +1,418 @@
+name: CI
+
+# Push covers every branch, so work in progress is gated before a pull
+# request exists; a pull request from a branch in this repository therefore
+# runs the workflow twice, once per ref.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # `bash` rather than the platform default `bash -e {0}`: this spelling is
+    # `bash --noprofile --norc -eo pipefail`, and the `-o pipefail` is the
+    # part that matters here. Without it a step whose `cargo` is missing can
+    # print `command not found` on the left of a pipe and still report
+    # success. Multi-line blocks below repeat `set -euo pipefail` in the
+    # script itself so the guarantee does not depend on this default alone.
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  # The MSRV, written here rather than read out of Cargo.toml. The msrv job
+  # compares this string against the workspace's own `rust-version` and fails
+  # when they differ, which a version derived from the manifest could not do.
+  MSRV: "1.87"
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal -c rustfmt --no-self-update
+          rustup default stable
+          cargo fmt --version
+      # --all, not the workspace's default members: porthole-gui is outside
+      # default-members and rustfmt reads it without GTK4 headers.
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (stable)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal -c clippy --no-self-update
+          rustup default stable
+          cargo clippy --version
+      # porthole-gui is excluded here and linted in the `gui` job instead,
+      # inside the image that carries gtk4 and libadwaita.
+      - name: cargo clippy --workspace --exclude porthole-gui
+        run: cargo clippy --workspace --exclude porthole-gui --all-targets -- -D warnings
+
+  test:
+    name: test (stable)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          cargo --version
+      - name: The environment the suite runs against
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dbus firewalld nftables iptables iproute2
+          sudo systemctl enable --now firewalld
+      # Three conditions the suite reads out of the machine, asserted before
+      # the suite runs so a changed runner image fails here rather than as a
+      # test result:
+      #
+      #   firewall-cmd present   eight tests in crates/porthole-cli/tests/cli.rs
+      #                          return early printing `skipped` without it, and
+      #                          a skip of that shape counts as a pass
+      #   firewalld running      those eight assert firewalld's own
+      #                          --add-rich-rule wording; with firewalld
+      #                          installed but not reachable, four of them
+      #                          were measured failing on `porthole open
+      #                          --dry-run` exiting 3
+      #   a system bus           doctor_says_the_helper_is_missing_when_it_is
+      #                          wants doctor to report a missing helper; with
+      #                          no system bus doctor reports a missing bus
+      - name: The conditions the suite reads out of this machine
+        run: |
+          set -euo pipefail
+          firewall-cmd --version
+          firewall-cmd --state
+          ip -j route show default
+          busctl --system --no-pager list > /dev/null
+      # --locked fails on a Cargo.lock that does not already satisfy
+      # Cargo.toml. No other command in this workflow reads the lockfile that
+      # strictly. First in the job, so it fails before the test build spends
+      # time.
+      - name: cargo build --locked
+        run: cargo build --locked
+      # dbus-run-session supplies the session bus a runner has none of;
+      # crates/porthole-cli/tests/helper_e2e.rs runs `porthole-helper
+      # --session` on it and crates/porthole-agent/tests/session.rs starts a
+      # further private bus per test. The system bus is left alone.
+      # DBUS_SYSTEM_BUS_ADDRESS is deliberately not redirected at the private
+      # bus: measured on a machine with firewalld installed and running, that
+      # redirection sends `firewall-cmd` to the private bus, where firewalld
+      # is not, and four dry-run tests in crates/porthole-cli/tests/cli.rs
+      # then fail with exit 3 and "FirewallD is not running". The
+      # redirection belongs to a build chroot that has no firewalld and no
+      # system bus, which is where packaging/rpm/porthole.spec uses it.
+      #
+      # One cargo test per job and no more: the helper claims a singleton bus
+      # name, and HELPER_LOCK in crates/porthole-cli/tests/helper_e2e.rs is a
+      # process-local mutex that a second cargo process cannot see.
+      - name: cargo test --workspace --exclude porthole-gui
+        run: dbus-run-session -- cargo test --workspace --exclude porthole-gui
+
+  msrv:
+    name: MSRV (pinned)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install "${MSRV}" --profile minimal -c clippy --no-self-update
+          cargo "+${MSRV}" --version
+      # Two separate things. The first reads the version rustc actually is,
+      # so a step that resolved to some other toolchain fails instead of
+      # passing under a name. The second compares the workspace's declared
+      # `rust-version` against the pin above: raising the declaration is
+      # caught by cargo itself, lowering it is caught only here.
+      - name: The toolchain and the manifest agree on the floor
+        run: |
+          set -euo pipefail
+          actual="$(rustc "+${MSRV}" --version)"
+          echo "${actual}"
+          case "${actual}" in
+            "rustc ${MSRV}."*) ;;
+            *) echo "expected rustc ${MSRV}.x, got: ${actual}" >&2; exit 1 ;;
+          esac
+          declared="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+          echo "Cargo.toml declares rust-version = ${declared}"
+          test "${declared}" = "${MSRV}"
+      - name: The environment the suite runs against
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dbus firewalld nftables iptables iproute2
+          sudo systemctl enable --now firewalld
+      # The same three conditions the stable test job asserts, and for the
+      # same reasons; that job's comment says what each one carries.
+      - name: The conditions the suite reads out of this machine
+        run: |
+          set -euo pipefail
+          firewall-cmd --version
+          firewall-cmd --state
+          ip -j route show default
+          busctl --system --no-pager list > /dev/null
+      - name: cargo +MSRV check
+        run: cargo "+${MSRV}" check --workspace --exclude porthole-gui --all-targets
+      - name: cargo +MSRV clippy
+        run: cargo "+${MSRV}" clippy --workspace --exclude porthole-gui --all-targets -- -D warnings
+      # A declared floor that nothing runs against is a guess, so the suite
+      # runs here too and not only `check`. Same bus arrangement as the
+      # stable test job, and on a machine of its own.
+      - name: cargo +MSRV test
+        run: dbus-run-session -- cargo "+${MSRV}" test --workspace --exclude porthole-gui
+
+  gui:
+    name: GUI (container)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: podman
+        run: |
+          set -euo pipefail
+          if ! command -v podman >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends podman
+          fi
+          podman --version
+      - name: Build the image
+        run: podman build -t porthole-gui-test -f tests/container/Containerfile.gui tests/container
+      # tests/container/gui-test.sh runs, in this order, `cargo +1.87 check`,
+      # `cargo clippy -p porthole-gui -- -D warnings`, and the crate's tests
+      # under Xvfb and dbus-run-session. porthole-gui is excluded from every
+      # other job in this workflow, so this is where its clippy and its MSRV
+      # check happen.
+      - name: tests/container/gui-test.sh
+        run: podman run --rm -v "${PWD}:/src:z" -w /src porthole-gui-test bash tests/container/gui-test.sh
+
+  container-tests:
+    name: container integration tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain and the musl target
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal -t x86_64-unknown-linux-musl --no-self-update
+          rustup default stable
+          cargo --version
+      - name: podman
+        run: |
+          set -euo pipefail
+          if ! command -v podman >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends podman
+          fi
+          podman --version
+          podman info --format '{{.Host.Security.Rootless}}'
+      # The ten #[ignore]d tests in crates/porthole-cli/tests/container.rs:
+      # the three backends and reconcile::sweep against a real ufw, a real
+      # firewalld and a real nftables, each inside its own container's own
+      # network namespace. run.sh builds the musl binaries they need, sets
+      # PORTHOLE_CONTAINER_TESTS=1 and passes --ignored --test-threads=1.
+      # Nothing in that file skips: once opted in, a missing podman or a
+      # stale binary panics rather than reporting a pass.
+      - name: tests/container/run.sh
+        run: tests/container/run.sh
+
+  rpm:
+    name: RPM (fedora:44)
+    runs-on: ubuntu-24.04
+    container: registry.fedoraproject.org/fedora:44
+    steps:
+      - name: git, before actions/checkout
+        run: dnf install -y --setopt=install_weak_deps=False git-core
+      - uses: actions/checkout@v5
+      - name: rpm tooling
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          # rpm-build, and the macro packages the spec expands, before
+          # `dnf builddep` has to parse it. dnf5-plugins is what provides
+          # builddep on Fedora 44.
+          dnf install -y --setopt=install_weak_deps=False \
+            rpm-build rpmdevtools dnf5-plugins jq \
+            rust-srpm-macros systemd-rpm-macros
+          rpmdev-setuptree
+      # BuildRequires is read from the spec rather than repeated here, so a
+      # dependency added there reaches this job without an edit.
+      - name: dnf builddep
+        run: dnf builddep -y packaging/rpm/porthole.spec
+      - name: Source tarball
+        run: |
+          set -euo pipefail
+          version="$(awk '/^Version:[[:space:]]/ { print $2; exit }' packaging/rpm/porthole.spec)"
+          echo "spec Version: ${version}"
+          test -n "${version}"
+          git archive --prefix="porthole-${version}/" \
+            -o "${HOME}/rpmbuild/SOURCES/porthole-${version}.tar.gz" HEAD
+      # %check inside this build runs desktop-file-validate,
+      # appstream-util validate-relax, the three-way agreement between the
+      # helper's path and the two files that name it, and
+      # `cargo test --locked --workspace --exclude porthole-gui` under
+      # dbus-run-session. That is the only cargo test in this job, and this
+      # job has a runner of its own.
+      - name: rpmbuild -ba
+        run: rpmbuild -ba packaging/rpm/porthole.spec
+      - name: What was built
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          rpms=("${HOME}"/rpmbuild/RPMS/*/*.rpm)
+          printf '%s\n' "${rpms[@]}"
+          test "${#rpms[@]}" -gt 0
+      # A spec that installs to the wrong paths builds cleanly and fails the
+      # user. The two doctor checks asserted below are the ones that read
+      # installed paths: polkit looks for the policy under
+      # /usr/share/polkit-1/actions, and the expiry timer looks for the CLI
+      # among porthole_core::cli_path::CLI_CANDIDATES. Both are false on an
+      # uninstalled tree. `porthole doctor` exits non-zero in a container
+      # that runs no firewall and no bus, so its status is recorded and
+      # printed rather than gated on.
+      - name: Install the RPMs and run porthole doctor
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          rpms=("${HOME}"/rpmbuild/RPMS/*/*.rpm)
+          dnf install -y "${rpms[@]}"
+          porthole --version
+          status=0
+          porthole doctor --json > doctor.json || status=$?
+          echo "porthole doctor exited ${status}"
+          jq . doctor.json
+          test "$(jq -r '.checks[] | select(.name == "polkit") | .ok' doctor.json)" = "true"
+          test "$(jq -r '.checks[] | select(.name == "Expiry timer") | .ok' doctor.json)" = "true"
+
+  deb:
+    name: DEB (debian:13)
+    runs-on: ubuntu-24.04
+    container: debian:13
+    steps:
+      - name: git, before actions/checkout
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git dpkg-dev
+      - uses: actions/checkout@v5
+      # Debian 13 ships rustc 1.85 and this workspace needs 1.87.
+      # trixie-backports carries 1.94, but backports sit at pin priority 100
+      # and apt does not reach past the candidate for a versioned dependency:
+      # with the suite merely enabled, `apt-get build-dep .` reports
+      # "rustc (>= 1.87) but 1.85.0 is to be installed". `-t trixie-backports`
+      # asks for the whole resolution against the suite, which is one of the
+      # two routes debian/README.source records.
+      - name: trixie-backports
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          cat > /etc/apt/sources.list.d/backports.sources <<'SOURCES'
+          Types: deb
+          URIs: http://deb.debian.org/debian
+          Suites: trixie-backports
+          Components: main
+          Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+          SOURCES
+          apt-get update
+      - name: apt-get build-dep -t trixie-backports
+        run: |
+          set -euo pipefail
+          apt-get build-dep -y -t trixie-backports .
+          rustc --version
+          cargo --version
+      # `cargo build --locked` fetches from crates.io, so this build needs the
+      # network and is not archive-buildd-ready; see debian/README.source.
+      # debian/rules runs no tests, for the reasons stated in that file.
+      - name: dpkg-buildpackage -b -us -uc
+        run: dpkg-buildpackage -b -us -uc
+      - name: What was built
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          out="$(dirname "${GITHUB_WORKSPACE}")"
+          debs=("${out}"/*.deb)
+          printf '%s\n' "${debs[@]}"
+          base=("${out}"/porthole_*.deb)
+          gui=("${out}"/porthole-gui_*.deb)
+          test "${#base[@]}" -eq 1
+          test "${#gui[@]}" -eq 1
+          dpkg-deb -c "${base[0]}"
+          dpkg-deb -c "${gui[0]}"
+
+  aur:
+    name: AUR (archlinux)
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - name: git, before actions/checkout
+        run: pacman -Syu --noconfirm --needed git
+      - uses: actions/checkout@v5
+      # makepkg refuses to run as root, so the build runs as `builder`.
+      # base-devel carries the sudo that `makepkg --syncdeps` calls to reach
+      # pacman.
+      - name: An unprivileged build user
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          pacman -Syu --noconfirm --needed base-devel
+          useradd --create-home builder
+          printf 'builder ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/builder
+          chmod 0440 /etc/sudoers.d/builder
+      # sha256sums=('SKIP'), and no tag matching the source= URL is published,
+      # so makepkg has nothing to download. A `git archive` of this commit is
+      # placed under the name source= gives it, and makepkg uses that rather
+      # than fetching.
+      # The download half of source= is not exercised by this job.
+      - name: The tree, under the name source= expects
+        run: |
+          set -euo pipefail
+          pkgver="$(sed -n 's/^pkgver=//p' packaging/aur/PKGBUILD)"
+          echo "PKGBUILD pkgver: ${pkgver}"
+          test -n "${pkgver}"
+          install -d -o builder -g builder /home/builder/build
+          install -m 0644 -o builder -g builder \
+            packaging/aur/PKGBUILD /home/builder/build/PKGBUILD
+          git archive --prefix="porthole-${pkgver}/" \
+            -o "/home/builder/build/porthole-${pkgver}.tar.gz" HEAD
+          chown builder:builder "/home/builder/build/porthole-${pkgver}.tar.gz"
+      # --syncdeps so pacman installs what the PKGBUILD declares, which makes
+      # an under-declared dependency a failure here. check() runs
+      # `cargo test --release --locked -p porthole-core`; the PKGBUILD says
+      # why it is that package and not the workspace.
+      - name: makepkg --syncdeps
+        working-directory: /home/builder/build
+        run: sudo -u builder -H makepkg --syncdeps --noconfirm
+      - name: What was built
+        working-directory: /home/builder/build
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          pkgs=(*.pkg.tar.zst)
+          printf '%s\n' "${pkgs[@]}"
+          base=(porthole-[0-9]*.pkg.tar.zst)
+          gui=(porthole-gui-[0-9]*.pkg.tar.zst)
+          test "${#base[@]}" -eq 1
+          test "${#gui[@]}" -eq 1
+          bsdtar -tf "${base[0]}"
+          bsdtar -tf "${gui[0]}"
