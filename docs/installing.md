@@ -6,8 +6,13 @@
 privileged helper to act, and that helper has to be installed once, as root,
 before they work. This is that installation.
 
-porthole is not packaged for any distribution yet, but the repository's
-`Makefile` does install every piece into a `DESTDIR`:
+porthole is in no distribution's repositories yet, and there is no release to
+download. What the repository does carry is the packaging for three formats,
+each building from this source tree and each installing through the `Makefile`
+below rather than listing files of its own: a Debian package under `debian/`,
+an Arch `PKGBUILD` under `packaging/aur/`, and an RPM spec under
+`packaging/rpm/`. Until one of them is published — and on any distribution
+none of them covers — the `Makefile` installs every piece into a `DESTDIR`:
 
 ```bash
 make                                  # the CLI, the helper and the agent,
@@ -19,10 +24,12 @@ sudo make install PREFIX=/usr
 `make check-install` stages the same layout into a throwaway directory and
 prints what landed, without root. `PREFIX` defaults to `/usr`, not
 `/usr/local`, because two of the files below name `/usr/libexec/porthole-helper`
-literally — `make install` refuses to run when `LIBEXECDIR` and those files
-disagree, so a `PREFIX=/usr/local` install needs `LIBEXECDIR=/usr/libexec`
-passed alongside it. `WITH_GUI=0` leaves out the GUI binary, its desktop entry
-and its AppStream metainfo.
+literally. The `Makefile` compares `LIBEXECDIR` against those two files while
+it is being read, before any recipe runs, and stops there when they disagree —
+so a wrong `PREFIX` leaves nothing at all installed rather than half of it, and
+a `PREFIX=/usr/local` install needs `LIBEXECDIR=/usr/libexec` passed alongside
+it. `WITH_GUI=0` leaves out the GUI binary, its desktop entry and its AppStream
+metainfo.
 
 `make install` also rewrites one line it does not copy verbatim: the agent's
 user unit ships `ExecStart=/usr/local/bin/porthole-agent`, the path the
