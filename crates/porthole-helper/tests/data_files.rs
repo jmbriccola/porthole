@@ -200,3 +200,46 @@ fn the_policy_is_well_formed_xml() {
         &policy[policy.len().saturating_sub(80)..]
     );
 }
+
+/// gdk-pixbuf picks a loader by sniffing the start of a file, and its window is
+/// 128 bytes. An SVG whose root element begins after that is reported as
+/// "couldn't recognize the image file format" — the file is never parsed, so a
+/// well-formed icon can be invisible everywhere while every other check passes.
+///
+/// Both shipped icons started with a five-line comment above `<svg`, which put
+/// the element at byte 337 and 619. The application had no icon in the shell,
+/// in the dock, on Wayland or on X11.
+#[test]
+fn every_shipped_icon_is_recognisable_as_an_svg() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/icons");
+    let mut checked = 0;
+    let mut stack = vec![std::path::PathBuf::from(dir)];
+    while let Some(path) = stack.pop() {
+        for entry in std::fs::read_dir(&path).unwrap_or_else(|e| panic!("{path:?}: {e}")) {
+            let entry = entry.expect("readable directory entry").path();
+            if entry.is_dir() {
+                stack.push(entry);
+                continue;
+            }
+            if entry.extension().is_none_or(|e| e != "svg") {
+                continue;
+            }
+            let bytes = std::fs::read(&entry).expect("readable icon");
+            let at = bytes
+                .windows(4)
+                .position(|w| w == b"<svg")
+                .unwrap_or_else(|| panic!("{entry:?} has no <svg element at all"));
+            assert!(
+                at < 128,
+                "{entry:?} puts <svg at byte {at}; gdk-pixbuf sniffs 128 and \
+                 reports the file as an unrecognised format, so the icon never \
+                 renders. Move anything above it below the opening tag.",
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 2,
+        "expected to find the shipped icons, checked {checked}"
+    );
+}

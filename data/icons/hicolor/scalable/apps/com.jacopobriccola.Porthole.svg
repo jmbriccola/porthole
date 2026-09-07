@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- com.jacopobriccola.Porthole: the app icon. A ship's porthole, literally:
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- com.jacopobriccola.Porthole: the app icon. A ship's porthole, literally:
      a round window that opens onto the network beyond, then closes again by
      itself. 128x128 viewBox per the freedesktop hicolor "scalable" size
      class; every shape is relative to that so it scales cleanly. -->
-<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
   <defs>
     <radialGradient id="glass" cx="42%" cy="38%" r="70%">
       <stop offset="0%" stop-color="#a8dcf0"/>
