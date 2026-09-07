@@ -1,7 +1,12 @@
 FROM registry.fedoraproject.org/fedora:44
+# `xprop` reads the X11 properties of a window this image's Xvfb is
+# displaying. `crates/porthole-gui/tests/identity.rs` uses it for something
+# a GTK process cannot read back out of its own widgets: the WM_CLASS its
+# window actually put on the X server, which is the name a desktop
+# environment looks the application's entry up by.
 RUN dnf install -y --setopt=install_weak_deps=False \
       gtk4-devel libadwaita-devel cargo rust clippy pkgconf-pkg-config \
-      xorg-x11-server-Xvfb dbus-daemon gcc curl \
+      xorg-x11-server-Xvfb xprop dbus-daemon gcc curl \
     && dnf clean all
 
 # A pinned 1.87 toolchain, installed alongside (not instead of) the dnf

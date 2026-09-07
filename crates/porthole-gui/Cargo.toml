@@ -96,6 +96,17 @@ name = "busy"
 path = "tests/busy.rs"
 harness = false
 
+# Same reasoning again, and one addition of its own: `tests/identity.rs`
+# runs `app::build()`, which sets `prgname` -- process-wide state, and the
+# state whose value that file's whole point is to measure. Every other
+# target here builds `adw::Application`s under ids of its own; keeping this
+# one in its own process is what leaves each of those measuring what it
+# meant to.
+[[test]]
+name = "identity"
+path = "tests/identity.rs"
+harness = false
+
 [dependencies]
 porthole-core = { path = "../porthole-core" }
 gtk = { package = "gtk4", version = "0.9" }
