@@ -7,10 +7,10 @@
 #
 # Nothing here lists a file. The install layout lives in the repository's
 # Makefile and only there, and `make install DESTDIR="$pkgdir" PREFIX=/usr`
-# is what package() runs. crates/porthole-cli/tests/install_layout.rs stages
-# a real `make install` on every `cargo test` and compares the resulting file
-# set for equality, so a package() that copied files by hand would be
-# comparing against nothing.
+# is what puts it down. crates/porthole-cli/tests/install_layout.rs stages
+# real `make install WITH_GUI=0` and `make install-gui` runs on every
+# `cargo test` and compares what those two calls produce against a
+# written-out list of paths: equal in union, and sharing none.
 
 pkgbase=porthole
 pkgname=('porthole' 'porthole-gui')
@@ -112,6 +112,18 @@ build() {
 	export CARGO_TARGET_DIR=target
 	export CARGO_NET_OFFLINE=true
 
+	# cargo's release profile carries debug = false, so without this the
+	# binaries reach makepkg with a symbol table and no DWARF, and the
+	# porthole-debug package split out of them holds a .debug file with no
+	# debug information in it -- four namcap errors, plus
+	# `W: Directory (usr/src/debug/porthole) is empty`. This is cargo's
+	# setting rather than makepkg's, and debian/rules exports the same one
+	# for the same reason. debug = 1 is line tables, which is what makes that
+	# package worth the space it takes; makepkg's own strip moves it out of
+	# the shipped binaries either way. `options=(!debug)` is the other answer
+	# and was not taken: a backtrace from a root-owned helper is worth having.
+	export CARGO_PROFILE_RELEASE_DEBUG=1
+
 	# `make` builds the CLI, the helper and the agent, and renders the eleven
 	# man pages and the three completion files as part of it. porthole-gui is
 	# not a workspace default-member, so it needs its own target.
@@ -141,6 +153,13 @@ check() {
 package_porthole() {
 	pkgdesc='Open a port to your local network, temporarily and on purpose.'
 
+	# /etc/xdg/autostart/porthole-agent.desktop is the one file here a user
+	# has a reason to edit: `Hidden=true` in it is how you stop the agent
+	# autostarting without uninstalling anything. dpkg records it as a
+	# conffile on its own; pacman records nothing unless it is named here,
+	# and would overwrite that edit on upgrade with no .pacnew beside it.
+	backup=('etc/xdg/autostart/porthole-agent.desktop')
+
 	# Arch has no rich dependencies -- there is no way to write "firewalld or
 	# ufw or nftables" in depends=. porthole drives whichever of the three is
 	# installed, needs none of them present to install, and does not install
@@ -162,9 +181,10 @@ package_porthole() {
 	# data/porthole-helper.service (ExecStart=) both name
 	# /usr/libexec/porthole-helper literally, and dbus-daemon and systemd read
 	# the path out of those installed files rather than from any build
-	# variable. `make install-helper` greps both files and stops when
-	# LIBEXECDIR disagrees with them, so LIBEXECDIR=/usr/lib does not install
-	# a helper the bus cannot activate -- it refuses to install at all.
+	# variable. The Makefile greps both files while it is being read and
+	# stops there when LIBEXECDIR disagrees with them, so LIBEXECDIR=/usr/lib
+	# does not install a helper the bus cannot activate -- it installs
+	# nothing at all.
 	# namcap reports this as `E: ELF file ('usr/libexec/porthole-helper')
 	# outside of a valid path`, plus two non-standard-directory warnings for
 	# usr/libexec/ and the binary in it. That error is the only one namcap

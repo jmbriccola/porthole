@@ -23,6 +23,7 @@ pkgname = porthole
 	optdepends = firewalld: firewall backend, preferred when installed
 	optdepends = ufw: firewall backend, used when firewalld is absent
 	optdepends = nftables: firewall backend, used when firewalld and ufw are absent
+	backup = etc/xdg/autostart/porthole-agent.desktop
 
 pkgname = porthole-gui
 	pkgdesc = GTK4/libadwaita front end for porthole
