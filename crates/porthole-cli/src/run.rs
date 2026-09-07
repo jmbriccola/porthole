@@ -145,22 +145,6 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
     let port = validate::parse_port(&args.port)?;
     let protocol = validate::parse_protocol(&args.proto)?;
 
-    // `--to` may name a saved device instead of an ordinary scope.
-    // Resolution happens here, client-side: the helper (and, under
-    // --dry-run, the local engine below) must only ever see an
-    // already-resolved IP -- see `porthole_core::devices`'s own module doc
-    // for why. `wire_to` is what actually crosses the bus for a real (non
-    // dry-run) open; for anything but a device it is `args.to` unchanged.
-    let (scope, wire_to): (ScopeSpec, String) = match crate::cli::parse_to(&args.to) {
-        crate::cli::ToSpec::Scope(scope) => (scope, args.to.clone()),
-        crate::cli::ToSpec::Invalid(err) => return Err(err),
-        crate::cli::ToSpec::Device(name) => {
-            let book = devices::Book::load(&devices::default_path())?;
-            let runner = make_runner(cli);
-            let addr = devices::resolve(&book, &name, runner.as_ref())?;
-            (ScopeSpec::Host(addr), addr.to_string())
-        }
-    };
     let lifetime = match (&args.duration, args.until_reboot) {
         (Some(raw), false) => Lifetime::For(validate::parse_duration(raw)?),
         (None, true) => Lifetime::UntilReboot,
@@ -170,6 +154,27 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
             return Err(Error::InvalidArgument(
                 "--for and --until-reboot cannot be combined".to_string(),
             ))
+        }
+    };
+
+    // `--to` may name a saved device instead of an ordinary scope.
+    // Resolution happens here, client-side: the helper (and, under
+    // --dry-run, the local engine below) must only ever see an
+    // already-resolved IP -- see `porthole_core::devices`'s own module doc
+    // for why. `wire_to` is what actually crosses the bus for a real (non
+    // dry-run) open; for anything but a device it is `args.to` unchanged.
+    //
+    // Below the duration, deliberately: resolving a device spawns `ip -4
+    // neigh show` or `getent`, and `--for 999h` must be refused without
+    // running either.
+    let (scope, wire_to): (ScopeSpec, String) = match crate::cli::parse_to(&args.to) {
+        crate::cli::ToSpec::Scope(scope) => (scope, args.to.clone()),
+        crate::cli::ToSpec::Invalid(err) => return Err(err),
+        crate::cli::ToSpec::Device(name) => {
+            let book = devices::Book::load(&devices::default_path())?;
+            let runner = make_runner(cli);
+            let addr = devices::resolve(&book, &name, runner.as_ref())?;
+            (ScopeSpec::Host(addr), addr.to_string())
         }
     };
 

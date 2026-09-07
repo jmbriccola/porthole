@@ -181,20 +181,19 @@ fn parse_docker_chain(text: &str) -> Result<Vec<Published>> {
         let Some(to_destination) = flag_value(&tokens, "--to-destination") else {
             continue;
         };
-        let Some((container_addr, container_port)) = to_destination.split_once(':') else {
+        let Some((container_addr, container_ports)) = to_destination.split_once(':') else {
             continue;
         };
         let Ok(container_addr) = container_addr.parse::<Ipv4Addr>() else {
             continue;
         };
-        let Ok(container_port) = container_port.parse::<u16>() else {
+        // `--to-destination` writes a port range with a hyphen, unlike
+        // `--dport`'s colon.
+        let Some(container_ports) = port_range(container_ports, '-') else {
             continue;
         };
 
-        let Some(dport) = flag_value(&tokens, "--dport") else {
-            continue;
-        };
-        let Ok(host_port) = dport.parse::<u16>() else {
+        let Some(host_ports) = host_ports(&tokens) else {
             continue;
         };
 
@@ -227,15 +226,72 @@ fn parse_docker_chain(text: &str) -> Result<Vec<Published>> {
             }
         };
 
-        out.push(Published {
-            host_addr,
-            host_port,
-            protocol,
-            container_addr,
-            container_port,
-        });
+        // One `Published` per host port the rule actually covers. A range
+        // maps onto the destination range by offset, which is what
+        // `iptables` itself does; a single destination port takes every host
+        // port in the rule. Any other pairing is a rule this parser cannot
+        // read, and is skipped whole rather than guessed at.
+        let container_ports: Vec<u16> = if container_ports.len() == 1 {
+            vec![container_ports[0]; host_ports.len()]
+        } else if container_ports.len() == host_ports.len() {
+            container_ports
+        } else {
+            continue;
+        };
+
+        for (host_port, container_port) in host_ports.into_iter().zip(container_ports) {
+            out.push(Published {
+                host_addr,
+                host_port,
+                protocol,
+                container_addr,
+                container_port,
+            });
+        }
     }
     Ok(out)
+}
+
+/// The host ports one rule covers, from `--dport` or multiport `--dports`.
+///
+/// Three shapes, all of them `iptables` syntax rather than anything Docker
+/// specific: a single port, a `low:high` range (`--dport 8000:8010`, which
+/// `-p 8000-8010:8000-8010` produces), and multiport's comma-separated list
+/// (`-m multiport --dports 80,443`), whose entries may themselves be ranges.
+///
+/// `None` for anything else, which skips the rule. Each returned port
+/// becomes its own [`Published`]: the struct describes one host port, and
+/// widening it to hold a range would change a type `porthole-gui` also
+/// builds and match on.
+fn host_ports(tokens: &[&str]) -> Option<Vec<u16>> {
+    if let Some(single) = flag_value(tokens, "--dport") {
+        return port_range(single, ':');
+    }
+    let list = flag_value(tokens, "--dports")?;
+    let mut out = Vec::new();
+    for part in list.split(',') {
+        out.extend(port_range(part, ':')?);
+    }
+    Some(out)
+}
+
+/// `raw` as the ports it names: `"80"` is one, `"80<sep>443"` is every port
+/// from 80 to 443 inclusive. `None` if it is neither, or if the range runs
+/// backwards.
+///
+/// The separator differs by flag -- `--dport` uses `:` and
+/// `--to-destination` uses `-` -- so it is a parameter rather than an
+/// assumption.
+fn port_range(raw: &str, separator: char) -> Option<Vec<u16>> {
+    if let Some((low, high)) = raw.split_once(separator) {
+        let low: u16 = low.parse().ok()?;
+        let high: u16 = high.parse().ok()?;
+        if low > high {
+            return None;
+        }
+        return Some((low..=high).collect());
+    }
+    Some(vec![raw.parse::<u16>().ok()?])
 }
 
 /// What to tell someone opening `port`/`protocol` when Docker already has an
@@ -244,9 +300,20 @@ fn parse_docker_chain(text: &str) -> Result<Vec<Published>> {
 /// the two exceptional ones: warning on every single open, docker-affected
 /// or not, would train a user to skip the one message that actually matters.
 pub fn advise(port: u16, protocol: Protocol, published: &[Published]) -> Option<String> {
+    // Not the first match: the most exposing one. A port can carry more than
+    // one DNAT rule -- `-p 127.0.0.1:5432:80 -p 0.0.0.0:5432:80` is two
+    // rules on one host port -- and the advice for each is opposite. Taking
+    // whichever came first in the chain would, half the time, tell a user
+    // that a port reachable from their network is not on it. Ordering by
+    // exposure means the message can only ever err towards warning.
     let entry = published
         .iter()
-        .find(|p| p.host_port == port && p.protocol == protocol)?;
+        .filter(|p| p.host_port == port && p.protocol == protocol)
+        .min_by_key(|p| match p.host_addr {
+            None => 0,                              // every interface
+            Some(addr) if !addr.is_loopback() => 1, // one address on the network
+            Some(_) => 2,                           // loopback only
+        })?;
 
     Some(match entry.host_addr {
         // Restricted to loopback: Docker's own DNAT rule only matches
@@ -394,6 +461,98 @@ mod tests {
 -A DOCKER -d not-an-address/32 ! -i docker0 -p tcp -m tcp --dport 8080 -j DNAT --to-destination 172.17.0.2:80
 ";
         assert!(parse_docker_chain(text).unwrap().is_empty());
+    }
+
+    /// A ranged and a multiport DNAT rule, in `iptables(8)`'s own syntax.
+    ///
+    /// Not captured: publishing a range would have meant writing real DNAT
+    /// rules into this machine's `nat` table, which this work was not
+    /// permitted to do. These are written from the flag syntax -- `--dport`
+    /// separates a range with `:`, `--to-destination` with `-`, and
+    /// multiport takes a comma-separated `--dports` -- so what they pin is
+    /// this parser's handling of those spellings, not that Docker emits
+    /// exactly these bytes.
+    #[cfg(test)]
+    const DOCKER_CHAIN_RANGES: &str = "\
+-N DOCKER
+-A DOCKER ! -i docker0 -p tcp -m tcp --dport 8000:8002 -j DNAT --to-destination 172.17.0.2:9000-9002
+-A DOCKER ! -i docker0 -p tcp -m multiport --dports 80,443 -j DNAT --to-destination 172.17.0.3:8080
+";
+
+    #[test]
+    fn a_ranged_rule_covers_every_port_in_it_mapped_by_offset() {
+        // Previously skipped whole, so `advise` stayed silent about every
+        // port in a published range -- the quiet direction, but wrong.
+        let found = parse_docker_chain(DOCKER_CHAIN_RANGES).unwrap();
+        let ranged: Vec<&Published> = found
+            .iter()
+            .filter(|p| (8000..=8002).contains(&p.host_port))
+            .collect();
+        assert_eq!(ranged.len(), 3);
+        for (i, p) in ranged.iter().enumerate() {
+            assert_eq!(p.host_port, 8000 + i as u16);
+            assert_eq!(p.container_port, 9000 + i as u16, "mapped by offset");
+            assert_eq!(p.host_addr, None);
+        }
+        assert!(advise(8001, Protocol::Tcp, &found).is_some());
+    }
+
+    #[test]
+    fn a_multiport_rule_covers_each_port_it_lists() {
+        let found = parse_docker_chain(DOCKER_CHAIN_RANGES).unwrap();
+        for port in [80, 443] {
+            let p = found
+                .iter()
+                .find(|p| p.host_port == port)
+                .unwrap_or_else(|| panic!("{port} missing"));
+            assert_eq!(p.container_port, 8080, "one destination takes them all");
+        }
+        // And nothing in between was invented.
+        assert!(!found.iter().any(|p| p.host_port == 81));
+    }
+
+    #[test]
+    fn a_range_that_cannot_be_paired_is_skipped_rather_than_guessed_at() {
+        // A backwards range, and a host range that does not line up with its
+        // destination range. Guessing either would report ports as published
+        // that may not be.
+        for line in [
+            "-A DOCKER -p tcp --dport 9000:8000 -j DNAT --to-destination 172.17.0.2:80",
+            "-A DOCKER -p tcp --dport 8000:8002 -j DNAT --to-destination 172.17.0.2:9000-9005",
+        ] {
+            assert!(
+                parse_docker_chain(line).unwrap().is_empty(),
+                "must skip: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_most_exposing_rule_wins_when_one_port_has_several() {
+        // `-p 127.0.0.1:5432:80 -p 0.0.0.0:5432:80` is two rules on one host
+        // port, and their advice is opposite. Taking whichever came first
+        // would tell the user a port reachable from their network is not on
+        // it, half the time. Both orderings are checked, since "first" is
+        // exactly what was wrong.
+        let loopback = Published {
+            host_addr: Some(Ipv4Addr::LOCALHOST),
+            host_port: 5432,
+            protocol: Protocol::Tcp,
+            container_addr: "172.17.0.3".parse().unwrap(),
+            container_port: 80,
+        };
+        let everywhere = Published {
+            host_addr: None,
+            ..loopback
+        };
+
+        for pair in [vec![loopback, everywhere], vec![everywhere, loopback]] {
+            let advice = advise(5432, Protocol::Tcp, &pair).unwrap();
+            assert!(
+                advice.contains("already reachable"),
+                "the exposing rule must win, got: {advice}"
+            );
+        }
     }
 
     #[test]

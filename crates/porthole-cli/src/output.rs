@@ -30,9 +30,20 @@ use serde_json::{json, Value};
 /// belongs beside a `Service`, not inside one. See `docs/json-schema.md`'s
 /// `listen --json` section for the JSON shape this produces.
 fn docker_for(port: u16, protocol: Protocol, docker: &[Published]) -> Option<Published> {
+    // The most exposing match, not the first -- one host port can carry more
+    // than one DNAT rule, and `docs/json-schema.md` documents this field as a
+    // single object. Reporting the loopback rule of a port that is *also*
+    // published on every interface would tell a script the port is not
+    // reachable from the network when it is. Same ordering as
+    // `porthole_core::docker::advise`, and for the same reason.
     docker
         .iter()
-        .find(|p| p.host_port == port && p.protocol == protocol)
+        .filter(|p| p.host_port == port && p.protocol == protocol)
+        .min_by_key(|p| match p.host_addr {
+            None => 0,
+            Some(addr) if !addr.is_loopback() => 1,
+            Some(_) => 2,
+        })
         .copied()
 }
 

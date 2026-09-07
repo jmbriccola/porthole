@@ -16,6 +16,24 @@ fn porthole(args: &[&str], state: &Path) -> Output {
         .expect("porthole binary runs")
 }
 
+/// `porthole` with the address book pointed at a file of this test's own.
+/// `PORTHOLE_DEVICES_FILE` is honoured in debug builds only, which is what
+/// a test binary always is.
+fn porthole_with_devices(args: &[&str], state: &Path, devices: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_porthole"))
+        .args(args)
+        .env("PORTHOLE_STATE_FILE", state)
+        .env("PORTHOLE_DEVICES_FILE", devices)
+        .output()
+        .expect("porthole binary runs")
+}
+
+/// A book with one device in it, written straight to disk -- `devices add`
+/// is an interactive prompt and cannot be driven from here.
+fn write_book(path: &Path, body: &str) {
+    std::fs::write(path, body).expect("the temp dir is writable");
+}
+
 fn code(out: &Output) -> i32 {
     out.status
         .code()
@@ -537,4 +555,154 @@ fn doctor_names_all_three_backends_when_none_is_found() {
         !remedy.to_lowercase().contains("wait for"),
         "must not tell someone to wait for a backend that already shipped: {remedy}"
     );
+}
+
+// --- saved devices, through the real binary -------------------------------
+//
+// `porthole_core::devices::resolve` has its own tests. What these cover is
+// the layer above it: which branch `--to` lands in, and what `open` does
+// with each -- none of which had a test at all.
+
+#[test]
+fn open_towards_an_unknown_device_says_so_and_lists_what_exists() {
+    let dir = TempDir::new().unwrap();
+    let book = dir.path().join("devices.toml");
+    write_book(
+        &book,
+        "[[device]]\nname = \"phone\"\nmac = \"bc:24:11:5e:1c:6e\"\n",
+    );
+
+    let out = porthole_with_devices(
+        &["open", "5173", "--to", "tablet"],
+        &state_path(&dir),
+        &book,
+    );
+
+    // Invalid arguments, not "device unreachable": the name is wrong, not
+    // the device absent.
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    let text = stderr(&out);
+    assert!(text.contains("tablet"), "name the device asked for: {text}");
+    assert!(text.contains("phone"), "and say what does exist: {text}");
+}
+
+#[test]
+fn open_towards_a_saved_device_that_is_absent_exits_device_unreachable() {
+    if !have("ip") {
+        return; // resolution shells out to `ip -4 neigh show`.
+    }
+    let dir = TempDir::new().unwrap();
+    let book = dir.path().join("devices.toml");
+    // A MAC from the reserved documentation range, which will not be in any
+    // real neighbour table.
+    write_book(
+        &book,
+        "[[device]]\nname = \"ghost\"\nmac = \"00:00:5e:00:53:01\"\n",
+    );
+
+    let out = porthole_with_devices(&["open", "5173", "--to", "ghost"], &state_path(&dir), &book);
+
+    assert_eq!(code(&out), 6, "{}", stderr(&out));
+    assert!(stderr(&out).contains("ghost"), "{}", stderr(&out));
+}
+
+#[test]
+fn a_to_that_looks_like_a_failed_network_keeps_the_network_error() {
+    let dir = TempDir::new().unwrap();
+    let book = dir.path().join("devices.toml");
+    write_book(&book, "");
+
+    // An IPv6 address must be answered as IPv6-unsupported, never as "no
+    // such device" -- the distinction `cli::parse_to` exists to keep.
+    let out = porthole_with_devices(
+        &["open", "5173", "--to", "fe80::1"],
+        &state_path(&dir),
+        &book,
+    );
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    let text = stderr(&out).to_lowercase();
+    assert!(text.contains("ipv6"), "got: {text}");
+    assert!(
+        !text.contains("saved device"),
+        "must not be reported as a device lookup: {text}"
+    );
+}
+
+#[test]
+fn a_bad_duration_is_refused_before_a_device_is_resolved() {
+    // Resolution shells out; `--for 999h` is refusable without doing that.
+    // What this pins is the ordering: the duration error, not a device one.
+    let dir = TempDir::new().unwrap();
+    let book = dir.path().join("devices.toml");
+    write_book(
+        &book,
+        "[[device]]\nname = \"ghost\"\nmac = \"00:00:5e:00:53:01\"\n",
+    );
+
+    let out = porthole_with_devices(
+        &["open", "5173", "--to", "ghost", "--for", "999h"],
+        &state_path(&dir),
+        &book,
+    );
+
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    let text = stderr(&out);
+    assert!(
+        !text.contains("not on this network"),
+        "the device must never have been resolved: {text}"
+    );
+}
+
+#[test]
+fn a_hand_edited_book_with_an_unusable_name_fails_naming_it() {
+    let dir = TempDir::new().unwrap();
+    let book = dir.path().join("devices.toml");
+    write_book(
+        &book,
+        "[[device]]\nname = \"office:pc\"\nmac = \"bc:24:11:5e:1c:6e\"\n",
+    );
+
+    // `devices list` is enough to reach `Book::load`.
+    let out = porthole_with_devices(&["devices", "list"], &state_path(&dir), &book);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(stderr(&out).contains("office:pc"), "{}", stderr(&out));
+}
+
+#[test]
+fn devices_rm_honours_json_and_reports_what_it_forgot() {
+    let dir = TempDir::new().unwrap();
+    let book = dir.path().join("devices.toml");
+    write_book(
+        &book,
+        "[[device]]\nname = \"phone\"\nmac = \"bc:24:11:5e:1c:6e\"\n",
+    );
+
+    let out = porthole_with_devices(
+        &["--json", "devices", "rm", "phone"],
+        &state_path(&dir),
+        &book,
+    );
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout(&out)).unwrap_or_else(|e| panic!("{e}: {}", stdout(&out)));
+    assert_eq!(json["schema"], 1);
+    assert_eq!(json["action"], "forgotten");
+    assert_eq!(json["device"]["name"], "phone");
+
+    // And it really is gone.
+    let out = porthole_with_devices(&["--json", "devices", "list"], &state_path(&dir), &book);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    assert_eq!(json["devices"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn devices_rm_of_something_that_is_not_there_fails_rather_than_reporting_success() {
+    let dir = TempDir::new().unwrap();
+    let book = dir.path().join("devices.toml");
+    write_book(&book, "");
+
+    let out = porthole_with_devices(&["devices", "rm", "phone"], &state_path(&dir), &book);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(stderr(&out).contains("phone"), "{}", stderr(&out));
 }

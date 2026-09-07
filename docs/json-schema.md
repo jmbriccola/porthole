@@ -338,6 +338,16 @@ protocol, so a published UDP port leaves a TCP row on the same number at
 `null`. `published_on` is the address Docker's own rule restricts
 the port to — `null` means every interface (no `-d` on the rule, i.e.
 published on `0.0.0.0`), a string like `"127.0.0.1"` means only that address.
+
+One host port can carry more than one DNAT rule — `-p 127.0.0.1:5432:80 -p
+0.0.0.0:5432:80` is two — and this field holds one object. It reports the
+**most exposing** of them: every interface first, then a specific address,
+then loopback. So `published_on: null` on a port that is also bound to
+loopback is not a contradiction, and the field never understates how
+reachable a port is.
+
+A rule that publishes a range (`-p 8000-8010:9000-9010`) or a multiport list
+counts as published for every port it names, each matched on its own.
 See `porthole open --json`'s own `docker_note` for the two-sentence version
 of what this means for a person opening that exact port, and
 `porthole_core::docker`'s own module doc for why both directions — already

@@ -330,7 +330,7 @@ pub fn current_network(runner: &dyn CommandRunner) -> Result<LocalNetwork> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::command::{CommandRunner, Output, RecordingRunner};
     use std::net::Ipv4Addr;
@@ -460,7 +460,12 @@ mod tests {
     /// the case that matters: an `INCOMPLETE` entry has no `lladdr` field at
     /// all, so a positional parse that assumed field 5 held the MAC would
     /// read the state word itself as one.
-    const IP_NEIGH: &str = "\
+    ///
+    /// Shared with `devices`' own tests, which resolve saved devices against
+    /// it -- the same arrangement `backend::firewalld::tests::ROUTE_JSON`
+    /// already has with `reconcile`. One captured table, so a device test
+    /// and a parser test cannot drift apart on what `ip` prints.
+    pub(crate) const IP_NEIGH: &str = "\
 10.10.10.1 dev wlo1 lladdr 50:e6:36:51:42:fd REACHABLE
 10.10.10.245 dev wlo1 lladdr bc:24:11:5e:1c:6e STALE
 10.10.10.101 dev wlo1 INCOMPLETE

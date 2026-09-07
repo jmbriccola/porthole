@@ -358,10 +358,16 @@ fn resolve_host(runner: &dyn CommandRunner, name: &str, host: &str) -> Result<Ip
     let cmd = Command::read("getent", ["ahostsv4", host]);
     let out = runner.run(&cmd)?;
     if !out.success() {
-        return Err(Error::DeviceUnreachable(format!(
-            "`{name}` ({host}) did not resolve: {}",
-            out.stderr.trim()
-        )));
+        // `getent` says nothing at all for a name it simply cannot find --
+        // exit 2, no stdout, no stderr -- so appending its stderr
+        // unconditionally ended the message with a colon and nothing after
+        // it. Only a `getent` that actually said something gets a colon.
+        let detail = out.stderr.trim();
+        return Err(Error::DeviceUnreachable(if detail.is_empty() {
+            format!("`{name}` ({host}) did not resolve")
+        } else {
+            format!("`{name}` ({host}) did not resolve: {detail}")
+        }));
     }
     out.stdout
         .lines()
@@ -379,6 +385,9 @@ fn resolve_host(runner: &dyn CommandRunner, name: &str, host: &str) -> Result<Ip
 mod tests {
     use super::*;
     use crate::command::{Output, RecordingRunner};
+    // The one captured `ip -4 neigh show` this crate keeps, rather than a
+    // second copy here that could drift from it.
+    use crate::net::tests::IP_NEIGH;
     use tempfile::TempDir;
 
     fn book_with(name: &str, mac: &str) -> Book {
@@ -394,13 +403,6 @@ mod tests {
             address: DeviceAddress::Host(host.to_string()),
         }])
     }
-
-    const IP_NEIGH: &str = "\
-10.10.10.1 dev wlo1 lladdr 50:e6:36:51:42:fd REACHABLE
-10.10.10.245 dev wlo1 lladdr bc:24:11:5e:1c:6e STALE
-10.10.10.101 dev wlo1 INCOMPLETE
-10.10.10.17 dev wlo1 lladdr bc:24:11:99:5d:f3 STALE
-";
 
     #[test]
     fn a_mac_is_matched_case_insensitively() {
@@ -488,6 +490,39 @@ mod tests {
         let err = resolve(&book, "printer", &runner).unwrap_err();
         assert_eq!(err.exit_code(), crate::error::ExitCode::DeviceUnreachable);
         assert!(err.to_string().contains("printer"), "got: {err}");
+    }
+
+    #[test]
+    fn a_silent_getent_failure_does_not_end_the_message_with_a_bare_colon() {
+        // What `getent ahostsv4` really does for a name it cannot find,
+        // checked on this machine: exit 2, nothing on stdout, nothing on
+        // stderr. Appending that empty stderr after a colon left the user
+        // reading "... did not resolve: " with nothing after it.
+        let book = book_with_host("printer", "printer.local");
+        let runner = RecordingRunner::with_responses(vec![Output {
+            status: 2,
+            stdout: String::new(),
+            stderr: String::new(),
+        }]);
+        let err = resolve(&book, "printer", &runner).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("did not resolve"), "got: {text}");
+        assert!(
+            !text.trim_end().ends_with(':'),
+            "nothing follows the colon: {text}"
+        );
+    }
+
+    #[test]
+    fn a_getent_that_did_say_something_still_passes_it_on() {
+        // The other half: when there is a reason, it must not be dropped in
+        // the course of suppressing the empty one.
+        let book = book_with_host("printer", "printer.local");
+        let runner = RecordingRunner::with_responses(vec![Output::failure(
+            "getent: unknown database `ahostsv4'",
+        )]);
+        let err = resolve(&book, "printer", &runner).unwrap_err();
+        assert!(err.to_string().contains("unknown database"), "got: {err}");
     }
 
     #[test]
