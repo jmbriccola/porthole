@@ -1,3 +1,29 @@
+## DO NOT SHIP THIS MODULE YET.
+##
+## Loading it stops porthole-helper from starting at all. Two rules are
+## missing, both found by reading the running policy rather than by loading
+## this one:
+##
+##   1. porthole-helper.service sets NoNewPrivileges=yes, and the
+##      nnp_nosuid_transition policy capability is enabled on Fedora 44.
+##      init_daemon_domain() grants no process2 permission, so pid 1's
+##      check_nnp_nosuid() denies the execve and the unit never launches.
+##      Needs init_nnp_daemon_domain(porthole_helper_t), and the same
+##      process2 nnp_transition toward iptables_t and ifconfig_t, since
+##      no_new_privs is inherited and cannot be cleared.
+##
+##   2. Every backend runs through Command::output(), which pipes stdout
+##      and stderr. After the domain transition the child writes a fifo_file
+##      labelled porthole_helper_t, and there is no generic
+##      allow domain domain:fifo_file rule. Every caller in the base policy
+##      carries an explicit one; this module does not. Without it nft, ip
+##      and iptables run and their output is discarded -- a silent misread,
+##      not an error.
+##
+## The helper runs unconfined today, so a permissive-mode run shows zero
+## denials. That silence means nothing is confined, not that nothing is
+## needed.
+##
 policy_module(porthole, 0.1.0)
 
 ########################################
