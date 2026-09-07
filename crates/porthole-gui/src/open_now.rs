@@ -15,10 +15,13 @@
 //! `app.rs`'s module doc for why those two are not the same bus despite
 //! sharing a name), then drops the closed rule from its own list and
 //! re-renders -- no second `list` round trip needed, since the caller
-//! already knows the `id` it just asked the helper to close. The helper's
-//! own response is only checked for success or failure here, not read for
-//! its content. A close that fails shows the helper's own message in an
-//! `adw::Toast`, verbatim: milestone 2
+//! already knows the `id` it just asked the helper to close. What that
+//! re-render leaves is also handed to whatever registered
+//! [`OpenNowSection::connect_close_succeeded`] -- a rule list this section
+//! changed on its own is one nothing else has been told about. The
+//! helper's own response is only checked for success or failure here, not
+//! read for its content. A close that fails shows the helper's own message
+//! in an `adw::Toast`, verbatim: milestone 2
 //! went to real trouble to stop the CLI from double-rendering exactly these
 //! strings, and a GUI toast must not reintroduce that.
 //!
@@ -105,6 +108,13 @@ use gtk::glib;
 use porthole_core::clock::{Clock, SystemClock};
 use porthole_core::ipc::{PortholeProxy, WireRule};
 
+/// What a caller registers through
+/// [`OpenNowSection::connect_close_succeeded`] to hear that a close this
+/// section issued came back successful, carrying the rules this section is
+/// showing now that it has re-rendered without the closed one. One slot,
+/// not a list: registering again replaces it.
+type CloseSucceededCallback = Rc<dyn Fn(&[WireRule])>;
+
 /// One rendered rule: the widgets `Inner::rows` needs to update or remove
 /// later, plus the one piece of the wire data the countdown needs on every
 /// tick. Everything else about the rule (title, subtitle) is baked into the
@@ -152,6 +162,11 @@ struct Inner {
     /// is no method that changes which clock a live section reads.
     clock: Box<dyn Clock>,
     toast_overlay: RefCell<Option<adw::ToastOverlay>>,
+    /// Where a successful close is announced, once this section has
+    /// re-rendered without the closed rule. Held on the section rather
+    /// than on the close buttons, so it outlives them: `apply` discards
+    /// every button it finds and builds new ones.
+    on_close_succeeded: RefCell<Option<CloseSucceededCallback>>,
 }
 
 impl Inner {
@@ -363,6 +378,10 @@ fn apply(inner: &Rc<Inner>, rules: &[WireRule]) {
 /// "remaining" from it would render state nobody confirmed -- including,
 /// starting from an emptied list, `apply`'s own calm empty-list rendering
 /// displacing whatever this section was showing instead.
+///
+/// The early return withholds the announcement too: the list
+/// [`OpenNowSection::connect_close_succeeded`]'s callback receives is the
+/// one `apply` has just rendered from.
 fn apply_close(inner: &Rc<Inner>, id: &str) {
     let rules = inner.rules.borrow();
     if !rules.iter().any(|r| r.id == id) {
@@ -371,6 +390,12 @@ fn apply_close(inner: &Rc<Inner>, id: &str) {
     let remaining: Vec<WireRule> = rules.iter().filter(|r| r.id != id).cloned().collect();
     drop(rules);
     apply(inner, &remaining);
+    // Cloned out of the cell before the call, so the callback is free to
+    // come back into this section.
+    let callback = inner.on_close_succeeded.borrow().clone();
+    if let Some(callback) = callback {
+        callback(&remaining);
+    }
 }
 
 /// Replaces whatever `inner.container` was showing with `error_page`,
@@ -488,6 +513,7 @@ impl OpenNowSection {
             rules: RefCell::new(Vec::new()),
             clock,
             toast_overlay: RefCell::new(None),
+            on_close_succeeded: RefCell::new(None),
         });
 
         // Keeps the on-screen countdown live on its own, without anything
@@ -518,6 +544,20 @@ impl OpenNowSection {
     /// always calls it.
     pub fn set_toast_overlay(&self, overlay: &adw::ToastOverlay) {
         *self.inner.toast_overlay.borrow_mut() = Some(overlay.clone());
+    }
+
+    /// Registers what to do when a close this section issued comes back
+    /// successful -- called with the rules this section is showing once it
+    /// has re-rendered without the closed one. Registering again replaces
+    /// the callback; never registering means a successful close changes
+    /// this section and tells nobody.
+    ///
+    /// This section holds no reference to any other, and this is how
+    /// something that does -- `PortholeWindow` -- learns that the rule list
+    /// changed. Same shape as `ListeningSection::connect_open_requested`,
+    /// registered from the same place for the same reason.
+    pub fn connect_close_succeeded(&self, f: impl Fn(&[WireRule]) + 'static) {
+        self.inner.on_close_succeeded.replace(Some(Rc::new(f)));
     }
 
     pub fn set_rules(&self, rules: &[WireRule]) {

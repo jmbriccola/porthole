@@ -546,13 +546,91 @@ fn a_close_resolving_after_a_refresh_failure_does_not_repaint_the_calm_state() -
     Ok(())
 }
 
+/// The same interleaving again, one layer out: the guard above also decides
+/// whether anything is announced. `connect_close_succeeded` hands its
+/// callback the list this section re-rendered from, and a close that
+/// resolves against a list it was not issued against never reaches that
+/// re-render -- so there is no list to hand out, and in particular not the
+/// empty one `set_unreachable` left behind, which a caller would read as
+/// "nothing is open" and mark its own rows from.
+fn a_close_resolving_after_a_refresh_failure_announces_nothing() -> Result<(), String> {
+    let announced = Rc::new(RefCell::new(Vec::new()));
+    let seen = announced.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenNowCloseRaceNoAnnouncement",
+        move |_app| {
+            let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
+            let rule = wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 3600);
+            let id = rule.id.clone();
+            section.set_rules(&[rule]);
+
+            let recorded = seen.clone();
+            section.connect_close_succeeded(move |remaining| {
+                recorded.borrow_mut().push(remaining.to_vec());
+            });
+
+            // The close is issued against the list above; a refresh failure
+            // lands before its reply does.
+            section.set_unreachable("could not reach the porthole helper: timed out");
+            section.simulate_close_succeeded(&id);
+        },
+    );
+    let calls = announced.borrow();
+    if !calls.is_empty() {
+        return Err(format!(
+            "a close resolving against a list it was not issued against must announce nothing, \
+             got {} call(s): {:?}",
+            calls.len(),
+            calls
+        ));
+    }
+    Ok(())
+}
+
+/// The other half of the same distinction, so the check above cannot pass
+/// by the callback never being called at all: an ordinary close, against
+/// the list it was issued against, announces exactly what is left.
+fn an_ordinary_close_announces_the_rules_that_remain() -> Result<(), String> {
+    let announced = Rc::new(RefCell::new(Vec::new()));
+    let seen = announced.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenNowCloseAnnouncement",
+        move |_app| {
+            let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
+            let closed = wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 3600);
+            let kept = wire_rule(BASE_TIME, 8080, "tcp", "10.10.10.0/24", 3600);
+            let id = closed.id.clone();
+            section.set_rules(&[closed, kept]);
+
+            let recorded = seen.clone();
+            section.connect_close_succeeded(move |remaining| {
+                recorded.borrow_mut().push(
+                    remaining
+                        .iter()
+                        .map(|r| r.id.clone())
+                        .collect::<Vec<String>>(),
+                );
+            });
+
+            section.simulate_close_succeeded(&id);
+        },
+    );
+    let calls = announced.borrow();
+    match calls.as_slice() {
+        [ids] if ids == &["8080/tcp".to_string()] => Ok(()),
+        other => Err(format!(
+            "a successful close must announce the rules that remain, once, got {other:?}"
+        )),
+    }
+}
+
 /// One named check, run by `main` below -- see `tests/window.rs`'s own
 /// `Case` alias for why this is a type alias rather than spelled out
 /// inline (the clippy finding that alias itself fixed there).
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 10] = [
+    let cases: [Case; 12] = [
         (
             "an_empty_list_is_a_calm_status_page_not_an_error",
             an_empty_list_is_a_calm_status_page_not_an_error,
@@ -592,6 +670,14 @@ fn main() {
         (
             "a_close_resolving_after_a_refresh_failure_does_not_repaint_the_calm_state",
             a_close_resolving_after_a_refresh_failure_does_not_repaint_the_calm_state,
+        ),
+        (
+            "a_close_resolving_after_a_refresh_failure_announces_nothing",
+            a_close_resolving_after_a_refresh_failure_announces_nothing,
+        ),
+        (
+            "an_ordinary_close_announces_the_rules_that_remain",
+            an_ordinary_close_announces_the_rules_that_remain,
         ),
     ];
 

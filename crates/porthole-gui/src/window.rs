@@ -319,6 +319,26 @@ impl PortholeWindow {
             present_open_dialog(&sections_for_row, &OpenDialog::for_port(port));
         });
 
+        // The other direction: what a successful close in "Open now" does
+        // to "Listening". That section withholds a row's Open button for a
+        // port the rule list names, and a close changes that list -- so it
+        // is told the list that close left behind, from the same section
+        // that now holds it. Registered here, and not in `open_now.rs`,
+        // for the reason the Open button's own callback is: neither
+        // section holds a reference to the other.
+        //
+        // `set_open_ports`, not `refresh`: the rules handed over are the
+        // ones "Open now" is showing, so both sections mark from one list
+        // rather than from two round trips that could land in either order.
+        // A close changes the rule list and nothing else this window reads
+        // -- the `/proc` listeners, the ports Docker publishes, the saved
+        // devices and every field of `WireStatus` are all independent of
+        // it.
+        let listening_for_close = listening.clone();
+        open_now.connect_close_succeeded(move |remaining| {
+            listening_for_close.set_open_ports(&open_tcp_ports(remaining));
+        });
+
         // No initial `refresh` here -- see `PortholeWindow::new` (the only
         // caller that wants one) and `PortholeWindow::new_without_initial_load`
         // (the one that deliberately does not) for where that call now
@@ -667,6 +687,23 @@ fn present_open_dialog(sections: &Sections, dialog: &OpenDialog) {
     dialog.present(Some(&sections.window));
 }
 
+/// Which ports [`ListeningSection::set_open_ports`] is given: the TCP ones,
+/// and only those. That section reads the list to withhold a row's Open
+/// button and print "already open", and `porthole_core::listening::scan`
+/// reports TCP sockets -- a UDP rule's port is not a listener that section
+/// lists, and including it would attach both to whatever TCP listener
+/// happens to share that port number.
+///
+/// One function, called from both places a rule list reaches that section:
+/// [`refresh`] below, and the close `PortholeWindow::build` registers.
+fn open_tcp_ports(rules: &[WireRule]) -> Vec<u16> {
+    rules
+        .iter()
+        .filter(|r| r.protocol == "tcp")
+        .map(|r| r.port)
+        .collect()
+}
+
 /// Populates "Open now", "Listening" and the status line -- the initial
 /// load this crate lacked before this task (see this module's own doc
 /// comment), and the same thing a successful open re-runs through
@@ -750,20 +787,7 @@ fn refresh(sections: &Sections) {
                 Some(Ok(snapshot)) => {
                     match snapshot.rules {
                         Ok(rules) => {
-                            // Scan-derived `open_ports` marks are read by
-                            // `ListeningSection` to withhold the Open button
-                            // and print "already open" -- both claims this
-                            // list can only back up for a port porthole
-                            // itself opened, i.e. a TCP rule (`scan` reports
-                            // TCP sockets only); a UDP rule's port is not a
-                            // listener this section will ever list, and
-                            // including it here would mislabel whatever TCP
-                            // listener happens to share that port number.
-                            let open_ports: Vec<u16> = rules
-                                .iter()
-                                .filter(|r| r.protocol == "tcp")
-                                .map(|r| r.port)
-                                .collect();
+                            let open_ports = open_tcp_ports(&rules);
                             open_now.set_rules(&rules);
                             listening.set_open_ports(&open_ports);
                         }
