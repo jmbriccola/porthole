@@ -82,9 +82,10 @@ sha256sums=('SKIP')
 # stay with the base package in both cases, because the agent's autostart
 # entry names the same icon.
 
-# No .install scriptlet, for either package. The post-install work this layout
-# needs is done by pacman hooks other packages already ship, each with a
-# Target that covers a directory installed into here:
+# No .install scriptlet for porthole-gui, and none of porthole's own is about
+# *installing*. The post-install work this layout needs is done by pacman
+# hooks other packages already ship, each with a Target that covers a
+# directory installed into here:
 #   systemd  30-systemd-daemon-reload-system.hook  usr/lib/systemd/system/*
 #   systemd  30-systemd-daemon-reload-user.hook    usr/lib/systemd/user/*
 #   dbus     dbus-reload.hook                      usr/share/dbus-1/system.d/*.conf
@@ -100,6 +101,15 @@ sha256sums=('SKIP')
 # Nothing here enables a unit either: porthole-helper.service is D-Bus
 # activated and has no [Install] section, and porthole-agent.service is a user
 # unit a user enables for their own session.
+#
+# What porthole.install does carry -- see package_porthole()'s install= below
+# -- is a pre_remove, and only that: removing this package has to close the
+# ports porthole still has open, because after the removal nothing is left
+# that could. A hook could have done it too (`Operation = Remove`,
+# `When = PreTransaction`, `Target = usr/bin/porthole`); it would ship an
+# installed file of its own to do what a scriptlet does with none, and would
+# put the remove/upgrade split in a Trigger clause instead of in the name of
+# the function that runs. porthole.install says the rest.
 
 prepare() {
 	cd "$pkgbase-$pkgver"
@@ -152,6 +162,10 @@ check() {
 
 package_porthole() {
 	pkgdesc='Open a port to your local network, temporarily and on purpose.'
+
+	# Base package only. porthole-gui ships no helper, holds no firewall
+	# rule and has nothing to close on its way out.
+	install=porthole.install
 
 	# /etc/xdg/autostart/porthole-agent.desktop is the one file here a user
 	# has a reason to edit: `Hidden=true` in it is how you stop the agent

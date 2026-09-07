@@ -82,6 +82,9 @@ Requires:       hicolor-icon-theme
 # caveat instead of naming the ports, and nothing else changes.
 Recommends:     iptables-nft
 %{?systemd_requires}
+# `timeout`, in %%preun: the close it bounds runs while the package is being
+# erased, so the dependency is on the scriptlet rather than on the package.
+Requires(preun): coreutils
 
 %description
 porthole opens one firewall port towards the network you are on right now,
@@ -253,8 +256,57 @@ dbus-run-session -- sh -c '
 systemctl reload dbus.service >/dev/null 2>&1 || :
 
 %preun
-# $1 is 0 on an erase and 1 on an upgrade, and both macros below branch on
-# that themselves. Nothing here acts on ports the helper has open.
+# $1 is 0 on an erase and 1 on an upgrade, and that is the whole distinction
+# the block below turns on: an erase must close every port porthole has open,
+# while an upgrade must leave them alone -- taking away access the user
+# arranged, silently, as the price of a version bump, would be its own bad
+# surprise. The two %%systemd_* macros branch on the same $1 themselves.
+if [ $1 -eq 0 ] ; then
+    # Removal has to close what porthole opened, because nothing else will.
+    # Every other way a porthole rule ends needs porthole to still be
+    # installed: the expiry timer re-executes %{_bindir}/porthole, `close`
+    # and the network-change monitor go through the helper, and
+    # reconciliation runs inside an operation. Erasing the package ends all
+    # of them at once and leaves the firewall rule enforced, with the state
+    # file that names it on a tmpfs and nothing left that can act on it. So
+    # the close happens here, while the binaries are still on disk -- and before
+    # %%systemd_preun below stops the helper, since stopping first would
+    # leave the close to D-Bus-activate it again.
+    #
+    # `porthole close --all` rather than any shell that guesses at rules: the
+    # helper owns the firewall and holds the record of what it opened, and it
+    # also cancels each opening's transient expiry timer as it closes -- a
+    # timer that would otherwise fire, after this erase, into a
+    # %{_bindir}/porthole that is no longer there.
+    #
+    # Never fatal. An un-erasable package is a worse failure than a port left
+    # open, and this call can fail for reasons that have nothing to do with
+    # the firewall: no system bus (a container, an image build), polkit not
+    # running, a helper left broken by an earlier failed upgrade. On any of
+    # those the erase continues and the warning below is what the user gets.
+    # Closing is not authenticated -- the polkit action
+    # com.jacopobriccola.Porthole.close is `yes` for allow_any, allow_active
+    # and allow_inactive -- so there is nothing here for a non-interactive
+    # erase to be prompted by.
+    #
+    # The timeout is a bound on how long an erase can sit here: the call
+    # reaches a root D-Bus service that drives the firewall, and a bus that
+    # never answers must not hang rpm indefinitely.
+    if [ -d /run/systemd/system ] && [ -x %{_bindir}/porthole ] ; then
+        echo 'porthole: closing every port porthole still has open, before removing it.' >&2
+        rc=0
+        timeout 60 %{_bindir}/porthole close --all >&2 || rc=$?
+        if [ "$rc" -ne 0 ] ; then
+            cat >&2 <<-WARNING
+	porthole: WARNING: \`porthole close --all\` failed (exit $rc).
+	porthole: Any port porthole had open is still open, and removing this
+	porthole: package leaves nothing behind that would close it. Check with
+	porthole: \`firewall-cmd --list-rich-rules\`, \`ufw status numbered\` or
+	porthole: \`nft list ruleset\` and remove what is left by hand.
+	WARNING
+        fi
+    fi
+fi
 %systemd_preun porthole-helper.service
 %systemd_user_preun porthole-agent.service
 

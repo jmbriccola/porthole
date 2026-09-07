@@ -20,6 +20,7 @@ pkgbase = porthole
 
 pkgname = porthole
 	pkgdesc = Open a port to your local network, temporarily and on purpose.
+	install = porthole.install
 	optdepends = firewalld: firewall backend, preferred when installed
 	optdepends = ufw: firewall backend, used when firewalld is absent
 	optdepends = nftables: firewall backend, used when firewalld and ufw are absent
