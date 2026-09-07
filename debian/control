@@ -59,6 +59,13 @@ Description: open a firewall port to your local network, temporarily
  .
  This package contains the command-line tool, the privileged helper with its
  polkit policy and D-Bus configuration, and the desktop notification agent.
+ .
+ The agent starts at the next login, not at install time: neither of its two
+ start files -- a systemd user unit and an XDG autostart entry -- runs in a
+ session that is already open. An announced close is the only signal a timed
+ port has gone, so a port opened in the session that installed this package
+ closes with nothing said. "systemctl --user start porthole-agent.service"
+ starts one for the session you are in.
 
 Package: porthole-gui
 Architecture: any

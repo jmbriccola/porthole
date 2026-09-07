@@ -1,7 +1,9 @@
 # porthole -- pacman install scriptlet for the base package.
 #
-# One function, and it exists for one reason: removal has to close what
-# porthole opened, because nothing else will.
+# Two functions. `pre_remove` is the one that had to exist: removal has to
+# close what porthole opened, because nothing else will. `post_install` only
+# says something -- that the notification agent is not running yet -- and
+# says it once.
 #
 # Every other way a porthole rule ends needs porthole to still be installed:
 # the expiry timer re-executes /usr/bin/porthole, `close` and the
@@ -24,6 +26,36 @@
 # access the user arranged as the price of a version bump -- is then the name
 # of the function rather than a Trigger clause. There is no pre_upgrade here,
 # so an upgrade closes nothing.
+
+post_install() {
+	# Say, once, that notifications do not work yet.
+	#
+	# porthole ships two ways to start the agent -- a systemd user unit and
+	# an XDG autostart entry -- and neither of them runs in a session that is
+	# already open: `WantedBy=graphical-session.target` is reached when a
+	# session begins, and so is /etc/xdg/autostart. This package enables
+	# neither, and enabling would not change it: enablement is a symlink, and
+	# an install running as root has no user session to start a user unit in.
+	#
+	# That matters more here than it would for most session services. An
+	# announced close is the only signal a timed port has gone -- the window
+	# that opened it is usually shut by then -- so a port opened in the
+	# session that installed porthole closes with nothing said.
+	#
+	# post_install and not post_upgrade, deliberately: an upgrade does not
+	# change which session the user is in, and a notice repeated on every
+	# version bump is one nobody reads on the day it matters.
+	# packaging/rpm/porthole.spec and debian/porthole.postinst say the same
+	# thing at the same moment.
+	cat >&2 <<-NOTICE
+		porthole: Desktop notifications start at your next login.
+		porthole: A port porthole closes by itself -- on expiry, or on a network
+		porthole: change -- is announced only while porthole-agent is running, and
+		porthole: neither of its start files runs in a session that is already
+		porthole: open. For the session you are in, without logging out:
+		porthole:     systemctl --user start porthole-agent.service
+	NOTICE
+}
 
 pre_remove() {
 	# Relative paths: pacman runs an install scriptlet with the install root

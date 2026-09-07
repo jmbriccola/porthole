@@ -371,6 +371,22 @@ and exits. A session with no notification service running is survived rather
 than reported: it keeps listening, and the closes are still in the helper's
 journal.
 
+**Neither start file runs in a session that is already open, so notifications
+begin at the next login.** Installing porthole — from a package or by hand —
+puts both files in place and starts nothing. The user unit is reached through
+`graphical-session.target` and the autostart entry when a desktop session
+begins; both of those have already happened. Since an announced close is the
+*only* signal a timed port has gone — the window that opened it is usually
+shut by then — a port opened in the session that installed porthole closes
+without a word. To have notifications in the session you are in:
+
+```bash
+systemctl --user start porthole-agent.service
+```
+
+That works whether or not the unit is enabled, and whether or not your desktop
+starts user units at all: it starts the one unit, now.
+
 ## Exit codes
 
 | Code | Meaning |

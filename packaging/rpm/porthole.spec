@@ -100,6 +100,13 @@ zones, no services, no NAT, no port forwarding.
 This package contains the porthole command, the privileged D-Bus helper it
 talks to, and the desktop notification agent that says when a port closed.
 
+The agent starts at the next login, not at install time: neither of its two
+start files -- a systemd user unit and an XDG autostart entry -- runs in a
+session that is already open. An announced close is the only signal a timed
+port has gone, so a port opened in the session that installed this package
+closes with nothing said. `systemctl --user start porthole-agent.service`
+starts one for the session you are in.
+
 %if %{with gui}
 %package gui
 Summary:        GTK4 desktop application for porthole
@@ -249,11 +256,37 @@ dbus-run-session -- sh -c '
 
 %post
 %systemd_post porthole-helper.service
+# Applies the preset, which on Fedora leaves this unit disabled: the enable
+# exceptions for user units live in fedora-release's own
+# /usr/lib/systemd/user-preset/90-default-user.preset, not in the package
+# that owns the unit, and /usr/lib/systemd/user-preset/99-default-disable.preset
+# is `disable *`. That is not what decides whether notifications work right
+# now, and the notice below says what does: this macro runs
+# `systemctl --no-reload preset --global`, which only settles whether a
+# symlink exists under /etc/systemd/user and starts nothing in a session that
+# is already running. Enabled or disabled, this install announces nothing
+# until the next login.
 %systemd_user_post porthole-agent.service
 # The bus reads /usr/share/dbus-1/system.d and
 # /usr/share/dbus-1/system-services at start-up and on reload. `|| :` because
 # there is no bus to reload in a chroot or an image build.
 systemctl reload dbus.service >/dev/null 2>&1 || :
+# $1 is 1 on a first install and 2 or more on an upgrade. Said on the first
+# install only: an upgrade does not change which session the user is in, and
+# a notice repeated on every version bump is one nobody reads on the day it
+# matters. Same wording as debian/porthole.postinst and
+# packaging/aur/porthole.install, which say it at the same moment for the
+# same reason.
+if [ $1 -eq 1 ] ; then
+    cat >&2 <<-NOTICE
+	porthole: Desktop notifications start at your next login.
+	porthole: A port porthole closes by itself -- on expiry, or on a network
+	porthole: change -- is announced only while porthole-agent is running, and
+	porthole: neither of its start files runs in a session that is already
+	porthole: open. For the session you are in, without logging out:
+	porthole:     systemctl --user start porthole-agent.service
+	NOTICE
+fi
 
 %preun
 # $1 is 0 on an erase and 1 on an upgrade, and that is the whole distinction

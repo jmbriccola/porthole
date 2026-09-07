@@ -185,6 +185,39 @@ check, `porthole open 5173 --for 70s` and wait: the notification appears when
 the expiry timer closes the port, and the journal above records either the
 notification the agent sent or the reason it could not show one.
 
+### From a package: notifications start at the next login
+
+The `--now` above is what a by-hand install has and a package install does
+not. Installing a package puts the unit and the autostart entry down and
+starts neither, because neither start file runs in a session that is already
+open: `WantedBy=graphical-session.target` is reached when a session begins,
+and so is `/etc/xdg/autostart`. Reported by the first person to install the
+RPM: `porthole-agent.service` was `inactive (dead)` straight afterwards, and a
+port opened in that session closed with no notification at all.
+
+The three packages differ in whether they enable the unit, and it makes no
+difference to that. The .deb enables it (`dh_installsystemduser`); the RPM
+does not, because on Fedora a user unit is enabled through a preset and
+`/usr/lib/systemd/user-preset/99-default-disable.preset` is `disable *`, with
+the exceptions kept centrally in `fedora-release` rather than shipped by the
+package that owns the unit; the Arch package enables nothing either. Enabling
+settles whether a symlink exists under `/etc/systemd/user` and starts nothing
+in a session that is already running — an install runs as root, where there
+is no user session to start a user unit in — so an enabled unit and a
+disabled one both leave that first port unannounced.
+
+Each of the three says so when it is installed, and the way out is the same
+for all three:
+
+```bash
+systemctl --user start porthole-agent.service
+```
+
+`start`, not `enable`: it needs no enablement and no `graphical-session.target`,
+and it is per user — run it as the person who will be opening ports. From the
+next login onwards, whichever of the two start files your desktop honours
+takes over.
+
 ## The GUI: making it appear in the app grid
 
 Building it needs GTK4/libadwaita development headers installed first — the
