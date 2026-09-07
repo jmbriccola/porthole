@@ -815,11 +815,12 @@ fn on_nftables_an_opened_port_is_actually_reachable() {
 ///
 /// Measured: running everything as the container's own root is enough for
 /// `firewall-cmd --add-rich-rule` to succeed with no polkit agent registered
-/// anywhere. This is the opposite of what `helper_e2e.rs`'s
-/// `an_open_reaches_the_firewall_and_changes_nothing_when_refused` relies on
-/// for an *unprivileged* caller against the *host's* real firewalld and
-/// polkit -- that test explicitly skips itself when run as root, for exactly
-/// this reason.
+/// anywhere -- and, measured in the same place, an unprivileged caller here
+/// is refused every firewalld call rather than only the config ones, because
+/// without systemd polkit cannot resolve a subject and firewalld falls back
+/// to a uid check. Both halves of
+/// `an_open_firewalld_agrees_to_lands_in_it_and_one_it_refuses_leaves_it_alone`
+/// below rest on those two measurements.
 const FIREWALLD_DAEMON_SETUP: &str = r#"
 set -e
 mkdir -p /run/dbus
@@ -1373,6 +1374,337 @@ kill "$MONPID" 2>/dev/null || true
         signals.contains(r#"string "network-changed""#),
         "the close the move caused must carry that reason, not `requested`: \
          {signals}"
+    );
+}
+
+/// The chain `helper_e2e.rs` used to drive against the developer's own
+/// firewall, both ways round: an open firewalld performs, and one it refuses.
+///
+/// The refusing half is what used to live on the host, as
+/// `an_open_reaches_the_firewall_and_changes_nothing_when_refused`. It could
+/// only ever watch firewalld say no, because saying no is all an unprivileged
+/// caller can make it do -- and it asked for that refusal by running a real
+/// `porthole open` against a real desktop's real firewalld, which raised
+/// firewalld's own polkit prompt on the person's screen every time the suite
+/// ran. Once, someone typed the password: the open succeeded, the test that
+/// asserts refusal failed, and the temporary state directory vanished at the
+/// end of the run leaving a real rich rule in that firewall with nothing left
+/// that could close it. Here the firewall goes away with the container.
+///
+/// **The half that was impossible on a development host.** Running as the
+/// container's own root, firewalld agrees, so this can assert what no host
+/// test could: the rich rule porthole says it added is really in
+/// `firewall-cmd --list-rich-rules` while the rule is open, carries the
+/// subnet the helper resolved rather than the word the client typed, is
+/// named by `porthole list`, and is gone again after `porthole close` -- with
+/// a rule the user added by hand still there on both sides of all of it.
+/// That was on the human acceptance checklist for exactly the reason this
+/// test now exists.
+///
+/// **What the refusing half proves here, and where it stops.** Measured
+/// inside this container: there is no systemd, so polkit cannot resolve a
+/// subject at all (`polkitd` logs `Error calling GetUnitByPIDFD` and denies
+/// every check), and firewalld falls back to its own uid check -- it answers
+/// an unprivileged caller `NotAuthorizedException: Not Authorized(uid)` for
+/// *every* call, including the read-only ones its own policy grants everyone
+/// on a machine that does have a session. So this half runs the same chain
+/// the host test did -- CLI, bus, the helper's authorization, its validation,
+/// `Engine::open`, `firewall-cmd` -- and stops one step earlier than the host
+/// version did: `Engine::open`'s own `health.active` guard refuses on a
+/// `--state` firewalld would not answer, rather than firewalld refusing the
+/// `--add-rich-rule` that would have come next. The outcome asserted is the
+/// one the host test asserted and the one that matters: the request fails,
+/// the firewall's own rule listing is byte-identical across it, and no state
+/// file is written. That a real `firewall-cmd` ran and was refused -- rather
+/// than porthole quietly doing nothing -- is asserted from the helper's own
+/// log, so this half cannot pass by never having run.
+///
+/// The one step it stops short of is the step the privileged half above goes
+/// all the way through, on the same firewalld, in the same container.
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn an_open_firewalld_agrees_to_lands_in_it_and_one_it_refuses_leaves_it_alone() {
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    ensure_image(FEDORA_IMAGE, "Containerfile.fedora");
+
+    let mut args: Vec<String> = vec!["--cap-add=NET_ADMIN".to_string()];
+    args.extend(cli_mounts(&cli, &helper));
+
+    // The privileged half. `--until-reboot` rather than `--for`, for the
+    // reason the module docs give: there is no systemd PID 1 here to serve a
+    // `systemd-run` timer.
+    let privileged = format!(
+        "porthole --session open 5173 --until-reboot\n{}\n{}\nporthole --session close 5173\n",
+        marker_block("RULES_WHILE_OPEN", "firewall-cmd --list-rich-rules"),
+        marker_block("LIST_WHILE_OPEN", "porthole --session list --json"),
+    );
+
+    // The refusing half. Its own session bus, its own state file, and an
+    // ordinary uid: `nobody` (65534) exists in the base image, so nothing
+    // here has to create an account. `set +e` around the open alone, so its
+    // failure is this script's subject rather than its end.
+    let unprivileged = "\
+set -e
+porthole-helper --session >/tmp/unprivileged/helper.log 2>&1 &
+HPID=$!
+ready=0
+for i in $(seq 1 100); do
+  if dbus-send --session --dest=com.jacopobriccola.Porthole --print-reply \\
+       /com/jacopobriccola/Porthole org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1
+  then
+    ready=1
+    break
+  fi
+  sleep 0.1
+done
+if [ \"$ready\" != 1 ]; then
+  echo \"PORTHOLE_HELPER_NEVER_READY\" >&2
+  cat /tmp/unprivileged/helper.log >&2
+  exit 97
+fi
+echo '===PH_REFUSED_START==='
+set +e
+porthole --session open 15173 --until-reboot
+echo \"EXIT=$?\"
+set -e
+echo '===PH_REFUSED_END==='
+kill \"$HPID\" 2>/dev/null || true
+wait \"$HPID\" 2>/dev/null || true
+";
+
+    let script = format!(
+        "set -e\n{FAKE_LAN_INTERFACE}\n{FIREWALLD_DAEMON_SETUP}\n\
+         # A rich rule the user added by hand, so every before/after pair\n\
+         # below compares two listings rather than two empty ones.\n\
+         firewall-cmd --add-rich-rule='rule family=\"ipv4\" \
+source address=\"192.168.77.0/24\" port port=\"9999\" protocol=\"tcp\" accept'\n\
+         {}\n\
+         {}\n\
+         mkdir -p /tmp/unprivileged\n\
+         chown 65534:65534 /tmp/unprivileged\n\
+         cat > /tmp/porthole-unprivileged.sh <<'PORTHOLE_UNPRIVILEGED_EOF'\n\
+         {}\n\
+         PORTHOLE_UNPRIVILEGED_EOF\n\
+         {}\n\
+         setpriv --reuid=65534 --regid=65534 --clear-groups \
+env HOME=/tmp/unprivileged PORTHOLE_STATE_FILE=/tmp/unprivileged/state.json \
+dbus-run-session -- bash /tmp/porthole-unprivileged.sh\n\
+         {}\n\
+         {}\n\
+         {}\n",
+        with_helper(&privileged),
+        marker_block("RULES_AFTER_CLOSE", "firewall-cmd --list-rich-rules"),
+        unprivileged,
+        marker_block("RULES_BEFORE_REFUSED", "firewall-cmd --list-rich-rules"),
+        marker_block("RULES_AFTER_REFUSED", "firewall-cmd --list-rich-rules"),
+        marker_block(
+            "UNPRIVILEGED_STATE",
+            "cat /tmp/unprivileged/state.json 2>/dev/null || echo '(no state file)'"
+        ),
+        marker_block("UNPRIVILEGED_LOG", "cat /tmp/unprivileged/helper.log"),
+    );
+
+    eprintln!("== firewalld test: an open it agrees to, and one it refuses ==");
+    let out = podman_run(FEDORA_IMAGE, &args, &script);
+    eprintln!("{}", String::from_utf8_lossy(&out.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&out.stderr));
+    assert_container_ok(&out, "the firewalld open-and-refusal container");
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+    // --- what happens when firewalld agrees ---
+    let while_open = extract_marker(&stdout, "RULES_WHILE_OPEN");
+    assert!(
+        while_open.contains(
+            r#"rule family="ipv4" source address="10.10.10.0/24" port port="5173" protocol="tcp" accept"#
+        ),
+        "the open reported success, so firewalld itself must be holding the \
+         rule: {while_open}"
+    );
+    assert!(
+        while_open.contains(r#"port="9999""#),
+        "the user's own rule must still be there: {while_open}"
+    );
+
+    let listed = extract_marker(&stdout, "LIST_WHILE_OPEN");
+    assert!(
+        listed.contains(r#""port":5173"#) && listed.contains(r#""target":"10.10.10.0/24""#),
+        "porthole must name the rule it opened, resolved subnet and all: {listed}"
+    );
+
+    let after_close = extract_marker(&stdout, "RULES_AFTER_CLOSE");
+    assert!(
+        !after_close.contains(r#"port="5173""#),
+        "the close must take the rule back out of firewalld: {after_close}"
+    );
+    assert!(
+        after_close.contains(r#"port="9999""#),
+        "and must leave the user's own rule where it was: {after_close}"
+    );
+
+    // --- what happens when it refuses ---
+    let refused = extract_marker(&stdout, "REFUSED");
+    assert!(
+        !refused.contains("EXIT=0"),
+        "an unprivileged porthole cannot change this firewall, so the open \
+         must fail: {refused}"
+    );
+    assert_eq!(
+        extract_marker(&stdout, "RULES_BEFORE_REFUSED"),
+        extract_marker(&stdout, "RULES_AFTER_REFUSED"),
+        "a refused open may leave nothing behind in the firewall"
+    );
+    let state = extract_marker(&stdout, "UNPRIVILEGED_STATE");
+    assert!(
+        state == "(no state file)" || !state.contains("15173"),
+        "a refused open may record nothing: {state}"
+    );
+    // The control: without this, a run in which porthole never got as far as
+    // the firewall at all would satisfy every assertion above.
+    let log = extract_marker(&stdout, "UNPRIVILEGED_LOG");
+    assert!(
+        log.contains("firewall-cmd") && log.contains("Not Authorized"),
+        "the refusal must be firewalld's, on a call porthole really made: {log}"
+    );
+}
+
+/// `close --id` for a rule the firewall does not have reports it missing,
+/// rather than issuing a removal for it.
+///
+/// This one also used to run on the host, where the record it seeds named the
+/// developer's own default zone and a syntactically valid rich rule for it --
+/// a removal spec aimed at their live firewall, held back only by
+/// reconciliation deciding to prune the record first. The version of this
+/// test before reconciliation existed asserted the opposite outcome: a real
+/// `firewall-cmd --remove-rich-rule` that hung for firewalld's ~25s reply
+/// timeout with no polkit agent to answer, which is what it then had to wait
+/// out on every run.
+///
+/// The state file is seeded *after* the helper is already serving, so what
+/// prunes the record is `Engine::close_by_id`'s own per-operation sweep and
+/// not the start-up one -- the start-up sweep has its own test
+/// (`the_start_up_sweep_announces_what_it_dropped`), and a seed written
+/// before the helper started would be gone before this test's own close ever
+/// ran.
+///
+/// **The control, which the host version could not have.** Exit 7 is only
+/// evidence that reconciliation pruned the record first if a removal that
+/// *was* attempted would have ended differently -- and it would: as root,
+/// against a rule firewalld does not have, `--remove-rich-rule` answers
+/// `NOT_ENABLED`, which `firewalld::is_already_absent` reads as "already
+/// gone" and `close_by_id` reports as a successful close (exit 0). The
+/// marker below runs exactly that removal and shows what firewalld says to
+/// it, so the discriminator is measured here rather than asserted from
+/// memory. On the host this test used elapsed time as the discriminator
+/// instead, which only worked because an unauthorized removal hung.
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn a_close_by_id_for_a_rule_the_firewall_lacks_reports_it_missing_and_removes_nothing() {
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    ensure_image(FEDORA_IMAGE, "Containerfile.fedora");
+
+    let mut args: Vec<String> = vec!["--cap-add=NET_ADMIN".to_string()];
+    args.extend(cli_mounts(&cli, &helper));
+
+    const RULE_ID: &str = "seeded-phantom";
+    const PORT: u16 = 25198;
+    const CIDR: &str = "203.0.113.0/24"; // TEST-NET-3: never a real subnet.
+    let rich_rule = format!(
+        r#"rule family="ipv4" source address="{CIDR}" port port="{PORT}" protocol="tcp" accept"#
+    );
+    // `__ZONE__` rather than a literal: the zone has to be the one this
+    // container's own firewalld would act on, which is only knowable inside
+    // it. Built with `serde_json` rather than written out by hand so the
+    // rich rule's own double quotes are escaped by the same code that will
+    // read them back.
+    let seeded = serde_json::json!({
+        "schema_version": 1,
+        "rules": [{
+            "id": RULE_ID,
+            "port": PORT,
+            "protocol": "tcp",
+            "target": {"kind": "network", "cidr": CIDR},
+            "backend": "firewalld",
+            "opened_at": 1_757_000_000_u64,
+            "expires_at": null,
+            "uid": 999_999,
+            "handle": {"backend": "firewalld", "zone": "__ZONE__", "rich_rule": rich_rule},
+        }]
+    });
+    let seeded = serde_json::to_string(&seeded).expect("the seed serialises");
+
+    let body = format!(
+        "cat > \"$PORTHOLE_STATE_FILE\" <<'PORTHOLE_SEED_EOF'\n{seeded}\n\
+         PORTHOLE_SEED_EOF\n\
+         sed -i \"s/__ZONE__/$ZONE/\" \"$PORTHOLE_STATE_FILE\"\n\
+         echo '===PH_CLOSE_START==='\n\
+         set +e\n\
+         porthole --session close --id {RULE_ID}\n\
+         echo \"EXIT=$?\"\n\
+         set -e\n\
+         echo '===PH_CLOSE_END==='\n"
+    );
+
+    let script = format!(
+        "set -e\n{FAKE_LAN_INTERFACE}\n{FIREWALLD_DAEMON_SETUP}\n\
+         export ZONE=$(firewall-cmd --get-default-zone)\n\
+         export PORTHOLE_STATE_FILE=/tmp/porthole-seeded.json\n\
+         # A rich rule the user added by hand: the before/after listings must\n\
+         # compare something, and this one must survive the close below.\n\
+         firewall-cmd --zone=\"$ZONE\" --add-rich-rule='rule family=\"ipv4\" \
+source address=\"192.168.77.0/24\" port port=\"9999\" protocol=\"tcp\" accept'\n\
+         {}\n\
+         {}\n\
+         {}\n\
+         {}\n\
+         {}\n",
+        marker_block("RULES_BEFORE", "firewall-cmd --list-rich-rules"),
+        with_helper(&body),
+        marker_block("RULES_AFTER", "firewall-cmd --list-rich-rules"),
+        marker_block("STATE_AFTER", "cat \"$PORTHOLE_STATE_FILE\""),
+        marker_block(
+            "ABSENT_REMOVAL",
+            &format!(
+                "firewall-cmd --zone=\"$ZONE\" --remove-rich-rule='{rich_rule}' \
+                 2>&1; echo \"EXIT=$?\""
+            )
+        ),
+    );
+
+    eprintln!("== firewalld test: closing a rule the firewall does not have ==");
+    let out = podman_run(FEDORA_IMAGE, &args, &script);
+    eprintln!("{}", String::from_utf8_lossy(&out.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&out.stderr));
+    assert_container_ok(&out, "the firewalld phantom-close container");
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+    let closed = extract_marker(&stdout, "CLOSE");
+    assert!(
+        closed.contains("EXIT=7"),
+        "reconciliation must prune the record before `close_by_id`'s own \
+         lookup runs, so this must report RuleNotFound: {closed}"
+    );
+    assert!(
+        !extract_marker(&stdout, "STATE_AFTER").contains(RULE_ID),
+        "the record must be pruned rather than left claiming a port is open \
+         that never was: {}",
+        extract_marker(&stdout, "STATE_AFTER")
+    );
+    assert_eq!(
+        extract_marker(&stdout, "RULES_BEFORE"),
+        extract_marker(&stdout, "RULES_AFTER"),
+        "nothing about the firewall's own rules may change"
+    );
+    let absent = extract_marker(&stdout, "ABSENT_REMOVAL");
+    assert!(
+        absent.contains("NOT_ENABLED"),
+        "this is what makes exit 7 above mean something: a removal that had \
+         been attempted would have been reported as an already-absent rule, \
+         and `close_by_id` would have exited 0. If firewalld stops answering \
+         that way, the assertion above stops discriminating: {absent}"
     );
 }
 

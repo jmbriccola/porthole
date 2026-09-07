@@ -5,19 +5,27 @@
 //! real `porthole` binary drives it. What this proves and what it cannot is
 //! written out in each test.
 //!
-//! # Why this is safe to run, precisely
+//! # What this file asks of the firewall on the machine running it
 //!
-//! An earlier version of this comment said the reason was that the helper
-//! talks to the real firewalld, whose own polkit policy requires an admin
-//! password for config actions. That is true of the ordinary `open`/`close`
-//! path, but it is backend-specific, and it stopped being the whole story the
-//! moment this milestone added reconciliation: starting the helper at all --
-//! for *every* test below, not only the ones that call `open` or `close` --
-//! runs its start-up sweep (`reconcile_at_startup` in `porthole-helper`'s
-//! `main.rs`) against whatever firewall backend this real machine actually
-//! has, before any client request exists to gate it.
+//! Nothing that would change it. No test here calls `open`; the one `close`
+//! runs against a state file with no rules in it, so there is no record for
+//! it to act on and no removal command it could build. What remains is
+//! reading: `backend::detect` runs `firewall-cmd --version` and `--state`,
+//! [`default_zone`] runs `--get-default-zone`, and starting the helper at all
+//! -- for *every* test below -- runs its start-up sweep (`reconcile_at_startup`
+//! in `porthole-helper`'s `main.rs`), which lists this machine's rules.
 //!
-//! What actually makes that safe:
+//! An open the firewall really performs, and one it refuses, both live in
+//! `crates/porthole-cli/tests/container.rs`, against a firewalld that goes
+//! away with its container. So does the `close --id` of a rule the firewall
+//! does not have, which is the only close that could reach a real removal
+//! command. An earlier version of this file ran all three here, and one of
+//! them left a rich rule in a developer's own firewall with nothing able to
+//! close it: the polkit prompt appeared, a person answered it, and the open
+//! the test expected to be refused succeeded instead.
+//!
+//! The start-up sweep is the one thing left here that could still act, and
+//! only on a backend that can prove ownership:
 //!
 //! - On firewalld, the sweep can never remove a rule it did not create --
 //!   rich rules carry no marker, so `Ownership::Unprovable` skips that half
@@ -30,16 +38,11 @@
 //!   real rule on either of those backends is the OS's own root check on
 //!   `ufw`/`nft` themselves.
 //!
-//! So the condition this suite's safety actually depends on is: this process
+//! So the condition this suite's safety still depends on is: this process
 //! is not genuinely root, or the detected backend is one whose sweep cannot
 //! remove anything (firewalld). `start_helper` below checks exactly that and
 //! refuses to start the helper otherwise, rather than let a start-up sweep
-//! mutate a real firewall on the machine running the tests. Run as an
-//! ordinary user, nothing in this file can mutate the real firewall on any
-//! backend: reaching the ordinary `open`/`close` mutations still needs
-//! firewalld's own polkit (which refuses an unauthenticated request) or, on
-//! ufw/nftables, real root that an ordinary test process does not have
-//! either.
+//! mutate a real firewall on the machine running the tests.
 
 use porthole_core::backend::{self, BackendId};
 use porthole_core::command::RealRunner;
@@ -56,7 +59,7 @@ impl Drop for Helper {
     }
 }
 
-/// All six tests below spawn a helper claiming the *same* well-known name on
+/// Every test below spawns a helper claiming the *same* well-known name on
 /// the *same* session bus, and `cargo test` runs the `#[test]` functions in
 /// one process on separate threads by default. Two helpers racing for that
 /// one name — or one test's `Drop` killing its helper while another test's
@@ -120,14 +123,18 @@ fn helper_bin() -> std::path::PathBuf {
 
 /// Every reason [`start_helper`] can fail to hand back a running helper, each
 /// carrying enough to say *which* it was rather than one blanket "skipped"
-/// that hides all five behind the same sentence — which is exactly how a
+/// that hides all four behind the same sentence — which is exactly how a
 /// missing `porthole` at `/usr/bin` and `/usr/local/bin` made every test below
 /// silently skip while `cargo test` still reported the suite `ok`.
+///
+/// A missing `porthole-helper` binary is not among them any more: it is an
+/// assertion in [`start_helper`], because `return`ing out of a test is
+/// counted by libtest as a pass, and `cargo test -p porthole-cli` — which
+/// never builds a sibling package's binary — used to report all of these
+/// green in half a second without running one of them.
 enum StartFailure {
     /// `--session` is debug-only; nothing to run under `--release`.
     ReleaseBuild,
-    /// `cargo test -p porthole-cli` alone never builds `porthole-helper`.
-    MissingBinary(std::path::PathBuf),
     /// The helper process ended before it ever claimed the bus name — most
     /// likely `resolve_cli` refusing to start. Carries its stderr so the
     /// reason is visible rather than guessed at.
@@ -152,12 +159,6 @@ impl StartFailure {
                  run under `cargo test --release`)"
                     .to_string()
             }
-            StartFailure::MissingBinary(path) => format!(
-                "porthole-helper binary not found at {} — these tests need the \
-                 whole workspace built, e.g. `cargo test` rather than \
-                 `cargo test -p porthole-cli`",
-                path.display()
-            ),
             StartFailure::HelperExited(stderr) => format!(
                 "the helper process exited before it started serving \
                  (most likely `resolve_cli` refusing to start) — its stderr: {stderr}"
@@ -194,10 +195,18 @@ fn start_helper(state: &std::path::Path) -> Result<Helper, StartFailure> {
         return Err(StartFailure::UnsafeStartupSweep(id));
     }
 
+    // Asserted, not skipped: `return`ing here is counted by libtest as a
+    // pass, and that is exactly how every test in this file once reported
+    // success in half a second under `cargo test -p porthole-cli`, which
+    // never builds a sibling package's binary. A missing helper is a broken
+    // invocation, and the message says how to fix it.
     let bin = helper_bin();
-    if !bin.exists() {
-        return Err(StartFailure::MissingBinary(bin));
-    }
+    assert!(
+        bin.exists(),
+        "porthole-helper is not at {} — these tests need the whole workspace \
+         built, e.g. `cargo test` rather than `cargo test -p porthole-cli`",
+        bin.display()
+    );
 
     let mut child = Command::new(&bin)
         .arg("--session")
@@ -267,15 +276,6 @@ fn cli(state: &std::path::Path, args: &[&str]) -> std::process::Output {
         .env("PORTHOLE_STATE_FILE", state)
         .output()
         .expect("the porthole binary runs")
-}
-
-fn rich_rules() -> String {
-    // An info action: `yes` in firewalld's policy, so this works unprivileged.
-    Command::new("firewall-cmd")
-        .args(["--list-rich-rules"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default()
 }
 
 /// The zone `firewall-cmd` would act on by default on *this* machine — read,
@@ -370,155 +370,6 @@ fn closing_something_that_is_not_open_round_trips_its_exit_code() {
         Some(7),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-#[test]
-fn an_open_reaches_the_firewall_and_changes_nothing_when_refused() {
-    // The whole chain, up to the point where the real system says no: CLI →
-    // bus → porthole's authorization → the helper's validation → the engine →
-    // firewall-cmd → firewalld's own polkit, which requires an admin password
-    // for config actions. What happens when firewalld agrees is on the human
-    // acceptance checklist; it needs root.
-    //
-    // That assumption is only true when this test itself is unprivileged: as
-    // root, firewalld's polkit would not refuse this, the open would really
-    // succeed, and the temp state directory vanishing at the end of the test
-    // would leave a real rule in the firewall with nothing able to close it.
-    // `cli.rs` already guards its own real-firewall tests the same way.
-    if is_root() {
-        eprintln!("skipped: running as root, where firewalld would not refuse this open");
-        return;
-    }
-    let _guard = lock_helper();
-    let dir = TempDir::new().unwrap();
-    let state = dir.path().join("state.json");
-    let _helper = start_or_skip!(&state);
-
-    let before = rich_rules();
-    let out = cli(&state, &["open", "15173", "--for", "5m"]);
-
-    assert!(
-        !out.status.success(),
-        "an unprivileged helper cannot change the firewall, so this must fail"
-    );
-    assert_eq!(
-        rich_rules(),
-        before,
-        "nothing may have been added to the firewall"
-    );
-    assert!(
-        !state.exists()
-            || std::fs::read_to_string(&state)
-                .unwrap()
-                .contains(r#""rules": []"#),
-        "a failed open must leave no rule recorded"
-    );
-}
-
-#[test]
-fn closing_a_seeded_phantom_rule_is_pruned_by_reconciliation_not_falsely_reported_open() {
-    // I6: the previous version of this test claimed to prove the audit trail
-    // names the requesting uid, but called `close 5173` (which fails
-    // `RuleNotFound` before `log_close` is ever reached) and `list` (which
-    // never touches the bus at all), then asserted only that stderr held the
-    // startup banner — true even with every line of `log_close` deleted.
-    //
-    // To reach `log_close` at all, a rule has to exist for `close_by_id` to
-    // find, so one is seeded directly into the state file (needing no
-    // firewall access to set up) rather than opened for real. Its target and
-    // port are deliberately outside anything a real network would ever use
-    // (TEST-NET-3, RFC 5737, and a high port), and its firewalld handle names
-    // this machine's own default zone but a rich rule that was never actually
-    // added.
-    //
-    // Before reconciliation (milestone 3, task 5) existed, that made
-    // `close --id` reach a real, unauthorized `firewall-cmd
-    // --remove-rich-rule` call, which -- with no polkit agent registered to
-    // answer firewalld's own internal authorization check -- hung for
-    // firewalld's own ~25s reply timeout before failing. This test used to
-    // assert exactly that slow failure, and skip itself entirely when run as
-    // root (where the removal would have gone through for real instead).
-    //
-    // Reconciliation changes the outcome, and makes it strictly better:
-    // `Engine::close_by_id` now reconciles state against the firewall first
-    // (see `porthole_core::reconcile`), which lists this machine's real rich
-    // rules -- a read, needing no authorization at all -- and finds that the
-    // seeded rule's rich rule genuinely is not among them. It is dropped
-    // from state as stale *before* `close_by_id`'s own lookup ever runs, so
-    // the close fails fast with "no rule matches" instead of hanging for 25
-    // seconds attempting a removal that could only ever fail. There is no
-    // longer a privileged-vs-unprivileged split to guard against either: the
-    // removal this test used to worry about as root never happens for this
-    // rule now, on any account, because reconciliation prunes it first.
-    //
-    // What this test proves end to end: reconciliation reaches the real
-    // backend (a real `firewall-cmd --list-rich-rules` against this
-    // machine's own zone, not a fake one), correctly decides the seeded rule
-    // is not there, and prunes it -- quickly, and without ever attempting
-    // the doomed removal the old version of this test had to wait out.
-    //
-    // `log_close`'s audit-line format is proven separately and directly:
-    // `porthole_helper::service::tests::the_close_line_names_both_uids_when_they_differ`
-    // calls `format_close_log` and checks both uids appear in it. This test
-    // does not reach `log_close` -- reconciliation prunes the rule before
-    // `close_by_id` gets far enough to call it -- and does not claim to.
-    let _guard = lock_helper();
-    let dir = TempDir::new().unwrap();
-    let state = dir.path().join("state.json");
-
-    const RULE_ID: &str = "i6-seeded-rule";
-    const PORT: u16 = 25198;
-    const CIDR: &str = "203.0.113.0/24"; // TEST-NET-3: never a real subnet.
-    let zone = default_zone();
-    let rich_rule = format!(
-        r#"rule family="ipv4" source address="{CIDR}" port port="{PORT}" protocol="tcp" accept"#
-    );
-    let seeded = serde_json::json!({
-        "schema_version": 1,
-        "rules": [{
-            "id": RULE_ID,
-            "port": PORT,
-            "protocol": "tcp",
-            "target": {"kind": "network", "cidr": CIDR},
-            "backend": "firewalld",
-            "opened_at": 1_757_000_000_u64,
-            "expires_at": null,
-            "uid": 999_999,
-            "handle": {"backend": "firewalld", "zone": zone, "rich_rule": rich_rule},
-        }]
-    });
-    std::fs::write(&state, serde_json::to_string_pretty(&seeded).unwrap())
-        .expect("seed the state file");
-
-    let mut helper = start_or_skip!(&state);
-    let started = std::time::Instant::now();
-    let out = cli(&state, &["close", "--id", RULE_ID]);
-    let elapsed = started.elapsed();
-
-    let _ = helper.0.kill();
-    let _ = helper.0.wait();
-
-    assert_eq!(
-        out.status.code(),
-        Some(7),
-        "reconciliation must prune the phantom rule before close_by_id's own \
-         lookup runs, so this must report RuleNotFound, not any other \
-         outcome; stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        elapsed < std::time::Duration::from_secs(10),
-        "reconciliation only reads the real rich rules, which needs no \
-         authorization; taking anywhere near the old ~25s polkit timeout \
-         would mean it did not prune the rule first, got {elapsed:?}"
-    );
-
-    let state_text = std::fs::read_to_string(&state).expect("the state file still exists");
-    assert!(
-        !state_text.contains(RULE_ID),
-        "the phantom rule must be pruned from state, not left behind claiming \
-         a port is open that never really was: {state_text}"
     );
 }
 

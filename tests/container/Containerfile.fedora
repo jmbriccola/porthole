@@ -6,14 +6,20 @@
 # directly. Verified empirically (see
 # .superpowers/sdd/milestone-3-verified-facts.md and the container test file
 # itself): running everything as the container's own root is enough for
-# firewalld to accept `--add-rich-rule` with no polkit agent anywhere --
-# unlike the real desktop `helper_e2e.rs` suite, which relies on the opposite
-# being true for an *unprivileged* caller against a *real* system firewalld.
+# firewalld to accept `--add-rich-rule` with no polkit agent anywhere, and
+# that an unprivileged caller in this same container is refused every
+# firewalld call instead of only the config ones -- there is no systemd here,
+# so polkit cannot resolve a subject and firewalld falls back to a uid check.
 #
 # No Rust toolchain, no copy of the porthole binaries: those are built once on
 # the host as a static musl binary and bind-mounted in at container-run time.
 FROM registry.fedoraproject.org/fedora:44
 
+# `util-linux` is here for `setpriv` alone: one test drops to an ordinary
+# uid to drive porthole against this container's own firewalld as a
+# non-root caller. The base image carries only `util-linux-core`, which
+# does not include it (measured -- `setpriv`, `runuser` and `su` are all in
+# the full package).
 RUN dnf install -y --setopt=install_weak_deps=False \
       firewalld \
       dbus-daemon \
@@ -21,4 +27,5 @@ RUN dnf install -y --setopt=install_weak_deps=False \
       iproute \
       nftables \
       procps-ng \
+      util-linux \
     && dnf clean all
