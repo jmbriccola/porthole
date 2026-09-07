@@ -30,6 +30,8 @@ pub enum ExitCode {
     RuleNotFound = 7,
     /// There is no usable network interface to open towards.
     NoNetwork = 8,
+    /// A command that offers a choice had nothing to offer.
+    NothingToOffer = 9,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -65,6 +67,16 @@ pub enum Error {
 
     #[error("{0}")]
     NoNetwork(String),
+
+    /// A command that offers a choice looked and found nothing to offer:
+    /// `porthole devices add` on a machine whose neighbour table is empty.
+    ///
+    /// Anticipated and refused deliberately, which is why it is not
+    /// `Unexpected`. Constructed in one place, `porthole-cli`'s `add_device`;
+    /// nothing in `porthole-helper` builds it, so it has no D-Bus error name
+    /// of its own and never crosses the bus.
+    #[error("{0}")]
+    NothingToOffer(String),
 
     #[error("command `{command}` exited with status {status}: {stderr}")]
     CommandFailed {
@@ -122,6 +134,7 @@ impl Error {
             Error::DeviceUnreachable(_) => ExitCode::DeviceUnreachable,
             Error::RuleNotFound(_) => ExitCode::RuleNotFound,
             Error::NoNetwork(_) => ExitCode::NoNetwork,
+            Error::NothingToOffer(_) => ExitCode::NothingToOffer,
             Error::Remote { code, .. } => *code,
             Error::CommandFailed { .. }
             | Error::CommandSpawn { .. }
@@ -141,6 +154,7 @@ impl Error {
             Error::DeviceUnreachable(_) => "device_unreachable",
             Error::RuleNotFound(_) => "rule_not_found",
             Error::NoNetwork(_) => "no_network",
+            Error::NothingToOffer(_) => "nothing_to_offer",
             Error::Remote { kind, .. } => kind,
             Error::CommandFailed { .. } => "command_failed",
             Error::CommandSpawn { .. } => "command_spawn_failed",
@@ -167,6 +181,7 @@ mod tests {
         assert_eq!(ExitCode::DeviceUnreachable as i32, 6);
         assert_eq!(ExitCode::RuleNotFound as i32, 7);
         assert_eq!(ExitCode::NoNetwork as i32, 8);
+        assert_eq!(ExitCode::NothingToOffer as i32, 9);
     }
 
     #[test]
@@ -191,6 +206,10 @@ mod tests {
             Error::NoNetwork("no default route".into()).exit_code(),
             ExitCode::NoNetwork
         );
+        assert_eq!(
+            Error::NothingToOffer("nothing seen".into()).exit_code(),
+            ExitCode::NothingToOffer
+        );
     }
 
     #[test]
@@ -200,6 +219,10 @@ mod tests {
             "invalid_argument"
         );
         assert_eq!(Error::NoNetwork("x".into()).kind(), "no_network");
+        assert_eq!(
+            Error::NothingToOffer("x".into()).kind(),
+            "nothing_to_offer"
+        );
     }
 
     #[test]

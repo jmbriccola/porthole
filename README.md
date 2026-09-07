@@ -311,6 +311,7 @@ journal.
 | 6 | The named device is not reachable on this network |
 | 7 | No porthole-managed rule matches |
 | 8 | No usable network |
+| 9 | There was nothing to choose from. `porthole devices add` found no device on this network to offer. |
 
 These are a public interface. New codes are added at the end; existing ones are
 never renumbered.

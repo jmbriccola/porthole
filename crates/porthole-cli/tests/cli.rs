@@ -706,3 +706,85 @@ fn devices_rm_of_something_that_is_not_there_fails_rather_than_reporting_success
     assert_eq!(code(&out), 2, "{}", stderr(&out));
     assert!(stderr(&out).contains("phone"), "{}", stderr(&out));
 }
+
+/// `devices add` refuses an empty neighbour table, and that refusal has to
+/// honour `--json` like every other one: `docs/json-schema.md` promises the
+/// object on stdout for *every* failure, and this path used to exit non-zero
+/// with stdout empty and prose on stderr.
+///
+/// Driven with a stub `ip` on `PATH` rather than by waiting for a quiet
+/// network: `net::neighbours` runs `ip -4 neigh show`, so an `ip` that
+/// prints nothing and succeeds is exactly an empty table, deterministically
+/// and without touching this machine's own. `devices add` reads its book and
+/// asks `ip` before it prompts for anything, so nothing here needs stdin.
+#[test]
+fn devices_add_with_nothing_to_offer_honours_json_and_exits_nine() {
+    let dir = TempDir::new().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let ip = bin.join("ip");
+    std::fs::write(&ip, "#!/bin/sh\nexit 0\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&ip, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let book = dir.path().join("devices.toml");
+    write_book(&book, "");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_porthole"))
+        .args(["--json", "devices", "add"])
+        .env("PORTHOLE_STATE_FILE", state_path(&dir))
+        .env("PORTHOLE_DEVICES_FILE", &book)
+        .env("PATH", &bin)
+        .output()
+        .expect("porthole binary runs");
+
+    assert_eq!(code(&out), 9, "{}", stderr(&out));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out))
+        .unwrap_or_else(|e| panic!("stdout must be the error object, got {e}: {}", stdout(&out)));
+    assert_eq!(json["schema"], 1);
+    assert_eq!(json["error"]["code"], 9);
+    assert_eq!(json["error"]["kind"], "nothing_to_offer");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("nothing seen on this network"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+/// The same refusal without `--json`: the message still goes to stderr, and
+/// the exit code is the specific one rather than 1, which the README
+/// documents as "unexpected failure" and this is not.
+#[test]
+fn devices_add_with_nothing_to_offer_is_not_reported_as_an_unexpected_failure() {
+    let dir = TempDir::new().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let ip = bin.join("ip");
+    std::fs::write(&ip, "#!/bin/sh\nexit 0\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&ip, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let book = dir.path().join("devices.toml");
+    write_book(&book, "");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_porthole"))
+        .args(["devices", "add"])
+        .env("PORTHOLE_STATE_FILE", state_path(&dir))
+        .env("PORTHOLE_DEVICES_FILE", &book)
+        .env("PATH", &bin)
+        .output()
+        .expect("porthole binary runs");
+
+    assert_eq!(code(&out), 9, "{}", stderr(&out));
+    assert!(stdout(&out).is_empty(), "got: {}", stdout(&out));
+    assert!(
+        stderr(&out).contains("nothing seen on this network"),
+        "{}",
+        stderr(&out)
+    );
+}

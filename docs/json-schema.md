@@ -454,6 +454,11 @@ Neither object carries `resolvable` or `resolved_address`. Those are a live
 lookup `devices list` performs and neither of these commands does, so
 reporting them would mean resolving a device nobody asked to resolve.
 
+`devices add` has one refusal of its own: an empty neighbour table, with
+nothing to put in front of you to pick. It exits `9` with the
+`nothing_to_offer` error object below, on stdout, like every other failure —
+it does not print a list of nothing and ask you to choose from it.
+
 ## `porthole doctor --json`
 
 ```json

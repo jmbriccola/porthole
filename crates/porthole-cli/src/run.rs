@@ -432,13 +432,20 @@ fn add_device(cli: &Cli, path: &std::path::Path) -> Result<ExitCode> {
     let mut book = devices::Book::load(path)?;
     let runner = make_runner(cli);
     let neighbours = net::neighbours(runner.as_ref())?;
+    // `Err`, not `Ok(ExitCode::Failure)`: `main` renders an `Err` as the
+    // `--json` error object when `--json` was asked for, and prints the
+    // message on stderr when it was not. Returning the code directly printed
+    // prose either way, so `porthole --json devices add` exited 1 with an
+    // empty stdout -- the one thing `docs/json-schema.md` promises no failure
+    // does. The other way this same command fails (`net::neighbours` cannot
+    // run `ip` at all) has always taken the `Err` path; both now report the
+    // same way.
     if neighbours.is_empty() {
-        eprintln!(
-            "porthole: nothing seen on this network yet to pick from -- make sure the device \
-             has talked to this machine recently, or add it by hand in {}",
+        return Err(Error::NothingToOffer(format!(
+            "nothing seen on this network yet to pick from -- make sure the device has \
+             talked to this machine recently, or add it by hand in {}",
             path.display()
-        );
-        return Ok(ExitCode::Failure);
+        )));
     }
 
     // The picker is a prompt, not output: it goes to stderr so that stdout
