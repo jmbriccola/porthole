@@ -717,6 +717,41 @@ fn a_row_published_on_one_address_names_that_address() -> Result<(), String> {
     Ok(())
 }
 
+/// A host port can carry more than one DNAT rule, and this row is where a
+/// user reads what Docker did with it. The lookup behind it used to return
+/// the first match only, so a second address was invisible on a row that
+/// read as the whole picture.
+fn a_row_with_two_docker_rules_names_both_addresses() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningDockerTwoRules",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_services(&[svc(5432, Some("docker-proxy"), Binding::AllInterfaces)]);
+            section.set_docker_ports(&[
+                published(5432, Some("127.0.0.1")),
+                published(5432, Some("10.0.0.5")),
+            ]);
+            *seen.borrow_mut() = Some((
+                section.rows()[0].subtitle().map(|s| s.to_string()),
+                section.is_marked_docker(0),
+            ));
+        },
+    );
+    let (subtitle, marked) = result.borrow_mut().take().ok_or("activation never ran")?;
+    let subtitle = subtitle.ok_or("the row must have a subtitle")?;
+    for address in ["127.0.0.1", "10.0.0.5"] {
+        if !subtitle.contains(address) {
+            return Err(format!("{address} is missing from the row: {subtitle}"));
+        }
+    }
+    if !marked {
+        return Err("a row with two published rules must still carry the marker".to_string());
+    }
+    Ok(())
+}
+
 /// All three things an unmarked row can mean, in the order a real session
 /// meets them: rows on screen with no Docker answer yet, then an answer,
 /// then an answer lost.
@@ -799,7 +834,7 @@ fn a_section_waiting_on_the_helper_does_not_report_a_failure() -> Result<(), Str
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 19] = [
+    let cases: [Case; 20] = [
         (
             "a_service_shows_its_name_and_port_the_way_the_spec_writes_it",
             a_service_shows_its_name_and_port_the_way_the_spec_writes_it,
@@ -867,6 +902,10 @@ fn main() {
         (
             "a_row_published_on_one_address_names_that_address",
             a_row_published_on_one_address_names_that_address,
+        ),
+        (
+            "a_row_with_two_docker_rules_names_both_addresses",
+            a_row_with_two_docker_rules_names_both_addresses,
         ),
         (
             "the_group_note_tracks_all_three_docker_states",

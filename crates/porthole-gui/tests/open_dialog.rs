@@ -148,7 +148,7 @@ fn anyone_is_last_marked_and_never_preselected() -> Result<(), String> {
             let dialog = OpenDialog::new();
             let labels = dialog.target_labels();
             let last_is_anyone = labels.last().map(|s| s.as_str()) == Some("Anyone");
-            let marked = dialog.is_marked_significant("Anyone");
+            let marked = dialog.is_marked_significant(labels.len() - 1);
             let scope = dialog
                 .selected_scope()
                 .expect("a target is always selected");
@@ -165,6 +165,41 @@ fn anyone_is_last_marked_and_never_preselected() -> Result<(), String> {
     }
     if scope == ScopeSpec::Anywhere {
         return Err("\"Anyone\" must not be preselected".to_string());
+    }
+    Ok(())
+}
+
+/// A saved device can be called anything, "Anyone" included, and then the
+/// target list has two rows with one title. The marking belongs to the last
+/// row and to no other -- which a lookup by title could not tell, since the
+/// device sorts ahead of it.
+fn a_device_named_anyone_does_not_take_the_real_anyones_marking() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.DeviceNamedAnyone",
+        move |_app| {
+            let dialog = OpenDialog::new();
+            dialog.set_devices(&[resolved("Anyone", "10.10.10.245")]);
+            let labels = dialog.target_labels();
+            *seen.borrow_mut() = Some((
+                labels.clone(),
+                // Index 1 is the device, index 2 the real "Anyone".
+                dialog.is_marked_significant(1),
+                dialog.is_marked_significant(labels.len() - 1),
+            ));
+        },
+    );
+    let (labels, device_marked, anyone_marked) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if labels != vec!["This network", "Anyone", "Anyone"] {
+        return Err(format!("expected two rows titled Anyone, got {labels:?}"));
+    }
+    if device_marked {
+        return Err("a device must not carry the significant-choice marking".to_string());
+    }
+    if !anyone_marked {
+        return Err("the real \"Anyone\" must still carry it".to_string());
     }
     Ok(())
 }
@@ -580,7 +615,7 @@ fn no_alert_for_a_port_docker_has_no_rule_for_or_could_not_be_checked() -> Resul
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 18] = [
+    let cases: [Case; 19] = [
         (
             "the_duration_chips_are_exactly_the_five_the_spec_names",
             the_duration_chips_are_exactly_the_five_the_spec_names,
@@ -600,6 +635,10 @@ fn main() {
         (
             "anyone_is_last_marked_and_never_preselected",
             anyone_is_last_marked_and_never_preselected,
+        ),
+        (
+            "a_device_named_anyone_does_not_take_the_real_anyones_marking",
+            a_device_named_anyone_does_not_take_the_real_anyones_marking,
         ),
         (
             "the_note_on_anyone_is_one_dry_sentence_with_no_scolding",

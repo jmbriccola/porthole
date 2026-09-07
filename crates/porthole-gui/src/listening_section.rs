@@ -268,27 +268,56 @@ impl DockerPorts {
     }
 }
 
-/// The port Docker publishes at `port`/`protocol`, if it publishes one at
-/// all. `published` is the whole checked list; a caller with no list at all
-/// has nothing to ask.
-fn docker_for(
+/// **Every** rule Docker has for `port`/`protocol`, most exposing first.
+///
+/// A host port can carry more than one DNAT rule -- `-p 127.0.0.1:5432:80
+/// -p 0.0.0.0:5432:80` is two -- and this used to return the first match
+/// only, so the second address was invisible and the row read as the whole
+/// picture. `porthole-cli`'s own lookup had the identical bug and was fixed
+/// to pick the most exposing single match; it has to pick one, because
+/// `docs/json-schema.md` documents that field as a single object. This row
+/// has no such limit: its subtitle is a sentence, so it names them all, and
+/// nothing has to be dropped or ranked to fit.
+///
+/// The order still matters, and it is `porthole_core::docker::advise`'s
+/// own: most exposing first, so the address that most affects what a user
+/// should do is the one they read first.
+fn docker_matches(
     port: u16,
     protocol: porthole_core::model::Protocol,
     published: &[Published],
-) -> Option<Published> {
-    published
+) -> Vec<Published> {
+    let mut matches: Vec<Published> = published
         .iter()
-        .find(|p| p.host_port == port && p.protocol == protocol)
+        .filter(|p| p.host_port == port && p.protocol == protocol)
         .copied()
+        .collect();
+    matches.sort_by_key(|p| match p.host_addr {
+        None => 0,                              // every interface
+        Some(addr) if !addr.is_loopback() => 1, // one address on the network
+        Some(_) => 2,                           // loopback only
+    });
+    matches
+}
+
+/// Where one rule publishes its port, as the `docker:` fragment names it.
+fn published_where(published: &Published) -> String {
+    match published.host_addr {
+        Some(addr) => addr.to_string(),
+        None => "every interface".to_string(),
+    }
 }
 
 /// The `docker:` fragment a published row's subtitle ends with, worded the
-/// same way `porthole listen`'s own trailing column words it.
-fn docker_fragment(published: &Published) -> String {
-    match published.host_addr {
-        Some(addr) => format!("docker: published on {addr}"),
-        None => "docker: published on every interface".to_string(),
-    }
+/// same way `porthole listen`'s own trailing column words it -- and, for a
+/// port carrying more than one rule, naming every one of them rather than
+/// whichever the lookup happened to reach first.
+///
+/// `matches` must be non-empty; a row with no matches carries no fragment
+/// at all. See [`docker_matches`] for the order they arrive in.
+fn docker_fragment(matches: &[Published]) -> String {
+    let places: Vec<String> = matches.iter().map(published_where).collect();
+    format!("docker: published on {}", places.join(", "))
 }
 
 /// Every row's subtitle. Always `Some` in this section's own design: even a
@@ -308,9 +337,12 @@ fn subtitle_for(
     docker: Option<&[Published]>,
 ) -> String {
     let base = subtitle_without_docker(service, open_ports);
-    match docker.and_then(|list| docker_for(service.port, service.protocol, list)) {
-        Some(published) => format!("{base} · {}", docker_fragment(&published)),
-        None => base,
+    let matches = docker.map(|list| docker_matches(service.port, service.protocol, list));
+    match matches.as_deref() {
+        Some(matches) if !matches.is_empty() => {
+            format!("{base} · {}", docker_fragment(matches))
+        }
+        _ => base,
     }
 }
 
@@ -447,11 +479,12 @@ fn apply(inner: &Rc<Inner>) {
         // only ever on a row a checked list actually names.
         let docker_icon = docker
             .checked()
-            .and_then(|list| docker_for(service.port, service.protocol, list))
-            .map(|published| {
+            .map(|list| docker_matches(service.port, service.protocol, list))
+            .filter(|matches| !matches.is_empty())
+            .map(|matches| {
                 let icon = gtk::Image::from_icon_name("package-x-generic-symbolic");
                 icon.set_valign(gtk::Align::Center);
-                icon.set_tooltip_text(Some(&docker_fragment(&published)));
+                icon.set_tooltip_text(Some(&docker_fragment(&matches)));
                 action_row.add_prefix(&icon);
                 icon
             });
@@ -1043,8 +1076,70 @@ mod tests {
     fn a_published_port_on_the_other_protocol_is_not_this_rows_docker_port() {
         let mut udp = published(8080, None);
         udp.protocol = Protocol::Udp;
-        assert!(docker_for(8080, Protocol::Tcp, &[udp]).is_none());
-        assert!(docker_for(8080, Protocol::Udp, &[udp]).is_some());
+        assert!(docker_matches(8080, Protocol::Tcp, &[udp]).is_empty());
+        assert_eq!(docker_matches(8080, Protocol::Udp, &[udp]).len(), 1);
+    }
+
+    #[test]
+    fn a_port_with_two_docker_rules_shows_both_addresses() {
+        // `-p 127.0.0.1:5432:80 -p 10.0.0.5:5432:80` is two DNAT rules on
+        // one host port. Taking the first match hid the second entirely,
+        // and the row read as the whole picture -- the same defect
+        // `porthole-cli`'s own lookup carried.
+        let open = HashSet::new();
+        let list = [
+            published(5432, Some("127.0.0.1")),
+            published(5432, Some("10.0.0.5")),
+        ];
+        let subtitle = subtitle_for(
+            &svc(5432, Some("docker-proxy"), Binding::AllInterfaces),
+            &open,
+            Some(&list),
+        );
+        assert!(
+            subtitle.contains("127.0.0.1"),
+            "the loopback rule must still be named: {subtitle}"
+        );
+        assert!(
+            subtitle.contains("10.0.0.5"),
+            "the second rule must not be hidden by the first: {subtitle}"
+        );
+    }
+
+    #[test]
+    fn the_most_exposing_rule_is_named_first() {
+        // Same ordering `porthole_core::docker::advise` uses, and for the
+        // same reason: the address that most affects what a user should do
+        // is the one they read first. The input here is in the opposite
+        // order, so a lookup that merely preserved chain order would fail.
+        let list = [
+            published(5432, Some("127.0.0.1")),
+            published(5432, Some("10.0.0.5")),
+            published(5432, None),
+        ];
+        let matches = docker_matches(5432, Protocol::Tcp, &list);
+        assert_eq!(
+            matches.iter().map(published_where).collect::<Vec<_>>(),
+            vec!["every interface", "10.0.0.5", "127.0.0.1"]
+        );
+        assert_eq!(
+            docker_fragment(&matches),
+            "docker: published on every interface, 10.0.0.5, 127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn a_port_with_one_docker_rule_reads_exactly_as_it_did() {
+        // The single-rule wording is what `porthole listen`'s own trailing
+        // column prints, and listing them all must not have changed it.
+        assert_eq!(
+            docker_fragment(&[published(8080, None)]),
+            "docker: published on every interface"
+        );
+        assert_eq!(
+            docker_fragment(&[published(5432, Some("127.0.0.1"))]),
+            "docker: published on 127.0.0.1"
+        );
     }
 
     #[test]

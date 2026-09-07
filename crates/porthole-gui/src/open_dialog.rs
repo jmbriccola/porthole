@@ -859,23 +859,25 @@ impl OpenDialog {
         selected_scope_of(&self.inner)
     }
 
-    /// Whether the target row titled `label` carries the significant-choice
-    /// icon, checked against the live widget tree -- the icon's own
-    /// `parent()` -- rather than only whether `significant_icon` is `Some`.
-    /// `Some` alone would only prove an icon was constructed; a future edit
-    /// that built one and never reached `add_suffix` would leave it `Some`
-    /// while nothing actually rendered, and `parent()` is what catches that.
-    pub fn is_marked_significant(&self, label: &str) -> bool {
-        self.inner
-            .target_rows
-            .borrow()
-            .iter()
-            .find(|r| r.row.title() == label)
-            .is_some_and(|r| {
-                r.significant_icon
-                    .as_ref()
-                    .is_some_and(|icon| icon.parent().is_some())
-            })
+    /// Whether target row `index` carries the significant-choice icon,
+    /// checked against the live widget tree -- the icon's own `parent()` --
+    /// rather than only whether `significant_icon` is `Some`. `Some` alone
+    /// would only prove an icon was constructed; a future edit that built
+    /// one and never reached `add_suffix` would leave it `Some` while
+    /// nothing actually rendered, and `parent()` is what catches that.
+    ///
+    /// By index for the same reason [`OpenDialog::is_target_selectable`] is:
+    /// a saved device's name is arbitrary user text, so a device named
+    /// "Anyone" gives this list two rows with one title, and a title lookup
+    /// would answer for whichever came first -- the device, which carries no
+    /// marking, standing in for the row that does. Index against
+    /// [`OpenDialog::target_labels`], which is in the same order.
+    pub fn is_marked_significant(&self, index: usize) -> bool {
+        self.inner.target_rows.borrow().get(index).is_some_and(|r| {
+            r.significant_icon
+                .as_ref()
+                .is_some_and(|icon| icon.parent().is_some())
+        })
     }
 
     /// The one dry sentence about what "Anyone" means -- see this module's
