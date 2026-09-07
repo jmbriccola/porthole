@@ -1,0 +1,202 @@
+policy_module(porthole, 0.1.0)
+
+########################################
+#
+# What this module is for
+#
+# porthole's privileged half is a D-Bus-activated system service running as
+# root that drives whatever firewall the machine has. Without this module,
+# the loaded targeted policy on Fedora 44 gives
+# /usr/libexec/porthole-helper the label bin_t, and systemd's exec of a
+# bin_t file carries
+#
+#     type_transition init_t bin_t:process unconfined_service_t;
+#
+# so the helper runs in unconfined_service_t, which carries the
+# unconfined_domain_type attribute. Both facts were read out of the running
+# policy with matchpathcon and setools rather than assumed. The consequence
+# is that a permissive-mode run of the unmodified package produces no AVC
+# denials, because there is nothing yet to deny.
+#
+# Every rule below is annotated with the call site that needs it. Where the
+# need was inferred from the shape of the program rather than read out of
+# the source, the comment says INFERRED.
+#
+
+########################################
+#
+# Declarations
+#
+
+# The helper: /usr/libexec/porthole-helper. Activated on the system bus,
+# started by systemd through porthole-helper.service (Type=dbus).
+type porthole_helper_t;
+type porthole_helper_exec_t;
+init_daemon_domain(porthole_helper_t, porthole_helper_exec_t)
+
+# The CLI: /usr/bin/porthole.
+#
+# It has its own domain because of one caller. porthole_core::expiry runs
+#
+#     systemd-run --collect --unit=porthole-close-<id> --on-active=<n>s \
+#         /usr/bin/porthole close --id <id> --from-timer
+#
+# as a transient *system* unit whenever the helper is root, so pid 1 execs
+# that path as root at a time nobody is watching. With /usr/bin/porthole
+# left as bin_t that execution lands in unconfined_service_t like any other
+# systemd-started bin_t program. The type_transition below sends it here
+# instead, and this domain holds only what
+# porthole_cli::client::close_by_id actually does: connect to the system
+# bus and call one method on com.jacopobriccola.Porthole.
+#
+# A user's own interactive `porthole` is not affected: unconfined_t carries
+# files_unconfined_type, which allows execute on every file_type, and no
+# transition rule sends it here. A confined user or admin domain that needs
+# the CLI takes porthole_exec() or porthole_run() from porthole.if.
+type porthole_t;
+type porthole_exec_t;
+init_daemon_domain(porthole_t, porthole_exec_t)
+
+# /run/porthole, created by porthole-helper.service's RuntimeDirectory= or,
+# when the helper finds it missing, by the helper itself
+# (porthole_core::state::ensure_dir). Mode 0755 so an unprivileged
+# `porthole list` can read state.json; the write side is the helper's alone.
+type porthole_runtime_t;
+files_pid_file(porthole_runtime_t)
+
+########################################
+#
+# porthole_helper_t
+#
+
+# tokio's runtime and zbus's internal channels. INFERRED: the shape of an
+# async daemon, not a line of porthole's own source.
+allow porthole_helper_t self:fifo_file rw_fifo_file_perms;
+allow porthole_helper_t self:unix_stream_socket create_stream_socket_perms;
+allow porthole_helper_t self:unix_dgram_socket create_socket_perms;
+allow porthole_helper_t self:process { getsched setsched signal_perms };
+
+# --- the state file ---------------------------------------------------
+#
+# porthole_core::state::StateStore: create_dir_all on /run/porthole, an
+# flock on state.json held across the whole read-modify-write, and a
+# write-and-rename to replace it.
+manage_dirs_pattern(porthole_helper_t, porthole_runtime_t, porthole_runtime_t)
+manage_files_pattern(porthole_helper_t, porthole_runtime_t, porthole_runtime_t)
+files_pid_filetrans(porthole_helper_t, porthole_runtime_t, dir, "porthole")
+
+# --- the firewall backends --------------------------------------------
+#
+# firewall-cmd and ufw are bin_t on Fedora 44 (checked with matchpathcon),
+# so they run in this domain rather than one of their own. systemd-run is
+# bin_t too.
+corecmd_exec_bin(porthole_helper_t)
+
+# ufw is a #!/usr/bin/python3 script and ships shell wrappers. INFERRED:
+# ufw is not packaged on Fedora, so this was not observed here.
+corecmd_exec_shell(porthole_helper_t)
+
+# /usr/sbin/nft and /usr/sbin/iptables both resolve to files labelled
+# iptables_exec_t (checked with matchpathcon: /usr/bin/nft directly,
+# /usr/sbin/iptables through /usr/bin/xtables-nft-multi), so executing
+# them is a domain transition into iptables_t, not an exec in place.
+# Callers: porthole_core::backend::nftables, and porthole_core::docker,
+# which reads Docker's DNAT rules with `iptables -t nat -S DOCKER`.
+iptables_domtrans(porthole_helper_t)
+
+# /usr/sbin/ip is ifconfig_exec_t. Callers: porthole_core::net, for
+# `ip -j route show default`, `ip -j -4 addr show` and `ip -4 neigh show`.
+sysnet_domtrans_ifconfig(porthole_helper_t)
+
+# porthole_core::expiry::cancel_close runs `systemctl stop
+# porthole-close-<id>.timer`. /usr/bin/systemctl is
+# systemd_systemctl_exec_t; systemctl runs in the caller's domain and
+# talks to pid 1 over D-Bus.
+#
+# This interface is the broadest thing in the module: alongside the exec and
+# the cgroup/efivarfs/unit-dir reads systemctl needs, it also grants
+# systemd_passwd_agent_exec and manage access to systemd_passwd_var_run_t,
+# for the interactive password agent. porthole's `systemctl stop` has no
+# tty and asks for no password. It is taken whole rather than hand-rolled
+# narrower because the shipped interface is what tracks systemctl's needs
+# across systemd versions, and a hand-rolled subset that turns out to be
+# short fails as a rule that will not close.
+systemd_exec_systemctl(porthole_helper_t)
+
+# porthole_core::cli_path::resolve_cli stats the CLI before the helper
+# will serve anything, to refuse to start when the binary the expiry timer
+# would run is not a root-owned regular file.
+allow porthole_helper_t porthole_exec_t:file getattr_file_perms;
+
+# --- the system bus ---------------------------------------------------
+#
+# Owns com.jacopobriccola.Porthole; dbus-daemon may also activate it
+# directly from data/com.jacopobriccola.Porthole.service's Exec= line.
+dbus_system_domain(porthole_helper_t, porthole_helper_exec_t)
+dbus_system_bus_client(porthole_helper_t)
+
+# porthole_helper::polkit::PolkitAuthorizer, on every open and close.
+optional_policy(`
+	policykit_dbus_chat(porthole_helper_t)
+')
+
+# firewall-cmd is a D-Bus client of firewalld, and it inherits this domain
+# rather than entering one of its own. porthole_core::backend::firewalld.
+optional_policy(`
+	firewalld_dbus_chat(porthole_helper_t)
+')
+
+# porthole_helper::netmon subscribes to
+# org.freedesktop.NetworkManager's StateChanged.
+optional_policy(`
+	networkmanager_dbus_chat(porthole_helper_t)
+')
+
+# --- systemd transient units ------------------------------------------
+#
+# This is the automatic close. `systemd-run` runs in this domain and asks
+# pid 1 to create the transient timer; `systemctl stop` asks it to stop
+# one. The running policy expresses both as the service class against
+# init_t (read with setools: `allow systemd_domain init_t:service
+# { reload start status stop }` and the same set for
+# unconfined_domain_type).
+init_dbus_chat(porthole_helper_t)
+init_start_transient_unit(porthole_helper_t)
+init_stop_transient_unit(porthole_helper_t)
+init_status_transient_unit(porthole_helper_t)
+
+# --- ordinary daemon needs --------------------------------------------
+#
+# The helper writes its diagnostics to stderr, which systemd hands to the
+# journal. INFERRED for this program specifically; it is what every daemon
+# in the shipped policy is given for the same reason.
+logging_send_syslog_msg(porthole_helper_t)
+
+kernel_read_system_state(porthole_helper_t)
+miscfiles_read_localization(porthole_helper_t)
+
+########################################
+#
+# porthole_t -- the CLI, when pid 1 runs it from an expiry timer
+#
+# porthole_cli::client is the whole of it: one system-bus connection and
+# one method call. In particular `close --id <id> --from-timer` does not
+# take the --dry-run branch, so it builds no engine, detects no backend and
+# runs no firewall command of its own; it asks the helper. Nothing below
+# grants a firewall command, a /proc scan or an exec.
+#
+
+allow porthole_t self:fifo_file rw_fifo_file_perms;
+allow porthole_t self:unix_stream_socket create_stream_socket_perms;
+
+dbus_system_bus_client(porthole_t)
+porthole_dbus_chat(porthole_t)
+
+# `porthole list` and `porthole status` read state.json without the bus.
+# The timer's own invocation does not, but this domain is entered by any
+# init-started `porthole`, so the read side is granted and the write side
+# is not.
+porthole_read_state(porthole_t)
+
+logging_send_syslog_msg(porthole_t)
+miscfiles_read_localization(porthole_t)

@@ -1,0 +1,21 @@
+# The helper, and only the helper. The root Makefile refuses at parse time
+# to install it anywhere but $(LIBEXECDIR)/porthole-helper, and the two
+# shipped files that name the path -- data/com.jacopobriccola.Porthole.service
+# and data/porthole-helper.service -- both say /usr/libexec/porthole-helper
+# literally.
+/usr/libexec/porthole-helper		--	gen_context(system_u:object_r:porthole_helper_exec_t,s0)
+
+# The CLI. A file-context regex has to match the whole path, so this does not
+# also catch /usr/bin/porthole-agent or /usr/bin/porthole-gui; those two keep
+# bin_t deliberately, since neither is ever executed by pid 1.
+/usr/bin/porthole			--	gen_context(system_u:object_r:porthole_exec_t,s0)
+
+# The by-hand install documented in README.md puts the CLI here instead.
+# porthole_core::cli_path::CLI_CANDIDATES lists both, in this order.
+/usr/local/bin/porthole			--	gen_context(system_u:object_r:porthole_exec_t,s0)
+
+# porthole-helper.service declares RuntimeDirectory=porthole, so systemd
+# creates this and labels it from the file-context database. The helper
+# recreates it itself if it is missing (porthole_core::state::ensure_dir),
+# which the filetrans rule in porthole.te covers.
+/run/porthole(/.*)?			gen_context(system_u:object_r:porthole_runtime_t,s0)

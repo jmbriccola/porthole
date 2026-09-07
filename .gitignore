@@ -19,3 +19,9 @@
 /debian/*.substvars
 /debian/*.debhelper
 /debian/*.log
+
+# The reference policy's makefile expands the .te through m4 into selinux/tmp/
+# and leaves the compiled module beside the sources. Both are build output;
+# selinux/{porthole.te,porthole.fc,porthole.if} are the sources.
+/selinux/tmp/
+/selinux/*.pp

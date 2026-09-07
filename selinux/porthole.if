@@ -1,0 +1,78 @@
+## <summary>Temporarily open one firewall port toward the local network.</summary>
+
+########################################
+## <summary>
+##	Execute the porthole CLI in the caller's own domain.
+## </summary>
+## <desc>
+##	<p>
+##	/usr/bin/porthole is porthole_exec_t rather than bin_t, because pid 1
+##	execs it from the transient timer that closes an expired rule (see
+##	porthole.te). A domain that could previously run it because it could
+##	run bin_t programs -- a confined user or admin domain -- needs this
+##	interface after that relabel. unconfined_t does not: it carries
+##	files_unconfined_type, which allows execute on every file_type.
+##	</p>
+## </desc>
+## <param name="domain">
+##	<summary>
+##	Domain allowed access.
+##	</summary>
+## </param>
+#
+interface(`porthole_exec',`
+	gen_require(`
+		type porthole_exec_t;
+	')
+
+	corecmd_search_bin($1)
+	can_exec($1, porthole_exec_t)
+')
+
+########################################
+## <summary>
+##	Read porthole's record of what is open right now.
+## </summary>
+## <desc>
+##	<p>
+##	/run/porthole/state.json, which `porthole list` and `porthole status`
+##	read directly rather than over the bus. The directory is mode 0755 for
+##	exactly this reason. Read only: the write side belongs to
+##	porthole_helper_t alone.
+##	</p>
+## </desc>
+## <param name="domain">
+##	<summary>
+##	Domain allowed access.
+##	</summary>
+## </param>
+#
+interface(`porthole_read_state',`
+	gen_require(`
+		type porthole_runtime_t;
+	')
+
+	files_search_pids($1)
+	list_dirs_pattern($1, porthole_runtime_t, porthole_runtime_t)
+	read_files_pattern($1, porthole_runtime_t, porthole_runtime_t)
+')
+
+########################################
+## <summary>
+##	Send and receive messages from the porthole helper over D-Bus.
+## </summary>
+## <param name="domain">
+##	<summary>
+##	Domain allowed access.
+##	</summary>
+## </param>
+#
+interface(`porthole_dbus_chat',`
+	gen_require(`
+		type porthole_helper_t;
+		class dbus send_msg;
+	')
+
+	allow $1 porthole_helper_t:dbus send_msg;
+	allow porthole_helper_t $1:dbus send_msg;
+')
