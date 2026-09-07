@@ -162,9 +162,16 @@ const UNUSABLE_NEIGHBOUR_STATES: [&str; 2] = ["FAILED", "INCOMPLETE"];
 /// value it just consumed so a state word is never confused with an
 /// interface name or a MAC.
 ///
-/// An entry is kept when it names an interface and an `lladdr`, and its
-/// state is not one of [`UNUSABLE_NEIGHBOUR_STATES`]. `STALE` is kept --
-/// see [`neighbours`] for what that does and does not mean.
+/// An entry is kept when it names a non-virtual interface
+/// ([`is_virtual_interface`]) and an `lladdr`, and its state is not one of
+/// [`UNUSABLE_NEIGHBOUR_STATES`]. `STALE` is kept -- see [`neighbours`] for
+/// what that does and does not mean.
+///
+/// The interface test is here, at the one place a [`Neighbour`] is built
+/// from the kernel's table, rather than at each caller. Nothing else in the
+/// crate turns `ip -4 neigh show` into `Neighbour` values, and there is no
+/// unfiltered variant to reach for, so a virtual interface's entry cannot be
+/// offered or resolved through by a caller that forgot to exclude it.
 fn parse_neighbours(text: &str) -> Result<Vec<Neighbour>> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -201,6 +208,14 @@ fn parse_neighbours(text: &str) -> Result<Vec<Neighbour>> {
         }
 
         if let (Some(interface), Some(mac)) = (interface, mac) {
+            // Docker containers, libvirt guests, VPN peers and podman pods
+            // all leave entries here, on interfaces that are not the network
+            // this machine is on. `parse_all_subnets` excludes the same
+            // interfaces from subnet detection; the neighbour table is the
+            // other half of the same question.
+            if is_virtual_interface(&interface) {
+                continue;
+            }
             out.push(Neighbour {
                 address,
                 interface,
@@ -212,13 +227,24 @@ fn parse_neighbours(text: &str) -> Result<Vec<Neighbour>> {
 }
 
 /// The kernel's IPv4 neighbour table, minus the entries that carry no
-/// mapping ([`UNUSABLE_NEIGHBOUR_STATES`]).
+/// mapping ([`UNUSABLE_NEIGHBOUR_STATES`]) and those on a virtual interface
+/// ([`is_virtual_interface`]).
 ///
 /// What a returned entry means, stated narrowly, because a saved device is
 /// resolved through this and a port is opened towards the address it gives:
 /// the kernel has an IP-to-MAC mapping recorded, and has not disproved it.
 /// It is not a reachability test, and nothing here sends a packet to make
 /// one.
+///
+/// Every entry is on an interface that carries a real network. A Docker
+/// container on a user-created bridge, a libvirt guest and a VPN peer are
+/// all in the kernel's table and none of them is on the network porthole
+/// opens a port towards, which is the same set of interfaces
+/// [`present_networks`] reports subnets for. The exclusion applies to
+/// resolution as well as to the two pickers: a MAC that is only in the
+/// table on a virtual interface does not resolve, and
+/// [`crate::devices::resolve`] reports it as not on this network rather
+/// than returning an address outside every subnet this machine holds.
 ///
 /// `STALE` entries are included. The kernel marks an entry `STALE` once it
 /// has not been confirmed recently -- roughly 30s of idleness on this
@@ -543,6 +569,86 @@ pub(crate) mod tests {
         assert!(commands
             .iter()
             .all(|c| c.effect == crate::command::Effect::Read));
+    }
+
+    /// The shape this machine's own table held while the picker was
+    /// offering Docker containers to open a firewall port towards: two
+    /// entries on the wifi interface and two on a user-created Docker
+    /// bridge. `br-5b772196d2da` is the interface name verbatim, and the
+    /// two `172.18.0.x` MACs are the locally-administered ones Docker
+    /// generates; the two `wlo1` rows use this module's other fixtures'
+    /// addresses rather than the real network's.
+    const IP_NEIGH_WITH_BRIDGE: &str = "\
+172.18.0.2 dev br-5b772196d2da lladdr 6a:df:71:ff:3c:e4 STALE
+10.10.10.1 dev wlo1 lladdr 50:e6:36:51:42:fd REACHABLE
+172.18.0.3 dev br-5b772196d2da lladdr 8e:3a:fc:5b:5c:dc STALE
+10.10.10.245 dev wlo1 lladdr bc:24:11:5e:1c:6e REACHABLE
+";
+
+    #[test]
+    fn a_docker_container_is_not_offered_as_a_device_on_this_network() {
+        let found = parse_neighbours(IP_NEIGH_WITH_BRIDGE).unwrap();
+        assert_eq!(
+            found.len(),
+            2,
+            "only the two wifi entries are on the network this machine is on"
+        );
+        assert!(
+            found.iter().all(|n| n.interface == "wlo1"),
+            "a `br-` entry is a container on a bridge, not a device to open a port towards: {found:?}"
+        );
+        assert!(
+            !found
+                .iter()
+                .any(|n| n.mac == "6a:df:71:ff:3c:e4" || n.mac == "8e:3a:fc:5b:5c:dc"),
+            "neither container MAC may reach a picker or a resolution"
+        );
+    }
+
+    #[test]
+    fn every_virtual_interface_kind_is_excluded_from_the_table_not_just_docker() {
+        // The same list subnet detection uses. A VPN peer, a libvirt guest
+        // and a podman container each land in the kernel's table under
+        // their own prefix.
+        let found = parse_neighbours(
+            "10.0.0.2 dev virbr0 lladdr aa:00:00:00:00:01 REACHABLE\n\
+             10.0.0.3 dev wg0 lladdr aa:00:00:00:00:02 REACHABLE\n\
+             10.0.0.4 dev podman0 lladdr aa:00:00:00:00:03 REACHABLE\n\
+             10.0.0.5 dev veth1234 lladdr aa:00:00:00:00:04 REACHABLE\n\
+             10.0.0.6 dev docker0 lladdr aa:00:00:00:00:05 REACHABLE\n\
+             10.0.0.7 dev tailscale0 lladdr aa:00:00:00:00:06 REACHABLE\n\
+             10.0.0.8 dev enp0s31f6 lladdr aa:00:00:00:00:07 REACHABLE\n",
+        )
+        .unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "only the ethernet entry survives: {found:?}"
+        );
+        assert_eq!(found[0].interface, "enp0s31f6");
+    }
+
+    #[test]
+    fn a_bridge_over_the_physical_nic_is_still_a_real_network() {
+        // `br-` is Docker's user-created-bridge naming. A traditional
+        // `br0` bridging the machine's own NIC is the network this machine
+        // is on, and excluding it would leave such a host with no devices
+        // to pick at all.
+        let found =
+            parse_neighbours("10.10.10.1 dev br0 lladdr 50:e6:36:51:42:fd REACHABLE\n").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].interface, "br0");
+    }
+
+    #[test]
+    fn the_public_entry_point_offers_no_virtual_interface_either() {
+        // `neighbours` is the only way anything outside this module turns
+        // the kernel's table into `Neighbour` values, so this is what every
+        // caller gets -- the two pickers and `devices::resolve` alike.
+        let runner = RecordingRunner::with_responses(vec![Output::stdout(IP_NEIGH_WITH_BRIDGE)]);
+        let found = neighbours(&runner).unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|n| !is_virtual_interface(&n.interface)));
     }
 
     #[test]

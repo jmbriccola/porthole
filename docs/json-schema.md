@@ -414,6 +414,13 @@ link-layer address at all because resolution is still in flight, and
 answer -- an entry that may still carry the MAC it last knew, which is
 precisely the mapping the probe disproved.
 
+Entries on a virtual interface are rejected too, on the same list of
+interface prefixes subnet detection uses. A Docker container, a libvirt guest
+and a VPN peer are each in the kernel's table and none of them is on the
+network porthole opens a port towards, so a MAC found only there reports
+`resolvable: false` rather than an address outside every subnet this machine
+holds.
+
 `STALE` entries are accepted, deliberately. `STALE` is what the kernel marks
 an entry once it has not been confirmed for roughly 30 seconds, which is the
 ordinary condition of an idle device rather than a sign anything is wrong.

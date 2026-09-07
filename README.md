@@ -231,10 +231,22 @@ Opened 5173/tcp towards 10.10.10.245/32 · closes 30m 0s
 
 `devices add` is an interactive prompt and offers the kernel's neighbour
 table, minus the entries that carry no mapping worth acting on (`FAILED` and
-`INCOMPLETE`, below). So a device that has not spoken to this machine
-recently is not in the list, and neither is one the kernel probed without
-getting an answer: make it talk to this machine — load something from it, or
-ping it — and run the command again. It saves a MAC and nothing else. A device
+`INCOMPLETE`, below) and minus every entry on a virtual interface. So a device
+that has not spoken to this machine recently is not in the list, and neither
+is one the kernel probed without getting an answer: make it talk to this
+machine — load something from it, or ping it — and run the command again. It
+saves a MAC and nothing else.
+
+Docker containers, libvirt guests, podman pods and VPN peers all sit in the
+kernel's neighbour table, on the interfaces that carry them. None of them is
+on the network porthole opens a port towards, and the picker excludes exactly
+the interfaces subnet detection already excludes (`docker*`, `br-*`,
+`virbr*`, `veth*`, `podman*`, `tun*`, `tap*`, `wg*`, `tailscale*`, `zt*`,
+`cni*`, `vboxnet*`, `lo`). A traditional `br0` bridging this machine's own
+NIC is not one of them and is still offered. The same exclusion applies at
+resolution time, so a MAC that is only in the table on one of those
+interfaces reports as not on this network rather than resolving to an address
+outside every subnet this machine holds. A device
 named by hostname (`host = "printer.local"`, resolved through `getent`) is
 added by editing `~/.config/porthole/devices.toml` by hand.
 
