@@ -32,8 +32,12 @@ polkit policy, a D-Bus configuration and a systemd unit. See
 [docs/installing.md](docs/installing.md) for where each one goes; until a
 distribution packages porthole, you place them by hand.
 
-`porthole list`, `porthole status` and anything with `--dry-run` need none of
-that installed at all — they never touch the bus. Once it is, opening towards
+`porthole list` and `porthole status` need none of that installed at all —
+they never touch the bus. `--dry-run` changes nothing and needs no privileges
+either, with one exception: `open --dry-run` makes the one read-only call
+every `open` makes, asking the helper whether Docker has already published
+that port. That call is best-effort — no helper, no answer, no complaint, and
+the dry run goes ahead. Once the helper is installed, opening towards
 your own subnet asks polkit to authenticate the first time and not again that
 session; opening towards everyone (`--to any`) asks every time, because it is
 the more dangerous request; closing never asks, because closing only ever
@@ -165,10 +169,12 @@ $ porthole open 5173 --to phone --for 30m
 Opened 5173/tcp towards 10.10.10.245/32 · closes 30m 0s
 ```
 
-`devices add` is an interactive prompt and offers exactly what `ip -4 neigh
-show` reports, so a device that has not spoken to this machine recently is not
-in the list: make it talk to this machine — load something from it, or ping
-it — and run the command again. It saves a MAC and nothing else. A device
+`devices add` is an interactive prompt and offers the kernel's neighbour
+table, minus the entries that carry no mapping worth acting on (`FAILED` and
+`INCOMPLETE`, below). So a device that has not spoken to this machine
+recently is not in the list, and neither is one the kernel probed without
+getting an answer: make it talk to this machine — load something from it, or
+ping it — and run the command again. It saves a MAC and nothing else. A device
 named by hostname (`host = "printer.local"`, resolved through `getent`) is
 added by editing `~/.config/porthole/devices.toml` by hand.
 
@@ -193,7 +199,12 @@ A few narrow edges worth knowing before you hit them:
   marks `FAILED` or `INCOMPLETE` are rejected, since neither carries a mapping
   worth acting on. A `STALE` entry is accepted, because that is the ordinary
   state of an idle device — so a device that has just left can still be opened
-  towards, until the kernel drops or rewrites its entry.
+  towards, until the kernel drops or rewrites its entry. **And the address it
+  left behind may no longer be its own.** DHCP hands an address out again once
+  the lease is gone, so `--to phone` can open a port towards whatever took
+  that address next — a visitor's laptop on the same network. porthole cannot
+  tell the two apart, and the rule stands for its whole duration either way.
+  Keep the durations short, and prefer `porthole close` to waiting one out.
 
 ## Docker
 
@@ -215,9 +226,12 @@ Three commands say so:
 All three read the `DOCKER` chain of iptables' `nat` table directly. porthole
 never runs `docker` and never looks at `docker` group membership, so it
 behaves the same whether or not you can query Docker at all. That read needs
-root, so it goes through the privileged helper: **with the helper not
-installed or not answering, each of the three says it could not check** rather
-than reporting that Docker touches nothing. `doctor` has one narrower
+root, so it goes through the privileged helper. **With the helper not
+installed or not answering, `listen` and `doctor` say they could not check**
+rather than reporting that Docker touches nothing. `open` does not: it prints
+its note when it has one and says nothing otherwise, so silence there means
+either that no container holds that port or that Docker could not be asked.
+`listen` is what tells those apart. `doctor` has one narrower
 condition of its own — it looks for the interface `docker0` first, and reports
 `not present` without asking the helper when there is none, so a daemon
 configured with no default bridge reads as absent there.

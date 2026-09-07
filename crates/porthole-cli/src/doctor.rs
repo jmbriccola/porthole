@@ -465,7 +465,7 @@ fn generic_docker_check() -> Check {
         ok: true,
         detail: "present. A container publishing a port on 0.0.0.0 is already \
                  reachable, and porthole cannot close it: Docker's rules are \
-                 evaluated before firewalld's."
+                 evaluated before your firewall's."
             .to_string(),
         remedy: "porthole could not read which ports Docker has actually published -- the \
                  helper could not be reached, or answered with an error (see the Helper \
@@ -493,12 +493,12 @@ fn describe_published(published: &[porthole_core::docker::Published]) -> String 
 }
 
 /// Not a failure either way — a warning. Docker writes its own iptables
-/// rules, evaluated before firewalld's, so porthole neither sees nor
-/// controls a port a container published; what changes below is only
-/// whether `doctor` can name exactly which ports that is true for, which
-/// needs the privileged helper (`porthole_core::docker`'s own module doc
-/// says why) and so is a best-effort extra, not something this check's own
-/// `ok: true` depends on either way.
+/// rules, evaluated before whichever firewall this machine has, so porthole
+/// neither sees nor controls a port a container published; what changes
+/// below is only whether `doctor` can name exactly which ports that is true
+/// for, which needs the privileged helper (`porthole_core::docker`'s own
+/// module doc says why) and so is a best-effort extra, not something this
+/// check's own `ok: true` depends on either way.
 fn check_docker(session: bool) -> Check {
     if !std::path::Path::new("/sys/class/net/docker0").exists() {
         return Check::good("Docker", "not present".to_string());
@@ -515,7 +515,7 @@ fn check_docker(session: bool) -> Check {
             detail: format!(
                 "present, publishing {}. Each of these is already reachable exactly as \
                  published, and porthole neither opened nor can close it: Docker's rules \
-                 are evaluated before firewalld's.",
+                 are evaluated before your firewall's.",
                 describe_published(&published)
             ),
             // Not "publish on 127.0.0.1 if you don't want it reachable" --

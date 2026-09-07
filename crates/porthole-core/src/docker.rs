@@ -332,12 +332,12 @@ pub fn advise(port: u16, protocol: Protocol, published: &[Published]) -> Option<
         Some(addr) => format!(
             "Docker already publishes {port}/{protocol} on {addr}: it is already reachable \
              from your network, and porthole cannot close it -- Docker's own iptables rules \
-             are evaluated before firewalld's."
+             are evaluated before your firewall's."
         ),
         None => format!(
             "Docker already publishes {port}/{protocol} on every interface (0.0.0.0): it is \
              already reachable from your network, and porthole cannot close it -- Docker's \
-             own iptables rules are evaluated before firewalld's."
+             own iptables rules are evaluated before your firewall's."
         ),
     })
 }
