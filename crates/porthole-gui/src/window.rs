@@ -160,11 +160,12 @@ struct Sections {
     busy: BusyIndicator,
 }
 
-/// The saved-devices entry in the window's own main menu: the action's
-/// bare name, as `gio::SimpleAction::new` takes it, and the same action
-/// prefixed for the menu item that points at it. Two constants rather than
-/// one string written twice -- a menu item naming an action the window does
-/// not have renders insensitive and says nothing about why.
+/// The saved-devices entry in the window's own main menu, written the two
+/// ways it has to be: the bare name `gio::SimpleAction::new` takes, and the
+/// `win.`-prefixed form a `gio::Menu` item points at. Kept adjacent because
+/// a menu item naming an action the window does not have renders
+/// insensitive and says nothing about why; `tests/devices_dialog.rs` checks
+/// that the item and the action actually meet.
 const DEVICES_ACTION_NAME: &str = "devices";
 const DEVICES_ACTION: &str = "win.devices";
 
@@ -1058,8 +1059,8 @@ fn present_devices_dialog(sections: &Sections, open_dialog: Option<OpenDialog>) 
     // exists for.
     dialog.reload();
 
-    // Presented over whichever dialog asked for it, so dismissing it returns
-    // to the choice that was interrupted rather than to the window.
+    // Over the dialog that asked for it, when one did; over the window
+    // otherwise.
     match &open_dialog {
         Some(open) => dialog.present(Some(open.dialog())),
         None => dialog.present(Some(&sections.window)),

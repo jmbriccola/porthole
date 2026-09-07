@@ -35,8 +35,9 @@
 //! anything either -- after writing the book it re-reads it, resolves every
 //! device in it exactly as `porthole devices list` does, and puts
 //! `porthole_core::devices::resolve`'s own sentence on screen for the device
-//! just saved when that resolution did not succeed. Opening a port towards
-//! such a device fails at the moment of opening, with the CLI's own exit
+//! just saved when that resolution did not succeed. A device in that state
+//! still gets a row in the open dialog's target list, carrying its own
+//! reason and unselectable; `porthole open --to <name>` refuses it with exit
 //! code 6.
 //!
 //! A resolution that *did* succeed is reported as what it is -- the address
@@ -733,9 +734,13 @@ impl DevicesDialog {
 
         let saved_group = adw::PreferencesGroup::builder()
             .title("Saved devices")
+            // Not "resolved through this machine's neighbour table" flatly:
+            // that is how a MAC is looked up, and a device saved by
+            // hostname goes through the system resolver instead. The
+            // caveat that matters belongs to the case it is true of.
             .description(
-                "Resolved through this machine's neighbour table, entries it has not \
-                 confirmed recently included.",
+                "Looked up now — a MAC through this machine's neighbour table, entries it \
+                 has not confirmed recently included.",
             )
             .build();
 
@@ -776,7 +781,7 @@ impl DevicesDialog {
         // again while the dialog is on screen. Measured in the container
         // without it: the dialog kept the height it had when it was
         // presented empty, roughly 430 px, and every row that arrived after
-        // that was cut off below the fold with the Save button among them.
+        // that was left below the fold, the Save button among them.
         let dialog = adw::Dialog::builder()
             .title("Saved devices")
             .content_width(420)
