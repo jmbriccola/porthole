@@ -227,12 +227,19 @@ pub enum Error {
     #[error("{0}")]
     AlreadyReachable(String),
 
-    /// A forward was refused because one of the checks porthole makes before
-    /// creating one has no coverage for what was asked.
+    /// A forward was refused because something porthole has to settle before
+    /// creating one has no answer for what was asked.
     ///
     /// Not [`Error::ForwardUnsupported`], which is about what the firewall
     /// can express. This one is about what porthole can verify, and the
-    /// message says which check and what it does not reach.
+    /// message says what it could not settle.
+    ///
+    /// Two situations reach it. A UDP request meets a listening check that
+    /// reads TCP sockets only, so it would be compared against nothing. And
+    /// a published port carrying rules for two *different* containers leaves
+    /// nothing in the request to choose between them — `porthole forward
+    /// 3000` names a port and no address, so picking one would let the order
+    /// of Docker's own chain decide where the traffic went.
     #[error("{0}")]
     ForwardCheckUnavailable(String),
 

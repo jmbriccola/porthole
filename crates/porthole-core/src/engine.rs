@@ -441,6 +441,20 @@ impl<'a> Engine<'a> {
     /// so anything said here reaches the user only after they have already
     /// authenticated for a forward they would not have asked for.
     ///
+    /// **And one more thing that same read settles**: whether the published
+    /// port names one container or two. A host port can carry more than one
+    /// DNAT rule, and two loopback addresses are two separate Docker
+    /// allocations rather than a shape only a hand-made rule could produce —
+    /// `-p 127.0.0.1:3000:80` on one container and `-p 127.0.0.2:3000:80` on
+    /// another is an ordinary thing to have. When the rules on the port point
+    /// at different containers, nothing in the request chooses between them:
+    /// `porthole forward 3000` names a port and no address, and the polkit
+    /// prompt says "a container that publishes 3000 on this machine". So it
+    /// is [`Error::ForwardCheckUnavailable`] rather than the first match,
+    /// which would have let the order of Docker's own chain decide where the
+    /// traffic went. Rules that agree on their destination — one container
+    /// published on two addresses — are not a choice and do not refuse.
+    ///
     /// **The external port is checked next**, against three sources: porthole's
     /// own state, Docker's table, and this machine's listening sockets. Each
     /// refuses with [`Error::ExternalPortInUse`], whose `detail` says which
@@ -534,18 +548,26 @@ impl<'a> Engine<'a> {
         })?;
 
         // A host port can carry more than one DNAT rule --
-        // `-p 127.0.0.1:5432:80 -p 0.0.0.0:5432:80` is two. The first match
-        // wins; the chain is not searched for a best one.
-        let mapping = published
+        // `-p 127.0.0.1:5432:80 -p 0.0.0.0:5432:80` is two, and so is
+        // `-p 127.0.0.1:5432:80` on one container beside
+        // `-p 127.0.0.2:5432:80` on another. Two addresses are two separate
+        // allocations, so this is a shape Docker itself allows and no
+        // hand-made rule is needed to reach it. Every rule on the port is
+        // kept, and the two questions that follow are asked of all of them:
+        // `already_reachable` below orders by exposure rather than by chain
+        // position, and the refusal after it is what happens when they do
+        // not agree on where they point.
+        let matching: Vec<crate::docker::Published> = published
             .iter()
             .copied()
-            .find(|p| p.host_port == published_port && p.protocol == req.protocol)
-            .ok_or_else(|| {
-                Error::NotPublishedByContainer(format!(
-                    "{published_port}/{} is not published by any container",
-                    req.protocol
-                ))
-            })?;
+            .filter(|p| p.host_port == published_port && p.protocol == req.protocol)
+            .collect();
+        let mapping = *matching.first().ok_or_else(|| {
+            Error::NotPublishedByContainer(format!(
+                "{published_port}/{} is not published by any container",
+                req.protocol
+            ))
+        })?;
 
         // Decided from Docker's answer and nothing else, which is why it
         // sits here: right after the read that produced it, beside the
@@ -554,8 +576,8 @@ impl<'a> Engine<'a> {
         // container is already exposed is told so whether or not their
         // firewall happens to be running.
         //
-        // Asked of the whole read rather than of `mapping`: the `find` above
-        // takes the first rule on the port, and a port can carry two
+        // Asked of the whole read rather than of `mapping`: `mapping` is the
+        // first rule on the port, and a port can carry two
         // (`-p 127.0.0.1:3000:80 -p 0.0.0.0:3000:80`) with the loopback one
         // first. Asking `mapping` alone would then forward onto a port the
         // network already reaches and report it as a bounded exposure --
@@ -578,6 +600,37 @@ impl<'a> Engine<'a> {
                  container, publish it on loopback instead (`-p 127.0.0.1:{published_port}:...` \
                  in your docker-compose.yml or `docker run -p`), so that the local network \
                  reaches it only through the forward.",
+                proto = req.protocol
+            )));
+        }
+
+        // Two publications of one host port that point at *different*
+        // containers. Everything on the port is loopback-restricted by now
+        // -- `already_reachable` refused above otherwise -- so both are
+        // shapes this command exists for, and nothing in the request says
+        // which is meant: `porthole forward 3000` names a port and no
+        // address, and the polkit prompt a person read named "a container
+        // that publishes 3000 on this machine". Taking `matching[0]` would
+        // let the order of Docker's own chain decide which container a
+        // redirect reached. Refuse instead of picking one.
+        //
+        // Not a refusal when the rules agree on their destination: one
+        // container published on two loopback addresses writes two rules
+        // with one `--to-destination`, and there is no choice to make.
+        if let Some(other) = matching.iter().find(|p| {
+            (p.container_addr, p.container_port) != (mapping.container_addr, mapping.container_port)
+        }) {
+            return Err(Error::ForwardCheckUnavailable(format!(
+                "porthole will not create this forward: {published_port}/{proto} is \
+                 published by more than one container on this machine -- {}:{} and \
+                 {}:{} -- and nothing in `porthole forward {published_port}` says which \
+                 of them you mean. Picking one would let the order of Docker's own \
+                 rules decide where your traffic went. Publish them on different host \
+                 ports, or stop the one you do not mean.",
+                mapping.container_addr,
+                mapping.container_port,
+                other.container_addr,
+                other.container_port,
                 proto = req.protocol
             )));
         }
@@ -2543,6 +2596,31 @@ mod tests {
 -A DOCKER ! -i docker0 -p tcp -m tcp --dport 3000 -j DNAT --to-destination 172.18.0.2:8080
 ";
 
+    /// Two *different* containers publishing the same host port, each on a
+    /// loopback address of its own -- `-p 127.0.0.1:3000:8080` on one and
+    /// `-p 127.0.0.2:3000:8080` on the other. Docker allocates these
+    /// separately and allows both; the ledger's ruling that one host port
+    /// cannot hold two published mappings was wrong.
+    ///
+    /// Both survive `already_reachable`, which only rejects a non-loopback
+    /// rule, so nothing before the ambiguity refusal has anything to say
+    /// about them.
+    const DOCKER_CHAIN_TWO_CONTAINERS_ON_ONE_PORT: &str = "\
+-N DOCKER
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 3000 -j DNAT --to-destination 172.18.0.2:8080
+-A DOCKER -d 127.0.0.2/32 ! -i docker0 -p tcp -m tcp --dport 3000 -j DNAT --to-destination 172.18.0.3:8080
+";
+
+    /// The same two rules pointing at the *same* container -- one container
+    /// published on two loopback addresses. There is no choice to make here,
+    /// and the refusal must not fire: the control that keeps it from being
+    /// "more than one rule on the port".
+    const DOCKER_CHAIN_ONE_CONTAINER_ON_TWO_ADDRESSES: &str = "\
+-N DOCKER
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 3000 -j DNAT --to-destination 172.18.0.2:8080
+-A DOCKER -d 127.0.0.2/32 ! -i docker0 -p tcp -m tcp --dport 3000 -j DNAT --to-destination 172.18.0.2:8080
+";
+
     /// The forward's own container on loopback, and a **second** container
     /// published on every interface on the port `--as` would claim. What
     /// `docker run -p 127.0.0.1:3000:8080` and `docker run -p 8443:80`
@@ -3130,6 +3208,82 @@ mod tests {
         assert_eq!(rule.port, EXTERNAL_PORT);
         assert_eq!(engine.rules().len(), 1);
         assert_eq!(engine.rules()[0].id, rule.id);
+    }
+
+    #[test]
+    fn forward_refuses_a_published_port_that_names_two_different_containers() {
+        // The code used to take the first matching DNAT rule and the reason
+        // recorded for that was false: "one host port cannot hold two
+        // published mappings". Two loopback addresses are two separate
+        // Docker allocations, both ordinary, and both survive
+        // `already_reachable`. So chain order decided which container a
+        // redirect reached, while the polkit prompt said only "a container
+        // that publishes 3000 on this machine".
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(
+            DockerChain::Reads(DOCKER_CHAIN_TWO_CONTAINERS_ON_ONE_PORT),
+            Vec::new(),
+        );
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let err = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &nothing_listening(),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::ForwardCheckUnavailable(_)),
+            "a request porthole cannot resolve is not one it may resolve by \
+             chain order: {err}"
+        );
+        assert_eq!(err.exit_code(), ExitCode::ForwardCheckUnavailable);
+        assert_eq!(err.kind(), "forward_check_unavailable");
+        let text = err.to_string();
+        for named in ["172.18.0.2:8080", "172.18.0.3:8080"] {
+            assert!(
+                text.contains(named),
+                "the refusal must name both candidates, or a person cannot tell \
+                 which to stop: {text}"
+            );
+        }
+        assert_eq!(
+            backend.touched(),
+            0,
+            "this is decided from Docker's own answer; nothing was written"
+        );
+    }
+
+    #[test]
+    fn forward_takes_one_container_published_on_two_loopback_addresses() {
+        // The control for the refusal above. Two rules, one
+        // `--to-destination`: there is no choice to make, so there is
+        // nothing to refuse, and the rule points where both rules point.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(
+            DockerChain::Reads(DOCKER_CHAIN_ONE_CONTAINER_ON_TWO_ADDRESSES),
+            Vec::new(),
+        );
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let rule = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &nothing_listening(),
+            )
+            .expect("two rules that agree on where they point are not ambiguous");
+        let to = rule.forward.as_ref().unwrap();
+        assert_eq!(to.container_addr.to_string(), CONTAINER_ADDR);
+        assert_eq!(to.container_port, CONTAINER_PORT);
     }
 
     #[test]
