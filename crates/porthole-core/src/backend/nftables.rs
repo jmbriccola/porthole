@@ -707,6 +707,15 @@ impl FirewallBackend for Nftables<'_> {
     /// collision. Claiming it anyway, the way `all_rules` does for the
     /// diagnostic `list_rules`, would hand the orphan sweep a rule to delete
     /// on exactly the same guess `open` already declined to make.
+    ///
+    /// This reads one filter chain, so a forward's two rules are treated
+    /// unequally here. The permit is in that chain and is returned, in the
+    /// same shape `open`'s rule has -- reconciliation must therefore
+    /// recognise it as belonging to a stored `RuleHandle::Forward`, which it
+    /// does through `RuleHandle::leaves`. The redirect is in a nat
+    /// prerouting chain, which nothing in this function reads, so an
+    /// orphaned redirect is never offered for removal and stays until a
+    /// reboot or a ruleset reload clears it.
     fn owned_rules(&self) -> Result<Option<Vec<RuleHandle>>> {
         let chain = self.discover_single_input_chain()?;
         let cmd = Command::read(
@@ -949,7 +958,7 @@ impl FirewallBackend for Nftables<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::command::{CommandRunner, Effect, Output, RecordingRunner};
     use crate::error::ExitCode;
@@ -959,7 +968,12 @@ mod tests {
     /// Captured from `nft -j list chains`. One base chain at the input hook,
     /// one regular chain that must not be mistaken for one, and a nat chain at
     /// a different hook.
-    const CHAINS_ONE_INPUT: &str = r#"{"nftables":[
+    ///
+    /// Reused by `reconcile::tests` -- the sweep's agreement with
+    /// `owned_rules` has to be exercised against a real backend, and a
+    /// retyped copy of this fixture could drift from the one the backend's
+    /// own tests use.
+    pub(crate) const CHAINS_ONE_INPUT: &str = r#"{"nftables":[
       {"metainfo":{"version":"1.1.3","json_schema_version":1}},
       {"chain":{"family":"inet","table":"filter","name":"input","handle":1,
                 "type":"filter","hook":"input","prio":0,"policy":"drop"}},

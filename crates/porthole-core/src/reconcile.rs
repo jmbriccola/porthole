@@ -198,7 +198,24 @@ pub fn sweep(
             report.foreign_backend.push(rule.clone());
             continue;
         }
-        if !present.contains(&rule.handle) {
+        // Through `leaves`, never against the handle itself. A forward's
+        // handle is a pair, and no backend lists a pair -- it lists the
+        // permit and the redirect as the ordinary rules they are, so a
+        // direct comparison is false for every forward that exists and
+        // drops the only record of it.
+        //
+        // A forward is stale only when no half is left. One half still
+        // standing is a rule porthole must keep a reference to, and on
+        // nftables the redirect never appears in `present` at all --
+        // `list_rules` walks input-hook chains, and the redirect is in a nat
+        // chain -- so a rule that needed both would be stale from the moment
+        // it was written.
+        let handle = &rule.handle;
+        if !handle
+            .leaves()
+            .iter()
+            .any(|leaf| present.iter().any(|p| p == *leaf))
+        {
             stale_ids.push(rule.id.clone());
         }
     }
@@ -226,10 +243,15 @@ pub fn sweep(
                 report.skipped_orphan_sweep = Some(backend.ownership());
             }
             Ok(Some(owned)) => {
+                // Flattened for the same reason the staleness check above
+                // is: `owned_rules` returns a forward's permit as the bare
+                // handle it is, and a stored `Forward` never equals it. What
+                // porthole knows it owns is the set of rules its handles
+                // stand for, not the set of handles.
                 let known: Vec<RuleHandle> = store
                     .rules()
                     .iter()
-                    .map(|rule| rule.handle.clone())
+                    .flat_map(|rule| rule.handle.leaves().into_iter().cloned())
                     .collect();
                 for handle in owned {
                     if known.contains(&handle) {
@@ -261,8 +283,12 @@ mod tests {
     use crate::backend::fake::FakeBackend;
     use crate::backend::firewalld;
     use crate::backend::firewalld::tests::{ROUTE_JSON, ZONE};
+    use crate::backend::nftables;
+    use crate::backend::nftables::tests::CHAINS_ONE_INPUT;
     use crate::backend::BackendId;
+    use crate::backend::FirewallBackend;
     use crate::command::{CommandRunner, Effect, Output, RecordingRunner};
+    use crate::forward::ForwardTo;
     use crate::model::{Lifetime, OpenRequest, Protocol, Target};
     use std::time::Duration;
     use tempfile::TempDir;
@@ -325,6 +351,143 @@ mod tests {
         store.save().unwrap();
         (dir, store)
     }
+
+    // --- a forward's two halves, against the sweep ------------------------
+
+    /// The permit half of a forward, as `nft -j list chain` reports it:
+    /// byte-identical to what `open` writes, so it passes
+    /// `rule_matches_porthole_shape` and `owned_rules` claims it.
+    const FORWARD_PERMIT_RULE: &str = r#"{"nftables":[
+      {"metainfo":{"version":"1.1.6","json_schema_version":1}},
+      {"rule":{"family":"inet","table":"filter","chain":"input","handle":4,
+               "comment":"porthole:fwd",
+               "expr":[
+                 {"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":3000}},
+                 {"match":{"op":"==","left":{"payload":{"protocol":"ip","field":"saddr"}},
+                           "right":{"prefix":{"addr":"10.10.10.0","len":24}}}},
+                 {"accept":null}
+               ]}}
+    ]}"#;
+
+    /// The state entry a completed `forward` produces, with the handle taken
+    /// from the backend itself rather than retyped here.
+    ///
+    /// That is the whole point of building it this way: the sweep's notion
+    /// of "porthole's own" and `owned_rules`' notion have to agree about a
+    /// forward, and a hand-written handle could go on agreeing with a stale
+    /// idea of the shape long after `forward` stopped producing it.
+    fn forward_recorded_by(backend: &nftables::Nftables) -> ManagedRule {
+        let to = ForwardTo {
+            container_addr: std::net::Ipv4Addr::new(172, 18, 0, 2),
+            container_port: 8080,
+            published_port: 3000,
+            protocol: Protocol::Tcp,
+        };
+        let handle = backend
+            .forward(&request(3000), &to, "porthole:fwd")
+            .expect("the script above completes a forward");
+        ManagedRule {
+            backend: BackendId::Nftables,
+            handle,
+            forward: Some(to),
+            ..managed("fwd", 3000)
+        }
+    }
+
+    #[test]
+    fn a_live_forward_survives_a_sweep_with_both_halves_intact() {
+        // The sweep's two directions both used to get this wrong, and both
+        // failures point the same way: porthole quietly stops forwarding
+        // while its own account says everything is fine.
+        //
+        // state -> firewall: `list_rules` reports the permit as a bare
+        // `Nftables` handle, and `Forward != Nftables`, so the record looked
+        // stale and was dropped -- losing the only reference to the
+        // redirect, which nothing else lists.
+        //
+        // firewall -> state: `owned_rules` claims that same permit, and
+        // nothing in `known` matched it, so the sweep closed it and reported
+        // success -- leaving a redirect nothing can reach.
+        //
+        // Both halves of this test go through the real backend: the handle
+        // comes from `forward`, and the rules the sweep sees come from
+        // `owned_rules` parsing a captured `nft -j` fixture. If either
+        // notion of "porthole's own" drifts from the other, this fails.
+        let runner = RecordingRunner::with_responses(vec![
+            // forward(): discover the filter chain, the nat chain, write both
+            Output::stdout(CHAINS_ONE_INPUT),
+            Output::stdout(CHAINS_ONE_INPUT),
+            Output::empty(),
+            Output::empty(),
+            // sweep, state -> firewall
+            Output::stdout(CHAINS_ONE_INPUT),
+            Output::stdout(FORWARD_PERMIT_RULE),
+            // sweep, firewall -> state
+            Output::stdout(CHAINS_ONE_INPUT),
+            Output::stdout(FORWARD_PERMIT_RULE),
+        ]);
+        let backend = nftables::Nftables::new(&runner);
+        let (_dir, mut store) = store_with(vec![forward_recorded_by(&backend)]);
+        let writes_by_forward = runner
+            .recorded()
+            .iter()
+            .filter(|c| c.effect == Effect::Mutate)
+            .count();
+        assert_eq!(writes_by_forward, 2, "the forward wrote its two rules");
+
+        let report = sweep(&backend, &mut store, APPLY).unwrap();
+
+        assert!(
+            report.dropped_from_state.is_empty(),
+            "a forward whose permit is still in the firewall is not stale: {:?}",
+            report.dropped_from_state
+        );
+        assert!(
+            report.removed_orphans.is_empty(),
+            "the sweep closed part of a live forward: {:?}",
+            report.removed_orphans
+        );
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(store.rules().len(), 1, "the record must survive");
+        assert_eq!(
+            runner
+                .recorded()
+                .iter()
+                .filter(|c| c.effect == Effect::Mutate)
+                .count(),
+            writes_by_forward,
+            "a sweep over a healthy forward must not change the ruleset"
+        );
+    }
+
+    #[test]
+    fn a_forward_is_dropped_from_state_once_no_half_is_left() {
+        // The other side of the rule above. Keeping a record whose every
+        // rule is gone is the mirror failure: a timer that will never find
+        // anything, and a `list` naming a forward that is not there.
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(CHAINS_ONE_INPUT),
+            Output::stdout(CHAINS_ONE_INPUT),
+            Output::empty(),
+            Output::empty(),
+            // The reload wiped both halves: the chain lists no rules at all.
+            Output::stdout(CHAINS_ONE_INPUT),
+            Output::stdout(NO_RULES),
+            Output::stdout(CHAINS_ONE_INPUT),
+            Output::stdout(NO_RULES),
+        ]);
+        let backend = nftables::Nftables::new(&runner);
+        let (_dir, mut store) = store_with(vec![forward_recorded_by(&backend)]);
+
+        let report = sweep(&backend, &mut store, APPLY).unwrap();
+
+        assert_eq!(report.dropped_from_state.len(), 1);
+        assert!(store.rules().is_empty());
+    }
+
+    const NO_RULES: &str = r#"{"nftables":[
+      {"metainfo":{"version":"1.1.6","json_schema_version":1}}
+    ]}"#;
 
     #[test]
     fn a_rule_the_firewall_no_longer_has_is_dropped_from_state() {

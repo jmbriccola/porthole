@@ -50,9 +50,9 @@ impl std::fmt::Display for BackendId {
 /// string, exactly as firewalld normalised it, *is* the identity.
 ///
 /// Note on the `backend` tag: it names the *variant*, and three of the four
-/// variants are named after a backend. [`RuleHandle::Forward`] is not — it is
-/// a pair of one backend's own handles, and which backend that is, is read
-/// from the tag each of the two carries.
+/// variants are named after a backend. [`RuleHandle::Forward`] is not — it
+/// holds two handles, each carrying its own tag, and has no backend of its
+/// own to name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "backend", rename_all = "snake_case")]
 pub enum RuleHandle {
@@ -94,13 +94,44 @@ pub enum RuleHandle {
     /// backend, so there is no case where one half stands alone and no
     /// `Option` here to represent one.
     ///
-    /// Both are handles of the same backend — the one that built them. A
-    /// backend's `close` refuses a handle it did not produce, and that
-    /// refusal reaches the halves too, because closing this walks into them.
+    /// Nothing here constrains the two halves to one backend: the type
+    /// admits a firewalld permit beside an nftables redirect, and
+    /// `a_forward_handle_survives_the_state_file_round_trip` builds exactly
+    /// that. What closes such a pair is a backend's `close` refusing a half
+    /// it did not produce, one half at a time — not any check on this
+    /// variant.
     Forward {
         permit: Box<RuleHandle>,
         redirect: Box<RuleHandle>,
     },
+}
+
+impl RuleHandle {
+    /// The individual firewall rules this handle stands for.
+    ///
+    /// Every variant but [`RuleHandle::Forward`] stands for one rule: itself.
+    /// A `Forward` stands for its two halves and for no rule of its own — no
+    /// backend can list or return a "forward", because no firewall has such
+    /// an object. [`FirewallBackend::list_rules`] and
+    /// [`FirewallBackend::owned_rules`] both report the halves separately, as
+    /// the ordinary handles they are.
+    ///
+    /// So a comparison between a stored handle and anything a backend
+    /// reports has to go through this. Comparing the handles directly makes
+    /// a live forward look like two rules nobody owns, because derived
+    /// `PartialEq` is false across variants — which is how reconciliation
+    /// came to drop a forward from state and then close its permit as an
+    /// orphan.
+    pub fn leaves(&self) -> Vec<&RuleHandle> {
+        match self {
+            RuleHandle::Forward { permit, redirect } => {
+                let mut out = permit.leaves();
+                out.extend(redirect.leaves());
+                out
+            }
+            leaf => vec![leaf],
+        }
+    }
 }
 
 /// Whether a backend can prove which rules porthole created.
@@ -192,20 +223,17 @@ pub trait FirewallBackend {
     ///
     /// The returned handle is a [`RuleHandle::Forward`] carrying both rules.
     ///
-    /// The default refuses, and says a forward here would have to be a
-    /// permanent rule. ufw is the backend that takes it: its forwarding
-    /// lives in `/etc/ufw/before.rules`, a file that survives a reboot, and
-    /// porthole never writes a permanent firewall rule.
+    /// The default refuses, and says only that. Any backend can inherit it,
+    /// including one whose reason for having no forward is not the reason
+    /// ufw has none — so the message states the absence and stops there. A
+    /// backend with something more specific to tell a user overrides this
+    /// and says it itself.
     ///
-    /// That sentence is about ufw, not about anything the default can check,
-    /// so this module's tests pin which backends reach it — see
-    /// `ufw_is_the_only_backend_without_a_forward`, whose match on
-    /// [`BackendId`] does not compile until a new backend picks a side.
+    /// ufw is the backend that takes the default today; `ufw.rs`'s module
+    /// docs carry why.
     fn forward(&self, _req: &OpenRequest, _to: &ForwardTo, _marker: &str) -> Result<RuleHandle> {
         Err(Error::ForwardUnsupported(format!(
-            "{} cannot redirect a port: porthole has no forward for this backend, because \
-             writing one there means writing a permanent firewall rule, and porthole never \
-             writes one",
+            "{} cannot redirect a port: porthole has no forward for this backend",
             self.id()
         )))
     }
@@ -225,6 +253,21 @@ pub trait FirewallBackend {
     /// [`Ownership::Unprovable`]. Reconciliation's orphan sweep consumes this,
     /// so on such a backend there is no way to obtain a list to sweep — the
     /// mistake is unavailable rather than merely discouraged.
+    ///
+    /// A [`RuleHandle::Forward`] never appears here, and neither does every
+    /// rule one is made of: this returns the ordinary handles for whatever
+    /// rules a backend can claim, and a forward's redirect lives somewhere
+    /// no implementation looks (see `nftables.rs`'s own `owned_rules`). Two
+    /// consequences, in opposite directions:
+    ///
+    /// - A permit belonging to a live forward *is* returned, and is
+    ///   indistinguishable from one `open` wrote. Anything deciding whether
+    ///   a returned handle is already accounted for must compare against
+    ///   [`RuleHandle::leaves`] of what it holds, not against the handles —
+    ///   `reconcile::sweep` does.
+    /// - An orphaned redirect is never returned, so the sweep leaves it. A
+    ///   redirect nothing permits is the harmless remainder; a forward
+    ///   silently missing its permit is not.
     fn owned_rules(&self) -> Result<Option<Vec<RuleHandle>>>;
 
     /// The static answer to "can this backend identify its own rules?", for
@@ -454,18 +497,17 @@ mod tests {
     }
 
     #[test]
-    fn ufw_is_the_only_backend_without_a_forward() {
-        // `FirewallBackend::forward`'s refusing default tells a user that
-        // writing a forward on this backend would mean writing a permanent
-        // firewall rule. That sentence is true of ufw, whose forwarding
-        // lives in /etc/ufw/before.rules; it is not something the default
-        // itself can check. This test is what keeps it true, by pinning
-        // exactly which backends fall through to it.
+    fn of_the_backends_detect_returns_only_ufw_has_no_forward() {
+        // Which of the three backends `detect` can hand back implements a
+        // forward, pinned so that a change to the set is a change to this
+        // test rather than a surprise at a call site.
         //
-        // The match on BackendId is exhaustive on purpose: a new backend
-        // does not compile until someone decides which side of this it is
-        // on, and if it is on the refusing side, whether the default's
-        // sentence is still honest about it.
+        // The match on BackendId is exhaustive on purpose: adding a variant
+        // there breaks the build here. That covers a new backend that also
+        // adds an id, which is how all three arrived; it does not cover a
+        // second backend reusing an existing id, which is what `fake.rs`
+        // does -- FakeBackend reports `BackendId::Firewalld` and inherits
+        // the refusing default, and no match on ids can see it.
         fn refuses(backend: &dyn FirewallBackend, runner: &RecordingRunner) {
             let err = backend
                 .forward(&forward_req(), &forward_to(), "porthole:abc")
@@ -530,11 +572,55 @@ mod tests {
     }
 
     #[test]
+    fn leaves_is_the_handle_itself_for_every_variant_but_a_forward() {
+        // The identity case is the load-bearing one: `reconcile::sweep`
+        // compares through `leaves` for every handle, not only forwards, so
+        // if this returned anything but the handle itself for an ordinary
+        // rule, every non-forward rule would look stale or orphaned.
+        let firewalld = RuleHandle::Firewalld {
+            zone: ZONE.to_string(),
+            rich_rule: SUBNET_RULE.to_string(),
+        };
+        let nft = RuleHandle::Nftables {
+            family: "ip".to_string(),
+            table: "nat".to_string(),
+            chain: "prerouting".to_string(),
+            marker: "porthole:abc".to_string(),
+        };
+        let ufw_handle = RuleHandle::Ufw {
+            spec: "from 10.10.10.0/24 to any port 5173 proto tcp".to_string(),
+            marker: "porthole:abc".to_string(),
+        };
+        for handle in [&firewalld, &nft, &ufw_handle] {
+            assert_eq!(handle.leaves(), vec![handle], "{handle:?}");
+        }
+
+        // A forward stands for its halves and for nothing of its own: the
+        // pair itself is never in this list, because no firewall holds a
+        // rule a backend would report as one.
+        let forward = RuleHandle::Forward {
+            permit: Box::new(firewalld.clone()),
+            redirect: Box::new(nft.clone()),
+        };
+        assert_eq!(forward.leaves(), vec![&firewalld, &nft]);
+        assert!(
+            !forward.leaves().contains(&&forward),
+            "a forward must not stand for itself"
+        );
+    }
+
+    #[test]
     fn a_forward_handle_survives_the_state_file_round_trip() {
         // `RuleHandle` is serialised into /run/porthole/state.json, and a
         // handle that cannot be read back is a rule nothing can ever remove.
         // The nesting is what makes this worth asserting: `Forward` holds
         // two `RuleHandle`s inside an enum that is itself internally tagged.
+        //
+        // The two halves below name different backends. Nothing porthole
+        // writes produces such a pair -- one backend's `forward` builds
+        // both -- and the type does not forbid one either; it is used here
+        // because two different tags prove the halves keep their own, which
+        // a same-backend pair could not show.
         let handle = RuleHandle::Forward {
             permit: Box::new(RuleHandle::Firewalld {
                 zone: ZONE.to_string(),

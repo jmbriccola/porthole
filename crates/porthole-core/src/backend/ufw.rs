@@ -15,6 +15,13 @@
 //! Deletion is **by specification, never by number**. `ufw status numbered`
 //! numbers shift as soon as any other rule is removed, so a stored number
 //! deletes whatever later occupies that slot — the user's rules included.
+//!
+//! **There is no `forward` here.** ufw's port forwarding is not a command at
+//! all: it is a hand-edited `*nat` block in `/etc/ufw/before.rules`, a file
+//! ufw reloads at boot. Writing one is writing a permanent firewall rule, and
+//! porthole never writes a permanent firewall rule. So this backend inherits
+//! `FirewallBackend::forward`'s refusing default rather than implementing one
+//! — see `ufw_refuses_to_forward_and_runs_nothing_at_all`.
 
 use super::{BackendHealth, BackendId, FirewallBackend, Ownership, RuleHandle};
 use crate::command::{Command, CommandRunner};
