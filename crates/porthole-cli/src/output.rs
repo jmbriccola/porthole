@@ -378,10 +378,31 @@ pub fn print_closed(rules: &[ManagedRule], dry_run: bool, forgotten: bool) {
         } else {
             ""
         };
-        println!(
-            "{verb} {}/{} towards {}{suffix}",
-            rule.port, rule.protocol, rule.target
-        );
+        println!("{verb} {}{suffix}", closed_subject(rule));
+    }
+}
+
+/// What a `close` line names, split out of [`print_closed`] so the one
+/// distinction it draws is testable without capturing stdout -- the same
+/// reason [`firewall_state_word`] is its own function.
+///
+/// **A forward says what it was.** `list`, `list --json`, the GUI row and
+/// the expiry notification were each taught to tell a redirect from an open;
+/// `close`'s own confirmation line was the surface that was missed.
+/// "Closed 3000/tcp towards 10.10.10.0/24" reads as an open ending: a person
+/// is told traffic to something on this machine stopped being let through,
+/// when what stopped was a redirect into a container.
+///
+/// The container's own address and port, in [`print_forwarded`]'s own words,
+/// because that is what says *which* redirect ended when more than one was
+/// open.
+fn closed_subject(rule: &ManagedRule) -> String {
+    match &rule.forward {
+        Some(f) => format!(
+            "{}/{} towards {} (a redirect to {}:{} in Docker)",
+            rule.port, rule.protocol, rule.target, f.container_addr, f.container_port
+        ),
+        None => format!("{}/{} towards {}", rule.port, rule.protocol, rule.target),
     }
 }
 
@@ -817,6 +838,44 @@ mod tests {
             },
             forward: None,
         }
+    }
+
+    #[test]
+    fn a_closed_forward_does_not_read_as_a_closed_open() {
+        // `close`'s own confirmation line was the one surface this branch
+        // taught nothing: `list`, `list --json`, the GUI row and the expiry
+        // notification all tell a redirect from an open, and
+        // "Closed 8443/tcp towards 10.10.10.0/24" tells a person traffic to
+        // something on this machine stopped being let through.
+        let permit = rule();
+        let mut forward = rule();
+        forward.port = 8443;
+        forward.forward = Some(porthole_core::forward::ForwardTo {
+            container_addr: "172.17.0.9".parse().unwrap(),
+            container_port: 80,
+            published_port: 3000,
+            protocol: Protocol::Tcp,
+        });
+
+        let redirected = closed_subject(&forward);
+        assert!(
+            redirected.contains("redirect"),
+            "a closed forward must say what ended: {redirected}"
+        );
+        assert!(
+            redirected.contains("172.17.0.9:80"),
+            "and which one, when more than one was open: {redirected}"
+        );
+        assert!(
+            redirected.starts_with("8443/tcp towards 10.10.10.0/24"),
+            "without losing what every close line says: {redirected}"
+        );
+
+        let plain = closed_subject(&permit);
+        assert_eq!(
+            plain, "5173/tcp towards 10.10.10.0/24",
+            "a rule that only permitted is unchanged, and claims no redirect"
+        );
     }
 
     #[test]

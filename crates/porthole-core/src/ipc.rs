@@ -88,6 +88,26 @@ impl WireRule {
             published_port: rule.forward.as_ref().map(|f| f.published_port).unwrap_or(0),
         }
     }
+
+    /// Whether this rule redirects rather than only permits.
+    ///
+    /// The sentinel is [`WireRule::container_addr`]'s, defined and documented
+    /// on the field itself: an address can never be the empty string, and the
+    /// two ports cannot say it, since `0` is also what a forward to a
+    /// container port nobody could have published would carry.
+    ///
+    /// **One method, on the type that owns the sentinel.** There were three
+    /// copies of this line — `porthole-agent`'s `notify::redirects`,
+    /// `porthole-gui`'s `open_now::is_forward`, and an inline
+    /// `container_addr.is_empty()` in `porthole-cli`'s `client.rs` — in three
+    /// crates, each deriving a rule this module defines. Two copies of a
+    /// one-line predicate is how a rule ends up *described* as one act and
+    /// *re-sent* as the other, which is a bug this branch has already fixed
+    /// once, in the agent's `Reopen`. Three copies is the same bug waiting.
+    /// Every crate that needs the answer already depends on this one.
+    pub fn redirects(&self) -> bool {
+        !self.container_addr.is_empty()
+    }
 }
 
 /// Why a rule stopped being open, as it crosses the bus in `RuleClosed`.
@@ -480,6 +500,11 @@ mod tests {
             "the published port is the one the person named, and is not `port`"
         );
         assert_eq!(wire.port, 5173, "`port` stays what the network connects to");
+        assert!(
+            wire.redirects(),
+            "the one predicate three crates ask, on the type that defines the \
+             sentinel it reads"
+        );
     }
 
     #[test]
@@ -491,6 +516,10 @@ mod tests {
         assert_eq!(wire.container_addr, "");
         assert_eq!(wire.container_port, 0);
         assert_eq!(wire.published_port, 0);
+        assert!(
+            !wire.redirects(),
+            "and the other direction: a rule that only permits says so"
+        );
     }
 
     #[test]

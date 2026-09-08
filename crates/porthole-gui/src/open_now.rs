@@ -130,7 +130,9 @@
 //! container rather than this machine. A forward's row names where the
 //! traffic actually goes, and carries its own marker, for the reason the
 //! "open to anyone" one does -- a subtitle is read, a marker is seen.
-//! [`is_forward`] is what decides, from the one field that can say it.
+//! [`porthole_core::ipc::WireRule::redirects`] is what decides, from the one
+//! field that can say it -- the method on the type that defines the
+//! sentinel, rather than a copy of the line here.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -414,15 +416,6 @@ fn towards_for(rule: &WireRule) -> &str {
     }
 }
 
-/// Whether this rule redirects rather than only permits. An address can
-/// never be the empty string, which is what makes the field usable as the
-/// wire's own sentinel -- see [`WireRule::container_addr`]. The two ports
-/// cannot say it: `0` is also what a forward to a container port nobody
-/// could have published would carry.
-fn is_forward(rule: &WireRule) -> bool {
-    !rule.container_addr.is_empty()
-}
-
 /// What one row says under its port.
 ///
 /// A rule that only permits says who may reach it: "open to anyone", "open
@@ -436,7 +429,7 @@ fn is_forward(rule: &WireRule) -> bool {
 /// they are separate strings in separate crates.
 fn subtitle_for(rule: &WireRule) -> String {
     let towards = towards_for(rule);
-    if is_forward(rule) {
+    if rule.redirects() {
         format!(
             "redirects to {}:{} (published on {}) · reachable from {towards}",
             rule.container_addr, rule.container_port, rule.published_port
@@ -561,7 +554,7 @@ fn apply(inner: &Rc<Inner>, rules: &[WireRule], listed_at: u64) {
         // state to be alarmed by -- but the package icon
         // `listening_section.rs` marks a container-published row with, on
         // the row that is now pointing at one.
-        let forward_icon = if is_forward(rule) {
+        let forward_icon = if rule.redirects() {
             let icon = gtk::Image::from_icon_name("package-x-generic-symbolic");
             icon.set_valign(gtk::Align::Center);
             icon.set_tooltip_text(Some(&format!(
@@ -1202,8 +1195,8 @@ mod tests {
             subtitle_for(&forward),
             "redirects to 172.18.0.2:8080 (published on 3000) · reachable from 10.10.10.0/24"
         );
-        assert!(!is_forward(&permit));
-        assert!(is_forward(&forward));
+        assert!(!permit.redirects());
+        assert!(forward.redirects());
     }
 
     #[test]

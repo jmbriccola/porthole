@@ -402,18 +402,20 @@ struct ReopenRequest {
 /// at. `CloseReason::TargetGone` only made that path easier to reach; it did
 /// not create it.
 ///
-/// Which of the two a rule was is [`notify::redirects`]'s question, asked
-/// here through that one function rather than re-derived from
+/// Which of the two a rule was is [`WireRule::redirects`]'s question, asked
+/// here through that one method rather than re-derived from
 /// `container_addr` a second time -- the notification's own wording asks it
-/// too, and a rule described as one act and re-sent as the other is exactly
-/// what two copies of this predicate would eventually produce.
+/// too, and so does `porthole-gui`'s row, and a rule described as one act
+/// and re-sent as the other is exactly what copies of this predicate
+/// eventually produce. It lives on `WireRule` in `porthole_core::ipc`, which
+/// is where the sentinel is defined.
 fn reopen_request(rule: &WireRule) -> ReopenRequest {
     ReopenRequest {
         port: rule.port,
         protocol: rule.protocol.clone(),
         scope: reopen_scope(rule),
         seconds: original_duration(rule),
-        published_port: notify::redirects(rule).then_some(rule.published_port),
+        published_port: rule.redirects().then_some(rule.published_port),
     }
 }
 

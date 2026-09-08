@@ -401,7 +401,7 @@ Forwarded 3000/tcp towards 10.10.10.0/24 · closes 30m 0s
   -> 172.17.0.2:8080 in Docker, published on this machine as 3000/tcp
 
 $ porthole close 3000
-Closed 3000/tcp towards 10.10.10.0/24
+Closed 3000/tcp towards 10.10.10.0/24 (a redirect to 172.17.0.2:8080 in Docker)
 ```
 
 `3000` is the port **Docker published on this machine** — the number

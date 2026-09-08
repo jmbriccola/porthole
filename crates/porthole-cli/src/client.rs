@@ -158,19 +158,17 @@ fn to_local(wire: &WireRule) -> Result<ManagedRule> {
             zone: String::new(),
             rich_rule: String::new(),
         },
-        // An empty `container_addr` is the wire's "this rule only permits"
-        // -- see `WireRule`'s own doc comment. Without this the CLI would
-        // render every forward the helper reports as an open: same port,
-        // same target, and nothing saying what the traffic actually
-        // reaches.
+        // `WireRule::redirects` is the wire's own question, asked through
+        // the method on the type that defines the sentinel rather than by
+        // reading `container_addr` here. Without this the CLI would render
+        // every forward the helper reports as an open: same port, same
+        // target, and nothing saying what the traffic actually reaches.
         //
         // The protocol is the rule's own. `ForwardTo` carries one of its
         // own and the wire does not, because a forward whose two ends
         // disagree is refused before it can exist
         // (`backend::forward_protocol`).
-        forward: if wire.container_addr.is_empty() {
-            None
-        } else {
+        forward: if wire.redirects() {
             Some(porthole_core::forward::ForwardTo {
                 container_addr: wire.container_addr.parse().map_err(|_| {
                     Error::Unexpected(format!(
@@ -182,6 +180,8 @@ fn to_local(wire: &WireRule) -> Result<ManagedRule> {
                 published_port: wire.published_port,
                 protocol,
             })
+        } else {
+            None
         },
     })
 }

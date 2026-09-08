@@ -78,21 +78,6 @@ pub fn is_worth_announcing(reason: CloseReason) -> bool {
     !matches!(reason, CloseReason::Requested)
 }
 
-/// Whether this rule redirected rather than only permitted.
-///
-/// A non-empty `container_addr` is the wire's own sentinel for it: an
-/// address can never be the empty string, and the two ports cannot say it,
-/// since `0` is also what a forward to a container port nobody could have
-/// published would carry -- see `WireRule::container_addr`.
-///
-/// One function for the whole binary. Both places that need the distinction
-/// call this: the wording here, and `crate::reopen_request`, which decides
-/// which method a `Reopen` sends. Two copies of a one-line predicate is how
-/// a rule ends up *described* as one act and *re-sent* as the other.
-pub fn redirects(rule: &WireRule) -> bool {
-    !rule.container_addr.is_empty()
-}
-
 /// What to say about a rule that has stopped being open.
 ///
 /// Total over every reason, including the one [`is_worth_announcing`] filters
@@ -125,52 +110,68 @@ pub fn redirects(rule: &WireRule) -> bool {
 /// A `Reopen` on a forward re-sends a **forward**, not an `open` -- see
 /// `crate::reopen_request` in `main.rs`, which is where that is decided and
 /// where the harm of getting it wrong is spelled out.
+/// What the rule was, named so that a reader can act on it: an ordinary
+/// open, or a redirect into a container.
+///
+/// **One subject, four sentences.** A forward expires, is closed on
+/// request, is closed when the machine leaves the subnet it was scoped to,
+/// and is dropped by reconciliation, exactly as an open is — and until this
+/// existed, only the first of those four said so. The other three read as
+/// an open: a person is told traffic was being let through to something on
+/// this machine when it was being redirected into a container. That is the
+/// identical collapse `porthole-gui`'s own `open_now.rs` was changed to stop
+/// making on the row, beside this very button.
+///
+/// It is one function rather than a second arm per reason for the reason
+/// `anyone_note` is one function: four wordings of one distinction are four
+/// things that can go stale separately, and this file already carried two of
+/// them.
+///
+/// The em dashes are inside the phrase so that every sentence below reads
+/// with or without it: `{subject} has expired`, `{subject} was closed on
+/// request`.
+fn subject(rule: &WireRule) -> String {
+    let port = format!("{}/{}", rule.port, rule.protocol);
+    if rule.redirects() {
+        format!(
+            "{port} towards {} — a redirect into the container publishing {} on this \
+             machine — ",
+            rule.target, rule.published_port
+        )
+    } else {
+        format!("{port} towards {} ", rule.target)
+    }
+}
+
 pub fn notification_for(rule: &WireRule, reason: CloseReason) -> Notification {
     let port = format!("{}/{}", rule.port, rule.protocol);
-    let target = &rule.target;
+    let subject = subject(rule);
     match reason {
-        // The one reason both kinds of rule reach in numbers, so it is the
-        // one whose wording has to tell them apart. A forward expires like
-        // anything else, and "8443/tcp towards 10.10.10.0/24 has expired"
-        // says nothing about the container -- the identical collapse
-        // `porthole-gui`'s own `open_now.rs` was changed to stop making on
-        // the row, beside this very button. Whoever is deciding whether to
-        // press `Reopen` is deciding about a redirect, and has to be told
-        // that is what it was.
-        CloseReason::Expired if redirects(rule) => Notification {
-            summary: format!("Port {port} closed"),
-            body: format!(
-                "{port} towards {target} — a redirect into the container publishing {} on \
-                 this machine — has expired and is closed again.",
-                rule.published_port
-            ),
-            actions: vec![(REOPEN.to_string(), "Reopen".to_string())],
-        },
         CloseReason::Expired => Notification {
             summary: format!("Port {port} closed"),
-            body: format!("{port} towards {target} has expired and is closed again."),
+            body: format!("{subject}has expired and is closed again."),
             actions: vec![(REOPEN.to_string(), "Reopen".to_string())],
         },
         CloseReason::NetworkChanged => Notification {
             summary: format!("Port {port} closed"),
             body: format!(
-                "{port} was open towards {target}, a network this machine is no longer on, \
-                 so porthole closed it."
+                "{subject}was for a network this machine is no longer on, so porthole \
+                 closed it."
             ),
             actions: Vec::new(),
         },
         CloseReason::Reconciled => Notification {
             summary: format!("Port {port} was already closed"),
             body: format!(
-                "{port} towards {target} had stopped being open before porthole looked: the \
-                 firewall no longer had the rule, so porthole dropped its record of it. \
-                 Nothing was removed from the firewall."
+                "{subject}was gone from the firewall before porthole looked: the rule was \
+                 no longer there, so porthole dropped its record of it. Nothing was \
+                 removed from the firewall."
             ),
             actions: Vec::new(),
         },
         CloseReason::Requested => Notification {
             summary: format!("Port {port} closed"),
-            body: format!("{port} towards {target} was closed on request."),
+            body: format!("{subject}was closed on request."),
             actions: Vec::new(),
         },
         CloseReason::TargetGone => Notification {
@@ -308,40 +309,74 @@ mod tests {
     }
 
     #[test]
-    fn an_expired_forward_says_a_container_was_behind_it() {
-        // A forward expires like any other rule, and this is the reason
-        // both kinds of rule reach in numbers. Told only "8443/tcp towards
-        // 10.10.10.0/24 has expired", a person deciding whether to press
-        // `Reopen` believes they are deciding about traffic to something on
-        // this machine. `porthole-gui`'s `open_now.rs` was changed to stop
-        // making exactly this collapse on the row; the notification beside
-        // the button made it too.
+    fn every_reason_a_forward_reaches_says_it_was_a_redirect() {
+        // Told only "8443/tcp towards 10.10.10.0/24 has expired", or "was
+        // open towards 10.10.10.0/24, a network this machine is no longer
+        // on", a person believes traffic was being let through to something
+        // on this machine when it was being redirected into a container.
+        // `porthole-gui`'s `open_now.rs` was changed to stop making exactly
+        // this collapse on the row; the notification beside the button made
+        // it too, and for a while it was repaired for `Expired` alone while
+        // the other three arms went on making it.
+        //
+        // All four reasons a rule of either kind can reach, in one loop, so
+        // a fifth arm added to the enum cannot be written as an open by
+        // being written somewhere this test does not look.
         let permit = closed_rule(5173, "tcp");
         let forward = forward_rule(8443, 3000);
 
-        let plain = notification_for(&permit, CloseReason::Expired);
-        let redirected = notification_for(&forward, CloseReason::Expired);
+        for reason in [
+            CloseReason::Expired,
+            CloseReason::NetworkChanged,
+            CloseReason::Reconciled,
+            CloseReason::Requested,
+        ] {
+            let plain = notification_for(&permit, reason);
+            let redirected = notification_for(&forward, reason);
 
-        assert!(
-            redirected.body.contains("redirect"),
-            "an expired forward must say it redirected: {}",
-            redirected.body
-        );
-        assert!(
-            redirected.body.contains("3000"),
-            "and name the published port it redirected to: {}",
-            redirected.body
-        );
-        assert!(
-            !plain.body.contains("redirect"),
-            "a rule that only permitted must claim no redirect: {}",
-            plain.body
-        );
-        // Both still say the thing an expiry notification is for, and both
-        // still carry the button -- this changed the words, not the offer.
-        for n in [&plain, &redirected] {
-            assert!(n.body.contains("expired"), "{}", n.body);
-            assert!(n.actions.iter().any(|a| a.0 == REOPEN), "{:?}", n.actions);
+            assert!(
+                redirected.body.contains("redirect"),
+                "{reason:?}: a forward must say it redirected: {}",
+                redirected.body
+            );
+            assert!(
+                redirected.body.contains("3000"),
+                "{reason:?}: and name the published port it redirected to, which is \
+                 the number the person knows the service by: {}",
+                redirected.body
+            );
+            assert!(
+                !plain.body.contains("redirect"),
+                "{reason:?}: a rule that only permitted must claim no redirect: {}",
+                plain.body
+            );
+            assert!(
+                !plain.body.contains("3000"),
+                "{reason:?}: and must name no container's port: {}",
+                plain.body
+            );
+            // Each still says the thing its own notification is for: this
+            // changed which act is named, not what happened.
+            let own_words = match reason {
+                CloseReason::Expired => "expired",
+                CloseReason::NetworkChanged => "no longer on",
+                CloseReason::Reconciled => "dropped its record",
+                CloseReason::Requested => "on request",
+                CloseReason::TargetGone => unreachable!("not in the loop above"),
+            };
+            for n in [&plain, &redirected] {
+                assert!(n.body.contains(own_words), "{reason:?}: {}", n.body);
+                assert!(n.body.contains("8443/tcp") || n.body.contains("5173/tcp"));
+            }
+        }
+
+        // And the offer is unchanged by any of it: an expiry still carries
+        // the button, both kinds of rule.
+        for rule in [&permit, &forward] {
+            assert!(notification_for(rule, CloseReason::Expired)
+                .actions
+                .iter()
+                .any(|a| a.0 == REOPEN));
         }
     }
 
