@@ -32,11 +32,13 @@ pub enum ExitCode {
     NoNetwork = 8,
     /// A command that offers a choice had nothing to offer.
     NothingToOffer = 9,
+    /// The port named is not published by a container, or Docker could not be
+    /// read at all. One code for two facts: the exit status does not say
+    /// which, and [`Error::kind`] and the variant are what do.
+    NotForwardable = 10,
+    /// The external port a forward would use is already carrying something.
+    ExternalPortInUse = 11,
     /// The detected backend has no way to redirect a port.
-    ///
-    /// 10 and 11 are unassigned. They are held for the two codes the
-    /// forwarding work adds next; this one takes 12 so that whichever of the
-    /// two lands first, no number here has to move.
     ForwardUnsupported = 12,
 }
 
@@ -90,6 +92,32 @@ pub enum Error {
     /// which every backend that does not implement a forward inherits.
     #[error("{0}")]
     ForwardUnsupported(String),
+
+    /// No container publishes the port a forward was asked for.
+    ///
+    /// Docker's table was read and the port is not in it. That is an answer.
+    /// [`Error::DockerUnreadable`] is the absence of one. The two share an
+    /// exit code, so a caller that needs to tell them apart reads
+    /// [`Error::kind`] or matches the variant; the message of each says only
+    /// what that one knows.
+    #[error("{0}")]
+    NotPublishedByContainer(String),
+
+    /// Docker's table could not be read, so whether the port is published is
+    /// unknown.
+    ///
+    /// The other half of the pair described on
+    /// [`Error::NotPublishedByContainer`].
+    #[error("{0}")]
+    DockerUnreadable(String),
+
+    /// The external port a forward would use is already carrying something.
+    ///
+    /// Two situations reach this, and `detail` is where they differ: porthole
+    /// already has a rule on that port, or a socket on this machine is
+    /// listening on it.
+    #[error("port {port} is already in use ({detail})")]
+    ExternalPortInUse { port: u16, detail: String },
 
     #[error("command `{command}` exited with status {status}: {stderr}")]
     CommandFailed {
@@ -149,6 +177,10 @@ impl Error {
             Error::NoNetwork(_) => ExitCode::NoNetwork,
             Error::NothingToOffer(_) => ExitCode::NothingToOffer,
             Error::ForwardUnsupported(_) => ExitCode::ForwardUnsupported,
+            Error::NotPublishedByContainer(_) | Error::DockerUnreadable(_) => {
+                ExitCode::NotForwardable
+            }
+            Error::ExternalPortInUse { .. } => ExitCode::ExternalPortInUse,
             Error::Remote { code, .. } => *code,
             Error::CommandFailed { .. }
             | Error::CommandSpawn { .. }
@@ -170,6 +202,9 @@ impl Error {
             Error::NoNetwork(_) => "no_network",
             Error::NothingToOffer(_) => "nothing_to_offer",
             Error::ForwardUnsupported(_) => "forward_unsupported",
+            Error::NotPublishedByContainer(_) => "not_published_by_container",
+            Error::DockerUnreadable(_) => "docker_unreadable",
+            Error::ExternalPortInUse { .. } => "external_port_in_use",
             Error::Remote { kind, .. } => kind,
             Error::CommandFailed { .. } => "command_failed",
             Error::CommandSpawn { .. } => "command_spawn_failed",
@@ -197,10 +232,8 @@ mod tests {
         assert_eq!(ExitCode::RuleNotFound as i32, 7);
         assert_eq!(ExitCode::NoNetwork as i32, 8);
         assert_eq!(ExitCode::NothingToOffer as i32, 9);
-        // 10 and 11 are unassigned, and this test is where that stays
-        // visible. `ForwardUnsupported` skipped them so that the two codes
-        // the forwarding work adds next can take them in either order
-        // without moving this one.
+        assert_eq!(ExitCode::NotForwardable as i32, 10);
+        assert_eq!(ExitCode::ExternalPortInUse as i32, 11);
         assert_eq!(ExitCode::ForwardUnsupported as i32, 12);
     }
 
@@ -234,6 +267,30 @@ mod tests {
             Error::ForwardUnsupported("ufw cannot".into()).exit_code(),
             ExitCode::ForwardUnsupported
         );
+        assert_eq!(
+            Error::ExternalPortInUse {
+                port: 8443,
+                detail: "something is listening on it".into()
+            }
+            .exit_code(),
+            ExitCode::ExternalPortInUse
+        );
+    }
+
+    #[test]
+    fn an_unread_docker_and_an_unpublished_port_share_a_code_but_not_a_kind() {
+        // One exit status covers both, so a script reading `$?` alone cannot
+        // tell "no container publishes that port" from "porthole never found
+        // out". `kind` is what carries the difference to a caller, and this
+        // is the assertion that keeps the two slugs from collapsing into one.
+        let unpublished = Error::NotPublishedByContainer("3000/tcp is not published".into());
+        let unreadable = Error::DockerUnreadable("could not read Docker's table".into());
+
+        assert_eq!(unpublished.exit_code(), ExitCode::NotForwardable);
+        assert_eq!(unreadable.exit_code(), ExitCode::NotForwardable);
+        assert_ne!(unpublished.kind(), unreadable.kind());
+        assert_eq!(unpublished.kind(), "not_published_by_container");
+        assert_eq!(unreadable.kind(), "docker_unreadable");
     }
 
     #[test]
@@ -247,6 +304,14 @@ mod tests {
         assert_eq!(
             Error::ForwardUnsupported("x".into()).kind(),
             "forward_unsupported"
+        );
+        assert_eq!(
+            Error::ExternalPortInUse {
+                port: 8443,
+                detail: "x".into()
+            }
+            .kind(),
+            "external_port_in_use"
         );
     }
 

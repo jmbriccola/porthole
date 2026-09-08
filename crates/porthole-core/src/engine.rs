@@ -15,6 +15,8 @@ use crate::clock::Clock;
 use crate::command::CommandRunner;
 use crate::error::{Error, Result};
 use crate::expiry;
+use crate::forward::ForwardTo;
+use crate::listening::ProcFs;
 use crate::model::{Lifetime, OpenRequest, Protocol, ScopeSpec, Target};
 use crate::net::{self, LocalNetwork};
 use crate::reconcile;
@@ -380,6 +382,151 @@ impl<'a> Engine<'a> {
         Ok(rule)
     }
 
+    /// Redirect the external port `req.port` to the container that publishes
+    /// `published_port`.
+    ///
+    /// `req.port` is what the local network connects to; `published_port` is
+    /// the port Docker published on this host, which is what the user named.
+    /// The two are separate arguments because they are separate ports: the
+    /// whole point of a forward is that they may differ.
+    ///
+    /// Four situations make a forward wrong, and the order they are found in
+    /// is part of what this method promises.
+    ///
+    /// **Docker is read first.** Until that read returns, nothing about the
+    /// request has been decided. A failed read yields
+    /// [`Error::DockerUnreadable`] and a successful read with no match yields
+    /// [`Error::NotPublishedByContainer`] -- two variants because they are
+    /// two facts, and reporting the first as the second would tell a user a
+    /// port is not published when porthole never found out. They share an
+    /// exit code; the variant and [`Error::kind`] are what carry the
+    /// difference.
+    ///
+    /// **The external port is checked next**, against porthole's own state
+    /// and then against this machine's listening sockets. Either refuses with
+    /// [`Error::ExternalPortInUse`], whose `detail` says which. Both exist
+    /// because a redirect claims the port: what arrives on it reaches the
+    /// container. The listening check does not look at what a socket is bound
+    /// to -- any listener on that port and protocol refuses, loopback ones
+    /// included.
+    ///
+    /// `procfs` is a parameter rather than an `Engine` field because this is
+    /// the only operation on this type that reads `/proc` at all.
+    pub fn forward(
+        &mut self,
+        req: &OpenRequest,
+        published_port: u16,
+        uid: u32,
+        procfs: &dyn ProcFs,
+    ) -> Result<ManagedRule> {
+        let published = crate::docker::published(self.runner).map_err(|e| {
+            Error::DockerUnreadable(format!(
+                "porthole could not read Docker's published ports, so it cannot say \
+                 whether {published_port}/{} is one of them: {e}",
+                req.protocol
+            ))
+        })?;
+
+        // The first match on the pair, not the most exposing one
+        // (`docker::advise` picks by exposure, because it is deciding what to
+        // warn about). A host port can carry more than one DNAT rule --
+        // `-p 127.0.0.1:5432:80 -p 0.0.0.0:5432:80` is two -- and this takes
+        // whichever came first in the chain.
+        let mapping = published
+            .iter()
+            .copied()
+            .find(|p| p.host_port == published_port && p.protocol == req.protocol)
+            .ok_or_else(|| {
+                Error::NotPublishedByContainer(format!(
+                    "{published_port}/{} is not published by any container",
+                    req.protocol
+                ))
+            })?;
+        let to = ForwardTo::from_published(&mapping);
+
+        // After the Docker read, so that a Docker failure is reported before
+        // this sweep can close anything; before the state check below, so a
+        // record the firewall no longer has is not read as a conflict -- the
+        // same reason `open` reconciles ahead of its own already-open check.
+        self.reconcile();
+
+        let external = req.port;
+        if let Some(existing) = self.state.find_by_port(external, req.protocol) {
+            return Err(Error::ExternalPortInUse {
+                port: external,
+                detail: format!(
+                    "porthole has a rule on it, towards {} (id {})",
+                    existing.target, existing.id
+                ),
+            });
+        }
+
+        // TCP only: `listening::scan` reads `/proc/net/tcp` and
+        // `/proc/net/tcp6`, not their `udp` counterparts, so a UDP external
+        // port passes this check having been compared against nothing.
+        let listeners = crate::listening::scan(procfs).map_err(|e| {
+            Error::Unexpected(format!(
+                "porthole could not read this machine's listening sockets, so it cannot \
+                 say whether anything already answers on {external}: {e}"
+            ))
+        })?;
+        if let Some(service) = listeners
+            .iter()
+            .find(|s| s.port == external && s.protocol == req.protocol)
+        {
+            let detail = match &service.process {
+                Some(name) => format!("`{name}` is listening on it"),
+                None => "something on this machine is listening on it".to_string(),
+            };
+            return Err(Error::ExternalPortInUse {
+                port: external,
+                detail,
+            });
+        }
+
+        // Minted before the backend call for the reason `open` gives: the
+        // marker in the firewall and the id in the state file are one
+        // identity.
+        let id = Uuid::new_v4().to_string();
+        let handle = self.backend.forward(req, &to, &format!("porthole:{id}"))?;
+
+        let now = self.clock.now();
+        let rule = ManagedRule {
+            id,
+            port: external,
+            protocol: req.protocol,
+            target: req.target,
+            backend: self.backend.id(),
+            opened_at: now,
+            expires_at: match req.lifetime {
+                Lifetime::For(d) => Some(now + d.as_secs()),
+                Lifetime::UntilReboot => None,
+            },
+            uid,
+            handle,
+            forward: Some(to),
+        };
+
+        if !self.runner.is_dry_run() {
+            self.state.insert(rule.clone());
+            if let Err(e) = self.state.save() {
+                self.roll_back(&rule);
+                return Err(e);
+            }
+        }
+
+        if let Lifetime::For(duration) = req.lifetime {
+            if let Err(e) =
+                expiry::schedule_close(self.runner, &self.executable, &rule, duration.as_secs())
+            {
+                self.roll_back(&rule);
+                return Err(e);
+            }
+        }
+
+        Ok(rule)
+    }
+
     /// Undo an opening that could not be completed.
     ///
     /// Best effort, but not blind: if the compensating close fails, the rule is
@@ -695,7 +842,10 @@ mod tests {
     use crate::backend::RuleHandle;
     use crate::clock::FixedClock;
     use crate::command::{Command, DryRunRunner, Effect, Output, RecordingRunner};
+    use crate::error::ExitCode;
+    use crate::listening::FakeProcFs;
     use crate::model::Protocol;
+    use std::sync::Mutex;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -2134,5 +2284,344 @@ mod tests {
             vec![orphan],
             "a read command must never close a rule the firewall holds"
         );
+    }
+
+    // --- forward -------------------------------------------------------
+
+    /// `iptables -t nat -S DOCKER` for one container published the way this
+    /// feature exists for: on loopback only, where the local network cannot
+    /// reach it. Shaped after `docker.rs`'s own `DOCKER_CHAIN`, which was
+    /// captured from a real daemon.
+    const DOCKER_CHAIN_LOOPBACK: &str = "\
+-N DOCKER
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 3000 -j DNAT --to-destination 172.18.0.2:8080
+";
+
+    /// The container behind [`DOCKER_CHAIN_LOOPBACK`], spelled out once.
+    const CONTAINER_ADDR: &str = "172.18.0.2";
+    const CONTAINER_PORT: u16 = 8080;
+    const PUBLISHED_PORT: u16 = 3000;
+    /// The port the local network would connect to. Deliberately not
+    /// `PUBLISHED_PORT`: a test where the two are equal cannot tell which of
+    /// them a rule was built from.
+    const EXTERNAL_PORT: u16 = 8443;
+
+    /// `/proc/net/tcp`'s header, which is all a machine with nothing
+    /// listening has.
+    const PROC_NET_TCP_EMPTY: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+";
+
+    /// The same, plus one `LISTEN` socket on 8443 (hex `20FB`) bound to
+    /// `0.0.0.0` -- a service the local network can already reach.
+    const PROC_NET_TCP_8443: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:20FB 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 67371 1 0000000000000000 100 0 0 10 0
+";
+
+    fn nothing_listening() -> FakeProcFs {
+        FakeProcFs::new(PROC_NET_TCP_EMPTY)
+    }
+
+    /// What `iptables -t nat -S DOCKER` answers.
+    enum DockerChain {
+        /// The chain, read successfully.
+        Reads(&'static str),
+        /// A read that did not happen. Exit 4 is `iptables(8)`'s "resource
+        /// problem", one of the statuses `docker::published` refuses to read
+        /// as an empty chain -- unlike exit 1, which it reads as exactly
+        /// that, and which would therefore test the wrong thing here.
+        Unreadable,
+    }
+
+    /// Answers the `DOCKER` chain read and passes everything else to an
+    /// ordinary [`RecordingRunner`], the way `SystemctlMissing` does for
+    /// `systemctl`. It keeps its own recording so the intercepted read is
+    /// visible too: a test that never proves the read happened would pass
+    /// just as well against an engine that skipped it.
+    struct DockerRunner {
+        chain: DockerChain,
+        inner: RecordingRunner,
+        seen: Mutex<Vec<Command>>,
+    }
+
+    impl DockerRunner {
+        fn new(chain: DockerChain, responses: Vec<Output>) -> Self {
+            DockerRunner {
+                chain,
+                inner: RecordingRunner::with_responses(responses),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CommandRunner for DockerRunner {
+        fn run(&self, cmd: &Command) -> Result<Output> {
+            self.seen.lock().expect("not poisoned").push(cmd.clone());
+            if cmd.program == "iptables" {
+                return Ok(match self.chain {
+                    DockerChain::Reads(text) => Output::stdout(text),
+                    DockerChain::Unreadable => Output {
+                        status: 4,
+                        stdout: String::new(),
+                        stderr: "iptables: Resource temporarily unavailable.".to_string(),
+                    },
+                });
+            }
+            self.inner.run(cmd)
+        }
+
+        fn recorded(&self) -> Vec<Command> {
+            self.seen.lock().expect("not poisoned").clone()
+        }
+    }
+
+    fn forward_req(external: u16) -> OpenRequest {
+        OpenRequest {
+            port: external,
+            protocol: Protocol::Tcp,
+            target: Target::Network {
+                cidr: "10.10.10.0/24".parse().unwrap(),
+            },
+            lifetime: Lifetime::For(Duration::from_secs(3600)),
+        }
+    }
+
+    #[test]
+    fn forward_tells_a_port_no_container_publishes_apart_from_a_docker_it_could_not_read() {
+        // Two different facts. "No container publishes 3000" is an answer;
+        // "porthole could not read Docker's table" is the absence of one, and
+        // reporting the second as the first would have a user believe porthole
+        // checked. They share an exit code, so the variant and `kind` are
+        // where the difference has to survive -- assert both.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+
+        let runner = DockerRunner::new(DockerChain::Reads("-N DOCKER\n"), Vec::new());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+        let err = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &nothing_listening(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::NotPublishedByContainer(_)),
+            "an empty chain is an answer: {err}"
+        );
+        assert_eq!(err.kind(), "not_published_by_container");
+        assert_eq!(err.exit_code(), ExitCode::NotForwardable);
+        assert!(
+            err.to_string().contains("3000/tcp"),
+            "the message must name the port asked about: {err}"
+        );
+
+        let harness = Harness::new();
+        let runner = DockerRunner::new(DockerChain::Unreadable, Vec::new());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+        let err = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &nothing_listening(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::DockerUnreadable(_)),
+            "an unreadable Docker table must not be reported as 'no container': {err}"
+        );
+        assert_eq!(err.kind(), "docker_unreadable");
+        assert_eq!(err.exit_code(), ExitCode::NotForwardable);
+        let text = err.to_string();
+        assert!(
+            text.contains("cannot say"),
+            "the message must not claim to know: {text}"
+        );
+        assert!(
+            !text.contains("is not published"),
+            "the message must not read like the answer it does not have: {text}"
+        );
+    }
+
+    #[test]
+    fn forward_reads_docker_before_it_looks_at_the_external_port() {
+        // The order is the substance. Here every one of the four things that
+        // makes a forward wrong is true at once: Docker cannot be read, the
+        // external port already carries a porthole rule, and something is
+        // listening on it. The Docker answer is the one that must come out --
+        // until that read returns, nothing else has been decided.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DockerChain::Unreadable, subnet_open_script());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        engine
+            .open(
+                EXTERNAL_PORT,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        let err = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &FakeProcFs::new(PROC_NET_TCP_8443),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::DockerUnreadable(_)),
+            "the external port's own troubles must not answer a question about Docker: {err}"
+        );
+        assert!(
+            runner
+                .recorded()
+                .iter()
+                .any(|c| c.program == "iptables" && c.args.iter().any(|a| a == "DOCKER")),
+            "the DOCKER chain read has to actually happen"
+        );
+    }
+
+    #[test]
+    fn forward_refuses_an_external_port_porthole_already_has_a_rule_on_and_names_it() {
+        // Silently redirecting a port the user already opened towards
+        // something else would send traffic somewhere they did not ask for
+        // and would have no way to notice.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(
+            DockerChain::Reads(DOCKER_CHAIN_LOOPBACK),
+            subnet_open_script(),
+        );
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let existing = engine
+            .open(
+                EXTERNAL_PORT,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        let err = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &nothing_listening(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, Error::ExternalPortInUse { .. }), "got {err}");
+        assert_eq!(err.exit_code(), ExitCode::ExternalPortInUse);
+        let text = err.to_string();
+        assert!(
+            text.contains("8443"),
+            "the message must name the conflict: {text}"
+        );
+        assert!(
+            text.contains(&existing.id),
+            "and the rule it conflicts with: {text}"
+        );
+        assert!(
+            backend.forwarded().is_empty(),
+            "a refusal must not have reached the firewall"
+        );
+    }
+
+    #[test]
+    fn forward_refuses_an_external_port_something_on_this_machine_is_listening_on() {
+        // A redirect claims the port: what arrives on it goes to the
+        // container instead of to whatever answered before.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DockerChain::Reads(DOCKER_CHAIN_LOOPBACK), Vec::new());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let err = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &FakeProcFs::new(PROC_NET_TCP_8443).with_socket(67371, 4242, "nginx"),
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, Error::ExternalPortInUse { .. }), "got {err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("8443") && text.contains("nginx"),
+            "the message must name the port and what holds it: {text}"
+        );
+        assert!(
+            backend.forwarded().is_empty(),
+            "a refusal must not have reached the firewall"
+        );
+    }
+
+    #[test]
+    fn forward_creates_the_rule_and_records_the_mapping_it_was_built_from() {
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DockerChain::Reads(DOCKER_CHAIN_LOOPBACK), Vec::new());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let rule = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &nothing_listening(),
+            )
+            .unwrap();
+
+        // The rule is on the external port -- what the local network sees --
+        // not on the port Docker published.
+        assert_eq!(rule.port, EXTERNAL_PORT);
+        assert_eq!(
+            rule.forward,
+            Some(ForwardTo {
+                container_addr: CONTAINER_ADDR.parse().unwrap(),
+                container_port: CONTAINER_PORT,
+                published_port: PUBLISHED_PORT,
+                protocol: Protocol::Tcp,
+            })
+        );
+        assert_eq!(rule.opened_at, NOW);
+        assert_eq!(rule.expires_at, Some(NOW + 3600));
+        assert_eq!(rule.uid, 1000);
+
+        // One rule reached the firewall, and it was a forward rather than an
+        // open.
+        assert_eq!(backend.forwarded().len(), 1);
+        assert!(backend.opened().is_empty());
+        assert_eq!(backend.markers(), vec![format!("porthole:{}", rule.id)]);
+
+        // Persisted, mapping and all, and readable by a fresh reader: the
+        // mapping is stored so a later check can ask whether this is still
+        // the same service, which it cannot do from memory.
+        let reloaded = StateStore::open(&harness.path).unwrap();
+        assert_eq!(reloaded.rules().len(), 1);
+        assert_eq!(reloaded.rules()[0].forward, rule.forward);
+
+        // And it closes by itself: a rule with no timer is the failure
+        // porthole exists to prevent.
+        let last = runner.recorded().pop().unwrap();
+        assert_eq!(last.program, "systemd-run");
+        assert!(last.args.contains(&"--on-active=3600s".to_string()));
+        assert!(last.args.contains(&rule.id));
     }
 }
