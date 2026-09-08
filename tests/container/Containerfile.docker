@@ -9,12 +9,19 @@
 # chain would prove the parser and nothing else -- and the parser already has
 # unit tests against a captured chain.
 #
-# Docker 29.8.0 from Docker's own Fedora repository, the identical version
-# this project's development host runs, so what the forward tests measure is
-# what a user of that host would get. Pinned to a version rather than taken
-# from `latest`: a forward's whole correctness argument rests on which rules
-# Docker writes, and a silent upgrade changing them should fail here rather
-# than be absorbed.
+# Docker from Docker's own Fedora repository — 29.8.0 when this was written,
+# the identical version this project's development host runs, so what the
+# forward tests measure is what a user of that host would get.
+#
+# **Deliberately not pinned.** A forward's whole correctness argument rests on
+# which rules Docker writes into the `nat` table's `DOCKER` chain, and pinning
+# a version is what would make this suite blind to the release that changes
+# them: the tests would go on passing against a Docker nobody runs any more.
+# Taking whatever `download.docker.com` resolves to is what gives the change a
+# chance to fail here. The cost is that the version is an input nobody
+# declared, so `DOCKER_DAEMON_SETUP` in `crates/porthole-cli/tests/container.rs`
+# prints the version it actually resolved into every run's output — a failure
+# then names the Docker it saw instead of leaving it to be guessed at.
 #
 # No Rust toolchain and no copy of the porthole binaries, exactly as the
 # other three images: they are built once on the host as static musl binaries

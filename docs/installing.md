@@ -1,14 +1,21 @@
 # Installing the privileged half
 
 `porthole` — the CLI — is one binary and needs nothing else: `porthole list`,
-`porthole status` and anything with `--dry-run` work as soon as it is on your
-`$PATH`. `porthole open`, `porthole forward` and `porthole close` are
-different: they ask a privileged helper to act, and that helper has to be
+`porthole status`, and `--dry-run` on `open` and `close`, work as soon as it
+is on your `$PATH`. `porthole open`, `porthole forward` and `porthole close`
+are different: they ask a privileged helper to act, and that helper has to be
 installed once, as root, before they work. `porthole listen` and `porthole
 doctor` need it too, though only for one part of what they report — reading
 Docker's own rules needs root, and without the helper they say they could not
 check rather than reporting that Docker touches nothing. This is that
 installation.
+
+**`forward --dry-run` is the one dry run that is not in the first group**, and
+it is not the helper it wants: it builds the engine in your own process, and
+that engine reads Docker's `DOCKER` chain directly, which needs root. So it
+exits 10 (`docker_unreadable`) for an ordinary user whether or not the helper
+is installed. Saying it could not check is the intended answer — the
+alternative is a dry run that reports a forward it never verified.
 
 porthole is in no distribution's repositories yet, and there is no release to
 download. What the repository does carry is the packaging for three formats,
@@ -132,7 +139,9 @@ longer the one it was created against — filtered to rules opened by that
 session's own uid. It has nothing to listen to until the helper above is
 installed. It closes nothing and keeps no view of what is open.
 
-**What it can cause on the system bus**, in full, and it is two things.
+**What it can cause at the helper**, in full, and it is two things. (On the
+bus daemon itself it also does what any client does — `Hello`, `AddMatch`, a
+name lookup — and none of that reaches porthole.)
 
 The first is a bare `List` at start-up, once, whose answer it throws away.
 Calling the helper is what D-Bus-activates it, and the agent has already

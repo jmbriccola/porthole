@@ -324,11 +324,38 @@ mod tests {
                     .then(|| (name.to_string(), value))
             })
             .collect();
+        // The floor, and it is a ratchet: raise it whenever the enum grows,
+        // never lower it. Codes are a public interface and are only ever
+        // appended, so the count can only go up -- which means a parse that
+        // has stopped matching the source is the *only* thing that can bring
+        // it down, and that is exactly what this catches.
+        //
+        // It was `>= 10` and that was the wrong size: with 15 variants, the
+        // five codes this feature added could all have silently stopped being
+        // parsed and both guards below would have gone on passing, checking
+        // codes 0-9 and calling it a table. A floor whose slack is precisely
+        // the subject of the work is not a floor.
+        const LOWEST_TOLERABLE: usize = 15;
         assert!(
-            found.len() >= 10,
-            "the enum body was parsed as {} variants, which is fewer than this enum \
-             has had since milestone 1 -- the parse above has stopped matching the \
-             source rather than the enum having shrunk: {found:?}",
+            found.len() >= LOWEST_TOLERABLE,
+            "the enum body was parsed as {} variants, fewer than the {LOWEST_TOLERABLE} \
+             it had when this assertion was last raised. Codes are only ever appended, \
+             so the enum cannot have shrunk: the parse above has stopped matching the \
+             source. Parsed: {found:?}",
+            found.len()
+        );
+        // The other way a parse can go wrong without shrinking: dropping a
+        // variant from the middle. Codes run 0..n with none missing and none
+        // repeated (`exit_codes_are_stable` pins each individual number), so
+        // a gap here is a variant the parse lost.
+        let mut values: Vec<i32> = found.iter().map(|(_, v)| *v).collect();
+        values.sort_unstable();
+        assert_eq!(
+            values,
+            (0..found.len() as i32).collect::<Vec<_>>(),
+            "the parsed codes are not the contiguous run 0..{}, so either the parse \
+             dropped a variant from the middle or a code was renumbered -- both of \
+             which this file's own header forbids: {found:?}",
             found.len()
         );
         found

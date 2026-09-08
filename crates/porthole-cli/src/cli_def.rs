@@ -102,7 +102,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Show what would happen without changing anything. Needs no privileges.
+    /// Show what would happen without changing anything. Needs no privileges,
+    /// except for `forward`: that one reads Docker's own rules itself, which
+    /// needs root, and exits 10 without it.
     #[arg(long, global = true)]
     pub dry_run: bool,
 

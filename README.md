@@ -33,11 +33,24 @@ polkit policy, a D-Bus configuration and a systemd unit. See
 distribution packages porthole, you place them by hand.
 
 `porthole list` and `porthole status` need none of that installed at all —
-they never touch the bus. `--dry-run` changes nothing and needs no privileges
-either, with one exception: `open --dry-run` makes the one read-only call
-every `open` makes, asking the helper whether Docker has already published
-that port. That call is best-effort — no helper, no answer, no complaint, and
-the dry run goes ahead. Once the helper is installed, opening towards
+they never touch the bus. `--dry-run` changes nothing, and for `open` and
+`close` it needs no privileges either. Two dry runs are not like that, and
+they differ from each other:
+
+- `open --dry-run` makes the one read-only call every `open` makes, asking the
+  helper whether Docker has already published that port. That call is
+  best-effort — no helper, no answer, no complaint, and the dry run goes
+  ahead.
+- **`forward --dry-run` needs root, and fails without it.** It does not go
+  through the helper at all: it builds the engine locally, and the engine
+  reads Docker's own `DOCKER` chain to find out which container publishes the
+  port. That read needs root, so an ordinary user gets exit 10
+  (`docker_unreadable`) rather than a printed command. That is the deliberate
+  direction — a dry run that could not check says so instead of pretending it
+  could — but it does mean this is the one `--dry-run` that is not available
+  to everyone.
+
+Once the helper is installed, opening towards
 your own subnet asks polkit to authenticate the first time and not again that
 session; opening towards everyone (`--to any`) asks every time, because it is
 the more dangerous request; `porthole forward` asks every time too, whatever
@@ -47,11 +60,15 @@ exposed.
 
 ## What it is not
 
-porthole is not a firewall manager. It does not do zones, services, NAT or
+porthole is not a firewall manager. It does not do zones, services or
 permanent rules. If you need those, use `firewall-config`, `ufw` or `nft`
 directly.
 
-It does one kind of redirect, and only one: `porthole forward` puts a port in
+It does write NAT, in exactly one shape. A `forward-port` rich rule is a DNAT
+— this repository's own test for it is called
+`a_redirect_rich_rule_renders_to_a_dnat_and_no_filter_rule` — so "porthole
+does no NAT" would be a distinction the code does not make. What is true is
+narrower: it does one kind of redirect, and only one. `porthole forward` puts a port in
 front of a Docker container that is published on this machine's loopback
 address and nowhere else — see [Forwarding to a
 container](#forwarding-to-a-container). It is a runtime rule with a timer like
@@ -121,9 +138,11 @@ sudo install -m 0755 target/release/porthole /usr/local/bin/porthole
 ```
 
 That gives you `porthole list`, `porthole status`, `porthole doctor`,
-`porthole devices` and `--dry-run`. `open` and `close` need the privileged
-helper installed; so does the Docker half of `porthole listen`, `porthole
-open` and `porthole doctor`, since reading Docker's own rules needs root. The
+`porthole devices`, and `--dry-run` for `open` and `close`. `open`, `forward`
+and `close` need the privileged helper installed; so does the Docker half of
+`porthole listen`, `porthole open` and `porthole doctor`, since reading
+Docker's own rules needs root — and so, for the same reason, does `forward
+--dry-run`, which does that read itself rather than through the helper. The
 same `cargo build --release` also produces `porthole-agent`, which is what
 turns a close nobody asked for into a desktop notification.
 
@@ -151,8 +170,9 @@ piece by hand.
 ### Removing it
 
 Removing the package closes every port porthole still has open — every
-redirect `porthole forward` made included — first. That is not a courtesy: uninstalling is the one action that ends every other way a
-porthole rule could close. The timer that would have closed it re-executes
+redirect `porthole forward` made included — first. That is not a courtesy:
+uninstalling is the one action that ends every other way a porthole rule
+could close. The timer that would have closed it re-executes
 `/usr/bin/porthole`; `close`, the network-change monitor and reconciliation
 all go through the helper. Take those away and the rule stays in the firewall,
 with the record of it on a tmpfs and nothing left that can act on it.
@@ -212,8 +232,10 @@ Global flags:
   honours it, and so does every failure. `devices add` is interactive, so its
   prompts go to stderr and stdout carries only the device it saved. See
   [docs/json-schema.md](docs/json-schema.md).
-- `--dry-run` — print the commands porthole would run, and change nothing. Needs
-  no privileges.
+- `--dry-run` — print the commands porthole would run, and change nothing.
+  Needs no privileges for `open` and `close`. `forward --dry-run` is the
+  exception: it reads Docker's own rules itself, which needs root, and exits
+  10 without it.
 
 Defaults: `--proto tcp`, `--for 1h`, `--to subnet`.
 
@@ -442,10 +464,16 @@ With Docker's default `userland-proxy` that is true — `docker-proxy` holds
 `127.0.0.1:<port>` — but a daemon configured with `"userland-proxy": false`
 has no host listener at all: the DNAT rule is the whole of the publication.
 Such a container has no row, and therefore no button, even though it is
-published and forwardable. `porthole forward 3000` on the command line works
-normally in that configuration, because it reads Docker's table rather than
-`/proc`. That follows from the GUI being row-driven; it is not a bug in
-either half, and neither half can see it to warn you.
+published and forwardable. On the command line `porthole forward 3000` is
+unaffected, and that follows from where each half looks rather than from a
+measurement: the GUI gives a row a Forward button only when the `/proc` scan
+produced that row in the first place, while `porthole forward` reads Docker's
+`DOCKER` chain, which Docker writes whether or not a proxy process is
+listening. **This is reasoning from the two code paths, not something
+porthole's tests exercise** — the test image runs Docker's default
+`userland-proxy: true`, so that configuration is described here and measured
+nowhere. It is not a bug in either half, and neither half can see it to warn
+you.
 
 ## When the network changes
 
@@ -575,9 +603,12 @@ starts user units at all: it starts the one unit, now.
 | 14 | Docker publishes that container on an address other than loopback, so the local network may already reach it. That is Docker's own rule, which porthole can neither have made nor close. What porthole read to decide it is the `-d` flag on Docker's own DNAT rule and nothing else: no `-d` is every interface, and a `-d` naming any other address is that address, whether or not this machine holds it. |
 
 These are a public interface. New codes are added at the end; existing ones are
-never renumbered. `porthole --help` prints the same table, and two tests in
+never renumbered. `porthole --help` and `porthole.1` list the same **codes** in
+shorter words — the `--json` `kind` names and the note about which backends can
+redirect are here only — and three tests keep all of it from drifting: two in
 `porthole-core`'s `error.rs` fail when `ExitCode` gains a variant this table
-does not name, or when this table keeps a row the enum no longer has.
+does not name or when this table keeps a row the enum no longer has, and one in
+`porthole-cli`'s `cli.rs` fails when the help text's own list misses a code.
 
 ## Limitations
 

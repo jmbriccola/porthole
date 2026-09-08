@@ -253,13 +253,21 @@ impl FirewallBackend for Firewalld<'_> {
     /// forwarded traffic; what does was measured to be already there, and
     /// is not porthole's to write.
     ///
-    /// The container suite has since reproduced both halves against a real
-    /// firewalld and a real Docker, on this same design rather than on a
-    /// spike's throwaway one:
-    /// `a_client_on_the_lan_reaches_the_container_through_the_forward_and_not_through_the_input_hook`
-    /// counts zero packets at the input hook while the forward hook carries
-    /// the connection, and writing the accept *instead of* the redirect
-    /// leaves the client unable to reach the container at all.
+    /// **What the container suite reproduces, and what it does not.**
+    /// `the_lan_reaches_the_container_through_the_forward_hook_and_only_on_the_port_it_was_given`
+    /// counts **zero packets addressed to the external port** at the input
+    /// hook while the forward hook carries the connection. That is the first
+    /// bullet above, on this same design rather than on a spike's throwaway
+    /// one, and it is the half that matters for whether an accept in a zone's
+    /// input chain could be carrying anything.
+    ///
+    /// The second and third bullets are the spike's alone. Nothing committed
+    /// compares the counters with and without the accept, and nothing
+    /// committed binds a host service to `0.0.0.0` to show the accept
+    /// exposing it — no test here writes an accept beside a redirect at all.
+    /// What keeps that accept from coming back is the unit test
+    /// `a_forward_writes_no_accept_for_the_external_port` below, which
+    /// asserts it is absent from every command a forward issues.
     fn forward(&self, req: &OpenRequest, to: &ForwardTo, _marker: &str) -> Result<RuleHandle> {
         // The marker goes nowhere, for the same reason `open` drops it: the
         // rich language has no comment element. The stored rule string is
@@ -633,6 +641,101 @@ pub(crate) mod tests {
             Output::stdout("success"),        // --add-rich-rule
             Output::stdout(FORWARD_REDIRECT), // after
         ]
+    }
+
+    /// `porthole forward 3000 --as 4000`: the local network connects to
+    /// **4000** and Docker published **3000**. Every other fixture in this
+    /// file has the two equal, which is the one arrangement in which a
+    /// confusion between them is invisible.
+    ///
+    /// Three numbers, three roles, and the rule has to put each in its own
+    /// place: `port=` is the external port (4000, what the LAN connects to),
+    /// `to-port=` is the **container's** port (8080), and the published port
+    /// (3000) appears **nowhere at all** -- it is how porthole found the
+    /// container, not part of what it writes.
+    ///
+    /// This is what closes the hole. Before it, no test at any level asserted
+    /// the rule built for a differing pair: the host test for `--as` checks
+    /// two JSON fields that both come from the `OpenRequest`, the container
+    /// tests all forwarded 3000 to a container published as 3000, and every
+    /// fixture here used `published_port == req.port`. `forward_rich_rule`
+    /// could have read `to.published_port` where it reads `req.port` and the
+    /// entire workspace would have stayed green while `--as` silently
+    /// forwarded the wrong number.
+    fn forward_request_as_4000() -> OpenRequest {
+        OpenRequest {
+            port: 4000,
+            ..subnet_request()
+        }
+    }
+
+    #[test]
+    fn a_forward_writes_the_external_port_not_the_published_one() {
+        let rule = Firewalld::forward_rich_rule(
+            &forward_request_as_4000(),
+            &forward_to(), // published_port: 3000, container_port: 8080
+            Protocol::Tcp,
+        );
+        assert_eq!(
+            rule,
+            r#"rule family="ipv4" source address="10.10.10.0/24" forward-port port="4000" protocol="tcp" to-port="8080" to-addr="172.18.0.2""#,
+            "the rule must match on the port the local network connects to and send to \
+             the container's own port"
+        );
+        // The discriminating assertion, and the reason the numbers were
+        // chosen so that no two roles share one: the published port is not
+        // part of the rule in any position. Swap `req.port` for
+        // `to.published_port` anywhere in `forward_rich_rule` and 3000
+        // appears here.
+        assert!(
+            !rule.contains("3000"),
+            "the published port has no place in the rule -- it is how the container was \
+             found, not what the rule matches or sends to: {rule}"
+        );
+    }
+
+    #[test]
+    fn a_forward_with_differing_ports_asks_firewalld_for_that_same_rule() {
+        // The rule string above is what `forward` must actually hand
+        // firewall-cmd, and what `add_rich_rule` must then match its
+        // read-back on -- which it does by `req.port`, so a confusion there
+        // would leave `forward` unable to recognise its own new rule at all.
+        const REDIRECT_AS_4000: &str = r#"rule family="ipv4" source address="10.10.10.0/24" forward-port port="4000" protocol="tcp" to-port="8080" to-addr="172.18.0.2""#;
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ZONE),
+            Output::stdout(""),
+            Output::stdout("success"),
+            Output::stdout(REDIRECT_AS_4000),
+        ]);
+        let handle = Firewalld::new(&runner)
+            .forward(&forward_request_as_4000(), &forward_to(), "porthole:test")
+            .expect("the read-back names port 4000, which is what add_rich_rule matches on");
+
+        assert_eq!(
+            handle,
+            RuleHandle::Firewalld {
+                zone: ZONE.to_string(),
+                rich_rule: REDIRECT_AS_4000.to_string(),
+            }
+        );
+        let adds: Vec<String> = runner
+            .recorded()
+            .iter()
+            .filter(|c| c.args.iter().any(|a| a.starts_with("--add-rich-rule=")))
+            .map(|c| c.display())
+            .collect();
+        assert_eq!(adds.len(), 1, "still one rule: {adds:#?}");
+        assert!(
+            adds[0].contains(r#"port="4000""#) && adds[0].contains(r#"to-port="8080""#),
+            "the issued command must carry the external port and the container port: {}",
+            adds[0]
+        );
+        assert!(
+            !adds[0].contains("3000"),
+            "the issued command must not carry the published port anywhere: {}",
+            adds[0]
+        );
     }
 
     #[test]

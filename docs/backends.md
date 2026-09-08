@@ -117,8 +117,14 @@ and no second rule to look for: `porthole close` removes the one rule it
 wrote. The container test
 `a_forward_is_one_rich_rule_and_closing_takes_exactly_it_back_out` is what
 holds this, against a real firewalld, and
-`a_client_on_the_lan_reaches_the_container_through_the_forward_and_not_through_the_input_hook`
-is what shows the traffic really travels the forward path.
+`the_lan_reaches_the_container_through_the_forward_hook_and_only_on_the_port_it_was_given`
+is what shows the traffic really travels the forward path -- it counts **zero
+packets addressed to the external port** at the input hook while the forward
+hook carries the connection. (The other two bullets above are the spike's
+alone: nothing committed compares the counters with and without an accept, and
+nothing committed binds a host service to show the accept exposing it. What
+keeps that accept from being written at all is a unit test,
+`a_forward_writes_no_accept_for_the_external_port`.)
 
 porthole writes nothing into Docker's own chains — not `DOCKER`, not
 `DOCKER-USER`. It has never needed to, and an unmarked rule in another

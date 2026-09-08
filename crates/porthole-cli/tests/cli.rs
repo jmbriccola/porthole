@@ -594,7 +594,9 @@ fn a_dry_run_works_without_a_writable_state_directory() {
     // Every other test points PORTHOLE_STATE_FILE at a temp path, so none of
     // them touches the real /run/porthole — which does not exist until
     // something privileged creates it. A dry run must still work there,
-    // because --dry-run needs no privileges. Taking the state lock would try
+    // because `open --dry-run` needs no privileges. (`forward --dry-run` is
+    // the one that does -- it reads Docker's chain itself -- which is why
+    // this test names `open`.) Taking the state lock would try
     // to create that directory and fail.
     if is_root() {
         eprintln!("skipped: running as root");

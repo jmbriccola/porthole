@@ -2308,6 +2308,14 @@ if [ "$docker_ready" != 1 ]; then
   exit 94
 fi
 
+# The image deliberately does not pin a Docker version -- see
+# `Containerfile.docker` for why -- so the version is an input nobody
+# declared. Printing it makes every run's output name the Docker it actually
+# got, so a failure that turns out to be "Docker changed the DOCKER chain"
+# says which Docker rather than leaving it to be guessed at. `report` echoes
+# this whole stream on success and on failure alike.
+echo "PORTHOLE_TEST_DOCKER_VERSION=$(docker version --format '{{.Server.Version}}')"
+
 mkdir -p /img/bin /img/www
 cp /usr/sbin/busybox /img/bin/busybox
 echo 'PORTHOLE-TARGET-OK' > /img/www/index.html
@@ -2359,10 +2367,20 @@ fn docker_container(name: &str, cli: &Path, helper: &Path, extra: &[String]) -> 
 }
 
 fn report(out: &Output, what: &str) -> String {
-    eprintln!("{}", String::from_utf8_lossy(&out.stdout));
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    eprintln!("{stdout}");
     eprintln!("{}", String::from_utf8_lossy(&out.stderr));
+    // Repeated on its own line, after the dump, so it is the last thing
+    // before the panic message rather than one line inside several hundred.
+    // See `DOCKER_DAEMON_SETUP` for why the version is worth naming at all.
+    if let Some(rest) = stdout.split("PORTHOLE_TEST_DOCKER_VERSION=").nth(1) {
+        eprintln!(
+            "== this container's Docker: {} ==",
+            rest.lines().next().unwrap_or("?").trim()
+        );
+    }
     assert_container_ok(out, what);
-    String::from_utf8_lossy(&out.stdout).to_string()
+    stdout
 }
 
 /// A forward is **one** rich rule -- the `forward-port` redirect -- and
@@ -2531,9 +2549,34 @@ fn a_forward_is_one_rich_rule_and_closing_takes_exactly_it_back_out() {
 /// Phase 1's non-zero input counter is the control: without it, "input == 0"
 /// in phase 2 would be satisfied just as well by a probe table that counts
 /// nothing at all.
+///
+/// **Phase 4 is `--as`, and it is the half of this command that had no test
+/// anywhere.** `porthole forward 3000 --as 4000` gives the local network
+/// **4000** while Docker published **3000**, and until this phase existed no
+/// test at any level asserted what rule is written when those two differ: the
+/// host test for `--as` checks two JSON fields that both come from the
+/// `OpenRequest` and never the rule; every fixture in `backend/firewalld.rs`
+/// used `published_port == req.port`; and phases 1-3 above forward 3000 to a
+/// container published as 3000. A confusion between `req.port` and
+/// `to.published_port` inside `forward_rich_rule` would have passed the whole
+/// workspace. `a_forward_writes_the_external_port_not_the_published_one` is
+/// the unit half of that repair -- measured: with the two swapped, every one
+/// of the twenty pre-existing forward tests still passed and only the new
+/// fixtures failed -- and this is the half that shows a real packet arriving.
+///
+/// Three things are asserted about it, and the second is the security-
+/// relevant one:
+///
+/// 1. The LAN reaches the container **on 4000**, and gets the container's own
+///    body there.
+/// 2. The LAN still **cannot** reach **3000**. A forward given `--as` must
+///    move the exposure, not add to it -- and nothing asserted that before.
+/// 3. `porthole close 4000` (the external port, not the published one) is
+///    what closes it, and the rule firewalld held was the one
+///    `Firewalld::forward_rich_rule` builds for the differing pair.
 #[test]
 #[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
-fn a_client_on_the_lan_reaches_the_container_through_the_forward_and_not_through_the_input_hook() {
+fn the_lan_reaches_the_container_through_the_forward_hook_and_only_on_the_port_it_was_given() {
     require_environment!();
     let (cli, helper) = require_musl_binaries!();
     let container = docker_container("porthole-container-test-forward-reach", &cli, &helper, &[]);
@@ -2556,6 +2599,15 @@ nft add rule inet probe pfwd ct status dnat counter";
          {}\n\
          porthole --session close 3000\n\
          {}\n\
+         {}\n\
+         # --- phase 4: the same container, given a different external port ---\n\
+         porthole --session forward 3000 --as 4000 --to 10.10.10.0/24 --for 15m\n\
+         {}\n\
+         {}\n\
+         {}\n\
+         {}\n\
+         porthole --session close 4000\n\
+         {}\n\
          {}\n",
         marker_block("PROBE_BEFORE", "nft list table inet probe"),
         marker_block("PHASE2_CLIENT", "client_get 3000"),
@@ -2565,13 +2617,24 @@ nft add rule inet probe pfwd ct status dnat counter";
             "LOOPBACK_AFTER_CLOSE",
             "curl -sS --max-time 4 http://127.0.0.1:3000/ || echo LOOPBACK_BROKEN"
         ),
+        marker_block("AS_RULES", "firewall-cmd --list-rich-rules"),
+        marker_block("AS_LIST", "porthole --session list --json"),
+        marker_block("AS_EXTERNAL", "client_get 4000"),
+        marker_block("AS_PUBLISHED", "client_get 3000"),
+        marker_block("AS_AFTER_CLOSE", "client_get 4000"),
+        marker_block("AS_RULES_AFTER_CLOSE", "firewall-cmd --list-rich-rules"),
     );
 
     let script = format!(
         "{DOCKER_LAN_SETUP}\n{FIREWALLD_DAEMON_SETUP}\n{DOCKER_DAEMON_SETUP}\n\
          start_target ''\n{probe}\n\
          {}\n\
+         {}\n\
          {}\n",
+        marker_block(
+            "CONTAINER_ADDR",
+            "docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' target"
+        ),
         marker_block("PHASE1_CLIENT", "client_get 3000"),
         with_helper(&body),
     );
@@ -2635,6 +2698,91 @@ nft add rule inet probe pfwd ct status dnat counter";
         forward_while > 0,
         "the forwarded connection was counted at neither hook: {}",
         extract_marker(&stdout, "PROBE_WHILE")
+    );
+
+    // --- phase 4: `--as`, where the two port numbers finally differ ---
+
+    let addr: std::net::Ipv4Addr = extract_marker(&stdout, "CONTAINER_ADDR")
+        .parse()
+        .unwrap_or_else(|e| {
+            panic!(
+                "Docker reported no address for the target container ({e}): {:?}",
+                extract_marker(&stdout, "CONTAINER_ADDR")
+            )
+        });
+
+    assert_eq!(
+        extract_marker(&stdout, "AS_EXTERNAL"),
+        "PORTHOLE-TARGET-OK",
+        "`--as 4000` must make the container answer on 4000 -- and this is a real \
+         packet arriving, not a rule that merely reads right"
+    );
+    // The security-relevant half. A forward given `--as` moves the exposure;
+    // it does not add to it. Before this, nothing anywhere asserted that the
+    // published port stays unreachable while the redirect is live on another.
+    assert_eq!(
+        extract_marker(&stdout, "AS_PUBLISHED"),
+        "CLIENT_UNREACHABLE",
+        "the published port must stay unreachable from the LAN while the forward is \
+         live on a different one -- `--as` moves the exposure, it does not widen it"
+    );
+
+    // The same technique the one-rule test uses: the expected string comes
+    // from the backend, so it cannot be a retyped copy that goes on passing
+    // after the code changes. With external 4000, published 3000 and
+    // container 8080, all three numbers are distinct -- which is what makes
+    // this compare anything at all.
+    let expected_as = {
+        use porthole_core::backend::firewalld::Firewalld;
+        use porthole_core::forward::ForwardTo;
+        use porthole_core::model::{Lifetime, OpenRequest, Protocol, Target};
+        Firewalld::forward_rich_rule(
+            &OpenRequest {
+                port: 4000,
+                protocol: Protocol::Tcp,
+                target: Target::Network {
+                    cidr: "10.10.10.0/24".parse().unwrap(),
+                },
+                lifetime: Lifetime::For(std::time::Duration::from_secs(900)),
+            },
+            &ForwardTo {
+                container_addr: addr,
+                container_port: 8080,
+                published_port: 3000,
+                protocol: Protocol::Tcp,
+            },
+            Protocol::Tcp,
+        )
+    };
+    let as_rules = extract_marker(&stdout, "AS_RULES");
+    let ours_as = porthole_rich_rules(as_rules);
+    assert_eq!(
+        ours_as.len(),
+        1,
+        "a forward with `--as` is still one rich rule: {as_rules}"
+    );
+    assert_eq!(
+        ours_as[0], expected_as,
+        "the rule firewalld is holding must name the external port it matches and the \
+         container port it sends to -- and the published port nowhere"
+    );
+
+    let as_list = extract_marker(&stdout, "AS_LIST");
+    assert!(
+        as_list.contains(r#""port":4000"#) && as_list.contains(r#""published_port":3000"#),
+        "`list --json` must carry both numbers, so a person can tell which is which: \
+         {as_list}"
+    );
+
+    assert_eq!(
+        extract_marker(&stdout, "AS_AFTER_CLOSE"),
+        "CLIENT_UNREACHABLE",
+        "`close 4000` -- the external port, not the published one -- must be what ends it"
+    );
+    assert!(
+        porthole_rich_rules(extract_marker(&stdout, "AS_RULES_AFTER_CLOSE")).is_empty(),
+        "and it must take the redirect out of firewalld: {}",
+        extract_marker(&stdout, "AS_RULES_AFTER_CLOSE")
     );
 }
 
@@ -3135,5 +3283,145 @@ set -e";
         extract_marker(&stdout, "BEFORE"),
         extract_marker(&stdout, "AFTER"),
         "a refused forward may leave nothing behind in the ruleset, handles included"
+    );
+}
+
+/// A forward is refused when something on this machine already answers on the
+/// external port, and the refusal names `--as`.
+///
+/// The companion of the `--as` phase above, and the reason `--as` exists at
+/// all: exit 11 is what a user meets when the number they typed is already
+/// taken, and its message is where they are told what to do about it.
+///
+/// **The discrimination this test exists for is which listeners refuse.**
+/// `Engine::forward` refuses on a socket bound to an address the network
+/// reaches (`Binding::AllInterfaces` or `Binding::Specific`) and deliberately
+/// does *not* refuse on a loopback-bound one — because `docker-proxy` holds
+/// `127.0.0.1:<published>` for every container published the way this command
+/// exists to forward, and refusing on that would refuse
+/// `porthole forward <PORT>` with no `--as` on a default Docker install.
+/// Both halves are asserted here against real sockets in `/proc`, which is
+/// what no unit test can do: the host tests feed `listening::scan` a
+/// fabricated `/proc/net/tcp`.
+///
+/// So the second half is the control. Without it, "exit 11 when a listener is
+/// present" would be satisfied just as well by a check that refuses on every
+/// listener there is — which would make this command unusable for its own
+/// primary case.
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn a_forward_is_refused_when_the_external_port_already_answers_and_the_refusal_names_as() {
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    let container = docker_container("porthole-container-test-forward-inuse", &cli, &helper, &[]);
+
+    let body = format!(
+        "set +e\n\
+         porthole --session forward 3000 --as 4000 --to 10.10.10.0/24 --for 15m --json\n\
+         echo \"EXIT=$?\"\n\
+         set -e\n\
+         {}\n\
+         {}\n",
+        marker_block("STATE", "porthole --session list --json"),
+        marker_block("RULES", "firewall-cmd --list-rich-rules"),
+    );
+
+    let script = format!(
+        "{DOCKER_LAN_SETUP}\n{FIREWALLD_DAEMON_SETUP}\n{DOCKER_DAEMON_SETUP}\n\
+         start_target ''\n\
+         # A service of the machine's own on the port `--as` would take, bound\n\
+         # where the local network can reach it. This is the situation exit 11\n\
+         # is for. `-h /img/www` is this container's own copy, built by\n\
+         # DOCKER_DAEMON_SETUP: `/www` exists only inside the Docker image, and\n\
+         # naming it here leaves busybox exiting instead of binding -- which is\n\
+         # what the LISTENERS control below caught when this was first written.\n\
+         busybox httpd -f -p 0.0.0.0:4000 -h /img/www &\n\
+         sleep 1\n\
+         {}\n\
+         {}\n\
+         {}\n",
+        marker_block("LISTENERS", "porthole listen"),
+        with_helper(&marker_block("REFUSAL", &body)),
+        marker_block(
+            "LOOPBACK_STILL_PUBLISHED",
+            "curl -sS --max-time 4 http://127.0.0.1:3000/ || echo LOOPBACK_BROKEN"
+        ),
+    );
+
+    eprintln!("== forward test: an external port something already answers on ==");
+    let stdout = report(
+        &container.exec(&script),
+        "the forward external-port-in-use container",
+    );
+
+    // The control comes first: porthole has to be able to see both sockets,
+    // or nothing below distinguishes "refused for the right reason" from
+    // "refused because it saw nothing and something else went wrong".
+    // `porthole listen` prints one row per socket -- `<port>/<proto>
+    // <process> <address> pid <n>` -- with the bind address alone in the
+    // third column, not `address:port`.
+    let listeners = extract_marker(&stdout, "LISTENERS");
+    let row = |port: &str| -> &str {
+        listeners
+            .lines()
+            .find(|l| l.trim_start().starts_with(port))
+            .unwrap_or_else(|| panic!("no row for {port} in:\n{listeners}"))
+    };
+    assert!(
+        row("4000/tcp").contains("0.0.0.0"),
+        "the host service must be visible to porthole's own /proc scan, bound where the \
+         network reaches it, or the refusal below is not the one this test is about: \
+         {listeners}"
+    );
+    assert!(
+        row("3000/tcp").contains("127.0.0.1"),
+        "and docker-proxy's loopback socket must be visible too, since the whole point \
+         is that it does *not* refuse: {listeners}"
+    );
+
+    let refusal = extract_marker(&stdout, "REFUSAL");
+    assert!(
+        refusal.contains("EXIT=11"),
+        "an external port something on this machine already answers on must be \
+         ExternalPortInUse (11): {refusal}"
+    );
+    assert!(
+        refusal.contains(r#""kind":"external_port_in_use""#),
+        "and must say so in --json's own slug: {refusal}"
+    );
+    assert!(
+        refusal.contains("--as"),
+        "the refusal must name the flag that gives the local network a different port \
+         -- it is the only way out of this, and a user who is not told it is stuck: \
+         {refusal}"
+    );
+    assert!(
+        refusal.contains("4000"),
+        "and must name the port it refused, not the one Docker published: {refusal}"
+    );
+
+    // The loopback listener did not refuse: the request got as far as the
+    // external-port check, which means `docker-proxy` on 127.0.0.1:3000 was
+    // looked at and passed over.
+    assert!(
+        !refusal.contains(r#""kind":"not_published_by_container""#),
+        "the request must have found the container -- if it did not, the exit 11 above \
+         would be about a port nothing publishes: {refusal}"
+    );
+
+    assert!(
+        extract_marker(&stdout, "STATE").contains(r#""rules":[]"#),
+        "a refused forward may record nothing: {}",
+        extract_marker(&stdout, "STATE")
+    );
+    assert!(
+        porthole_rich_rules(extract_marker(&stdout, "RULES")).is_empty(),
+        "and may leave nothing in the firewall: {}",
+        extract_marker(&stdout, "RULES")
+    );
+    assert_eq!(
+        extract_marker(&stdout, "LOOPBACK_STILL_PUBLISHED"),
+        "PORTHOLE-TARGET-OK",
+        "a refused forward must not have disturbed Docker's own publication"
     );
 }
