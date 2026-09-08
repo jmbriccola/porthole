@@ -26,9 +26,12 @@ firewalld and nowhere else. ufw and nftables refuse it, with exit code 12 and
 a message of their own; the two refusals have different reasons and say
 different things, and each backend's section below gives its own. A machine
 whose firewall cannot redirect is told so before porthole reads Docker, the
-state file or `/proc` — nothing about any of those changes the answer, and
-reporting one of them instead would send you looking for a container on a
-machine that could not have forwarded to it either way.
+state file or `/proc`, and before it asks you to authenticate — nothing about
+any of those changes the answer, and reporting one of them instead would send
+you looking for a container on a machine that could not have forwarded to it
+either way. `forward` is `auth_admin` every time, with no session window, so
+asking after the prompt would have cost an administrator password to be told
+the operation was never going to happen.
 
 Reconciliation runs before every command, `--dry-run` included, so the list of
 commands a dry-run `open` prints can contain one you did not ask for: an

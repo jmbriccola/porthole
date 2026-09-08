@@ -10,7 +10,13 @@
 //!    however it was spelled. `forward` resolves for the second reason
 //!    alone, the prompt: its action is the same whatever the scope turns
 //!    out to be.
-//! 3. **Authorize**, before touching anything.
+//! 3. **Authorize**, before touching anything. [`Porthole::forward`] has one
+//!    step in front of this one that no other method has: it asks the
+//!    detected firewall whether it can redirect at all. That answer needs no
+//!    privilege, no input and no read, and on a firewall that cannot, every
+//!    later question is moot — so asking it after the authorization would
+//!    charge a person an administrator password to learn something already
+//!    known. It is not the enforcement, which stays in `Engine::forward`.
 //! 4. **Take the state lock and act.** Not before: a polkit check can block
 //!    for as long as a human takes to type a password, and the lock would
 //!    stall every other writer for that whole time.
@@ -206,10 +212,17 @@ impl Porthole {
     /// authentication given minutes ago for something else. So there is no
     /// `_keep` severity to choose between, and nothing to choose it with.
     ///
-    /// The refusals a forward has of its own -- a firewall that cannot
-    /// redirect, UDP, Docker unreadable, a port no container publishes, an
-    /// external port already answered on -- all belong to
+    /// The refusals a forward has of its own are enumerated in one place,
+    /// [`porthole_core::error::FORWARD_REFUSALS`], and decided in one place,
     /// [`Engine::forward`], which is reached only after this has authorized.
+    ///
+    /// The first of them is asked here as well, and deliberately: whether
+    /// the detected firewall can redirect at all needs no privilege, no
+    /// input and no read, so asking it before the authorization above saves
+    /// a person an administrator password for an operation their machine
+    /// was never going to perform. It is not enforced here -- `Engine::
+    /// forward` asks the same question again, first, and that is the answer
+    /// that binds.
     // Eight arguments, two of them the macro's own header and emitter. Each
     // of the six a client sends is a separate thing the helper has to be
     // told, and folding them into a struct would put a type on the wire in
@@ -256,7 +269,36 @@ impl Porthole {
         let target = resolve_scope(&runner, &spec).map_err(HelperError::from)?;
         let details = crate::polkit::forward_details(port, protocol, &target, published_port);
 
-        // 3. Authorize, before anything acts.
+        // 3. Ask the firewall whether it can redirect at all -- before
+        // authorizing, not after.
+        //
+        // `forward_capability` runs no command and reads nothing: the answer
+        // is a property of the detected backend and of no input, so it is
+        // already known here. On ufw and on nftables it is "no", and asking
+        // it after the authorization below would charge a person an
+        // administrator password -- `auth_admin`, every time, no `_keep` --
+        // to be told their firewall was never going to do this. Worse than
+        // the annoyance: it trains password entry for an operation that
+        // could not have happened.
+        //
+        // This is a client-side saving of a prompt, not a check: the same
+        // question is asked again inside `Engine::forward`, first and before
+        // any read, and that is where the refusal is enforced. A caller that
+        // somehow got past this one is refused there.
+        //
+        // The cost is that `backend::detect`'s two probe commands
+        // (`firewall-cmd --version` and `--state`, or their ufw/nftables
+        // equivalents) now run before authentication. They already do for an
+        // unauthenticated caller: `status` is `Action::List`, which the
+        // shipped policy declares `yes`, and it detects the backend the same
+        // way. Scoped so the backend -- which is not `Send` -- is dropped
+        // before the `.await` below.
+        {
+            let backend = backend::detect(&runner).map_err(HelperError::from)?;
+            backend.forward_capability().map_err(HelperError::from)?;
+        }
+
+        // 4. Authorize, before anything acts.
         self.authorizer
             .check(Action::Forward, &details, &header)
             .await
@@ -266,7 +308,7 @@ impl Porthole {
             .await
             .map_err(HelperError::from)?;
 
-        // 4. Only now take the lock and act. Scoped for the three reasons
+        // 5. Only now take the lock and act. Scoped for the three reasons
         // `open`'s own block is scoped: the `Engine` is not `Send`, the
         // exclusive lock is released before the announcement, and what
         // reconciliation dropped comes out separately from the result.
@@ -290,7 +332,7 @@ impl Porthole {
             (forwarded, engine.take_reconciled())
         };
 
-        // 5 and 6. The journal, then the bus -- the same announcement an
+        // 6 and 7. The journal, then the bus -- the same announcement an
         // `open` makes, from the same `ManagedRule`, which is what carries
         // the mapping a subscriber needs to tell the two apart.
         Self::announce_reconciled(Some(&emitter), &reconciled).await;

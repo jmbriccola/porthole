@@ -148,63 +148,12 @@ async fn opening_towards_everyone_asks_for_the_stronger_action() {
     );
 }
 
-#[tokio::test]
-async fn a_forward_asks_every_time_whatever_it_is_towards() {
-    // The severity is the point of this method. `open` towards the local
-    // subnet takes `open-subnet`, which the policy declares `auth_admin_keep`
-    // -- a password typed once and reused for minutes. A forward makes a port
-    // published on this machine answer to another machine, and must never
-    // reach the weaker action by being spelled as the narrower target: the
-    // same `subnet` that gives `open` its keep window gives this
-    // `Porthole.forward`, and so does `any`.
-    //
-    // Stopped before the engine exactly as
-    // `opening_towards_everyone_asks_for_the_stronger_action` is, and for
-    // the same safety reason: a state path whose parent is a regular file
-    // ends each request at the exclusive open, with the authorization
-    // already recorded and no `firewall-cmd` that could change anything ever
-    // run. Nothing here reads Docker or /proc either -- `Engine::forward`
-    // is never reached.
-    let dir = TempDir::new().unwrap();
-    let not_a_directory = dir.path().join("not-a-directory");
-    std::fs::write(&not_a_directory, "").expect("the temp dir is writable");
-    let (_server, authz, name) = serve("Forward", &not_a_directory.join("state.json")).await;
-
-    let client = zbus::Connection::session().await.unwrap();
-    let proxy = PortholeProxy::builder(&client)
-        .destination(name)
-        .unwrap()
-        .build()
-        .await
-        .unwrap();
-
-    let subnet = proxy
-        .forward(18080, "tcp", "subnet", 60, 3000)
-        .await
-        .expect_err("the state path is unusable, so this cannot succeed");
-    let any = proxy
-        .forward(18081, "tcp", "any", 60, 3000)
-        .await
-        .expect_err("the state path is unusable, so this cannot succeed");
-
-    for err in [&subnet, &any] {
-        assert!(
-            stopped_before_the_engine(err),
-            "the forward must end before an engine exists, got: {err}"
-        );
-    }
-
-    let asked: Vec<String> = authz.asked().into_iter().map(|(a, _)| a).collect();
-    assert_eq!(
-        asked,
-        vec![
-            Action::Forward.id().to_string(),
-            Action::Forward.id().to_string(),
-        ],
-        "a forward takes its own action whatever it is towards -- never one \
-         of the open-* pair, one of which has a keep window"
-    );
-}
+/// `a_forward_asks_every_time_whatever_it_is_towards` used to sit here. It
+/// moved to `tests/forward_gate.rs`, whose own module doc says why: a
+/// forward now asks the detected firewall whether it can redirect *before*
+/// it authorizes, so "a forward reaches the authorizer" holds only where
+/// that firewall can. The moved test puts a stub `firewall-cmd` on `PATH`
+/// and asserts the same thing on every machine.
 
 #[tokio::test]
 async fn a_forward_of_a_port_no_container_could_publish_is_refused_unauthorized() {
