@@ -498,8 +498,18 @@ fn the_note_on_anyone_is_one_dry_sentence_with_no_scolding() -> Result<(), Strin
             return Err(format!("note scolds (\"{scolding}\"): {note}"));
         }
     }
-    if !note.contains("anyone your machine can reach") {
+    if !note.contains("anyone who can reach this machine") {
         return Err(format!("note must say what it means: {note}"));
+    }
+    // The direction, on the real widget's own string. "anyone your machine
+    // can reach" is outbound reachability; what a rule changes is which
+    // sources this machine answers, because the rich rule drops its
+    // `source address` clause.
+    if note.contains("your machine can reach") {
+        return Err(format!(
+            "the note points the wrong way -- it must say who reaches the \
+             machine, not who the machine reaches: {note}"
+        ));
     }
     // The same act-neutrality the unit guard holds, on the string the real
     // widget actually carries. This row appears on a forwarding dialog too,
@@ -938,6 +948,53 @@ fn facts_about(dialog: &OpenDialog) -> DialogFacts {
 /// `forwards()` is the value the button's own handler reads to decide which
 /// method to send, so a dialog that looked right and sent an `open` would
 /// fail here too.
+/// "Forwards are TCP" is written under the port field of a forwarding
+/// dialog. Until `selected_protocol_of` was taught about it, that sentence
+/// was true because `for_forward` hides the protocol row and nothing can
+/// activate a hidden toggle -- true by the order the widgets are built in,
+/// not by anything holding it true.
+///
+/// The control is the second half: the same press on an ordinary dialog
+/// does select UDP, so this cannot pass against a toggle that stopped
+/// working.
+fn a_forward_sends_tcp_even_with_the_hidden_udp_toggle_active() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ForwardProtocol",
+        move |_app| {
+            let forwarding = OpenDialog::for_forward(3000);
+            forwarding.udp_button().set_active(true);
+
+            let opening = OpenDialog::for_port(3000);
+            opening.udp_button().set_active(true);
+
+            *seen.borrow_mut() = Some((
+                forwarding.protocol(),
+                forwarding.request().map(|r| r.protocol),
+                opening.protocol(),
+                opening.request().map(|r| r.protocol),
+            ));
+        },
+    );
+    let (forward_protocol, forward_request, open_protocol, open_request) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+
+    if forward_protocol != Protocol::Tcp || forward_request != Some(Protocol::Tcp) {
+        return Err(format!(
+            "a forward is TCP whatever the hidden toggle says, got {forward_protocol:?} \
+             and {forward_request:?}"
+        ));
+    }
+    if open_protocol != Protocol::Udp || open_request != Some(Protocol::Udp) {
+        return Err(format!(
+            "the control: on an ordinary dialog the same press must select UDP, or the \
+             assertion above proves nothing. Got {open_protocol:?} and {open_request:?}"
+        ));
+    }
+    Ok(())
+}
+
 fn the_forward_dialog_says_it_redirects_and_sends_a_forward() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
@@ -1075,7 +1132,7 @@ fn the_forward_dialog_says_it_redirects_and_sends_a_forward() -> Result<(), Stri
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 25] = [
+    let cases: [Case; 26] = [
         (
             "the_duration_chips_are_the_five_fixed_ones_and_a_custom_field",
             the_duration_chips_are_the_five_fixed_ones_and_a_custom_field,
@@ -1175,6 +1232,10 @@ fn main() {
         (
             "the_forward_dialog_says_it_redirects_and_sends_a_forward",
             the_forward_dialog_says_it_redirects_and_sends_a_forward,
+        ),
+        (
+            "a_forward_sends_tcp_even_with_the_hidden_udp_toggle_active",
+            a_forward_sends_tcp_even_with_the_hidden_udp_toggle_active,
         ),
     ];
 

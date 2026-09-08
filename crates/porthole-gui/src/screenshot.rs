@@ -452,27 +452,12 @@ pub fn run(path: &Path) -> gtk::glib::ExitCode {
     outcome.get()
 }
 
-/// `<stem>-alert.png` beside `path` -- where [`run_dialog`] writes its
-/// second image. Two images from one flag because the Docker explanation is
-/// a second dialog on top of the first, and a single snapshot can only show
-/// whichever is in front.
-fn alert_path(path: &Path) -> PathBuf {
-    let stem = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "screenshot".to_string());
-    let extension = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_string())
-        .unwrap_or_else(|| "png".to_string());
-    path.with_file_name(format!("{stem}-alert.{extension}"))
-}
-
 /// `main.rs`'s debug-only `--screenshot-dialog <path>` flag: the same
 /// fixture window as [`run`], with an [`OpenDialog`] presented over it --
 /// saved devices in its target list, and the Docker list that makes its
 /// "Open Anyway" explanation appear. Writes three images: `path` for the
-/// dialog itself, [`alert_path`] for the Docker explanation on top of it,
+/// dialog itself, `<stem>-alert` for the Docker explanation on top of it
+/// (a second dialog over the first, which one snapshot cannot show),
 /// and `<stem>-forward` for [`OpenDialog::for_forward`] -- the same widgets
 /// sending the other request, which is the image that shows whether the two
 /// can be told apart.
@@ -544,7 +529,7 @@ pub fn run_dialog(path: &Path) -> gtk::glib::ExitCode {
                 // would place it somewhere no user ever sees it.
                 alert.present(Some(dialog.dialog()));
                 settle();
-                let alert_path = alert_path(&path);
+                let alert_path = beside(&path, "alert");
                 match capture_with_dialogs(&win, &alert_path) {
                     Ok(()) => {
                         eprintln!(
@@ -665,8 +650,10 @@ fn fixture_neighbours() -> Vec<NeighbourChoice> {
 }
 
 /// `<stem>-<suffix>.<ext>` beside `path`, for the extra images a flag
-/// writes. [`alert_path`]'s own job, generalised: `--screenshot-devices`
-/// writes three.
+/// writes: `--screenshot-dialog` writes two extras, `--screenshot-devices`
+/// three. There was a second copy of this function, `alert_path`, twenty
+/// lines from the first and identical to `beside(path, "alert")` character
+/// for character -- its own doc comment said so.
 fn beside(path: &Path, suffix: &str) -> PathBuf {
     let stem = path
         .file_stem()
@@ -910,7 +897,7 @@ mod tests {
     #[test]
     fn the_alert_image_sits_beside_the_dialog_image() {
         assert_eq!(
-            alert_path(Path::new("/tmp/dialog.png")),
+            beside(Path::new("/tmp/dialog.png"), "alert"),
             PathBuf::from("/tmp/dialog-alert.png")
         );
     }

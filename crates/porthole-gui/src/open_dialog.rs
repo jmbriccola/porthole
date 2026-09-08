@@ -204,8 +204,14 @@ fn duration_options() -> Vec<(&'static str, Lifetime)> {
 ///
 /// `the_note_on_anyone_is_one_dry_sentence_with_no_scolding` is what holds
 /// this: it fails on any wording that names either act.
+///
+/// The object was wrong too, and for longer than the verb was. "anyone
+/// **your machine can reach**" describes outbound reachability, which is not
+/// what a rule does: the rich rule drops its `source address` clause, so
+/// what changes is which sources this machine will answer. The same guard
+/// now fails on that direction as well.
 pub(crate) fn anyone_note() -> String {
-    "Lets in anyone your machine can reach, not just devices on this network.".to_string()
+    "Lets in anyone who can reach this machine, not just devices on this network.".to_string()
 }
 
 /// One saved device as this dialog needs it: its name, and either the
@@ -478,7 +484,21 @@ impl Inner {
     }
 }
 
+/// The protocol pressing the button would send.
+///
+/// **A forward is TCP, and this is what makes that a fact.** The port
+/// field's description on a forward dialog says "Forwards are TCP", and
+/// [`OpenDialog::for_forward`] hides `protocol_group` -- but hiding a
+/// toggle is not clearing it, and this read the toggle regardless. Nothing
+/// today can activate a hidden one, so the sentence was true by the order
+/// the widgets happen to be built in rather than by anything holding it
+/// true. `porthole-core` refuses a UDP forward (exit 13), so the failure
+/// mode was a refusal rather than an exposure; it is still a sentence the
+/// code did not enforce.
 fn selected_protocol_of(inner: &Inner) -> Protocol {
+    if inner.forward.get().is_some() {
+        return Protocol::Tcp;
+    }
     if inner.udp_toggle.is_active() {
         Protocol::Udp
     } else {
@@ -1431,6 +1451,19 @@ impl OpenDialog {
         selected_protocol_of(&self.inner)
     }
 
+    /// The UDP toggle itself, so a caller can press it rather than set state
+    /// a press would have set -- the reason [`OpenDialog::duration_button`]
+    /// exists.
+    ///
+    /// On a forwarding dialog the whole protocol row is hidden and nothing a
+    /// person can do reaches this button. That is what made "Forwards are
+    /// TCP" true by construction *order* rather than by construction, and
+    /// what this accessor exists to let a test drive around:
+    /// [`selected_protocol_of`] is what makes it a fact.
+    pub fn udp_button(&self) -> gtk::ToggleButton {
+        self.inner.udp_toggle.clone()
+    }
+
     /// Whether pressing Open right now would send anything at all -- read
     /// from [`OpenDialog::request`] itself rather than from the port alone,
     /// so it cannot claim a request exists that `request` would decline to
@@ -1641,7 +1674,23 @@ mod tests {
         for scolding in ["careful", "dangerous", "warning", "risk", "are you sure"] {
             assert!(!note.to_lowercase().contains(scolding), "{note}");
         }
-        assert!(note.contains("anyone your machine can reach"));
+        // The direction matters and was wrong. "anyone your machine can
+        // reach" describes *outbound* reachability; the rich rule drops its
+        // `source address` clause, so what changes is who can reach the
+        // machine. A reader of the old sentence concluded that opening to
+        // "Anyone" let their machine talk to more of the world; a reader of
+        // this one concludes that more of the world can talk to this port,
+        // which is the fact.
+        assert!(
+            note.contains("anyone who can reach this machine"),
+            "the note must say who reaches the machine, not who the machine \
+             reaches: {note}"
+        );
+        assert!(
+            !note.contains("your machine can reach"),
+            "the wrong direction, which the sentence carried for four call \
+             sites: {note}"
+        );
 
         // And it names neither act. Two of the four sites belong to an
         // `open` and two to a `forward`, so a sentence naming either is
