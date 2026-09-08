@@ -43,6 +43,21 @@ pub enum ExitCode {
     /// A check porthole makes before creating a forward does not cover what
     /// was asked for.
     ForwardCheckUnavailable = 13,
+    /// The port a forward was asked to redirect to is already reachable from
+    /// the network, because Docker published it there.
+    ///
+    /// Its own code rather than one of 10-13 above, because it is a
+    /// different answer from every one of them: [`ExitCode::NotForwardable`]
+    /// covers the two shapes of "porthole has no container to redirect to"
+    /// (not published, or Docker unreadable) and here the container is
+    /// published and Docker was read; [`ExitCode::ForwardUnsupported`] is
+    /// about what the firewall can express; and
+    /// [`ExitCode::ForwardCheckUnavailable`] is about a check porthole could
+    /// not make, where this one is a check that was made and failed. Not
+    /// [`ExitCode::AlreadyOpen`] either: that code means porthole has a rule
+    /// of its own on the port, which a script may close. Nothing porthole can
+    /// close is involved here.
+    AlreadyReachable = 14,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +137,17 @@ pub enum Error {
     #[error("port {port} is already in use ({detail})")]
     ExternalPortInUse { port: u16, detail: String },
 
+    /// A forward was refused because the port it names is already reachable
+    /// from the network: Docker's own DNAT rule for it is not restricted to
+    /// a loopback address.
+    ///
+    /// The message is [`crate::docker::already_reachable`]'s, which is
+    /// [`crate::docker::advise`]'s own sentence for the same fact, so that
+    /// the refusal `forward` returns and the warning `open` prints read as
+    /// one voice rather than two.
+    #[error("{0}")]
+    AlreadyReachable(String),
+
     /// A forward was refused because one of the checks porthole makes before
     /// creating one has no coverage for what was asked.
     ///
@@ -194,6 +220,7 @@ impl Error {
             }
             Error::ExternalPortInUse { .. } => ExitCode::ExternalPortInUse,
             Error::ForwardCheckUnavailable(_) => ExitCode::ForwardCheckUnavailable,
+            Error::AlreadyReachable(_) => ExitCode::AlreadyReachable,
             Error::Remote { code, .. } => *code,
             Error::CommandFailed { .. }
             | Error::CommandSpawn { .. }
@@ -219,6 +246,7 @@ impl Error {
             Error::DockerUnreadable(_) => "docker_unreadable",
             Error::ExternalPortInUse { .. } => "external_port_in_use",
             Error::ForwardCheckUnavailable(_) => "forward_check_unavailable",
+            Error::AlreadyReachable(_) => "already_reachable",
             Error::Remote { kind, .. } => kind,
             Error::CommandFailed { .. } => "command_failed",
             Error::CommandSpawn { .. } => "command_spawn_failed",
@@ -250,6 +278,7 @@ mod tests {
         assert_eq!(ExitCode::ExternalPortInUse as i32, 11);
         assert_eq!(ExitCode::ForwardUnsupported as i32, 12);
         assert_eq!(ExitCode::ForwardCheckUnavailable as i32, 13);
+        assert_eq!(ExitCode::AlreadyReachable as i32, 14);
     }
 
     #[test]
@@ -294,6 +323,27 @@ mod tests {
             Error::ForwardCheckUnavailable("no udp check".into()).exit_code(),
             ExitCode::ForwardCheckUnavailable
         );
+        assert_eq!(
+            Error::AlreadyReachable("docker published it on 0.0.0.0".into()).exit_code(),
+            ExitCode::AlreadyReachable
+        );
+    }
+
+    #[test]
+    fn an_already_reachable_port_is_not_reported_as_an_already_open_one() {
+        // Both are "that port is already carrying something", and collapsing
+        // them would tell a script there is a porthole rule to close. There
+        // is not: what makes the port reachable is Docker's own rule, which
+        // porthole cannot remove.
+        let reachable = Error::AlreadyReachable("docker published it on 0.0.0.0".into());
+        let open = Error::AlreadyOpen {
+            port: 3000,
+            protocol: Protocol::Tcp,
+            detail: "open towards 10.10.10.0/24".into(),
+        };
+        assert_ne!(reachable.exit_code(), open.exit_code());
+        assert_ne!(reachable.kind(), open.kind());
+        assert_eq!(reachable.kind(), "already_reachable");
     }
 
     #[test]
@@ -335,6 +385,10 @@ mod tests {
         assert_eq!(
             Error::ForwardCheckUnavailable("x".into()).kind(),
             "forward_check_unavailable"
+        );
+        assert_eq!(
+            Error::AlreadyReachable("x".into()).kind(),
+            "already_reachable"
         );
     }
 

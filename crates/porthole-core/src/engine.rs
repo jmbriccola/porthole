@@ -413,7 +413,7 @@ impl<'a> Engine<'a> {
     /// The two are separate arguments because they are separate ports: the
     /// whole point of a forward is that they may differ.
     ///
-    /// Four situations make a forward wrong, and the order they are found in
+    /// Five situations make a forward wrong, and the order they are found in
     /// is part of what this method promises.
     ///
     /// **Docker is read first.** Until that read returns, nothing about the
@@ -424,6 +424,17 @@ impl<'a> Engine<'a> {
     /// port is not published when porthole never found out. They share an
     /// exit code; the variant and [`Error::kind`] are what carry the
     /// difference.
+    ///
+    /// **That same read settles one more thing**, before anything else is
+    /// consulted: a published mapping that is not restricted to a loopback
+    /// address is already reachable from the network, so a forward would add
+    /// a second way in rather than the only one, and expiring would close
+    /// only the one porthole made. That is [`Error::AlreadyReachable`]. It is
+    /// a refusal and not a warning because there is nowhere a warning could
+    /// arrive in time: `porthole-helper`'s `service.rs` builds the polkit
+    /// details before it authorizes, which is before Docker is read at all,
+    /// so anything said here reaches the user only after they have already
+    /// authenticated for a forward they would not have asked for.
     ///
     /// **The external port is checked next**, against porthole's own state
     /// and then against this machine's listening sockets. Either refuses with
@@ -495,6 +506,42 @@ impl<'a> Engine<'a> {
                     req.protocol
                 ))
             })?;
+
+        // Decided from Docker's answer and nothing else, which is why it
+        // sits here: right after the read that produced it, beside the
+        // refusal for a port no container publishes, and before this
+        // machine's firewall or state file is consulted at all. A user whose
+        // container is already exposed is told so whether or not their
+        // firewall happens to be running.
+        //
+        // Asked of the whole read rather than of `mapping`: the `find` above
+        // takes the first rule on the port, and a port can carry two
+        // (`-p 127.0.0.1:3000:80 -p 0.0.0.0:3000:80`) with the loopback one
+        // first. Asking `mapping` alone would then forward onto a port the
+        // network already reaches and report it as a bounded exposure --
+        // `docker::already_reachable` orders by exposure instead.
+        //
+        // What is read to decide it: one DNAT rule's own `-d` flag. No `-d`
+        // at all is every interface; a `-d` naming an address outside
+        // 127.0.0.0/8 is that one address. porthole has not looked at which
+        // interface carries that address, so a container published on an
+        // address no network of this machine's actually holds is refused
+        // too. That is the conservative direction, and it is the reading
+        // `open`'s own warning already gives that same rule.
+        if let Some(reachable) =
+            crate::docker::already_reachable(published_port, req.protocol, &published)
+        {
+            return Err(Error::AlreadyReachable(format!(
+                "{reachable} A forward would not change that: it would add a second way in \
+                 on {external}/{proto} and, when it expired, close only the one porthole \
+                 made -- {published_port}/{proto} would still be open. To forward this \
+                 container, publish it on loopback instead (`-p 127.0.0.1:{published_port}:...` \
+                 in your docker-compose.yml or `docker run -p`), so that the local network \
+                 reaches it only through the forward.",
+                proto = req.protocol
+            )));
+        }
+
         let to = ForwardTo::from_published(&mapping);
 
         // After the Docker read, so that a Docker failure is reported before
@@ -2384,6 +2431,24 @@ mod tests {
 -A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 3000 -j DNAT --to-destination 172.18.0.2:8080
 ";
 
+    /// The same container published on every interface instead: no `-d` at
+    /// all, which is what a plain `-p 3000:8080` writes on a daemon that has
+    /// not been told to bind loopback. The local network already reaches this
+    /// one, and porthole cannot close it.
+    const DOCKER_CHAIN_EVERY_INTERFACE: &str = "\
+-N DOCKER
+-A DOCKER ! -i docker0 -p tcp -m tcp --dport 3000 -j DNAT --to-destination 172.18.0.2:8080
+";
+
+    /// One host port carrying both rules, the loopback one first -- what
+    /// `-p 127.0.0.1:3000:8080 -p 0.0.0.0:3000:8080` writes. The order is the
+    /// point: whichever a first-match search picks, the port is reachable.
+    const DOCKER_CHAIN_BOTH: &str = "\
+-N DOCKER
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 3000 -j DNAT --to-destination 172.18.0.2:8080
+-A DOCKER ! -i docker0 -p tcp -m tcp --dport 3000 -j DNAT --to-destination 172.18.0.2:8080
+";
+
     /// The container behind [`DOCKER_CHAIN_LOOPBACK`], spelled out once.
     const CONTAINER_ADDR: &str = "172.18.0.2";
     const CONTAINER_PORT: u16 = 8080;
@@ -2742,6 +2807,124 @@ mod tests {
         assert!(
             matches!(err, Error::DockerUnreadable(_)),
             "a stopped firewall must not answer a question about Docker: {err}"
+        );
+    }
+
+    #[test]
+    fn forward_refuses_a_container_the_network_can_already_reach() {
+        // Docker published 3000 on every interface, so it is open now,
+        // permanently, and porthole never opened it. A forward onto 8443
+        // would not be a no-op: it would add a second way in and then, on
+        // expiry, report that the exposure had ended while 3000 stayed open.
+        // The only honest answer is to refuse before writing anything.
+        //
+        // The loopback case -- the one this feature exists for -- is not
+        // refused, and `forward_creates_the_rule_and_records_the_mapping_it_
+        // was_built_from` is what holds that: it runs the same call against
+        // `DOCKER_CHAIN_LOOPBACK` and expects a rule.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner =
+            DockerRunner::new(DockerChain::Reads(DOCKER_CHAIN_EVERY_INTERFACE), Vec::new());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let err = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &nothing_listening(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, Error::AlreadyReachable(_)), "got {err}");
+        assert_eq!(err.exit_code(), ExitCode::AlreadyReachable);
+        assert_eq!(err.kind(), "already_reachable");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("3000/tcp") && text.contains("already reachable"),
+            "the message must name the port and say it is already reachable: {text}"
+        );
+        assert!(
+            text.contains("8443/tcp"),
+            "and the port the forward would have used: {text}"
+        );
+        assert!(
+            text.contains("still be open"),
+            "and that closing the forward would not close the published port: {text}"
+        );
+
+        assert!(
+            backend.forwarded().is_empty(),
+            "a refusal must not have reached the firewall"
+        );
+        assert!(
+            StateStore::open(&harness.path).unwrap().rules().is_empty(),
+            "and must not have recorded anything"
+        );
+    }
+
+    #[test]
+    fn forward_refuses_an_already_reachable_container_ahead_of_the_firewall_and_the_port() {
+        // Where the refusal sits in the order, pinned. Three things are true
+        // at once here: the container is already reachable, the firewall is
+        // not running, and something on this machine is listening on the
+        // external port. The Docker fact is the one that must come out --
+        // moving this check below `require_enforcing_firewall` would answer
+        // `BackendUnavailable`, and moving it below the listening scan would
+        // answer `ExternalPortInUse`. Both would send the user to fix
+        // something that would not have made the forward right.
+        let harness = Harness::new();
+        let backend = FakeBackend::inactive();
+        let clock = FixedClock(NOW);
+        let runner =
+            DockerRunner::new(DockerChain::Reads(DOCKER_CHAIN_EVERY_INTERFACE), Vec::new());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let err = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &FakeProcFs::new(PROC_NET_TCP_8443),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::AlreadyReachable(_)),
+            "a stopped firewall and a busy external port must not answer a question \
+             about what Docker already published: {err}"
+        );
+    }
+
+    #[test]
+    fn forward_refuses_when_a_second_docker_rule_exposes_the_port_the_first_one_restricts() {
+        // `-p 127.0.0.1:3000:8080 -p 0.0.0.0:3000:8080`, loopback first. The
+        // mapping this forward would be built from is found by first match,
+        // so reading the refusal off that mapping would let this through --
+        // onto a port the network already reaches. The check asks the whole
+        // read instead.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DockerChain::Reads(DOCKER_CHAIN_BOTH), Vec::new());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let err = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &nothing_listening(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, Error::AlreadyReachable(_)), "got {err}");
+        assert!(
+            backend.forwarded().is_empty(),
+            "a refusal must not have reached the firewall"
         );
     }
 

@@ -294,26 +294,60 @@ fn port_range(raw: &str, separator: char) -> Option<Vec<u16>> {
     Some(vec![raw.parse::<u16>().ok()?])
 }
 
-/// What to tell someone opening `port`/`protocol` when Docker already has an
-/// opinion about it — or nothing at all, when Docker has never heard of this
-/// port. The silence in the ordinary case matters as much as the words in
-/// the two exceptional ones: warning on every single open, docker-affected
-/// or not, would train a user to skip the one message that actually matters.
-pub fn advise(port: u16, protocol: Protocol, published: &[Published]) -> Option<String> {
-    // Not the first match: the most exposing one. A port can carry more than
-    // one DNAT rule -- `-p 127.0.0.1:5432:80 -p 0.0.0.0:5432:80` is two
-    // rules on one host port -- and the advice for each is opposite. Taking
-    // whichever came first in the chain would, half the time, tell a user
-    // that a port reachable from their network is not on it. Ordering by
-    // exposure means the message can only ever err towards warning.
-    let entry = published
+/// The rule that exposes `port`/`protocol` most, out of every rule Docker
+/// holds on that port -- or `None` when it holds none.
+///
+/// Deliberately not the first match. A port can carry more than one DNAT
+/// rule -- `-p 127.0.0.1:5432:80 -p 0.0.0.0:5432:80` is two rules on one
+/// host port -- and what each one means is opposite. Taking whichever came
+/// first in the chain would, half the time, read a port that is reachable
+/// from the network as one that is not. Ordering by exposure is what makes
+/// every caller below err towards the safe reading instead.
+fn most_exposing(port: u16, protocol: Protocol, published: &[Published]) -> Option<&Published> {
+    published
         .iter()
         .filter(|p| p.host_port == port && p.protocol == protocol)
         .min_by_key(|p| match p.host_addr {
             None => 0,                              // every interface
             Some(addr) if !addr.is_loopback() => 1, // one address on the network
             Some(_) => 2,                           // loopback only
-        })?;
+        })
+}
+
+/// The sentence [`advise`] and [`already_reachable`] both say about a rule
+/// that is not restricted to a loopback address.
+///
+/// Written once on purpose: `open` warns about this and `forward` refuses on
+/// it, and two vocabularies for one fact would leave a user who has seen the
+/// warning unable to recognise the refusal.
+///
+/// `host_addr` is one DNAT rule's own `-d` and nothing else has been looked
+/// at -- not Docker, not this machine's interfaces. `None` is a rule that
+/// carries no `-d` at all, which matches traffic arriving on any interface;
+/// `Some(addr)` is a rule that matches only traffic already addressed to
+/// that one address.
+fn reachable_sentence(port: u16, protocol: Protocol, host_addr: Option<Ipv4Addr>) -> String {
+    match host_addr {
+        Some(addr) => format!(
+            "Docker already publishes {port}/{protocol} on {addr}: it is already reachable \
+             from your network, and porthole cannot close it -- Docker's own iptables rules \
+             are evaluated before your firewall's."
+        ),
+        None => format!(
+            "Docker already publishes {port}/{protocol} on every interface (0.0.0.0): it is \
+             already reachable from your network, and porthole cannot close it -- Docker's \
+             own iptables rules are evaluated before your firewall's."
+        ),
+    }
+}
+
+/// What to tell someone opening `port`/`protocol` when Docker already has an
+/// opinion about it — or nothing at all, when Docker has never heard of this
+/// port. The silence in the ordinary case matters as much as the words in
+/// the two exceptional ones: warning on every single open, docker-affected
+/// or not, would train a user to skip the one message that actually matters.
+pub fn advise(port: u16, protocol: Protocol, published: &[Published]) -> Option<String> {
+    let entry = most_exposing(port, protocol, published)?;
 
     Some(match entry.host_addr {
         // Restricted to loopback: Docker's own DNAT rule only matches
@@ -329,17 +363,29 @@ pub fn advise(port: u16, protocol: Protocol, published: &[Published]) -> Option<
              port binding in your docker-compose.yml (or `docker run -p`) from \
              {addr}:{port}:... to 0.0.0.0:{port}:...; porthole cannot do that for you."
         ),
-        Some(addr) => format!(
-            "Docker already publishes {port}/{protocol} on {addr}: it is already reachable \
-             from your network, and porthole cannot close it -- Docker's own iptables rules \
-             are evaluated before your firewall's."
-        ),
-        None => format!(
-            "Docker already publishes {port}/{protocol} on every interface (0.0.0.0): it is \
-             already reachable from your network, and porthole cannot close it -- Docker's \
-             own iptables rules are evaluated before your firewall's."
-        ),
+        host_addr => reachable_sentence(port, protocol, host_addr),
     })
+}
+
+/// The same fact as [`advise`]'s exposing half, for a caller that has to act
+/// on it rather than print it: `Some` when Docker's own rules already make
+/// `port`/`protocol` reachable from the network, in [`advise`]'s own words.
+///
+/// `None` says only that nothing here says otherwise -- either no rule of
+/// Docker's covers this port and protocol at all, or every rule that does
+/// carries a `-d` naming a loopback address. It is not a claim that the port
+/// is unreachable: something other than Docker may well answer on it, and
+/// this function has not looked.
+///
+/// `forward` is the caller. A redirect onto a container the network can
+/// already reach adds a second way in without removing the first, and
+/// closing it later removes only the one porthole made.
+pub fn already_reachable(port: u16, protocol: Protocol, published: &[Published]) -> Option<String> {
+    let entry = most_exposing(port, protocol, published)?;
+    match entry.host_addr {
+        Some(addr) if addr.is_loopback() => None,
+        host_addr => Some(reachable_sentence(port, protocol, host_addr)),
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +398,18 @@ mod tests {
             host_port: port,
             protocol: Protocol::Tcp,
             container_addr: "172.17.0.2".parse().unwrap(),
+            container_port: 80,
+        }]
+    }
+
+    /// Published on one address that is not loopback -- what
+    /// `-p 192.168.1.5:8080:80` writes on a machine holding that address.
+    fn published_on_one_address(port: u16) -> Vec<Published> {
+        vec![Published {
+            host_addr: Some(Ipv4Addr::new(192, 168, 1, 5)),
+            host_port: port,
+            protocol: Protocol::Tcp,
+            container_addr: "172.17.0.4".parse().unwrap(),
             container_port: 80,
         }]
     }
@@ -551,6 +609,61 @@ mod tests {
             assert!(
                 advice.contains("already reachable"),
                 "the exposing rule must win, got: {advice}"
+            );
+        }
+    }
+
+    #[test]
+    fn already_reachable_says_nothing_about_a_publish_the_network_cannot_reach() {
+        // The case `forward` exists for. A refusal here would refuse every
+        // forward there is.
+        assert!(already_reachable(5432, Protocol::Tcp, &published_on_loopback(5432)).is_none());
+        // Nor about a port Docker has never heard of, nor about the same port
+        // number on the other protocol -- `None` is "nothing here says
+        // otherwise", not "porthole checked and it is unreachable".
+        assert!(already_reachable(5173, Protocol::Tcp, &[]).is_none());
+        assert!(already_reachable(8080, Protocol::Udp, &published_on_all(8080)).is_none());
+    }
+
+    #[test]
+    fn already_reachable_borrows_advises_own_sentence_rather_than_writing_a_second_one() {
+        // `open` warns with these words and `forward` refuses with them. Two
+        // vocabularies for one fact would leave a user who has seen the
+        // warning unable to recognise the refusal, so this asserts they are
+        // the same string rather than merely both mentioning Docker.
+        for published in [published_on_all(8080), published_on_one_address(8080)] {
+            let refusal = already_reachable(8080, Protocol::Tcp, &published).unwrap();
+            assert_eq!(
+                Some(refusal.clone()),
+                advise(8080, Protocol::Tcp, &published),
+                "the refusal has to be the warning's own sentence: {refusal}"
+            );
+            assert!(refusal.contains("already reachable"), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn already_reachable_answers_for_the_most_exposing_rule_not_the_first_one() {
+        // Two rules on one host port, the loopback one first. A caller that
+        // read only the first would create a forward onto a port the network
+        // already reaches, and then report its expiry as the end of an
+        // exposure that outlives it. Both orderings, since "first" is exactly
+        // what would be wrong.
+        let loopback = Published {
+            host_addr: Some(Ipv4Addr::LOCALHOST),
+            host_port: 3000,
+            protocol: Protocol::Tcp,
+            container_addr: "172.17.0.3".parse().unwrap(),
+            container_port: 80,
+        };
+        let everywhere = Published {
+            host_addr: None,
+            ..loopback
+        };
+        for pair in [vec![loopback, everywhere], vec![everywhere, loopback]] {
+            assert!(
+                already_reachable(3000, Protocol::Tcp, &pair).is_some(),
+                "the exposing rule must win"
             );
         }
     }
