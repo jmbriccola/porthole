@@ -42,6 +42,26 @@
 //! `open` attempt would be refused by the helper for a reason nothing on
 //! this screen had suggested.
 //!
+//! ## The Open button's handler
+//!
+//! A row's Open button is connected as it is built, in `apply`, which is
+//! the only place in this crate that constructs one. What it is connected
+//! to is the callback [`ListeningSection::connect_open_requested`] stores
+//! on the section itself, which outlives every button. So the handler is
+//! not something a caller has to reattach after a rebuild: a rendered
+//! button is a connected button, and a setter that rebuilds rows cannot
+//! produce a row whose button does nothing.
+//!
+//! It was that, before: the connection was made from outside, after
+//! whichever setters the code that made it knew about. Two setters added
+//! later rebuilt rows the same way, and one of them runs on every launch,
+//! so the button never worked for anyone -- found by a person, not by the
+//! GUI checks here, which asked whether the button existed and never
+//! pressed it. `tests/window.rs` presses it now.
+//!
+//! The callback lives here and the dialog does not: this section renders
+//! what it is given, and knows nothing about `OpenDialog` or the window.
+//!
 //! ## Dual-stack rows
 //!
 //! `porthole listen`'s human output (`porthole-cli`) prints a dual-stack
@@ -90,8 +110,8 @@
 //! silently present "porthole could not check" as "porthole checked and
 //! found nothing", the identical collapse `open_now.rs`'s own module doc
 //! describes. [`ListeningSection::set_scan_failed`] is the distinct state
-//! for it: a fourth widget, [`Inner::error_page`], never the calm one.
-//! [`Inner::loading_page`] is the fifth and last, for the identical reason
+//! for it: a fourth widget, [`Inner::error_note`], never the calm one.
+//! [`Inner::loading_note`] is the fifth and last, for the identical reason
 //! before the first scan result has ever arrived at all.
 //!
 //! **Both of those must survive `set_open_ports` on its own**, and an
@@ -104,8 +124,8 @@
 //! failed scan (traced in a container: a `/proc` read on the thread pool
 //! reliably beats a system-bus connect plus two polkit-checked calls, so
 //! this is the *likely* arrival order for a real failure, not an edge
-//! case) rebuilt the calm page right out from under `error_page`, and the
-//! same held for `loading_page` before any scan had run. [`Inner::scanned`]
+//! case) rebuilt the calm page right out from under `error_note`, and the
+//! same held for `loading_note` before any scan had run. [`Inner::scanned`]
 //! is the fix: `apply` now checks *that* first, not `services.is_empty()`,
 //! and `set_open_ports` alone can no longer produce either page --
 //! `tests/listening.rs`'s own opposite-order tests pin both halves of
@@ -119,6 +139,25 @@ use adw::prelude::*;
 
 use porthole_core::docker::Published;
 use porthole_core::listening::{Binding, Service};
+
+use crate::quiet::{quiet_note, TroubleNote};
+
+/// What this section says once a scan has come back and found nothing.
+/// One dim line rather than a whole-view empty state -- see `quiet.rs`.
+const EMPTY_NOTE: &str =
+    "Nothing else is listening. Other services running on this machine will appear here.";
+
+/// What this section says before any scan result has arrived. Same shape
+/// and same scale as [`EMPTY_NOTE`], different words -- see this module's
+/// own doc comment on why "no scan yet" is not the same fact as "the scan
+/// found nothing".
+const LOADING_NOTE: &str = "Checking what's listening…";
+
+/// What a caller registers through
+/// [`ListeningSection::connect_open_requested`] to hear that a row's Open
+/// button was pressed, carrying that row's port. One slot, not a list:
+/// registering again replaces it.
+type OpenRequestedCallback = Rc<dyn Fn(u16)>;
 
 /// One rendered service: the widgets `Inner::rows` needs to update or
 /// remove later, plus the port a caller needs back from [`activate_open`]
@@ -139,9 +178,9 @@ struct Row {
 
 struct Inner {
     /// What `PortholeWindow` appends into its `content()` box. Holds
-    /// exactly one child at a time: `loading_page` while `scanned` is
-    /// `false` and no row list has ever been confirmed, `status_page` once
-    /// a scan confirmed there is nothing listening, `error_page` when the
+    /// exactly one child at a time: `loading_note` while `scanned` is
+    /// `false` and no row list has ever been confirmed, `empty_note` once
+    /// a scan confirmed there is nothing listening, `error_note` when the
     /// last scan failed, `group` otherwise -- the same shape
     /// `open_now::Inner::container` uses, for the same reason. `apply`
     /// (called by both `set_services` and `set_open_ports`) is the only
@@ -150,20 +189,22 @@ struct Inner {
     /// module's own doc comment for why that distinction is the whole fix.
     container: gtk::Box,
     group: adw::PreferencesGroup,
-    status_page: adw::StatusPage,
-    /// A **different** widget from `status_page` -- see this module's own
-    /// doc comment on why a scan failure must never render as "nothing is
-    /// listening", and stays that way through a `set_open_ports` that
-    /// arrives afterward.
-    error_page: adw::StatusPage,
+    /// The confirmed-nothing-listening state: one dim line, section-
+    /// scaled, carrying [`EMPTY_NOTE`] and no icon at all. See `quiet.rs`.
+    empty_note: gtk::Label,
+    /// A **different** widget from `empty_note`, of a different type --
+    /// see this module's own doc comment on why a scan failure must never
+    /// render as "nothing is listening", and stays that way through a
+    /// `set_open_ports` that arrives afterward.
+    error_note: TroubleNote,
     /// A **different** widget again, shown only while `scanned` is `false`
     /// -- necessary, not sufficient: `scanned` is also `false` right after
-    /// `set_scan_failed`, when `error_page` is what actually shows. See
+    /// `set_scan_failed`, when `error_note` is what actually shows. See
     /// this module's own doc comment. Not "before `set_services` has ever
     /// been called" alone either: `set_open_ports` alone cannot displace
     /// it, which is exactly the property an earlier version of this
     /// section did not have.
-    loading_page: adw::StatusPage,
+    loading_note: gtk::Label,
     rows: RefCell<Vec<Row>>,
     /// The last list `set_services` was given. Kept so `set_open_ports`
     /// alone can re-render without a caller having to resupply the service
@@ -185,6 +226,11 @@ struct Inner {
     /// the two apart -- see this module's own doc comment on the bug that
     /// produced.
     scanned: Cell<bool>,
+    /// Where every Open button's click goes. Held on the section rather
+    /// than on the buttons, so it outlives them: `apply` discards every
+    /// button it finds and builds new ones, and this is what the new ones
+    /// are connected to as they are built.
+    on_open_requested: RefCell<Option<OpenRequestedCallback>>,
 }
 
 /// `"node · 5173"` when the owning process is known, `"4000"` alone when it
@@ -406,8 +452,8 @@ fn group_rank(binding: &Binding) -> u8 {
 /// `set_scan_failed`, or before the first `set_services` at all) fell
 /// through to the `services.is_empty()` branch below -- `apply_scan_failed`
 /// and the constructor both leave `services` empty -- and rebuilt the calm
-/// "Nothing else is listening" page right out from under `error_page` or
-/// `loading_page`. Traced in a container: a `/proc` read on the thread
+/// "Nothing else is listening" page right out from under `error_note` or
+/// `loading_note`. Traced in a container: a `/proc` read on the thread
 /// pool reliably finishes before a system-bus connect plus two
 /// polkit-checked calls, so `set_scan_failed` → `set_open_ports` is the
 /// likely arrival order for a real scan failure, not an edge case. See
@@ -430,27 +476,27 @@ fn apply(inner: &Rc<Inner>) {
     // A successful `apply` -- even from an empty list -- means the scan
     // *did* answer (the guard above already confirmed `scanned`), so any
     // previous "scan failed"/"not scanned yet" state is stale and must go,
-    // the same way `error_page` and `loading_page` displace `group` and
-    // `status_page` in `apply_scan_failed` below.
-    if inner.error_page.parent().is_some() {
-        inner.container.remove(&inner.error_page);
+    // the same way `error_note` displaces `group`, `empty_note` and
+    // `loading_note` in `apply_scan_failed` below.
+    if inner.error_note.is_showing() {
+        inner.container.remove(inner.error_note.widget());
     }
-    if inner.loading_page.parent().is_some() {
-        inner.container.remove(&inner.loading_page);
+    if inner.loading_note.parent().is_some() {
+        inner.container.remove(&inner.loading_note);
     }
 
     if services.is_empty() {
         if inner.group.parent().is_some() {
             inner.container.remove(&inner.group);
         }
-        if inner.status_page.parent().is_none() {
-            inner.container.append(&inner.status_page);
+        if inner.empty_note.parent().is_none() {
+            inner.container.append(&inner.empty_note);
         }
         return;
     }
 
-    if inner.status_page.parent().is_some() {
-        inner.container.remove(&inner.status_page);
+    if inner.empty_note.parent().is_some() {
+        inner.container.remove(&inner.empty_note);
     }
     if inner.group.parent().is_none() {
         inner.container.append(&inner.group);
@@ -496,6 +542,20 @@ fn apply(inner: &Rc<Inner>) {
                 .css_classes(["suggested-action"])
                 .tooltip_text(format!("Open port {}", service.port))
                 .build();
+            // Connected here, in the same statement that builds it: a
+            // button this section renders is a button this section has
+            // already wired. See this module's own doc comment.
+            let inner_for_click = Rc::clone(inner);
+            let port = service.port;
+            button.connect_clicked(move |_| {
+                // Cloned out of the cell before the call, so the callback
+                // is free to come back into this section -- opening a port
+                // ends in a refresh, and a refresh rebuilds these rows.
+                let callback = inner_for_click.on_open_requested.borrow().clone();
+                if let Some(callback) = callback {
+                    callback(port);
+                }
+            });
             action_row.add_suffix(&button);
             Some(button)
         } else {
@@ -528,7 +588,7 @@ fn apply(inner: &Rc<Inner>) {
     inner.rows.replace(rows);
 }
 
-/// Replaces whatever `inner.container` was showing with `error_page`,
+/// Replaces whatever `inner.container` was showing with `error_note`,
 /// described by `message` -- [`ListeningSection::set_scan_failed`]'s
 /// state. Clears `services` (`open_ports` is untouched: it comes from an
 /// entirely different, independent round trip and a scan failure says
@@ -543,7 +603,7 @@ fn apply(inner: &Rc<Inner>) {
 /// confirmed scan at all", so a `set_open_ports` arriving after this
 /// call did read as the former. Pinned by `tests/listening.rs`'s
 /// `a_scan_failure_survives_a_later_set_open_ports` (`set_scan_failed`,
-/// then `set_open_ports`, then still `error_page`, not `status_page`).
+/// then `set_open_ports`, then still `error_note`, not `empty_note`).
 fn apply_scan_failed(inner: &Rc<Inner>, message: &str) {
     inner.services.replace(Vec::new());
     inner.scanned.set(false);
@@ -554,16 +614,16 @@ fn apply_scan_failed(inner: &Rc<Inner>, message: &str) {
     if inner.group.parent().is_some() {
         inner.container.remove(&inner.group);
     }
-    if inner.status_page.parent().is_some() {
-        inner.container.remove(&inner.status_page);
+    if inner.empty_note.parent().is_some() {
+        inner.container.remove(&inner.empty_note);
     }
-    if inner.loading_page.parent().is_some() {
-        inner.container.remove(&inner.loading_page);
+    if inner.loading_note.parent().is_some() {
+        inner.container.remove(&inner.loading_note);
     }
 
-    inner.error_page.set_description(Some(message));
-    if inner.error_page.parent().is_none() {
-        inner.container.append(&inner.error_page);
+    inner.error_note.set_description(message);
+    if !inner.error_note.is_showing() {
+        inner.container.append(inner.error_note.widget());
     }
 }
 
@@ -587,48 +647,43 @@ impl ListeningSection {
 
         // Nothing else listening is an ordinary, calm state on most
         // machines -- not an error -- so this mirrors `OpenNowSection`'s own
-        // status page: no warning icon, no error styling.
-        let status_page = adw::StatusPage::builder()
-            .title("Nothing else is listening")
-            .description("Other services running on this machine will appear here.")
-            .icon_name("network-server-symbolic")
-            .build();
+        // quiet note: one dim line, no icon, no error styling, and no
+        // whole-window widget standing in for one section (see `quiet.rs`).
+        let empty_note = quiet_note(EMPTY_NOTE);
 
         // A scan failure is a different fact from a confirmed-empty scan --
         // see this module's own doc comment. Same shape as
-        // `open_now::Inner::error_page`: an icon and CSS class absent from
-        // the calm page above.
-        let error_page = adw::StatusPage::builder()
-            .title("Could not check what's listening")
-            .icon_name("dialog-error-symbolic")
-            .css_classes(["error"])
-            .build();
+        // `open_now::Inner::error_note`: an icon and a CSS class, on a
+        // widget of a different type from the calm note above, which has
+        // neither.
+        let error_note = TroubleNote::new();
+        error_note.set_title("Could not check what's listening");
 
         // Shown while `scanned` is still `false` -- see this module's own
-        // doc comment on why the calm page must not be the default, and on
+        // doc comment on why the calm note must not be the default, and on
         // why "before `set_services`" alone used to be the wrong
-        // condition. Neutral: no error/warning styling.
-        let loading_page = adw::StatusPage::builder()
-            .title("Checking what's listening…")
-            .icon_name("content-loading-symbolic")
-            .build();
+        // condition. Neutral: no error/warning styling, and the same scale
+        // as `empty_note`, so the section does not change height when one
+        // replaces the other.
+        let loading_note = quiet_note(LOADING_NOTE);
 
         let container = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .build();
-        container.append(&loading_page);
+        container.append(&loading_note);
 
         let inner = Rc::new(Inner {
             container,
             group,
-            status_page,
-            error_page,
-            loading_page,
+            empty_note,
+            error_note,
+            loading_note,
             rows: RefCell::new(Vec::new()),
             services: RefCell::new(Vec::new()),
             open_ports: RefCell::new(HashSet::new()),
             docker: RefCell::new(DockerPorts::NotChecked),
             scanned: Cell::new(false),
+            on_open_requested: RefCell::new(None),
         });
 
         Self { inner }
@@ -638,6 +693,17 @@ impl ListeningSection {
     /// contribution as.
     pub fn widget(&self) -> &gtk::Box {
         &self.inner.container
+    }
+
+    /// Registers what a row's Open button does, once, for the whole life
+    /// of this section: `f` is called with that row's port every time one
+    /// is pressed, however many times the rows have been rebuilt in
+    /// between. Registering again replaces it.
+    ///
+    /// This section renders what it is given and knows nothing about the
+    /// dialog `f` goes on to present -- see this module's own doc comment.
+    pub fn connect_open_requested(&self, f: impl Fn(u16) + 'static) {
+        self.inner.on_open_requested.replace(Some(Rc::new(f)));
     }
 
     /// The whole way a service list reaches this section -- see this
@@ -710,12 +776,15 @@ impl ListeningSection {
     }
 
     /// `Some` only while there is nothing to list -- once there is a row,
-    /// the last scan failed ([`ListeningSection::error_page`]), or no scan
-    /// has run yet ([`ListeningSection::loading_page`]), this section
+    /// the last scan failed ([`ListeningSection::error_note`]), or no scan
+    /// has run yet ([`ListeningSection::loading_note`]), this section
     /// shows something else instead.
-    pub fn status_page(&self) -> Option<adw::StatusPage> {
-        if self.inner.status_page.parent().is_some() {
-            Some(self.inner.status_page.clone())
+    ///
+    /// A `gtk::Label`, not an `adw::StatusPage`: this is one section of a
+    /// window, not a view of its own. See `quiet.rs`.
+    pub fn empty_note(&self) -> Option<gtk::Label> {
+        if self.inner.empty_note.parent().is_some() {
+            Some(self.inner.empty_note.clone())
         } else {
             None
         }
@@ -723,10 +792,11 @@ impl ListeningSection {
 
     /// `Some` only while [`ListeningSection::set_scan_failed`]'s state is
     /// showing -- a real, distinct widget from
-    /// [`ListeningSection::status_page`], never both at once.
-    pub fn error_page(&self) -> Option<adw::StatusPage> {
-        if self.inner.error_page.parent().is_some() {
-            Some(self.inner.error_page.clone())
+    /// [`ListeningSection::empty_note`], of a different type, never both at
+    /// once.
+    pub fn error_note(&self) -> Option<TroubleNote> {
+        if self.inner.error_note.is_showing() {
+            Some(self.inner.error_note.clone())
         } else {
             None
         }
@@ -739,9 +809,9 @@ impl ListeningSection {
     /// those, leaves this exactly as it was: `apply` (which
     /// `set_open_ports` calls) checks `scanned` before it touches the
     /// container at all.
-    pub fn loading_page(&self) -> Option<adw::StatusPage> {
-        if self.inner.loading_page.parent().is_some() {
-            Some(self.inner.loading_page.clone())
+    pub fn loading_note(&self) -> Option<gtk::Label> {
+        if self.inner.loading_note.parent().is_some() {
+            Some(self.inner.loading_note.clone())
         } else {
             None
         }
@@ -791,12 +861,15 @@ impl ListeningSection {
             .and_then(|r| r.open_button.clone())
     }
 
-    /// What pressing row `index`'s Open button carries: the port a future
-    /// "open a port" form should pre-fill. `None` when that row has no Open
-    /// button at all -- there is nothing to activate. A pure lookup, not a
-    /// simulated click: safe to call both from a test standing in for a
-    /// user's press, and from inside a real `connect_clicked` handler a
-    /// later task attaches to the button `open_button_for` returns.
+    /// What pressing row `index`'s Open button carries: the port
+    /// [`ListeningSection::connect_open_requested`]'s callback is handed.
+    /// `None` when that row has no Open button at all -- there is nothing
+    /// to activate.
+    ///
+    /// A pure lookup, not a simulated click. It reads back which port a
+    /// row would send; it does not prove the button sends anything. Only
+    /// emitting `clicked` on the button itself proves that, and
+    /// `tests/window.rs` is where that is done.
     pub fn activate_open(&self, index: usize) -> Option<u16> {
         self.inner.rows.borrow().get(index).and_then(|r| {
             if r.open_button.is_some() {

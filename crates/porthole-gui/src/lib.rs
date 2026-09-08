@@ -6,9 +6,12 @@
 //! bin-only crate.
 
 pub mod app;
+pub mod busy;
+pub mod devices_dialog;
 pub mod listening_section;
 pub mod open_dialog;
 pub mod open_now;
+pub mod quiet;
 pub mod screenshot;
 pub mod status_bar;
 pub mod window;

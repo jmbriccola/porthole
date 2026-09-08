@@ -11,6 +11,7 @@ use crate::error::{Error, Result};
 use ipnet::Ipv4Net;
 use serde::Deserialize;
 use std::net::Ipv4Addr;
+use std::time::{Duration, Instant};
 
 /// Interface name prefixes that are never "the network I am on".
 const VIRTUAL_PREFIXES: &[&str] = &[
@@ -162,9 +163,16 @@ const UNUSABLE_NEIGHBOUR_STATES: [&str; 2] = ["FAILED", "INCOMPLETE"];
 /// value it just consumed so a state word is never confused with an
 /// interface name or a MAC.
 ///
-/// An entry is kept when it names an interface and an `lladdr`, and its
-/// state is not one of [`UNUSABLE_NEIGHBOUR_STATES`]. `STALE` is kept --
-/// see [`neighbours`] for what that does and does not mean.
+/// An entry is kept when it names a non-virtual interface
+/// ([`is_virtual_interface`]) and an `lladdr`, and its state is not one of
+/// [`UNUSABLE_NEIGHBOUR_STATES`]. `STALE` is kept -- see [`neighbours`] for
+/// what that does and does not mean.
+///
+/// The interface test is here, at the one place a [`Neighbour`] is built
+/// from the kernel's table, rather than at each caller. Nothing else in the
+/// crate turns `ip -4 neigh show` into `Neighbour` values, and there is no
+/// unfiltered variant to reach for, so a virtual interface's entry cannot be
+/// offered or resolved through by a caller that forgot to exclude it.
 fn parse_neighbours(text: &str) -> Result<Vec<Neighbour>> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -201,6 +209,14 @@ fn parse_neighbours(text: &str) -> Result<Vec<Neighbour>> {
         }
 
         if let (Some(interface), Some(mac)) = (interface, mac) {
+            // Docker containers, libvirt guests, VPN peers and podman pods
+            // all leave entries here, on interfaces that are not the network
+            // this machine is on. `parse_all_subnets` excludes the same
+            // interfaces from subnet detection; the neighbour table is the
+            // other half of the same question.
+            if is_virtual_interface(&interface) {
+                continue;
+            }
             out.push(Neighbour {
                 address,
                 interface,
@@ -212,13 +228,24 @@ fn parse_neighbours(text: &str) -> Result<Vec<Neighbour>> {
 }
 
 /// The kernel's IPv4 neighbour table, minus the entries that carry no
-/// mapping ([`UNUSABLE_NEIGHBOUR_STATES`]).
+/// mapping ([`UNUSABLE_NEIGHBOUR_STATES`]) and those on a virtual interface
+/// ([`is_virtual_interface`]).
 ///
 /// What a returned entry means, stated narrowly, because a saved device is
 /// resolved through this and a port is opened towards the address it gives:
 /// the kernel has an IP-to-MAC mapping recorded, and has not disproved it.
 /// It is not a reachability test, and nothing here sends a packet to make
 /// one.
+///
+/// Every entry is on an interface that carries a real network. A Docker
+/// container on a user-created bridge, a libvirt guest and a VPN peer are
+/// all in the kernel's table and none of them is on the network porthole
+/// opens a port towards, which is the same set of interfaces
+/// [`present_networks`] reports subnets for. The exclusion applies to
+/// resolution as well as to the two pickers: a MAC that is only in the
+/// table on a virtual interface does not resolve, and
+/// [`crate::devices::resolve`] reports it as not on this network rather
+/// than returning an address outside every subnet this machine holds.
 ///
 /// `STALE` entries are included. The kernel marks an entry `STALE` once it
 /// has not been confirmed recently -- roughly 30s of idleness on this
@@ -250,6 +277,81 @@ pub fn neighbours(runner: &dyn CommandRunner) -> Result<Vec<Neighbour>> {
     let cmd = Command::read("ip", ["-4", "neigh", "show"]);
     let out = runner.run(&cmd)?.into_ok(&cmd)?;
     parse_neighbours(&out.stdout)
+}
+
+/// How long one name lookup may take before it is abandoned.
+///
+/// A resolver that does not answer is ordinary on a home network, and the
+/// picker has to appear either way. On the machine this was measured on the
+/// local resolver answered in 3-4 ms, and an address it had no record for
+/// came back in 0.32 s; a second is far above both, and a resolver that has
+/// not answered within one is not going to make the list better by being
+/// waited for.
+pub const NAME_LOOKUP_BOUND: Duration = Duration::from_secs(1);
+
+/// How long a whole pass of them may take, however many addresses there are.
+///
+/// The per-lookup bound alone does not bound the picker: a silent resolver
+/// costs [`NAME_LOOKUP_BOUND`] per address, and a busy network has plenty of
+/// addresses. Once this is spent the remaining addresses get no name, which
+/// is the same outcome as a resolver that answered nothing for them.
+pub const NAME_LOOKUP_BUDGET: Duration = Duration::from_secs(2);
+
+/// What this machine's resolver answers for each address, in the same order,
+/// `None` where it answered nothing.
+///
+/// This is a hint for a person choosing a row, and nothing else. A device is
+/// saved and resolved by MAC; no value from here is stored, matched, or used
+/// to pick a row.
+///
+/// `getent hosts` is what is asked, so the answer is whatever the host's
+/// name service returns -- which on a typical machine merges `/etc/hosts`,
+/// locally synthesised names, mDNS and DNS, and reports which of them
+/// answered for none of it. So an answer is shown as an answer to that
+/// question and nothing is claimed about where it came from. Where there is
+/// no answer there is no name: nothing is substituted for one.
+///
+/// Bounded twice, by [`NAME_LOOKUP_BOUND`] per address and
+/// [`NAME_LOOKUP_BUDGET`] over the pass. Nothing here fails: a lookup that
+/// could not be spawned, exited non-zero, timed out or printed something
+/// unparseable is an address with no name, not an error, since a picker that
+/// refused to appear because a name could not be found would be worse than
+/// one that shows the MAC alone.
+pub fn resolver_names(runner: &dyn CommandRunner, addresses: &[Ipv4Addr]) -> Vec<Option<String>> {
+    let deadline = Instant::now() + NAME_LOOKUP_BUDGET;
+    addresses
+        .iter()
+        .map(|address| {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            resolver_name(runner, *address)
+        })
+        .collect()
+}
+
+fn resolver_name(runner: &dyn CommandRunner, address: Ipv4Addr) -> Option<String> {
+    let cmd = Command::read("getent", ["hosts", &address.to_string()]);
+    let out = runner.run_within(&cmd, NAME_LOOKUP_BOUND).ok()??;
+    if !out.success() {
+        return None;
+    }
+    parse_getent_hosts(&out.stdout)
+}
+
+/// The canonical name on `getent hosts`'s first line.
+///
+/// The format is `/etc/hosts`'s: an address, then the canonical name, then
+/// any aliases. This machine's own resolver returned two names for one
+/// address and eleven for another, so taking the first is a choice -- it is
+/// the one the name service put first, and the alternative is a row too wide
+/// to read.
+fn parse_getent_hosts(text: &str) -> Option<String> {
+    text.lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)
+        .map(|name| name.to_string())
 }
 
 /// Every subnet this machine currently holds on a non-virtual interface,
@@ -543,6 +645,206 @@ pub(crate) mod tests {
         assert!(commands
             .iter()
             .all(|c| c.effect == crate::command::Effect::Read));
+    }
+
+    /// The shape this machine's own table held while the picker was
+    /// offering Docker containers to open a firewall port towards: two
+    /// entries on the wifi interface and two on a user-created Docker
+    /// bridge. `br-5b772196d2da` is the interface name verbatim, and the
+    /// two `172.18.0.x` MACs are the locally-administered ones Docker
+    /// generates; the two `wlo1` rows use this module's other fixtures'
+    /// addresses rather than the real network's.
+    const IP_NEIGH_WITH_BRIDGE: &str = "\
+172.18.0.2 dev br-5b772196d2da lladdr 6a:df:71:ff:3c:e4 STALE
+10.10.10.1 dev wlo1 lladdr 50:e6:36:51:42:fd REACHABLE
+172.18.0.3 dev br-5b772196d2da lladdr 8e:3a:fc:5b:5c:dc STALE
+10.10.10.245 dev wlo1 lladdr bc:24:11:5e:1c:6e REACHABLE
+";
+
+    #[test]
+    fn a_name_is_read_from_the_canonical_column_not_the_address_or_an_alias() {
+        // `getent hosts` output shape, verbatim from this machine: the
+        // address, the canonical name, then aliases.
+        assert_eq!(
+            parse_getent_hosts("192.168.177.142 laptop.example alias.example"),
+            Some("laptop.example".to_string())
+        );
+        assert_eq!(
+            parse_getent_hosts("192.168.177.1 _gateway"),
+            Some("_gateway".to_string())
+        );
+    }
+
+    #[test]
+    fn an_answer_with_no_name_in_it_yields_no_name_rather_than_the_address() {
+        assert_eq!(parse_getent_hosts(""), None);
+        assert_eq!(parse_getent_hosts("192.168.177.9"), None);
+        assert_eq!(parse_getent_hosts("\n"), None);
+    }
+
+    #[test]
+    fn each_address_gets_the_name_its_own_lookup_answered() {
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout("10.10.10.1 _gateway"),
+            Output::stdout("10.10.10.245 phone.example phone"),
+        ]);
+        let names = resolver_names(
+            &runner,
+            &[
+                "10.10.10.1".parse().unwrap(),
+                "10.10.10.245".parse().unwrap(),
+            ],
+        );
+        assert_eq!(
+            names,
+            vec![
+                Some("_gateway".to_string()),
+                Some("phone.example".to_string())
+            ]
+        );
+
+        let commands = runner.recorded();
+        assert_eq!(commands[0].display(), "getent hosts 10.10.10.1");
+        assert_eq!(commands[1].display(), "getent hosts 10.10.10.245");
+        assert!(commands
+            .iter()
+            .all(|c| c.effect == crate::command::Effect::Read));
+    }
+
+    #[test]
+    fn an_address_the_resolver_has_nothing_for_gets_no_name_and_no_stand_in() {
+        // What `getent hosts` does with an address it cannot find: exit 2,
+        // nothing on stdout. The row keeps its MAC and its address and
+        // gains nothing else -- no "unknown device", no vendor guessed off
+        // the MAC prefix.
+        let runner = RecordingRunner::with_responses(vec![Output {
+            status: 2,
+            stdout: String::new(),
+            stderr: String::new(),
+        }]);
+        let names = resolver_names(&runner, &["10.10.10.7".parse().unwrap()]);
+        assert_eq!(names, vec![None]);
+    }
+
+    #[test]
+    fn a_lookup_that_cannot_be_run_at_all_is_a_missing_name_not_a_failure() {
+        // A picker that refused to appear because `getent` is not there
+        // would be worse than one showing MAC and address alone.
+        let cmd = Command::read("porthole-no-such-program-exists", ["hosts"]);
+        let runner = crate::command::RealRunner;
+        assert!(runner.run_within(&cmd, NAME_LOOKUP_BOUND).is_err());
+
+        let names = resolver_names(&runner, &["203.0.113.1".parse().unwrap()]);
+        assert_eq!(
+            names,
+            vec![None],
+            "a spawn failure is an address with no name"
+        );
+    }
+
+    #[test]
+    fn a_command_that_never_answers_is_abandoned_at_the_bound() {
+        // The bound is real, not documentation: this child would run for
+        // thirty seconds. Bounded at 200ms here rather than
+        // `NAME_LOOKUP_BOUND` so the suite does not pay a second for it.
+        let runner = crate::command::RealRunner;
+        let cmd = Command::read("sleep", ["30"]);
+        let started = Instant::now();
+        let answer = runner
+            .run_within(&cmd, Duration::from_millis(200))
+            .expect("spawning `sleep` succeeds even though waiting for it does not");
+        assert!(
+            answer.is_none(),
+            "the bound was reached, so there is no output"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait must be bounded, not merely described as bounded: took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_command_that_answers_inside_the_bound_is_not_cut_off() {
+        // The negative control for the test above: the same bounded call,
+        // on a command that finishes, returns its real output.
+        let runner = crate::command::RealRunner;
+        let cmd = Command::read("echo", ["10.10.10.1 named.example"]);
+        let answer = runner
+            .run_within(&cmd, Duration::from_secs(5))
+            .unwrap()
+            .expect("a command that finishes inside the bound has output");
+        assert_eq!(answer.status, 0);
+        assert_eq!(
+            parse_getent_hosts(&answer.stdout),
+            Some("named.example".to_string())
+        );
+    }
+
+    #[test]
+    fn a_docker_container_is_not_offered_as_a_device_on_this_network() {
+        let found = parse_neighbours(IP_NEIGH_WITH_BRIDGE).unwrap();
+        assert_eq!(
+            found.len(),
+            2,
+            "only the two wifi entries are on the network this machine is on"
+        );
+        assert!(
+            found.iter().all(|n| n.interface == "wlo1"),
+            "a `br-` entry is a container on a bridge, not a device to open a port towards: {found:?}"
+        );
+        assert!(
+            !found
+                .iter()
+                .any(|n| n.mac == "6a:df:71:ff:3c:e4" || n.mac == "8e:3a:fc:5b:5c:dc"),
+            "neither container MAC may reach a picker or a resolution"
+        );
+    }
+
+    #[test]
+    fn every_virtual_interface_kind_is_excluded_from_the_table_not_just_docker() {
+        // The same list subnet detection uses. A VPN peer, a libvirt guest
+        // and a podman container each land in the kernel's table under
+        // their own prefix.
+        let found = parse_neighbours(
+            "10.0.0.2 dev virbr0 lladdr aa:00:00:00:00:01 REACHABLE\n\
+             10.0.0.3 dev wg0 lladdr aa:00:00:00:00:02 REACHABLE\n\
+             10.0.0.4 dev podman0 lladdr aa:00:00:00:00:03 REACHABLE\n\
+             10.0.0.5 dev veth1234 lladdr aa:00:00:00:00:04 REACHABLE\n\
+             10.0.0.6 dev docker0 lladdr aa:00:00:00:00:05 REACHABLE\n\
+             10.0.0.7 dev tailscale0 lladdr aa:00:00:00:00:06 REACHABLE\n\
+             10.0.0.8 dev enp0s31f6 lladdr aa:00:00:00:00:07 REACHABLE\n",
+        )
+        .unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "only the ethernet entry survives: {found:?}"
+        );
+        assert_eq!(found[0].interface, "enp0s31f6");
+    }
+
+    #[test]
+    fn a_bridge_over_the_physical_nic_is_still_a_real_network() {
+        // `br-` is Docker's user-created-bridge naming. A traditional
+        // `br0` bridging the machine's own NIC is the network this machine
+        // is on, and excluding it would leave such a host with no devices
+        // to pick at all.
+        let found =
+            parse_neighbours("10.10.10.1 dev br0 lladdr 50:e6:36:51:42:fd REACHABLE\n").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].interface, "br0");
+    }
+
+    #[test]
+    fn the_public_entry_point_offers_no_virtual_interface_either() {
+        // `neighbours` is the only way anything outside this module turns
+        // the kernel's table into `Neighbour` values, so this is what every
+        // caller gets -- the two pickers and `devices::resolve` alike.
+        let runner = RecordingRunner::with_responses(vec![Output::stdout(IP_NEIGH_WITH_BRIDGE)]);
+        let found = neighbours(&runner).unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|n| !is_virtual_interface(&n.interface)));
     }
 
     #[test]

@@ -49,12 +49,38 @@ fn activate<F: FnOnce(&adw::Application) + 'static>(app_id: &str, f: F) {
     app.run_with_args::<&str>(&[]);
 }
 
+/// Drains the main context until `condition` holds, or `timeout` elapses --
+/// the same bounded shape `tests/window.rs` and `tests/signals.rs` use, so
+/// a path that never settles fails the check rather than hanging the
+/// process. Only the close check below needs it: every other check here
+/// asserts on properties this section sets directly, with no round trip in
+/// between.
+fn pump_until(condition: impl Fn() -> bool, timeout: std::time::Duration) -> bool {
+    let context = gtk::glib::MainContext::default();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        while context.iteration(false) {}
+        if condition() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return condition();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// A fixed constant, never read from the real clock. Every test that cares
 /// about a specific countdown value builds its fixture and its
 /// `SharedClock` from this same constant, so there is exactly one source of
 /// "now" per test and no possibility of two independent clock reads landing
 /// on either side of a second boundary.
 const BASE_TIME: u64 = 1_757_100_000;
+
+/// `PortholeWindow`'s own default window width, in pixels -- the width a
+/// height measurement here has to be taken at for the wrapping it sees to
+/// be the wrapping a user gets.
+const WINDOW_WIDTH_PX: i32 = 480;
 
 /// A `Clock` a test can move forward directly, by mutating the `Cell` it
 /// shares with whichever `OpenNowSection` was built with a clone of it via
@@ -107,10 +133,10 @@ fn wire_rule(base: u64, port: u16, protocol: &str, target: &str, lifetime_secs: 
 /// "No ports open" is this machine's normal state, not an error. Presenting
 /// it as a problem -- a warning icon, an error style, a red anything --
 /// teaches the user to ignore the one part of this window that should mean
-/// something. Checked structurally (the icon name, the CSS classes), not
-/// only the title -- a title alone would still pass if a later change added
-/// `.add_css_class("error")` or swapped in a warning glyph.
-fn an_empty_list_is_a_calm_status_page_not_an_error() -> Result<(), String> {
+/// something. Checked structurally (the CSS classes, and that the error
+/// state is genuinely absent), not only the text -- text alone would still
+/// pass if a later change added `.add_css_class("error")`.
+fn an_empty_list_is_a_calm_note_not_an_error() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
     activate(
@@ -118,37 +144,36 @@ fn an_empty_list_is_a_calm_status_page_not_an_error() -> Result<(), String> {
         move |_app| {
             let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
             section.set_rules(&[]);
-            let status = section.status_page();
-            let title = status.as_ref().map(|p| p.title().to_string());
-            let icon_name = status
+            let note = section.empty_note();
+            let text = note.as_ref().map(|n| n.label().to_string());
+            let css_classes: Vec<String> = note
                 .as_ref()
-                .and_then(|p| p.icon_name())
-                .map(|s| s.to_string());
-            let css_classes: Vec<String> = status
-                .as_ref()
-                .map(|p| p.css_classes().iter().map(|c| c.to_string()).collect())
+                .map(|n| n.css_classes().iter().map(|c| c.to_string()).collect())
                 .unwrap_or_default();
+            let error_showing = section.error_note().is_some();
             let rows_empty = section.rows().is_empty();
-            *seen.borrow_mut() = Some((title, icon_name, css_classes, rows_empty));
+            *seen.borrow_mut() = Some((text, css_classes, error_showing, rows_empty));
         },
     );
-    let (title, icon_name, css_classes, rows_empty) =
+    let (text, css_classes, error_showing, rows_empty) =
         result.borrow_mut().take().ok_or("activation never ran")?;
-    if title.as_deref() != Some("No ports open") {
+    let text = text.ok_or("a confirmed-empty list must show its own note")?;
+    if !text.starts_with("No ports open") {
         return Err(format!(
-            "expected a status page titled \"No ports open\", got {title:?}"
-        ));
-    }
-    let icon = icon_name.unwrap_or_default();
-    if icon.contains("warning") || icon.contains("error") {
-        return Err(format!(
-            "the empty state's icon reads as a problem, not the ordinary state it is: {icon:?}"
+            "expected the confirmed-empty note to say so, got {text:?}"
         ));
     }
     if css_classes.iter().any(|c| c == "error" || c == "warning") {
         return Err(format!(
             "the empty state carries an error/warning CSS class: {css_classes:?}"
         ));
+    }
+    if error_showing {
+        return Err(
+            "the \"could not ask\" state must not be on screen alongside a confirmed-empty \
+             list"
+                .to_string(),
+        );
     }
     if !rows_empty {
         return Err("rows must be empty when nothing is open".to_string());
@@ -290,11 +315,23 @@ fn until_reboot_says_so_instead_of_showing_a_countdown() -> Result<(), String> {
     Ok(())
 }
 
-/// The other half of the live-countdown property: a rule that still has a
-/// few seconds left when the section first renders it must flip to
-/// "closing" -- on the real widget, via `refresh()` -- once that time has
-/// genuinely passed, rather than ever showing a negative duration.
-fn an_expired_rule_reads_as_closing_not_as_a_negative_time() -> Result<(), String> {
+/// The other half of the live-countdown property, and the defect a person
+/// found on a Fedora Workstation VM.
+///
+/// A rule with a few seconds left when the section first renders it must,
+/// once that time has genuinely passed, stop counting down -- and what it
+/// says instead must be true of what this section actually knows. This
+/// section never calls `list`. It knows the deadline arrived and nothing
+/// else, so that is all the row may say: not "closing", which is an outcome,
+/// and which read identically whether the close had already succeeded or had
+/// failed an hour ago.
+///
+/// Checked on the real widget, via `refresh()`, at three points across the
+/// deadline the fixture itself carries: still counting down before it,
+/// saying the same thing at it and an hour past it while nothing new has
+/// been read, and never marked as something to look at while that is all
+/// that is known.
+fn an_expired_rule_states_the_clock_and_claims_no_outcome() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
     activate(
@@ -303,16 +340,185 @@ fn an_expired_rule_reads_as_closing_not_as_a_negative_time() -> Result<(), Strin
             let clock = SharedClock::at(BASE_TIME);
             let section = OpenNowSection::with_clock(Box::new(clock.clone()));
             // 65s lifetime, opened 60s before BASE_TIME: 5 seconds left as
-            // of BASE_TIME, still a normal countdown at construction.
-            section.set_rules(&[wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 65)]);
-            clock.advance_to(BASE_TIME + 65);
+            // of BASE_TIME, still a normal countdown at construction. Every
+            // clock reading below is taken from the fixture's own
+            // `expires_at`, never from that arithmetic repeated by hand.
+            let rule = wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 65);
+            let deadline = rule.expires_at;
+            section.set_rules(&[rule]);
+            let before = section.countdown_text(0);
+            clock.advance_to(deadline);
             section.refresh();
-            *seen.borrow_mut() = Some(section.countdown_text(0));
+            let at_the_deadline = section.countdown_text(0);
+            // An hour later, with no fresher list handed over: still the
+            // same thing, because still nothing more is known.
+            clock.advance_to(deadline + 3_600);
+            section.refresh();
+            *seen.borrow_mut() = Some((
+                before,
+                at_the_deadline,
+                section.countdown_text(0),
+                section.countdown_is_marked_overdue(0),
+            ));
         },
     );
-    let text = result.borrow_mut().take().ok_or("activation never ran")?;
-    if text != "closing" {
-        return Err(format!("expected \"closing\", got {text:?}"));
+    let (before, at_the_deadline, an_hour_later, marked) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if before != "00:05 left" {
+        return Err(format!(
+            "expected a live countdown before the deadline, got {before:?}"
+        ));
+    }
+    if at_the_deadline.contains("clos") || an_hour_later.contains("clos") {
+        return Err(format!(
+            "the row must not name an outcome this section cannot know: {at_the_deadline:?} \
+             then {an_hour_later:?}"
+        ));
+    }
+    if at_the_deadline != an_hour_later {
+        return Err(format!(
+            "nothing was read between these two, so the row must not have changed what it \
+             claims: {at_the_deadline:?} then {an_hour_later:?}"
+        ));
+    }
+    if marked {
+        return Err(
+            "a deadline nobody has checked yet must not be marked as something to look at"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The case a close that failed produces, and the one the old single word
+/// made unreachable: a list read well past a rule's deadline that still
+/// names the rule.
+///
+/// That is a different fact from the one above -- porthole asked, rather
+/// than porthole not having heard -- so it must not read the same, and it
+/// carries the marking the other does not.
+fn a_list_read_past_the_deadline_that_still_names_the_rule_reads_differently() -> Result<(), String>
+{
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenNowStillListed",
+        move |_app| {
+            let clock = SharedClock::at(BASE_TIME);
+            let section = OpenNowSection::with_clock(Box::new(clock.clone()));
+            let rule = wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 65);
+            let deadline = rule.expires_at;
+            section.set_rules(std::slice::from_ref(&rule));
+            clock.advance_to(deadline);
+            section.refresh();
+            let unconfirmed = section.countdown_text(0);
+
+            // A minute past the deadline, the helper is asked again and
+            // still names the rule. That is the answer, and it is not the
+            // one above.
+            clock.advance_to(deadline + 60);
+            section.set_rules(&[rule]);
+            *seen.borrow_mut() = Some((
+                unconfirmed,
+                section.countdown_text(0),
+                section.countdown_is_marked_overdue(0),
+            ));
+        },
+    );
+    let (unconfirmed, still_listed, marked) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if unconfirmed == still_listed {
+        return Err(format!(
+            "a close that has not been checked and a port the helper still reports open past \
+             its deadline must not read the same: both said {still_listed:?}"
+        ));
+    }
+    if still_listed.contains("clos") {
+        return Err(format!(
+            "a port the helper still reports open must not be described as closing or closed: \
+             {still_listed:?}"
+        ));
+    }
+    if !marked {
+        return Err(
+            "a port the helper still reports open past its own deadline must be marked, not \
+             left reading like an ordinary row"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The section cannot settle a passed deadline on its own -- it never calls
+/// `list` -- so it says so, once, to whoever does.
+///
+/// Reported only after the deadline is far enough behind for a list to be an
+/// answer about it, and only for a row built from a list read before that
+/// point: a row built from a list already read past it has its answer
+/// already, and reporting again would ask for a fresh list every second for
+/// as long as the rule stayed open.
+fn a_passed_deadline_is_reported_once_to_whoever_can_re_read_the_list() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenNowExpiryReported",
+        move |_app| {
+            let clock = SharedClock::at(BASE_TIME);
+            let section = OpenNowSection::with_clock(Box::new(clock.clone()));
+            let reports = Rc::new(Cell::new(0u32));
+            let counted = reports.clone();
+            section.connect_expiry_unconfirmed(move || counted.set(counted.get() + 1));
+
+            let rule = wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 65);
+            let deadline = rule.expires_at;
+            section.set_rules(std::slice::from_ref(&rule));
+            // Right at the deadline: a close may well be under way, and
+            // nothing is asked for yet.
+            clock.advance_to(deadline);
+            section.refresh();
+            let at_the_deadline = reports.get();
+
+            // A minute past it, with the list still the one read before.
+            clock.advance_to(deadline + 60);
+            section.refresh();
+            let after = reports.get();
+            // Every following tick, with nothing having changed.
+            section.refresh();
+            section.refresh();
+            let after_more_ticks = reports.get();
+
+            // The fresh list arrives and still names the rule. The answer is
+            // on screen; nothing more is to be asked.
+            section.set_rules(&[rule]);
+            section.refresh();
+            section.refresh();
+            *seen.borrow_mut() = Some((at_the_deadline, after, after_more_ticks, reports.get()));
+        },
+    );
+    let (at_the_deadline, after, after_more_ticks, after_a_fresh_list) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if at_the_deadline != 0 {
+        return Err(format!(
+            "the deadline itself must not be reported -- a close is ordinarily under way at \
+             that moment; got {at_the_deadline}"
+        ));
+    }
+    if after != 1 {
+        return Err(format!(
+            "a deadline the list cannot yet account for must be reported exactly once, got \
+             {after}"
+        ));
+    }
+    if after_more_ticks != 1 {
+        return Err(format!(
+            "the once-a-second tick must not repeat the report, got {after_more_ticks}"
+        ));
+    }
+    if after_a_fresh_list != 1 {
+        return Err(format!(
+            "a row built from a list already read past its own deadline has its answer and \
+             must ask for nothing, got {after_a_fresh_list}"
+        ));
     }
     Ok(())
 }
@@ -322,7 +528,7 @@ fn an_expired_rule_reads_as_closing_not_as_a_negative_time() -> Result<(), Strin
 /// conflating "confirmed nothing is open" with "could not ask" is this
 /// project's characteristic defect. Checked structurally (icon, CSS
 /// classes, and that the calm page is genuinely gone, not merely covered),
-/// the same way `an_empty_list_is_a_calm_status_page_not_an_error` checks
+/// the same way `an_empty_list_is_a_calm_note_not_an_error` checks
 /// the calm state's own icon/CSS rather than only its title.
 fn an_unreachable_helper_does_not_render_as_the_calm_empty_state() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
@@ -332,8 +538,8 @@ fn an_unreachable_helper_does_not_render_as_the_calm_empty_state() -> Result<(),
         move |_app| {
             let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
             section.set_unreachable("could not reach the porthole helper: timed out");
-            let calm = section.status_page();
-            let error = section.error_page();
+            let calm = section.empty_note();
+            let error = section.error_note();
             let icon_name = error
                 .as_ref()
                 .and_then(|p| p.icon_name())
@@ -407,9 +613,9 @@ fn the_initial_state_before_any_answer_is_neither_calm_nor_populated() -> Result
         move |_app| {
             let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
             *seen.borrow_mut() = Some((
-                section.loading_page().is_some(),
-                section.status_page().is_some(),
-                section.error_page().is_some(),
+                section.loading_note().is_some(),
+                section.empty_note().is_some(),
+                section.error_note().is_some(),
                 section.rows().is_empty(),
             ));
         },
@@ -448,7 +654,7 @@ fn an_errored_reply_reads_differently_from_an_unreachable_helper() -> Result<(),
         move |_app| {
             let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
             section.set_errored("not authorized: com.jacopobriccola.Porthole.List");
-            let page = section.error_page();
+            let page = section.error_note();
             let title = page.as_ref().map(|p| p.title().to_string());
             let description = page
                 .as_ref()
@@ -514,8 +720,8 @@ fn a_close_resolving_after_a_refresh_failure_does_not_repaint_the_calm_state() -
             // Only now does the close's reply arrive.
             section.simulate_close_succeeded(&id);
 
-            let calm = section.status_page();
-            let error = section.error_page();
+            let calm = section.empty_note();
+            let error = section.error_note();
             let error_title = error.as_ref().map(|p| p.title().to_string());
             *seen.borrow_mut() = Some((calm.is_some(), error.is_some(), error_title));
         },
@@ -546,16 +752,210 @@ fn a_close_resolving_after_a_refresh_failure_does_not_repaint_the_calm_state() -
     Ok(())
 }
 
+/// The same interleaving again, one layer out: the guard above also decides
+/// whether anything is announced. `connect_close_succeeded` hands its
+/// callback the list this section re-rendered from, and a close that
+/// resolves against a list it was not issued against never reaches that
+/// re-render -- so there is no list to hand out, and in particular not the
+/// empty one `set_unreachable` left behind, which a caller would read as
+/// "nothing is open" and mark its own rows from.
+fn a_close_resolving_after_a_refresh_failure_announces_nothing() -> Result<(), String> {
+    let announced = Rc::new(RefCell::new(Vec::new()));
+    let seen = announced.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenNowCloseRaceNoAnnouncement",
+        move |_app| {
+            let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
+            let rule = wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 3600);
+            let id = rule.id.clone();
+            section.set_rules(&[rule]);
+
+            let recorded = seen.clone();
+            section.connect_close_succeeded(move |remaining| {
+                recorded.borrow_mut().push(remaining.to_vec());
+            });
+
+            // The close is issued against the list above; a refresh failure
+            // lands before its reply does.
+            section.set_unreachable("could not reach the porthole helper: timed out");
+            section.simulate_close_succeeded(&id);
+        },
+    );
+    let calls = announced.borrow();
+    if !calls.is_empty() {
+        return Err(format!(
+            "a close resolving against a list it was not issued against must announce nothing, \
+             got {} call(s): {:?}",
+            calls.len(),
+            calls
+        ));
+    }
+    Ok(())
+}
+
+/// The other half of the same distinction, so the check above cannot pass
+/// by the callback never being called at all: an ordinary close, against
+/// the list it was issued against, announces exactly what is left.
+fn an_ordinary_close_announces_the_rules_that_remain() -> Result<(), String> {
+    let announced = Rc::new(RefCell::new(Vec::new()));
+    let seen = announced.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenNowCloseAnnouncement",
+        move |_app| {
+            let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
+            let closed = wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 3600);
+            let kept = wire_rule(BASE_TIME, 8080, "tcp", "10.10.10.0/24", 3600);
+            let id = closed.id.clone();
+            section.set_rules(&[closed, kept]);
+
+            let recorded = seen.clone();
+            section.connect_close_succeeded(move |remaining| {
+                recorded.borrow_mut().push(
+                    remaining
+                        .iter()
+                        .map(|r| r.id.clone())
+                        .collect::<Vec<String>>(),
+                );
+            });
+
+            section.simulate_close_succeeded(&id);
+        },
+    );
+    let calls = announced.borrow();
+    match calls.as_slice() {
+        [ids] if ids == &["8080/tcp".to_string()] => Ok(()),
+        other => Err(format!(
+            "a successful close must announce the rules that remain, once, got {other:?}"
+        )),
+    }
+}
+
+/// The confirmed-empty state is one section among several, not a whole
+/// view of its own. Measured on the real widget rather than argued from
+/// its type: the section is asked how tall it wants to be at the window's
+/// own default width, first with nothing open and then holding one rule,
+/// and the empty state must not want more room than the section does with
+/// something actually in it. A whole-view empty state fails this by a wide
+/// margin -- its icon and padding alone are several rows tall -- and what
+/// that costs is the rest of the window scrolling out of sight to make
+/// room for a sentence.
+fn the_confirmed_empty_state_is_no_taller_than_one_rendered_rule() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenNowEmptyHeight",
+        move |_app| {
+            let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
+            section.set_rules(&[]);
+            // `WINDOW_WIDTH_PX` is `PortholeWindow`'s own default width, so
+            // the wrapping this measurement sees is the wrapping a user
+            // gets.
+            let (_, empty, _, _) = section
+                .widget()
+                .measure(gtk::Orientation::Vertical, WINDOW_WIDTH_PX);
+            section.set_rules(&[wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 3600)]);
+            let (_, one_rule, _, _) = section
+                .widget()
+                .measure(gtk::Orientation::Vertical, WINDOW_WIDTH_PX);
+            let expands = section.widget().compute_expand(gtk::Orientation::Vertical);
+            *seen.borrow_mut() = Some((empty, one_rule, expands));
+        },
+    );
+    let (empty, one_rule, expands) = result.borrow_mut().take().ok_or("activation never ran")?;
+    if empty > one_rule {
+        return Err(format!(
+            "the empty state wants {empty}px of height, more than the {one_rule}px this \
+             section takes with a rule actually in it -- a section-scaled quiet state \
+             cannot cost more room than the content it stands in for"
+        ));
+    }
+    if expands {
+        return Err(
+            "the empty state claims vertical expansion, which is what pushes every other \
+             section down the window"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// A close pressed for real, with no helper anywhere to answer it: this
+/// container has no system bus at all (see `tests/window.rs`'s own
+/// unreachable check for why), so `close_by_id_over_dbus` fails at the
+/// connection. The row's busy indication is armed by that press and has to
+/// be gone once the attempt is over, with the button pressable again -- a
+/// row left spinning over a close that already failed is the same "the
+/// application looks stuck" defect the indication was added to repair,
+/// wearing the opposite costume.
+///
+/// The press is a real `emit_clicked` on the real button, not a call to
+/// anything this file could reach directly. What this check cannot see is
+/// the *middle* of that attempt: with no bus to connect to, the failure can
+/// land within a single turn of the main context, so there is no reliable
+/// moment at which to observe the indication switched on. `tests/busy.rs`
+/// is where the appearing half is pinned, and `tests/signals.rs` is where a
+/// helper slow enough to watch actually answers one.
+fn a_close_with_no_helper_to_answer_it_leaves_nothing_waiting() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenNowCloseUnreachable",
+        move |_app| {
+            let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
+            section.set_rules(&[wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 3600)]);
+            let Some(button) = section.close_button_for(0) else {
+                return;
+            };
+            let Some(busy) = section.close_busy_for(0) else {
+                return;
+            };
+            button.emit_clicked();
+            let settled = pump_until(|| !busy.is_busy(), std::time::Duration::from_secs(5));
+            *seen.borrow_mut() = Some((
+                settled,
+                busy.is_showing(),
+                button.is_sensitive(),
+                section.rows().len(),
+            ));
+        },
+    );
+    let (settled, showing, sensitive, rows) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if !settled {
+        return Err(
+            "the close never stopped reporting an outstanding operation, so nothing ever \
+             released the row's busy indication"
+                .to_string(),
+        );
+    }
+    if showing {
+        return Err("the row is still spinning over a close that already failed".to_string());
+    }
+    if !sensitive {
+        return Err(
+            "the close button never came back, so the port cannot be closed again without \
+             restarting porthole"
+                .to_string(),
+        );
+    }
+    if rows != 1 {
+        return Err(format!(
+            "a close that failed must leave its row exactly where it was, got {rows} rows"
+        ));
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below -- see `tests/window.rs`'s own
 /// `Case` alias for why this is a type alias rather than spelled out
 /// inline (the clippy finding that alias itself fixed there).
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 10] = [
+    let cases: [Case; 16] = [
         (
-            "an_empty_list_is_a_calm_status_page_not_an_error",
-            an_empty_list_is_a_calm_status_page_not_an_error,
+            "an_empty_list_is_a_calm_note_not_an_error",
+            an_empty_list_is_a_calm_note_not_an_error,
         ),
         (
             "each_rule_shows_port_protocol_target_and_a_close_button",
@@ -574,8 +974,16 @@ fn main() {
             until_reboot_says_so_instead_of_showing_a_countdown,
         ),
         (
-            "an_expired_rule_reads_as_closing_not_as_a_negative_time",
-            an_expired_rule_reads_as_closing_not_as_a_negative_time,
+            "an_expired_rule_states_the_clock_and_claims_no_outcome",
+            an_expired_rule_states_the_clock_and_claims_no_outcome,
+        ),
+        (
+            "a_list_read_past_the_deadline_that_still_names_the_rule_reads_differently",
+            a_list_read_past_the_deadline_that_still_names_the_rule_reads_differently,
+        ),
+        (
+            "a_passed_deadline_is_reported_once_to_whoever_can_re_read_the_list",
+            a_passed_deadline_is_reported_once_to_whoever_can_re_read_the_list,
         ),
         (
             "an_unreachable_helper_does_not_render_as_the_calm_empty_state",
@@ -592,6 +1000,22 @@ fn main() {
         (
             "a_close_resolving_after_a_refresh_failure_does_not_repaint_the_calm_state",
             a_close_resolving_after_a_refresh_failure_does_not_repaint_the_calm_state,
+        ),
+        (
+            "a_close_resolving_after_a_refresh_failure_announces_nothing",
+            a_close_resolving_after_a_refresh_failure_announces_nothing,
+        ),
+        (
+            "an_ordinary_close_announces_the_rules_that_remain",
+            an_ordinary_close_announces_the_rules_that_remain,
+        ),
+        (
+            "the_confirmed_empty_state_is_no_taller_than_one_rendered_rule",
+            the_confirmed_empty_state_is_no_taller_than_one_rendered_rule,
+        ),
+        (
+            "a_close_with_no_helper_to_answer_it_leaves_nothing_waiting",
+            a_close_with_no_helper_to_answer_it_leaves_nothing_waiting,
         ),
     ];
 

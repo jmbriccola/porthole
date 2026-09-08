@@ -448,12 +448,40 @@ fn add_device(cli: &Cli, path: &std::path::Path) -> Result<ExitCode> {
         )));
     }
 
+    // A MAC and an address are not something a person can choose between:
+    // two of them on one line look alike, and picking the wrong one opens a
+    // port towards the wrong machine. Whatever this machine's resolver
+    // answers for each address goes on the row as well, and rows it answered
+    // nothing for get nothing.
+    let addresses: Vec<std::net::Ipv4Addr> = neighbours.iter().map(|n| n.address).collect();
+    let names = net::resolver_names(runner.as_ref(), &addresses);
+
     // The picker is a prompt, not output: it goes to stderr so that stdout
     // carries only the result, and `--json` has a stdout worth parsing. A
     // person at a terminal sees no difference.
     eprintln!("Seen on this network:");
     for (i, n) in neighbours.iter().enumerate() {
-        eprintln!("  {}) {}  {}  ({})", i + 1, n.mac, n.address, n.interface);
+        match names.get(i).and_then(Option::as_deref) {
+            Some(name) => eprintln!(
+                "  {}) {}  {}  ({})  {}",
+                i + 1,
+                n.mac,
+                n.address,
+                n.interface,
+                name
+            ),
+            None => eprintln!("  {}) {}  {}  ({})", i + 1, n.mac, n.address, n.interface),
+        }
+    }
+    if names.iter().any(Option::is_some) {
+        // Said once, and only when there is a name to say it about. It
+        // reports what porthole asked and what it saves, and claims nothing
+        // about where an answer came from -- `getent` does not say which of
+        // the host's name sources answered.
+        eprintln!(
+            "The name after an address is what this machine's resolver answered for it. The \
+             MAC is what gets saved."
+        );
     }
     eprint!("Pick a number: ");
     std::io::stderr().flush().ok();

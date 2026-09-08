@@ -262,6 +262,28 @@ fn the_window_has_an_open_button_that_is_reachable_from_the_keyboard() -> Result
     Ok(())
 }
 
+/// Whether `widget` can be reached with Tab: either it is focusable itself,
+/// or one of its descendants is.
+///
+/// The second case is not hypothetical and is why this is not a plain
+/// `is_focusable()` any more. A `gtk::MenuButton` -- the window's own main
+/// menu -- reads back as not focusable: it is a composite widget, and the
+/// focus belongs to the button inside it. Measured in this container, where
+/// the plain check failed on exactly that widget.
+fn keyboard_reachable(widget: &gtk::Widget) -> bool {
+    if widget.is_focusable() {
+        return true;
+    }
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        if keyboard_reachable(&current) {
+            return true;
+        }
+        child = current.next_sibling();
+    }
+    false
+}
+
 /// Task 6's own check: every action a click can reach must also be
 /// reachable from the keyboard -- a GNOME app that needs a mouse is not a
 /// GNOME app. Populates both sections with real fixture data first (via
@@ -281,18 +303,19 @@ fn every_action_is_reachable_from_the_keyboard() -> Result<(), String> {
         let flags: Vec<bool> = win
             .actionable_widgets()
             .iter()
-            .map(|w| w.is_focusable())
+            .map(keyboard_reachable)
             .collect();
         seen.replace(Some(flags));
     });
     let flags = result.borrow_mut().take().ok_or("activation never ran")?;
-    // The header button, one "Open now" close button, one "Listening" Open
-    // button: proof the fixtures above actually produced rows to check,
-    // not just the one widget an empty window would have had anyway.
-    if flags.len() < 3 {
+    // The header button, the main menu, one "Open now" close button, one
+    // "Listening" Open button: proof the fixtures above actually produced
+    // rows to check, not just the two widgets an empty window would have
+    // had anyway.
+    if flags.len() < 4 {
         return Err(format!(
-            "expected at least 3 actionable widgets (header button + one row from each \
-             section), got {}",
+            "expected at least 4 actionable widgets (header button, main menu, and one row \
+             from each section), got {}",
             flags.len()
         ));
     }
@@ -389,11 +412,11 @@ fn a_construction_with_an_unreachable_helper_does_not_show_the_calm_empty_state(
             let win = PortholeWindow::new(app);
             win.present();
             let settled = pump_until(
-                || win.open_now().status_page().is_none() && win.open_now().error_page().is_some(),
+                || win.open_now().empty_note().is_none() && win.open_now().error_note().is_some(),
                 Duration::from_secs(5),
             );
-            let calm_showing = win.open_now().status_page().is_some();
-            let error_showing = win.open_now().error_page().is_some();
+            let calm_showing = win.open_now().empty_note().is_some();
+            let error_showing = win.open_now().error_note().is_some();
             let status_bar_prominent = win.status_bar().is_prominent();
             seen.replace(Some((
                 settled,
@@ -435,6 +458,218 @@ fn a_construction_with_an_unreachable_helper_does_not_show_the_calm_empty_state(
     Ok(())
 }
 
+/// Presses a "Listening" row's own Open button -- `emit_clicked`, the real
+/// signal a pointer or the keyboard would emit -- and reads back the one
+/// thing pressing it is supposed to produce: the open dialog, on this
+/// window, as `AdwApplicationWindow::visible_dialog` reports it.
+///
+/// This crate's other checks on that button all stop at
+/// `open_button_for(index).is_some()` and `activate_open(index)`, which
+/// `listening_section.rs` documents as a pure lookup rather than a
+/// simulated click. Presence was covered; pressing was not, and a button
+/// with no handler passes every one of them. A user on Fedora
+/// Workstation found the difference: the button did nothing at all.
+fn pressing_a_listening_rows_open_button_opens_the_dialog() -> Result<(), String> {
+    let opened = Rc::new(Cell::new(false));
+    let seen = opened.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.RowOpenButtonClick",
+        move |app| {
+            let win = PortholeWindow::new(app);
+            win.present();
+            win.listening().set_services(&[listening_service_fixture()]);
+            let Some(button) = win.listening().open_button_for(0) else {
+                return;
+            };
+            button.emit_clicked();
+            pump_main_context();
+            seen.set(win.visible_dialog().is_some());
+        },
+    );
+    if opened.get() {
+        Ok(())
+    } else {
+        Err("pressing a Listening row's Open button presented no dialog".to_string())
+    }
+}
+
+/// The same press, after the answer about Docker has landed.
+///
+/// That answer arrives on every launch -- a list of published ports, or
+/// the fact that none could be had -- and it rebuilds this section's rows.
+/// A row's Open button therefore has to survive a rebuild that no part of
+/// the open flow asked for. It did not: the button was dead in every
+/// installed copy of porthole, because the handler was attached from
+/// outside the rebuild.
+fn a_rows_open_button_survives_the_docker_answer() -> Result<(), String> {
+    let opened = Rc::new(Cell::new(false));
+    let seen = opened.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.RowOpenButtonAfterDocker",
+        move |app| {
+            let win = PortholeWindow::new(app);
+            win.present();
+            win.listening().set_services(&[listening_service_fixture()]);
+            // Both ways that answer can come back, one after the other:
+            // neither may cost the row its button's handler.
+            win.listening().set_docker_ports(&[]);
+            win.listening().set_docker_unavailable();
+            let Some(button) = win.listening().open_button_for(0) else {
+                return;
+            };
+            button.emit_clicked();
+            pump_main_context();
+            seen.set(win.visible_dialog().is_some());
+        },
+    );
+    if opened.get() {
+        Ok(())
+    } else {
+        Err(
+            "pressing a Listening row's Open button after the Docker answer presented no dialog"
+                .to_string(),
+        )
+    }
+}
+
+/// The round trip a person actually made on a Fedora Workstation VM: open a
+/// port from a "Listening" row, then close it again from "Open now", and
+/// find the row's Open button back where it was.
+///
+/// Both buttons are pressed for real -- `emit_clicked` on the widgets the
+/// window itself built, not a setter standing in for a press. The one thing
+/// this container cannot supply is the close's own reply: `close_by_id`
+/// goes out over the system bus, and there is no system bus here (see
+/// `a_construction_with_an_unreachable_helper_does_not_show_the_calm_empty_state`
+/// above), so the reply arrives through `simulate_close_succeeded`, which
+/// `open_now.rs` documents as the seam onto the same close-success path the
+/// button's own `Ok(())` arm takes.
+///
+/// `new_without_initial_load`, not `new`: the initial load calls the same
+/// two setters this check drives -- `set_services` from the `/proc` scan,
+/// `set_open_ports`/`set_open_ports_unknown` from the helper round trip --
+/// and lands them whenever they land. This constructor starts neither, so
+/// the calls reaching these two sections are this check's own. (Both
+/// constructors were measured against the code that had the defect; both
+/// failed this check, so the choice buys determinism here, not the
+/// failure.)
+fn closing_a_port_brings_back_the_listening_rows_open_button() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.CloseRestoresOpenButton",
+        move |app| {
+            let win = PortholeWindow::new_without_initial_load(app);
+            win.present();
+            win.listening().set_services(&[listening_service_fixture()]);
+
+            // Open, from the row itself.
+            let Some(open_button) = win.listening().open_button_for(0) else {
+                return;
+            };
+            open_button.emit_clicked();
+            pump_main_context();
+            let dialog_opened = win.visible_dialog().is_some();
+            if let Some(dialog) = win.visible_dialog() {
+                dialog.close();
+            }
+            pump_main_context();
+
+            // What a successful open leaves on screen: `refresh`'s own two
+            // calls, the rule list and the ports derived from it.
+            let rule = wire_rule_fixture();
+            win.open_now().set_rules(std::slice::from_ref(&rule));
+            win.listening().set_open_ports(&[rule.port]);
+            let button_withheld = win.listening().open_button_for(0).is_none();
+
+            // Close, from the "Open now" row itself.
+            let Some(close_button) = win.open_now().close_button_for(0) else {
+                return;
+            };
+            close_button.emit_clicked();
+            pump_main_context();
+            win.open_now().simulate_close_succeeded(&rule.id);
+            pump_main_context();
+
+            let button_back = win.listening().open_button_for(0).is_some();
+            *seen.borrow_mut() = Some((dialog_opened, button_withheld, button_back));
+        },
+    );
+    let (dialog_opened, button_withheld, button_back) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if !dialog_opened {
+        return Err("pressing the Listening row's Open button presented no dialog".to_string());
+    }
+    if !button_withheld {
+        return Err(
+            "a port reported open must leave its Listening row without an Open button, or this \
+             check cannot tell the button coming back from its never having gone"
+                .to_string(),
+        );
+    }
+    if !button_back {
+        return Err(
+            "closing the port from \"Open now\" left the Listening row still showing it as open, \
+             with no way to open it again"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// A refresh that finds no helper at all must leave nothing waiting.
+///
+/// Same real failure this file's own unreachable check runs against -- the
+/// container has no system bus, so `refresh`'s round trip genuinely fails
+/// rather than being simulated. What is asserted here is the other half of
+/// it: the header bar's busy indication is armed by that round trip and has
+/// to be gone once the round trip is over, however it ended. A spinner
+/// still turning over a refresh that failed is the same "the application
+/// looks stuck" defect the indication was added to repair.
+///
+/// The settled error state is what proves the refresh actually finished, so
+/// this is not a check that happens to pass because nothing ever started.
+fn a_refresh_that_finds_no_helper_leaves_nothing_waiting() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.UnreachableBusy",
+        move |app| {
+            let win = PortholeWindow::new(app);
+            win.present();
+            let settled = pump_until(
+                || win.open_now().error_note().is_some(),
+                Duration::from_secs(5),
+            );
+            seen.replace(Some((
+                settled,
+                win.busy().is_busy(),
+                win.busy().is_showing(),
+            )));
+        },
+    );
+    let (settled, still_busy, still_showing) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if !settled {
+        return Err(
+            "the helper-unreachable state never settled within the timeout, so this check \
+             never saw a finished refresh at all"
+                .to_string(),
+        );
+    }
+    if still_busy {
+        return Err(
+            "the refresh is over -- its failure is on screen -- and the window still \
+             reports a helper round trip outstanding"
+                .to_string(),
+        );
+    }
+    if still_showing {
+        return Err("the header bar is still spinning over a refresh that failed".to_string());
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below. A type alias rather than spelling
 /// `(&str, fn() -> Result<(), String>)` out at the call site: clippy's
 /// `type_complexity` flagged the inline form (the actual finding from the
@@ -447,7 +682,7 @@ fn main() {
     // A plain array, not `vec![]`: the list is fixed at compile time and
     // never grows, so there is nothing a `Vec` buys here, independently of
     // what clippy does or does not flag.
-    let cases: [Case; 10] = [
+    let cases: [Case; 14] = [
         (
             "the_window_is_actually_realized_not_merely_constructed",
             the_window_is_actually_realized_not_merely_constructed,
@@ -487,6 +722,22 @@ fn main() {
         (
             "a_construction_with_an_unreachable_helper_does_not_show_the_calm_empty_state",
             a_construction_with_an_unreachable_helper_does_not_show_the_calm_empty_state,
+        ),
+        (
+            "a_refresh_that_finds_no_helper_leaves_nothing_waiting",
+            a_refresh_that_finds_no_helper_leaves_nothing_waiting,
+        ),
+        (
+            "pressing_a_listening_rows_open_button_opens_the_dialog",
+            pressing_a_listening_rows_open_button_opens_the_dialog,
+        ),
+        (
+            "a_rows_open_button_survives_the_docker_answer",
+            a_rows_open_button_survives_the_docker_answer,
+        ),
+        (
+            "closing_a_port_brings_back_the_listening_rows_open_button",
+            closing_a_port_brings_back_the_listening_rows_open_button,
         ),
     ];
 

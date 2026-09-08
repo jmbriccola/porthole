@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- com.jacopobriccola.Porthole-symbolic: the single-colour outline variant
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- com.jacopobriccola.Porthole-symbolic: the single-colour outline variant
      freedesktop's icon theme spec and GNOME's HIG both expect alongside the
      full-colour icon, used in menus, lists and high-contrast themes.
      16x16 viewBox, the symbolic size class; `currentColor` so it inherits
@@ -7,7 +8,6 @@
      rather than carrying one of its own. Same porthole-frame-plus-rivets
      shape as the full-colour icon, reduced to what still reads at 16px:
      two concentric circles and four rivets, not eight. -->
-<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
   <g fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round">
     <circle cx="8" cy="8" r="6.4"/>
     <circle cx="8" cy="8" r="3.6"/>

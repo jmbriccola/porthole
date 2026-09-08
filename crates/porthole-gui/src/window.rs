@@ -33,13 +33,13 @@
 //! the same way; task 5 left `OpenDialog::on_opened` uncalled for the
 //! identical reason. This task is what finally calls all three: the free
 //! function `refresh` (module-private -- reached through
-//! [`PortholeWindow::refresh`] and run once at the end of
-//! [`PortholeWindow::new`]) populates "Open now" and the status line from
-//! the helper's own `list`/`status` over D-Bus, and "Listening" from
-//! `porthole_core::listening::scan`, and the same function runs again
-//! every time [`OpenDialog::on_opened`] fires -- wired onto both the
-//! header bar's own "Open a port" button and every "Listening" row's
-//! pre-filled one, through `present_open_dialog`.
+//! [`PortholeWindow::refresh`], and run for the initial load by the task
+//! [`PortholeWindow::new`] starts) populates "Open now" and the status line
+//! from the helper's own `list`/`status` over D-Bus, and "Listening" from
+//! `porthole_core::listening::scan`, and the same function runs again every
+//! time [`OpenDialog::on_opened`] fires -- wired onto both the header bar's
+//! own "Open a port" button and every "Listening" row's pre-filled one,
+//! through `present_open_dialog`.
 //!
 //! Neither read blocks the UI thread, and the helper round trip is bounded
 //! by [`HELPER_TIMEOUT`] (zbus proxies carry no default one of their own).
@@ -48,6 +48,27 @@
 //! different things -- see `refresh`'s own doc comment, `open_now.rs`'s and
 //! `status_bar.rs`'s module docs for why conflating any pair of them is
 //! this project's characteristic defect.
+//!
+//! ## What is open changes without this window doing anything
+//!
+//! A rule runs out its own clock. Someone runs `porthole close` in a
+//! terminal. The machine leaves the subnet a rule was scoped to. The
+//! helper's reconciliation sweep finds a record the firewall no longer has.
+//! None of those goes through this process, and until this window listened
+//! for them it went on showing a list that had stopped being true -- a user
+//! on a Fedora Workstation VM watched a row stand for a port their firewall
+//! had already stopped holding open.
+//!
+//! [`listen_and_load`] is the repair: subscribe to the helper's own
+//! `RuleOpened`, `RuleClosed` and `NetworkChanged`, and re-read `list` when
+//! any of them arrives. What an announcement *carries* is dropped -- see
+//! [`subscribe`] for why `list` is the only thing this window ever renders,
+//! and [`PortholeWindow::start_listening`] for how the subscription ends.
+//! Whose rules those are is unchanged by any of this: `list` is authorized
+//! for everyone by polkit and reports every rule porthole holds regardless
+//! of who opened it, the announcements are broadcasts carrying the opening
+//! uid, and this window filters on neither -- it shows exactly what `list`
+//! returns, exactly as it did before.
 //!
 //! ## The saved devices and Docker's own ports
 //!
@@ -66,12 +87,28 @@
 //! such state, the open dialog's group description. porthole never touches
 //! Docker's rules; every one of these surfaces only ever reads and
 //! explains.
+//!
+//! ## Writing the address book
+//!
+//! Until [`present_devices_dialog`] existed, that book could only be read
+//! here: a device became a target in the open dialog, and the only way to
+//! put one there was a terminal. Two things reach it now -- the main menu's
+//! own entry ([`DEVICES_ACTION`]), and the button beside the open dialog's
+//! target list, whose slot this file fills. Both present a
+//! [`crate::devices_dialog::DevicesDialog`], and both register the hook that
+//! re-reads the book after every write, so a device saved while the open
+//! dialog is up appears in its target list without it being closed.
+//!
+//! The helper is not involved in any of it. The address book is
+//! client-side, it never crosses the bus, and what does cross it at the
+//! moment a port is opened is an already-resolved address.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::Deref;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use futures_util::StreamExt;
 use gtk::glib;
 
 use porthole_core::command::RealRunner;
@@ -80,6 +117,8 @@ use porthole_core::docker::Published;
 use porthole_core::ipc::{PortholeProxy, WireDockerPort, WireRule, WireStatus};
 use porthole_core::listening::RealProcFs;
 
+use crate::busy::BusyIndicator;
+use crate::devices_dialog::DevicesDialog;
 use crate::listening_section::ListeningSection;
 use crate::open_dialog::{DeviceEntry, OpenDialog};
 use crate::open_now::OpenNowSection;
@@ -89,7 +128,7 @@ use crate::status_bar::StatusBar;
 /// the address book itself could not be read -- two facts an empty `Vec`
 /// alone cannot tell apart, and the second of which must not render as "no
 /// devices are saved".
-type DeviceSnapshot = Result<Vec<DeviceEntry>, String>;
+pub type DeviceSnapshot = Result<Vec<DeviceEntry>, String>;
 
 /// What [`refresh`] fills in, and what it keeps for an [`OpenDialog`]
 /// opened later. One value rather than six parameters threaded through four
@@ -113,7 +152,22 @@ struct Sections {
     /// in either `None` case, so it needs no finer distinction than this;
     /// the "Listening" section does, and keeps its own.
     docker: Rc<RefCell<Option<Vec<Published>>>>,
+    /// Whether a refresh is already scheduled -- see [`schedule_refresh`].
+    refresh_pending: Rc<Cell<bool>>,
+    /// The header bar's own busy indication, held for as long as a helper
+    /// round trip is outstanding -- see [`refresh`], and `busy.rs` for what
+    /// it is allowed to mean.
+    busy: BusyIndicator,
 }
+
+/// The saved-devices entry in the window's own main menu, written the two
+/// ways it has to be: the bare name `gio::SimpleAction::new` takes, and the
+/// `win.`-prefixed form a `gio::Menu` item points at. Kept adjacent because
+/// a menu item naming an action the window does not have renders
+/// insensitive and says nothing about why; `tests/devices_dialog.rs` checks
+/// that the item and the action actually meet.
+const DEVICES_ACTION_NAME: &str = "devices";
+const DEVICES_ACTION: &str = "win.devices";
 
 /// The width, in CSS pixels, at or below which the narrow layout applies.
 /// The `Breakpoint` object itself is reachable via
@@ -139,8 +193,11 @@ pub struct PortholeWindow {
     listening: ListeningSection,
     status_bar: StatusBar,
     open_button: gtk::Button,
+    menu_button: gtk::MenuButton,
     devices: Rc<RefCell<DeviceSnapshot>>,
     docker: Rc<RefCell<Option<Vec<Published>>>>,
+    refresh_pending: Rc<Cell<bool>>,
+    busy: BusyIndicator,
 }
 
 impl Deref for PortholeWindow {
@@ -165,7 +222,11 @@ impl PortholeWindow {
         // earned) until `refresh` resolves; `refresh` runs the same path a
         // later explicit refresh does, there is no separate "first load"
         // code.
-        refresh(&window.sections());
+        //
+        // That load is now made *inside* the subscription task, after the
+        // match rules exist and never conditionally on them -- see
+        // [`listen_and_load`] for the ordering and why it is that order.
+        window.start_listening();
         window
     }
 
@@ -216,6 +277,33 @@ impl PortholeWindow {
             .build();
         let header_bar = adw::HeaderBar::new();
         header_bar.pack_start(&open_button);
+
+        // The window's main menu, and the one entry it has: the saved
+        // devices, reachable without opening a port. The open dialog's own
+        // button beside its target list is the other way to the same
+        // dialog; this is the way that does not start by choosing a port.
+        // A `gio::Menu` item rather than a button, so the same entry is
+        // reachable by keyboard through the menu and can grow a second one
+        // later without another piece of header chrome.
+        let menu = gtk::gio::Menu::new();
+        menu.append(Some("Saved Devices"), Some(DEVICES_ACTION));
+        let menu_button = gtk::MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .tooltip_text("Main menu")
+            .menu_model(&menu)
+            .build();
+        header_bar.pack_end(&menu_button);
+
+        // Where a refresh says it is still waiting. In the header bar
+        // rather than in either section: a refresh is a fact about the
+        // window as a whole, and both sections plus the status line are
+        // filled from the one round trip it makes. Hidden until
+        // `crate::busy::BUSY_DELAY` has gone by, so a refresh that comes
+        // straight back shows nothing -- see `busy.rs`.
+        let busy = BusyIndicator::new();
+        busy.spinner()
+            .set_tooltip_text(Some("Waiting for the porthole helper"));
+        header_bar.pack_end(busy.spinner());
 
         let toolbar_view = adw::ToolbarView::new();
         toolbar_view.add_top_bar(&header_bar);
@@ -287,6 +375,7 @@ impl PortholeWindow {
         let devices: Rc<RefCell<DeviceSnapshot>> =
             Rc::new(RefCell::new(Err(DEVICES_NOT_READ_YET.to_string())));
         let docker: Rc<RefCell<Option<Vec<Published>>>> = Rc::new(RefCell::new(None));
+        let refresh_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
         let sections_for_open = Sections {
             window: window.clone(),
@@ -295,9 +384,72 @@ impl PortholeWindow {
             status_bar: status_bar.clone(),
             devices: devices.clone(),
             docker: docker.clone(),
+            refresh_pending: refresh_pending.clone(),
+            busy: busy.clone(),
         };
         open_button.connect_clicked(move |_| {
             present_open_dialog(&sections_for_open, &OpenDialog::new());
+        });
+
+        // What a "Listening" row's own Open button does, registered once
+        // here and held by the section for as long as it exists. The
+        // section connects every button it builds to this as it builds it,
+        // so no caller of any setter has anything to reattach -- see
+        // `listening_section.rs`'s own doc comment. It is registered here,
+        // and not there, because that section knows nothing about
+        // `OpenDialog` or this window.
+        let sections_for_row = Sections {
+            window: window.clone(),
+            open_now: open_now.clone(),
+            listening: listening.clone(),
+            status_bar: status_bar.clone(),
+            devices: devices.clone(),
+            docker: docker.clone(),
+            refresh_pending: refresh_pending.clone(),
+            busy: busy.clone(),
+        };
+        listening.connect_open_requested(move |port| {
+            present_open_dialog(&sections_for_row, &OpenDialog::for_port(port));
+        });
+
+        // What the menu entry above actually does. A `gio::SimpleAction` on
+        // the window rather than a click handler on a widget: that is what a
+        // `gio::Menu` item can point at, and it is the same action whether
+        // it is reached with the mouse or from the keyboard.
+        let sections_for_devices = Sections {
+            window: window.clone(),
+            open_now: open_now.clone(),
+            listening: listening.clone(),
+            status_bar: status_bar.clone(),
+            devices: devices.clone(),
+            docker: docker.clone(),
+            refresh_pending: refresh_pending.clone(),
+            busy: busy.clone(),
+        };
+        let devices_action = gtk::gio::SimpleAction::new(DEVICES_ACTION_NAME, None);
+        devices_action.connect_activate(move |_, _| {
+            present_devices_dialog(&sections_for_devices, None);
+        });
+        window.add_action(&devices_action);
+
+        // The other direction: what a successful close in "Open now" does
+        // to "Listening". That section withholds a row's Open button for a
+        // port the rule list names, and a close changes that list -- so it
+        // is told the list that close left behind, from the same section
+        // that now holds it. Registered here, and not in `open_now.rs`,
+        // for the reason the Open button's own callback is: neither
+        // section holds a reference to the other.
+        //
+        // `set_open_ports`, not `refresh`: the rules handed over are the
+        // ones "Open now" is showing, so both sections mark from one list
+        // rather than from two round trips that could land in either order.
+        // A close changes the rule list and nothing else this window reads
+        // -- the `/proc` listeners, the ports Docker publishes, the saved
+        // devices and every field of `WireStatus` are all independent of
+        // it.
+        let listening_for_close = listening.clone();
+        open_now.connect_close_succeeded(move |remaining| {
+            listening_for_close.set_open_ports(&open_tcp_ports(remaining));
         });
 
         // No initial `refresh` here -- see `PortholeWindow::new` (the only
@@ -313,8 +465,11 @@ impl PortholeWindow {
             listening,
             status_bar,
             open_button,
+            menu_button,
             devices,
             docker,
+            refresh_pending,
+            busy,
         }
     }
 
@@ -330,6 +485,8 @@ impl PortholeWindow {
             status_bar: self.status_bar.clone(),
             devices: self.devices.clone(),
             docker: self.docker.clone(),
+            refresh_pending: self.refresh_pending.clone(),
+            busy: self.busy.clone(),
         }
     }
 
@@ -385,25 +542,50 @@ impl PortholeWindow {
         &self.open_button
     }
 
+    /// The header bar's main menu, for a test that wants to check it is
+    /// reachable from the keyboard and that it really carries an entry --
+    /// the entry itself is a `gio::Menu` item, activated through
+    /// [`DEVICES_ACTION`] rather than by pressing a widget.
+    pub fn menu_button(&self) -> &gtk::MenuButton {
+        &self.menu_button
+    }
+
+    /// The header bar's own busy indication -- `is_busy()` for "a helper
+    /// round trip is outstanding", `is_showing()` for "and it has been
+    /// outstanding long enough to say so on screen". A test reads these to
+    /// check that a refresh clears them again however it ends: an answer,
+    /// a typed error, no helper at all, or [`HELPER_TIMEOUT`] running out.
+    pub fn busy(&self) -> &BusyIndicator {
+        &self.busy
+    }
+
     /// Every widget this window currently has that a click can activate --
     /// a structural readback, not a hand-maintained list: the header bar's
-    /// own "Open a port" button, plus every currently-rendered close
-    /// button in "Open now" and every currently-rendered Open button in
-    /// "Listening" (rows with neither -- an unopenable "Listening" row, an
-    /// unopened "Open now" list -- contribute nothing, since there is
-    /// nothing there to reach). `tests/window.rs`'s own keyboard-
-    /// reachability test checks `is_focusable()` on each of these: a GNOME
-    /// app that needs a mouse is not a GNOME app.
-    pub fn actionable_widgets(&self) -> Vec<gtk::Button> {
-        let mut widgets = vec![self.open_button.clone()];
+    /// own "Open a port" button and its main menu, plus every
+    /// currently-rendered close button in "Open now" and every
+    /// currently-rendered Open button in "Listening" (rows with neither --
+    /// an unopenable "Listening" row, an unopened "Open now" list --
+    /// contribute nothing, since there is nothing there to reach).
+    /// `tests/window.rs`'s own keyboard-reachability test checks
+    /// `is_focusable()` on each of these: a GNOME app that needs a mouse is
+    /// not a GNOME app.
+    ///
+    /// `gtk::Widget`, not `gtk::Button`: the main menu is a
+    /// `gtk::MenuButton`, and a list that could only hold buttons would
+    /// have left it out while still claiming to be every one of them.
+    pub fn actionable_widgets(&self) -> Vec<gtk::Widget> {
+        let mut widgets: Vec<gtk::Widget> = vec![
+            self.open_button.clone().upcast(),
+            self.menu_button.clone().upcast(),
+        ];
         for index in 0..self.open_now.rows().len() {
             if let Some(button) = self.open_now.close_button_for(index) {
-                widgets.push(button);
+                widgets.push(button.upcast());
             }
         }
         for index in 0..self.listening.rows().len() {
             if let Some(button) = self.listening.open_button_for(index) {
-                widgets.push(button);
+                widgets.push(button.upcast());
             }
         }
         widgets
@@ -417,6 +599,71 @@ impl PortholeWindow {
     /// neither read blocks the UI thread.
     pub fn refresh(&self) {
         refresh(&self.sections());
+    }
+
+    /// Starts the one task that keeps this window's view of what is open
+    /// tied to the helper's, and arranges for it to end.
+    ///
+    /// **How it ends.** Two things here hold this window: the task, and the
+    /// expiry callback left on the "Open now" section. The window's own
+    /// `close-request` releases both, and nothing else holds either. Every
+    /// window `app::build`'s activation handler makes gets its own
+    /// subscription, and closing one ends that one.
+    ///
+    /// Removing the task's source from the main context drops the future,
+    /// the signal streams and the D-Bus connection under them -- so the
+    /// match rules go too. `slot` holds the source's id and nothing else, a
+    /// plain integer, so the handler hanging off the window is not a second
+    /// reference back into the task; whichever of the two empties it first
+    /// -- the task on its way out, the handler on its way in -- leaves
+    /// nothing for the other, because `SourceId::remove` on a source that
+    /// has already finished is a panic, not a no-op.
+    ///
+    /// The callback is the cut described on
+    /// [`OpenNowSection::forget_expiry_unconfirmed`]: that section outlives
+    /// every window in this process, and the callback registered below holds
+    /// this one.
+    ///
+    /// **`close-request`, not `destroy`.** Measured in this milestone's own
+    /// container, on a real presented window: `gtk::Window::destroy` hid the
+    /// window and emitted no `destroy` signal at all, so a handler on that
+    /// signal never ran. GTK4 emits it from the widget's own dispose, which
+    /// needs every reference to have gone -- and this crate holds one that
+    /// does not, the `Sections` inside `ListeningSection`'s own
+    /// `connect_open_requested` callback, which points back at the window
+    /// that holds the section. `close-request` is the signal the window
+    /// manager's close button, `Ctrl-W` and `gtk::Window::close` all raise,
+    /// and it fires with references outstanding.
+    fn start_listening(&self) {
+        // The other half of the same problem, one section down: a countdown
+        // reaching zero is a deadline, not an outcome, and only `list` can
+        // settle what happened -- which "Open now" never calls. It reports
+        // the deadline; this is what reads.
+        let sections_for_expiry = self.sections();
+        self.open_now.connect_expiry_unconfirmed(move || {
+            schedule_refresh(&sections_for_expiry);
+        });
+
+        let slot: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let sections = self.sections();
+        let slot_for_task = slot.clone();
+        let handle = glib::spawn_future_local(async move {
+            listen_and_load(sections).await;
+            slot_for_task.borrow_mut().take();
+        });
+        // The task cannot have run yet: it only runs when the main context
+        // iterates, and this is still inside the constructor.
+        *slot.borrow_mut() = handle.into_source_id().ok();
+        let open_now = self.open_now.clone();
+        self.window.connect_close_request(move |_| {
+            if let Some(id) = slot.borrow_mut().take() {
+                id.remove();
+            }
+            open_now.forget_expiry_unconfirmed();
+            // Nothing here is a reason to keep the window: this is
+            // bookkeeping on the way out, not a veto.
+            glib::Propagation::Proceed
+        });
     }
 }
 
@@ -572,7 +819,7 @@ const DEVICES_NOT_READ_YET: &str = "porthole has not read the saved devices yet.
 /// absent phone does not hide the laptop that is here. Only the address
 /// book itself failing to load produces the outer `Err`, since then there
 /// are no devices to report at all.
-fn load_devices() -> DeviceSnapshot {
+pub fn load_devices() -> DeviceSnapshot {
     let book = devices::Book::load(&devices::default_path()).map_err(|e| e.to_string())?;
     let runner = RealRunner;
     Ok(book
@@ -590,7 +837,7 @@ fn load_devices() -> DeviceSnapshot {
 /// timeout of their own -- against a live-but-hung helper, an unbounded
 /// wait would leave both sections sitting on their own indeterminate "not
 /// answered yet" state (`OpenNowSection`'s and `ListeningSection`'s own
-/// `loading_page`) forever, rather than ever settling into a state a user
+/// `loading_note`) forever, rather than ever settling into a state a user
 /// can act on.
 const HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
@@ -618,12 +865,108 @@ async fn with_timeout<F: std::future::Future>(
     .await
 }
 
+/// One refresh per burst of announcements.
+///
+/// `close --all` announces every rule it closed, one signal each, and a
+/// refresh is three D-Bus calls, a `/proc` scan and a subprocess per saved
+/// device. The first announcement schedules a refresh this far ahead; the
+/// rest arrive inside that window and are absorbed by it.
+const SIGNAL_COALESCE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Asks for a [`refresh`] shortly, unless one is already asked for.
+///
+/// The flag is cleared before the refresh runs, so an announcement that
+/// arrives while that refresh is in flight schedules the next one rather
+/// than being dropped into it.
+fn schedule_refresh(sections: &Sections) {
+    if sections.refresh_pending.replace(true) {
+        return;
+    }
+    let sections = sections.clone();
+    glib::timeout_add_local_once(SIGNAL_COALESCE, move || {
+        sections.refresh_pending.set(false);
+        refresh(&sections);
+    });
+}
+
+/// Every announcement the helper makes, as one stream of "read `list`
+/// again", together with the connection and proxy they arrive over -- both
+/// returned so the caller's own frame keeps them alive for as long as the
+/// stream is read.
+///
+/// `None` is every way there was nothing to subscribe to: no bus, no
+/// activatable helper, a connection lost while the match rules were being
+/// installed.
+///
+/// **The payloads are dropped here.** `RuleOpened` carries the rule the
+/// helper created and `RuleClosed` carries the rule and why it stopped being
+/// open, and this window renders neither. `porthole_core::ipc`'s own
+/// `rule_closed` doc gives three reasons a subscriber cannot keep its view
+/// from these alone: `close --id --forget` drops a record with nothing
+/// announced at all, announcements are emitted after the state lock is
+/// released so one can arrive ahead of the `RuleOpened` for a different
+/// rule, and anything sent before the match rules existed is simply gone.
+/// So `list` is the authority here in the strongest sense available -- it is
+/// the only thing this window ever renders, and an announcement is a cue to
+/// read it. There is no second account of what is open for the list to
+/// disagree with.
+async fn subscribe() -> Option<(
+    zbus::Connection,
+    PortholeProxy<'static>,
+    futures_util::stream::LocalBoxStream<'static, ()>,
+)> {
+    let connection = zbus::Connection::system().await.ok()?;
+    let proxy = PortholeProxy::new(&connection).await.ok()?;
+    let opened = proxy.receive_rule_opened().await.ok()?;
+    let closed = proxy.receive_rule_closed().await.ok()?;
+    // The machine's own subnet changing is not itself a rule leaving the
+    // list, but it is what the helper closes subnet-scoped rules for, and
+    // it changes the network the status line reports either way.
+    let network = proxy.receive_network_changed().await.ok()?;
+    let signals = futures_util::stream::select_all(vec![
+        opened.map(|_| ()).boxed_local(),
+        closed.map(|_| ()).boxed_local(),
+        network.map(|_| ()).boxed_local(),
+    ])
+    .boxed_local();
+    Some((connection, proxy, signals))
+}
+
+/// Subscribes, then loads, then keeps loading whenever the helper says
+/// something changed.
+///
+/// **Subscribe first, then call.** The helper is D-Bus activated, so the
+/// call that reaches it is what starts it, and its start-up sweep announces
+/// what it dropped as soon as it owns the bus name. A client whose match
+/// rules already exist by then receives those; one that calls first can lose
+/// them. `porthole-agent`'s own `main` does this in the same order, for the
+/// same reason, and says so at greater length.
+///
+/// The load runs whether or not subscribing worked. A window that could not
+/// subscribe still has to populate, and a helper that is not there is a
+/// state both sections and the status line already render as itself.
+async fn listen_and_load(sections: Sections) {
+    let subscription = subscribe().await;
+    refresh(&sections);
+    let Some((_connection, _proxy, mut signals)) = subscription else {
+        return;
+    };
+    while signals.next().await.is_some() {
+        schedule_refresh(&sections);
+    }
+    // The stream ends when the connection under it does. One more read
+    // replaces what is on screen with whatever the next call finds, rather
+    // than leaving the last answer standing with nothing left that could
+    // ever change it.
+    refresh(&sections);
+}
+
 /// Presents `dialog`, transient for `window`, and registers its
 /// `on_opened` hook -- task 5's own hook, left uncalled until this task,
 /// see this module's own doc comment -- to run [`refresh`] again on a
 /// successful open. Shared by the header bar's own "Open a port" button
-/// and every "Listening" row's pre-filled one (wired by
-/// `wire_listening_open_buttons`), so both paths refresh the same way.
+/// and every "Listening" row's pre-filled one, so both paths refresh the
+/// same way.
 fn present_open_dialog(sections: &Sections, dialog: &OpenDialog) {
     // Whatever the last `refresh` learned, handed over before the dialog is
     // ever on screen: the saved devices it offers as targets, and the ports
@@ -645,42 +988,100 @@ fn present_open_dialog(sections: &Sections, dialog: &OpenDialog) {
     dialog.on_opened(move |_rule| {
         refresh(&sections_for_refresh);
     });
+
+    // What the button beside the target list does. Registered here, and not
+    // in `open_dialog.rs`, for the reason every other cross-section callback
+    // in this file is: that dialog knows nothing about the saved-devices one.
+    let sections_for_devices = sections.clone();
+    let dialog_for_devices = dialog.clone();
+    dialog.on_manage_devices(move || {
+        present_devices_dialog(&sections_for_devices, Some(dialog_for_devices.clone()));
+    });
+
     dialog.present(Some(&sections.window));
 }
 
-/// Connects each "Listening" row's own Open button (if it has one -- see
-/// `listening_section.rs`'s own doc comment for which rows do not) to a
-/// dialog pre-filled with that row's port.
+/// Re-reads the address book, off the UI thread, into the cache
+/// [`present_open_dialog`] hands to every dialog it opens -- and, when one
+/// is currently on screen, straight into that one as well.
 ///
-/// Every `set_services`/`set_open_ports` call that actually rebuilds rows
-/// (`listening_section.rs`'s own `apply` -- gated by `scanned`, see its own
-/// module doc) drops whatever click handler a previous call to this
-/// function had connected, since it discards the old `gtk::Button` objects
-/// entirely and builds new ones. This is called again immediately after
-/// each such rebuild so the buttons currently on screen are the ones with
-/// a handler. A call after `set_scan_failed` specifically is harmless, not
-/// merely avoided: `apply_scan_failed` clears `listening`'s rows outright
-/// (`tests/listening.rs`'s own `a_scan_failure_does_not_render_as_the_calm_
-/// empty_state` asserts exactly that), so `listening.rows()` reports none
-/// and this function's loop below simply does nothing -- there is no
-/// leftover button here for a second handler to stack onto. It lives here
-/// rather than inside `listening_section.rs` itself because that module
-/// renders what it is given and knows nothing about `OpenDialog` or this
-/// window.
-fn wire_listening_open_buttons(sections: &Sections) {
-    let listening = &sections.listening;
-    for index in 0..listening.rows().len() {
-        let (Some(button), Some(port)) = (
-            listening.open_button_for(index),
-            listening.activate_open(index),
-        ) else {
-            continue;
+/// Two callers, one function: [`refresh`] runs it as a third read alongside
+/// the `/proc` scan and the helper round trip, and
+/// [`present_devices_dialog`] runs it again after every write to the book,
+/// so a device saved while the open dialog is up appears in its target list
+/// without the dialog being closed and re-opened.
+///
+/// Reading the book resolves every device in it, and each resolution runs a
+/// subprocess, so this goes to GLib's own I/O thread pool. Nothing on screen
+/// changes when a `None` call lands: it fills a cache.
+fn reload_devices(sections: &Sections, dialog: Option<OpenDialog>) {
+    let sections = sections.clone();
+    glib::spawn_future_local(async move {
+        let loaded = gtk::gio::spawn_blocking(load_devices).await;
+        let snapshot = match loaded {
+            Ok(snapshot) => snapshot,
+            Err(_) => Err("reading the saved devices panicked".to_string()),
         };
-        let sections = sections.clone();
-        button.connect_clicked(move |_| {
-            present_open_dialog(&sections, &OpenDialog::for_port(port));
-        });
+        if let Some(dialog) = &dialog {
+            match &snapshot {
+                Ok(entries) => dialog.set_devices(entries),
+                Err(reason) => dialog.set_devices_unreadable(reason),
+            }
+        }
+        *sections.devices.borrow_mut() = snapshot;
+    });
+}
+
+/// Presents a fresh [`DevicesDialog`] -- from the main menu, where
+/// `open_dialog` is `None`, and from the open dialog's own button beside its
+/// target list, where it is the dialog that button was pressed in.
+///
+/// Registered on it: a hook that re-reads the address book after every write
+/// and pushes the result back into that same open dialog, when there is one.
+/// This is the only place that knows about both dialogs at once, exactly as
+/// it is the only place that knows about more than one section.
+///
+/// Nothing here goes near the helper. The address book is client-side and the
+/// helper never learns that devices exist -- see
+/// `porthole_core::devices`'s own module doc for what that keeps small.
+fn present_devices_dialog(sections: &Sections, open_dialog: Option<OpenDialog>) {
+    let dialog = DevicesDialog::new();
+
+    let sections_for_changed = sections.clone();
+    let open_dialog_for_changed = open_dialog.clone();
+    dialog.on_changed(move || {
+        reload_devices(&sections_for_changed, open_dialog_for_changed.clone());
+    });
+
+    // The book and the neighbour table are read here rather than in the
+    // constructor, so a test can build one of these and drive it with
+    // fixture data -- the same split `PortholeWindow::new_without_initial_load`
+    // exists for.
+    dialog.reload();
+
+    // Over the dialog that asked for it, when one did; over the window
+    // otherwise.
+    match &open_dialog {
+        Some(open) => dialog.present(Some(open.dialog())),
+        None => dialog.present(Some(&sections.window)),
     }
+}
+
+/// Which ports [`ListeningSection::set_open_ports`] is given: the TCP ones,
+/// and only those. That section reads the list to withhold a row's Open
+/// button and print "already open", and `porthole_core::listening::scan`
+/// reports TCP sockets -- a UDP rule's port is not a listener that section
+/// lists, and including it would attach both to whatever TCP listener
+/// happens to share that port number.
+///
+/// One function, called from both places a rule list reaches that section:
+/// [`refresh`] below, and the close `PortholeWindow::build` registers.
+fn open_tcp_ports(rules: &[WireRule]) -> Vec<u16> {
+    rules
+        .iter()
+        .filter(|r| r.protocol == "tcp")
+        .map(|r| r.port)
+        .collect()
 }
 
 /// Populates "Open now", "Listening" and the status line -- the initial
@@ -689,15 +1090,11 @@ fn wire_listening_open_buttons(sections: &Sections) {
 /// [`present_open_dialog`]'s `on_opened` hook.
 ///
 /// The `/proc` scan and the helper round trip run as two **independent**
-/// spawned futures below, not sequenced against each other. Each one wires
-/// its own rows (`wire_listening_open_buttons`) immediately after whichever
-/// of `listening`'s setters it just called -- so there is no shared "wire
-/// once, at the end" step left for the two to race over. An earlier draft
-/// of this function sequenced the scan before the helper fetch specifically
-/// to avoid that race (both eventually called `wire_listening_open_buttons`
-/// once, together, at the very end); that avoidance is no longer needed now
-/// that wiring happens right where each setter that could change the rows
-/// is actually called.
+/// spawned futures below, not sequenced against each other, and either may
+/// land first. Nothing here has to be ordered around a "Listening" row's
+/// Open button: that button is connected where it is built, by the section
+/// that builds it, so calling any of its setters in any order leaves every
+/// rendered button working. See `listening_section.rs`'s own doc comment.
 ///
 /// Neither read blocks the UI thread: the D-Bus round trip already yields
 /// at every `.await` (the same `glib::spawn_future_local` shape
@@ -728,7 +1125,6 @@ fn refresh(sections: &Sections) {
             match scanned {
                 Ok(Ok(services)) => {
                     sections.listening.set_services(&services);
-                    wire_listening_open_buttons(&sections);
                 }
                 Ok(Err(e)) => {
                     sections
@@ -744,50 +1140,32 @@ fn refresh(sections: &Sections) {
         });
     }
 
-    {
-        // A third independent read, alongside the `/proc` scan and the
-        // helper round trip: reading the address book and resolving every
-        // device in it runs subprocesses, so it goes to the same I/O thread
-        // pool the scan does and never touches the UI thread. Nothing on
-        // screen changes when it lands -- it fills the cache
-        // `present_open_dialog` reads when a dialog is actually opened.
-        let sections = sections.clone();
-        glib::spawn_future_local(async move {
-            let loaded = gtk::gio::spawn_blocking(load_devices).await;
-            *sections.devices.borrow_mut() = match loaded {
-                Ok(snapshot) => snapshot,
-                Err(_) => Err("reading the saved devices panicked".to_string()),
-            };
-        });
-    }
+    // A third independent read, alongside the `/proc` scan and the helper
+    // round trip -- see [`reload_devices`], which a write to the address
+    // book runs again on its own.
+    reload_devices(sections, None);
 
     {
         let sections = sections.clone();
         let open_now = sections.open_now.clone();
         let listening = sections.listening.clone();
         let status_bar = sections.status_bar.clone();
+        let busy = sections.busy.clone();
         glib::spawn_future_local(async move {
+            // The one read here that can take long enough to look like a
+            // stall. The `/proc` scan and the address book above are on
+            // GLib's I/O thread pool and come back in milliseconds; this
+            // one crosses a bus, and the helper behind it can be slow or
+            // absent. Held across the round trip and dropped on the way
+            // out of this block, whichever way that is -- see `busy.rs`.
+            let _busy = busy.begin();
             match with_timeout(fetch_helper_snapshot(), HELPER_TIMEOUT).await {
                 Some(Ok(snapshot)) => {
                     match snapshot.rules {
                         Ok(rules) => {
-                            // Scan-derived `open_ports` marks are read by
-                            // `ListeningSection` to withhold the Open button
-                            // and print "already open" -- both claims this
-                            // list can only back up for a port porthole
-                            // itself opened, i.e. a TCP rule (`scan` reports
-                            // TCP sockets only); a UDP rule's port is not a
-                            // listener this section will ever list, and
-                            // including it here would mislabel whatever TCP
-                            // listener happens to share that port number.
-                            let open_ports: Vec<u16> = rules
-                                .iter()
-                                .filter(|r| r.protocol == "tcp")
-                                .map(|r| r.port)
-                                .collect();
+                            let open_ports = open_tcp_ports(&rules);
                             open_now.set_rules(&rules);
                             listening.set_open_ports(&open_ports);
-                            wire_listening_open_buttons(&sections);
                         }
                         Err(failure) => {
                             apply_failure_to_open_now(&open_now, &failure);

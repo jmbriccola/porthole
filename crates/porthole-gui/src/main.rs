@@ -12,10 +12,11 @@
 //! interface (`porthole_core::ipc`) -- never a rule composed in this crate,
 //! and never a firewall command run by this crate's own process.
 //!
-//! `--screenshot <path>` and `--screenshot-dialog <path>` are the only flags
-//! this binary parses itself, ahead of everything above: debug builds only,
-//! see [`run_screenshot`] and `porthole_gui::screenshot`'s own module doc for
-//! what they render and why neither touches the helper or `/proc`.
+//! `--screenshot <path>`, `--screenshot-dialog <path>` and
+//! `--screenshot-devices <path>` are the only flags this binary parses
+//! itself, ahead of everything above: debug builds only, see
+//! [`run_screenshot`] and `porthole_gui::screenshot`'s own module doc for
+//! what they render and why none of them touches the helper or `/proc`.
 
 use adw::prelude::*;
 
@@ -31,12 +32,21 @@ fn main() -> gtk::glib::ExitCode {
             &path,
         );
     }
+    if let Some(path) = flag_value(&args, "--screenshot-devices") {
+        return run_screenshot(
+            "--screenshot-devices",
+            porthole_gui::screenshot::run_devices,
+            &path,
+        );
+    }
     porthole_gui::app::build().run()
 }
 
-/// The value after `flag`, or `None` when the flag is absent. Parsed by hand
-/// rather than pulling in a CLI-argument crate for two flags this binary's
-/// ordinary users never see -- everyone else runs this with no arguments at
+/// The value after `flag`, or `None` when the flag is absent. Matched
+/// exactly, so `--screenshot` does not swallow `--screenshot-dialog` or
+/// `--screenshot-devices`. Parsed by hand rather than pulling in a
+/// CLI-argument crate for three flags this binary's ordinary users never
+/// see -- everyone else runs this with no arguments at
 /// all, the same as any other GNOME application launched from a desktop
 /// file.
 fn flag_value(args: &[String], flag: &str) -> Option<std::path::PathBuf> {

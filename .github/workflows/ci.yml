@@ -97,9 +97,12 @@ jobs:
       #                          installed but not reachable, four of them
       #                          were measured failing on `porthole open
       #                          --dry-run` exiting 3
-      #   a system bus           doctor_says_the_helper_is_missing_when_it_is
-      #                          wants doctor to report a missing helper; with
-      #                          no system bus doctor reports a missing bus
+      #   a system bus           firewall-cmd is how those eight reach
+      #                          firewalld, and it reaches it over the system
+      #                          bus. No test needs the runner's system bus
+      #                          for anything else: the porthole processes in
+      #                          crates/porthole-cli/tests/cli.rs are each
+      #                          given a private one of that file's own.
       - name: The conditions the suite reads out of this machine
         run: |
           set -euo pipefail
@@ -117,13 +120,15 @@ jobs:
       # crates/porthole-cli/tests/helper_e2e.rs runs `porthole-helper
       # --session` on it and crates/porthole-agent/tests/session.rs starts a
       # further private bus per test. The system bus is left alone.
-      # DBUS_SYSTEM_BUS_ADDRESS is deliberately not redirected at the private
-      # bus: measured on a machine with firewalld installed and running, that
+      # DBUS_SYSTEM_BUS_ADDRESS is deliberately not redirected job-wide:
+      # measured on a machine with firewalld installed and running, that
       # redirection sends `firewall-cmd` to the private bus, where firewalld
       # is not, and four dry-run tests in crates/porthole-cli/tests/cli.rs
-      # then fail with exit 3 and "FirewallD is not running". The
-      # redirection belongs to a build chroot that has no firewalld and no
-      # system bus, which is where packaging/rpm/porthole.spec uses it.
+      # then fail with exit 3 and "FirewallD is not running".
+      # crates/porthole-cli/tests/cli.rs redirects it per porthole process
+      # instead, with a `firewall-cmd` shim that unsets it again, so no
+      # porthole process this suite starts can reach a helper on the system
+      # bus while firewalld still can be reached over it.
       #
       # One cargo test per job and no more: the helper claims a singleton bus
       # name, and HELPER_LOCK in crates/porthole-cli/tests/helper_e2e.rs is a

@@ -414,6 +414,13 @@ link-layer address at all because resolution is still in flight, and
 answer -- an entry that may still carry the MAC it last knew, which is
 precisely the mapping the probe disproved.
 
+Entries on a virtual interface are rejected too, on the same list of
+interface prefixes subnet detection uses. A Docker container, a libvirt guest
+and a VPN peer are each in the kernel's table and none of them is on the
+network porthole opens a port towards, so a MAC found only there reports
+`resolvable: false` rather than an address outside every subnet this machine
+holds.
+
 `STALE` entries are accepted, deliberately. `STALE` is what the kernel marks
 an entry once it has not been confirmed for roughly 30 seconds, which is the
 ordinary condition of an idle device rather than a sign anything is wrong.
@@ -461,6 +468,12 @@ address it no longer holds.
 Neither object carries `resolvable` or `resolved_address`. Those are a live
 lookup `devices list` performs and neither of these commands does, so
 reporting them would mean resolving a device nobody asked to resolve.
+
+`devices add`'s picker prints a name beside an address when `getent hosts`
+answers for it, on stderr with the rest of the prompt -- stdout is unchanged,
+and no name reaches the address book or any JSON field. Each lookup is
+bounded at one second and the pass at two; an address with no answer is
+printed without a name.
 
 `devices add` has one refusal of its own: an empty neighbour table, with
 nothing to put in front of you to pick. It exits `9` with the

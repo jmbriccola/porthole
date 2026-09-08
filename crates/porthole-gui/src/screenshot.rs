@@ -1,4 +1,4 @@
-//! `main.rs`'s two debug-only screenshot flags.
+//! `main.rs`'s three debug-only screenshot flags.
 //!
 //! `--screenshot <path>` ([`run`]) populates a real [`PortholeWindow`] with
 //! invented data, renders exactly what GTK is currently displaying, saves
@@ -12,12 +12,21 @@
 //! truncated row, a window forced wide by a single unwrapped line, and an
 //! unmarked "open to anyone" that no test had caught.
 //!
+//! `--screenshot-devices <path>` ([`run_devices`]) renders the saved-devices
+//! dialog three times: populated, on a machine with nothing saved and
+//! nothing seen on the network, and after a MAC typed by hand for a device
+//! that is not here. That third image drives the real Save button and so
+//! writes a real address book, which is why it is rendered only when
+//! `PORTHOLE_DEVICES_FILE` names one.
+//!
 //! **Fixture data, never live data.** [`run`] never lets a live helper round
 //! trip or a `/proc` scan touch the window at all --
 //! [`PortholeWindow::new_without_initial_load`] is what makes that true,
 //! rather than [`PortholeWindow::new`] plus a hope that the fixture setters
 //! below win whatever race they would otherwise be in against the real
-//! ones. Either real source would be the wrong picture for this flag's own
+//! ones. That constructor also starts no subscription to the helper's
+//! announcements, so nothing can arrive later and re-read over the fixture
+//! either. Either real source would be the wrong picture for this flag's own
 //! purpose: the container this runs in has no `porthole-helper` and nothing
 //! open, so a live read would screenshot an empty window, and `/proc` in
 //! that same container reflects whatever this milestone's own test process
@@ -45,6 +54,7 @@ use porthole_core::ipc::{WireRule, WireStatus};
 use porthole_core::listening::{Binding, Service};
 use porthole_core::model::Protocol;
 
+use crate::devices_dialog::{DevicesDialog, NeighbourChoice, SavedDevice};
 use crate::open_dialog::{DeviceEntry, OpenDialog};
 use crate::window::PortholeWindow;
 
@@ -57,6 +67,9 @@ const APP_ID: &str = "com.jacopobriccola.Porthole.Screenshot";
 /// [`run_dialog`]'s own id, for the same reason -- the two flags can be run
 /// one after the other on the same session bus.
 const DIALOG_APP_ID: &str = "com.jacopobriccola.Porthole.ScreenshotDialog";
+
+/// [`run_devices`]'s own id, for the same reason again.
+const DEVICES_APP_ID: &str = "com.jacopobriccola.Porthole.ScreenshotDevices";
 
 /// Two open rules: one mid-countdown towards the current subnet, one
 /// towards "anyone" and until reboot -- between them, both scope words
@@ -185,8 +198,12 @@ fn fixture_devices() -> Vec<DeviceEntry> {
         },
         DeviceEntry {
             name: "laptop".to_string(),
+            // What `porthole_core::devices::resolve` actually hands a
+            // caller: an `Error`'s own rendered form, prefix included.
             resolved: Err(
-                "`laptop` (bc:24:11:5e:1c:6e) is not on this network right now".to_string(),
+                "device not reachable: `laptop` (bc:24:11:5e:1c:6e) is not on \
+                           this network right now"
+                    .to_string(),
             ),
         },
     ]
@@ -429,15 +446,16 @@ pub fn run_dialog(path: &Path) -> gtk::glib::ExitCode {
         win.listening().set_docker_ports(&fixture_docker());
         win.status_bar().set_status(&fixture_status());
 
-        // Wider than [`run`]'s own window, on purpose. Measured in the
-        // container while writing this: this dialog asks for 606 px --
-        // with the device list empty, that is, so it is the dialog's own
-        // width, not the saved devices' -- and libadwaita renders it
-        // clipped, warning `AdwFloatingSheet exceeds AdwBreakpointBin
-        // width`, in any window narrower than that. A clipped image is not
-        // something to look at, so this flag's window is big enough to hold
-        // it whole.
-        win.set_default_size(700, 820);
+        // `PortholeWindow::build`'s own default width, deliberately: a
+        // dialog this flag renders in a window wider than the one a user
+        // gets is a picture of a layout nobody sees. It was 700 px wide
+        // while the dialog's minimum width was 606 and libadwaita clipped
+        // it -- warning `AdwFloatingSheet exceeds AdwBreakpointBin width` --
+        // in anything narrower. Measured in the container after the
+        // duration chips were made to reflow: that minimum is 160 px. Taller
+        // than the default, though, for the same reason [`run`]'s window is:
+        // this flag's fixture fills the window behind the dialog.
+        win.set_default_size(480, 820);
         win.present();
         pump_main_context();
 
@@ -501,6 +519,190 @@ pub fn run_dialog(path: &Path) -> gtk::glib::ExitCode {
 
     app.run_with_args::<&str>(&[]);
     outcome.get()
+}
+
+/// Three saved devices as the devices dialog renders them: one that
+/// resolves, one with a name long enough to show what an arbitrary one does
+/// to a row, and one that does not resolve -- carrying
+/// `porthole_core::devices::resolve`'s own sentence, which is the sentence a
+/// typed MAC for a switched-off device produces.
+fn fixture_saved_devices() -> Vec<SavedDevice> {
+    vec![
+        SavedDevice {
+            name: "phone".to_string(),
+            address: "bc:24:11:5e:1c:6e".to_string(),
+            resolved: Ok("10.10.10.245".parse().unwrap()),
+        },
+        SavedDevice {
+            name: "living room television (the big one)".to_string(),
+            address: "aa:bb:cc:dd:ee:ff".to_string(),
+            resolved: Ok("10.10.10.31".parse().unwrap()),
+        },
+        SavedDevice {
+            name: "laptop".to_string(),
+            address: "12:34:56:78:9a:bc".to_string(),
+            resolved: Err(
+                "device not reachable: `laptop` (12:34:56:78:9a:bc) is not on \
+                           this network right now"
+                    .to_string(),
+            ),
+        },
+    ]
+}
+
+/// What the picker offers when this machine has seen something: the same
+/// address and interface the rest of this project's examples use.
+fn fixture_neighbours() -> Vec<NeighbourChoice> {
+    vec![
+        NeighbourChoice {
+            mac: "bc:24:11:5e:1c:6e".to_string(),
+            address: "10.10.10.245".parse().unwrap(),
+            interface: "wlo1".to_string(),
+            name: Some("phone.example".to_string()),
+        },
+        NeighbourChoice {
+            mac: "aa:bb:cc:dd:ee:ff".to_string(),
+            address: "10.10.10.31".parse().unwrap(),
+            interface: "wlo1".to_string(),
+            name: Some("_gateway".to_string()),
+        },
+        // The third has no name, so the picture shows both shapes of row --
+        // a resolver answering nothing is ordinary, not an error state.
+        NeighbourChoice {
+            mac: "de:ad:be:ef:00:01".to_string(),
+            address: "10.10.10.7".parse().unwrap(),
+            interface: "enp3s0".to_string(),
+            name: None,
+        },
+    ]
+}
+
+/// `<stem>-<suffix>.<ext>` beside `path`, for the extra images a flag
+/// writes. [`alert_path`]'s own job, generalised: `--screenshot-devices`
+/// writes three.
+fn beside(path: &Path, suffix: &str) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "screenshot".to_string());
+    let extension = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_string())
+        .unwrap_or_else(|| "png".to_string());
+    path.with_file_name(format!("{stem}-{suffix}.{extension}"))
+}
+
+/// `main.rs`'s debug-only `--screenshot-devices <path>` flag: the saved-
+/// devices dialog, in the three states a person actually meets.
+///
+/// `path` is the populated one -- saved devices including a long name and
+/// one that does not resolve, and a picker with something in it.
+/// `<stem>-empty` is a machine with nothing saved and nothing seen on the
+/// network, which is what the typed-MAC field exists for. `<stem>-typed`
+/// is the real save path, driven through the real widgets: a name and a MAC
+/// typed in, the real Save button pressed, and whatever the re-read book
+/// then says about that device on screen.
+///
+/// That third image writes an address book, so it is rendered **only** when
+/// `PORTHOLE_DEVICES_FILE` names one -- a development flag must not write
+/// the address book of whoever is running it. Without that variable the
+/// first two images are still written and the third is skipped.
+pub fn run_devices(path: &Path) -> gtk::glib::ExitCode {
+    let app = adw::Application::builder()
+        .application_id(DEVICES_APP_ID)
+        .build();
+    let path = path.to_path_buf();
+    let outcome = std::rc::Rc::new(std::cell::Cell::new(gtk::glib::ExitCode::FAILURE));
+    let outcome_for_activate = outcome.clone();
+
+    app.connect_activate(move |app| {
+        let win = PortholeWindow::new_without_initial_load(app);
+        win.open_now().set_rules(&fixture_rules());
+        win.status_bar().set_status(&fixture_status());
+        // The open dialog's own default width, and tall enough that this
+        // dialog is what the image is about rather than the window behind
+        // it -- the same reasoning `run_dialog`'s own size carries. Taller
+        // than either of those, because this dialog carries two groups: at
+        // the window's own 560 px default it scrolls, and an image of the
+        // top third of it is not what this flag is for.
+        win.set_default_size(480, 1080);
+        win.present();
+        pump_main_context();
+
+        let mut all_ok = true;
+
+        let populated = DevicesDialog::new();
+        populated.set_saved(&fixture_saved_devices());
+        populated.set_neighbours(&fixture_neighbours());
+        populated.present(Some(&*win));
+        settle();
+        all_ok &= write_image(&win, &path);
+        populated.dialog().close();
+        settle();
+
+        let empty = DevicesDialog::new();
+        empty.set_saved(&[]);
+        empty.set_neighbours(&[]);
+        empty.present(Some(&*win));
+        settle();
+        all_ok &= write_image(&win, &beside(&path, "empty"));
+        empty.dialog().close();
+        settle();
+
+        match devices_file_override() {
+            Some(_) => {
+                let typed = DevicesDialog::new();
+                typed.reload();
+                typed.present(Some(&*win));
+                settle();
+                // Typed by hand, not picked: the MAC of a device that is
+                // switched off is not in the neighbour table to pick.
+                typed.set_name_text("laptop");
+                typed.set_mac_text("12:34:56:78:9a:bc");
+                typed.save_button().emit_clicked();
+                settle();
+                all_ok &= write_image(&win, &beside(&path, "typed"));
+                typed.dialog().close();
+                settle();
+            }
+            None => eprintln!(
+                "porthole-gui: --screenshot-devices: PORTHOLE_DEVICES_FILE is not set, so \
+                 the save was not rendered -- this flag will not write a real address book"
+            ),
+        }
+
+        if all_ok {
+            outcome_for_activate.set(gtk::glib::ExitCode::SUCCESS);
+        }
+        app.quit();
+    });
+
+    app.run_with_args::<&str>(&[]);
+    outcome.get()
+}
+
+/// The address book override, when one is set to a non-empty path. Read
+/// through the same constant `porthole_core::devices` honours, rather than
+/// a second copy of the variable's name written down here.
+fn devices_file_override() -> Option<String> {
+    std::env::var(porthole_core::devices::DEVICES_FILE_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+/// [`capture_with_dialogs`] plus the two lines every caller wrote around
+/// it.
+fn write_image(win: &PortholeWindow, path: &Path) -> bool {
+    match capture_with_dialogs(win, path) {
+        Ok(()) => {
+            eprintln!("porthole-gui: wrote a screenshot to {}", path.display());
+            true
+        }
+        Err(message) => {
+            eprintln!("porthole-gui: --screenshot-devices failed: {message}");
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -567,6 +769,26 @@ mod tests {
             devices.iter().any(|d| d.name.len() > 30),
             "a long device name is the case this fixture exists to show"
         );
+    }
+
+    #[test]
+    fn the_saved_device_fixture_has_a_long_name_and_one_that_does_not_resolve() {
+        let saved = fixture_saved_devices();
+        assert!(
+            saved.iter().any(|d| d.name.len() > 30),
+            "a long name is where a row that cannot take one shows itself"
+        );
+        assert!(
+            saved.iter().any(|d| d.resolved.is_err()),
+            "the state a typed MAC for a switched-off device produces must be rendered"
+        );
+    }
+
+    #[test]
+    fn the_extra_device_images_sit_beside_the_first_one() {
+        let path = Path::new("/x/devices.png");
+        assert_eq!(beside(path, "empty"), PathBuf::from("/x/devices-empty.png"));
+        assert_eq!(beside(path, "typed"), PathBuf::from("/x/devices-typed.png"));
     }
 
     #[test]

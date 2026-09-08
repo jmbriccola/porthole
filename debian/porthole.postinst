@@ -1,0 +1,38 @@
+#!/bin/sh
+set -e
+
+# Say, once, that notifications do not work yet.
+#
+# porthole ships two ways to start the agent -- a systemd user unit and an
+# XDG autostart entry -- and neither of them runs in a session that is
+# already open: `WantedBy=graphical-session.target` is reached when a session
+# begins, and so is /etc/xdg/autostart. dh_installsystemduser enables the
+# unit (see debian/rules), which writes an enablement symlink and starts
+# nothing: unpacking runs as root, where there is no user session to start a
+# user unit in. So enabled or not, the agent is not running after this
+# install.
+#
+# That matters more here than it would for most session services. An
+# announced close is the only signal a timed port has gone -- the window that
+# opened it is usually shut by then -- so a port opened in the session that
+# installed porthole closes with nothing said.
+#
+# `configure` with an empty $2 is a first install; an upgrade carries the
+# previous version there. Said on a first install only: an upgrade does not
+# change which session the user is in, and a notice repeated on every version
+# bump is one nobody reads on the day it matters. packaging/rpm/porthole.spec
+# and packaging/aur/porthole.install say the same thing at the same moment.
+if [ "$1" = "configure" ] && [ -z "$2" ] ; then
+    cat >&2 <<-NOTICE
+	porthole: Desktop notifications start at your next login.
+	porthole: A port porthole closes by itself -- on expiry, or on a network
+	porthole: change -- is announced only while porthole-agent is running, and
+	porthole: neither of its start files runs in a session that is already
+	porthole: open. For the session you are in, without logging out:
+	porthole:     systemctl --user start porthole-agent.service
+	NOTICE
+fi
+
+#DEBHELPER#
+
+exit 0

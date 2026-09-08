@@ -74,14 +74,15 @@ act on.
 
 Everything above is also a window. `porthole-gui` shows what is open now with
 a live countdown, shows what is listening on this machine so you can open a
-port without typing a number, and opens one in two clicks. It talks to the
+port without typing a number, opens one in two clicks, and saves a device to
+open towards. It talks to the
 same privileged helper over the same D-Bus interface the CLI uses, so it
 inherits the 8-hour ceiling and the polkit prompts without restating either —
 nothing about *what* porthole will do changes depending on which one you run.
 A window has no exit code to inherit; a failed request shows the helper's own
 message in the GUI instead, the same wording the CLI would have printed.
 
-![The Porthole window: two rules under "Open now", one with a live countdown and one until reboot, and five services under "Listening", one of them already open and one reachable only over IPv6](docs/screenshot.png)
+![The Porthole window: two rules under "Open now", one with a live countdown and one until reboot, and six services under "Listening", one of them already open and one reachable only over IPv6](docs/screenshot.png)
 
 *Rendered by the app itself, under Xvfb, from invented example data — not a
 real machine's, which would either show nothing on a machine with no ports
@@ -214,8 +215,10 @@ table at the moment the port is opened — never earlier.
 ```console
 $ porthole devices add
 Seen on this network:
-  1) bc:24:11:5e:1c:6e  10.10.10.245  (wlo1)
-  2) 50:e6:36:1a:9f:04  10.10.10.1    (wlo1)
+  1) bc:24:11:5e:1c:6e  10.10.10.245  (wlo1)  phone.example
+  2) 50:e6:36:1a:9f:04  10.10.10.1  (wlo1)  _gateway
+  3) de:ad:be:ef:00:01  10.10.10.7  (enp3s0)
+The name after an address is what this machine's resolver answered for it. The MAC is what gets saved.
 Pick a number: 1
 Name this device: phone
 Saved `phone` as bc:24:11:5e:1c:6e.
@@ -230,12 +233,48 @@ Opened 5173/tcp towards 10.10.10.245/32 · closes 30m 0s
 
 `devices add` is an interactive prompt and offers the kernel's neighbour
 table, minus the entries that carry no mapping worth acting on (`FAILED` and
-`INCOMPLETE`, below). So a device that has not spoken to this machine
-recently is not in the list, and neither is one the kernel probed without
-getting an answer: make it talk to this machine — load something from it, or
-ping it — and run the command again. It saves a MAC and nothing else. A device
+`INCOMPLETE`, below) and minus every entry on a virtual interface. So a device
+that has not spoken to this machine recently is not in the list, and neither
+is one the kernel probed without getting an answer: make it talk to this
+machine — load something from it, or ping it — and run the command again. It
+saves a MAC and nothing else.
+
+Docker containers, libvirt guests, podman pods and VPN peers all sit in the
+kernel's neighbour table, on the interfaces that carry them. None of them is
+on the network porthole opens a port towards, and the picker excludes exactly
+the interfaces subnet detection already excludes (`docker*`, `br-*`,
+`virbr*`, `veth*`, `podman*`, `tun*`, `tap*`, `wg*`, `tailscale*`, `zt*`,
+`cni*`, `vboxnet*`, `lo`). A traditional `br0` bridging this machine's own
+NIC is not one of them and is still offered. The same exclusion applies at
+resolution time, so a MAC that is only in the table on one of those
+interfaces reports as not on this network rather than resolving to an address
+outside every subnet this machine holds. A device
 named by hostname (`host = "printer.local"`, resolved through `getent`) is
 added by editing `~/.config/porthole/devices.toml` by hand.
+
+The name on a row is there so a person can tell two MAC addresses apart —
+picking the wrong one opens a port towards the wrong machine. porthole asks
+`getent hosts` for each address, which is the host's own name service: on a
+typical machine that merges `/etc/hosts`, locally synthesised names, mDNS and
+DNS, and it does not report which of them answered. So the name is shown as
+the answer to that question and nothing is claimed about where it came from
+— it is a hint, not an identity. **The MAC is the identity.** It is what the
+picker saves, what `devices.toml` records and what `--to` matches; no name
+seen here is stored or matched.
+
+An address the resolver answers nothing for gets no name. Nothing stands in
+for one — no "unknown device", no vendor guessed from the MAC prefix. Each
+lookup is abandoned after **1 second** and the whole pass after **2**, since
+a resolver that does not answer is ordinary on a home network and the picker
+has to appear either way; addresses left over when the budget runs out are
+shown without a name, exactly as an unanswered one is.
+
+The GUI writes the same file, through **Saved Devices** in its menu or the
+button beside the open dialog's target list. It offers the same picker and
+adds a field for typing a MAC by hand, for a device that is switched off and
+so cannot be picked. Such a device is saved without being found: the dialog
+says at that moment that it did not resolve, and `open --to <name>` fails
+with exit code 6 until it does.
 
 That file is the whole address book, and it lives client-side. **The
 privileged helper never reads it**: `--to <name>` is resolved in the CLI, and
@@ -370,6 +409,22 @@ anything: it takes a session bus name, and a second copy finds the name taken
 and exits. A session with no notification service running is survived rather
 than reported: it keeps listening, and the closes are still in the helper's
 journal.
+
+**Neither start file runs in a session that is already open, so notifications
+begin at the next login.** Installing porthole — from a package or by hand —
+puts both files in place and starts nothing. The user unit is reached through
+`graphical-session.target` and the autostart entry when a desktop session
+begins; both of those have already happened. Since an announced close is the
+*only* signal a timed port has gone — the window that opened it is usually
+shut by then — a port opened in the session that installed porthole closes
+without a word. To have notifications in the session you are in:
+
+```bash
+systemctl --user start porthole-agent.service
+```
+
+That works whether or not the unit is enabled, and whether or not your desktop
+starts user units at all: it starts the one unit, now.
 
 ## Exit codes
 
