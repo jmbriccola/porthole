@@ -7,7 +7,9 @@
 //! it stays out of `--json`.
 //!
 //! D-Bus has no optional types, so `expires_at == 0` means "until reboot".
-//! Epoch 0 is 1970 and can never be a real expiry.
+//! Epoch 0 is 1970 and can never be a real expiry. An empty `container_addr`
+//! is the same device for the other absent thing: a rule that redirects
+//! rather than merely permits.
 
 use crate::engine::Status;
 use crate::model::Target;
@@ -39,6 +41,26 @@ pub struct WireRule {
     /// Seconds since the epoch, or **0 for until-reboot**.
     pub expires_at: u64,
     pub uid: u32,
+    /// The address a forward redirects to, or **empty for a rule that only
+    /// permits**. An address can never be the empty string, so this is the
+    /// field that tells the two apart — the ports below cannot, since `0` is
+    /// also what a forward to a container port nobody could have published
+    /// would carry.
+    ///
+    /// Without it a forward reaches a subscriber as an open with the same
+    /// port and the same target, and gets rendered as one: nothing in the
+    /// remaining fields says that what answers on that port is a container
+    /// rather than something on this machine. It discloses no more than the
+    /// bus already carries — `docker_ports` returns the same addresses to
+    /// every caller `list` is open to.
+    pub container_addr: String,
+    /// The port inside the container. `0` when `container_addr` is empty.
+    pub container_port: u16,
+    /// The port Docker published on this machine, which is the port the
+    /// person named. Not `port`: that is what the local network connects to,
+    /// and the whole point of a forward is that the two may differ. `0` when
+    /// `container_addr` is empty.
+    pub published_port: u16,
 }
 
 impl WireRule {
@@ -57,6 +79,13 @@ impl WireRule {
             opened_at: rule.opened_at,
             expires_at: rule.expires_at.unwrap_or(0),
             uid: rule.uid,
+            container_addr: rule
+                .forward
+                .as_ref()
+                .map(|f| f.container_addr.to_string())
+                .unwrap_or_default(),
+            container_port: rule.forward.as_ref().map(|f| f.container_port).unwrap_or(0),
+            published_port: rule.forward.as_ref().map(|f| f.published_port).unwrap_or(0),
         }
     }
 }
@@ -268,6 +297,28 @@ pub trait Porthole {
         seconds: u32,
     ) -> zbus::Result<WireRule>;
 
+    /// Redirect `port` to the container that publishes `published_port` on
+    /// this machine, for `seconds` (0 for until-reboot). `scope` is what the
+    /// user typed and the helper parses, exactly as in `open` — named the
+    /// same thing here because it is the same thing.
+    ///
+    /// Authorized every time. `open` towards the local subnet can reuse an
+    /// authentication given minutes earlier; this never does, and the action
+    /// it asks for does not depend on `scope`.
+    ///
+    /// Refusals all come from the helper, and in a fixed order: a firewall
+    /// that cannot redirect at all, a UDP request, Docker that could not be
+    /// read, a `published_port` no container publishes, and a `port`
+    /// something already answers on.
+    async fn forward(
+        &self,
+        port: u16,
+        protocol: &str,
+        scope: &str,
+        seconds: u32,
+        published_port: u16,
+    ) -> zbus::Result<WireRule>;
+
     async fn close(&self, port: u16, protocol: &str) -> zbus::Result<WireRule>;
 
     /// `from_timer` is the expiry timer's own claim about itself, forwarded
@@ -387,6 +438,41 @@ mod tests {
         assert_eq!(wire.opened_at, 1_757_000_000);
         assert_eq!(wire.expires_at, 1_757_003_600);
         assert_eq!(wire.uid, 1000);
+    }
+
+    #[test]
+    fn a_forward_reaches_a_subscriber_as_something_it_can_tell_from_an_open() {
+        // Same port, same protocol, same target, same everything an `open`
+        // has: a client with only those fields renders a redirect to a
+        // container as a permission granted to whatever is on this machine.
+        // The three fields below are what it takes to say otherwise, and to
+        // say where the traffic actually goes.
+        let mut r = rule(None);
+        r.forward = Some(crate::forward::ForwardTo {
+            container_addr: "172.18.0.2".parse().unwrap(),
+            container_port: 80,
+            published_port: 3000,
+            protocol: Protocol::Tcp,
+        });
+        let wire = WireRule::from_rule(&r);
+        assert_eq!(wire.container_addr, "172.18.0.2");
+        assert_eq!(wire.container_port, 80);
+        assert_eq!(
+            wire.published_port, 3000,
+            "the published port is the one the person named, and is not `port`"
+        );
+        assert_eq!(wire.port, 5173, "`port` stays what the network connects to");
+    }
+
+    #[test]
+    fn an_ordinary_open_carries_the_empty_address_that_means_not_a_forward() {
+        // D-Bus has no optional types. The address is the sentinel rather
+        // than either port, because `0` is a value a port field can hold for
+        // other reasons and the empty string is not an address.
+        let wire = WireRule::from_rule(&rule(None));
+        assert_eq!(wire.container_addr, "");
+        assert_eq!(wire.container_port, 0);
+        assert_eq!(wire.published_port, 0);
     }
 
     #[test]

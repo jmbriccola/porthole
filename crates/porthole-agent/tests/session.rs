@@ -137,6 +137,10 @@ fn wire_rule(port: u16, uid: u32) -> WireRule {
         opened_at: OPENED_AT,
         expires_at: EXPIRES_AT,
         uid,
+        // Not a forward: an empty address is what says so.
+        container_addr: String::new(),
+        container_port: 0,
+        published_port: 0,
     }
 }
 

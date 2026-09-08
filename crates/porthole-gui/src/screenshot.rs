@@ -88,6 +88,10 @@ fn fixture_rules() -> Vec<WireRule> {
             opened_at: now.saturating_sub(600),
             expires_at: now + 1_800,
             uid: 1000,
+            // Not a forward: an empty address is what says so.
+            container_addr: String::new(),
+            container_port: 0,
+            published_port: 0,
         },
         WireRule {
             id: "8080/tcp".to_string(),
@@ -99,6 +103,10 @@ fn fixture_rules() -> Vec<WireRule> {
             opened_at: now.saturating_sub(60),
             expires_at: 0, // the wire's own until-reboot sentinel
             uid: 1000,
+            // Not a forward: an empty address is what says so.
+            container_addr: String::new(),
+            container_port: 0,
+            published_port: 0,
         },
     ]
 }

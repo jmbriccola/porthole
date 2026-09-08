@@ -141,6 +141,10 @@ fn wire_rule_fixture() -> WireRule {
         opened_at: 1_757_100_000,
         expires_at: 1_757_103_600,
         uid: 1000,
+        // Not a forward: an empty address is what says so.
+        container_addr: String::new(),
+        container_port: 0,
+        published_port: 0,
     }
 }
 

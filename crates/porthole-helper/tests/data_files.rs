@@ -3,11 +3,48 @@
 //! falls back to its default and nothing errors.
 
 use porthole_core::cli_path::CLI_CANDIDATES;
-use porthole_helper::authz::Action;
+use porthole_core::model::{Protocol, Target};
+use porthole_helper::authz::{Action, Details};
+use porthole_helper::polkit::{forward_details, open_details};
 
 fn data(name: &str) -> String {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/");
     std::fs::read_to_string(format!("{path}{name}")).unwrap_or_else(|e| panic!("{path}{name}: {e}"))
+}
+
+/// One `<action>` element, from its opening tag to its close.
+///
+/// Bounded at both ends on purpose. An unbounded search reads the rest of
+/// the file, so a severity declared in some *other* action further down
+/// satisfies it — which is the one mistake these tests exist to catch.
+fn section_for<'a>(policy: &'a str, id: &str) -> &'a str {
+    policy
+        .split(&format!(r#"<action id="{id}">"#))
+        .nth(1)
+        .unwrap_or_else(|| panic!("{id} is declared in the policy"))
+        .split("</action>")
+        .next()
+        .expect("the action element is closed")
+}
+
+/// Every `$(key)` one action's `<message>` asks polkit to substitute.
+fn message_keys(section: &str) -> Vec<String> {
+    let message = section
+        .split("<message>")
+        .nth(1)
+        .expect("the action has a message")
+        .split("</message>")
+        .next()
+        .expect("the message element is closed");
+    let mut keys = Vec::new();
+    let mut rest = message;
+    while let Some(at) = rest.find("$(") {
+        rest = &rest[at + 2..];
+        let end = rest.find(')').expect("a $( substitution is closed");
+        keys.push(rest[..end].to_string());
+        rest = &rest[end + 1..];
+    }
+    keys
 }
 
 #[test]
@@ -16,6 +53,7 @@ fn the_policy_declares_every_action_the_code_checks() {
     for action in [
         Action::OpenSubnet,
         Action::OpenAny,
+        Action::Forward,
         Action::Close,
         Action::List,
     ] {
@@ -69,6 +107,58 @@ fn the_severities_are_the_ones_the_spec_chose() {
             head.contains("<allow_active>yes</allow_active>"),
             "{yes_action} must never prompt, got: {head}"
         );
+    }
+}
+
+#[test]
+fn forwarding_is_never_remembered() {
+    // A forward exposes something published on this machine to another
+    // machine. It must not ride on an authorisation granted moments earlier
+    // for something else, so every context is `auth_admin` and none of them
+    // is the `_keep` variant `open-subnet` deliberately uses.
+    let policy = data("com.jacopobriccola.Porthole.policy");
+    let action = section_for(&policy, Action::Forward.id());
+    for context in ["allow_any", "allow_inactive", "allow_active"] {
+        assert!(
+            action.contains(&format!("<{context}>auth_admin</{context}>")),
+            "{context} must be auth_admin with no _keep suffix, got: {action}",
+        );
+    }
+}
+
+#[test]
+fn every_substitution_a_policy_message_asks_for_is_one_the_code_supplies() {
+    // polkit substitutes `$(key)` from the details map the helper passes to
+    // `check_authorization`, and a key that map does not carry is not an
+    // error: the dialog renders with the placeholder unfilled. The port and
+    // target in the prompt are the whole reason a person can tell an
+    // expected request from an unexpected one, so a message asking for
+    // something no call site supplies would quietly cost exactly that.
+    let policy = data("com.jacopobriccola.Porthole.policy");
+    let target = Target::Network {
+        cidr: "10.10.10.0/24".parse().unwrap(),
+    };
+    for (action, details) in [
+        (
+            Action::OpenSubnet,
+            open_details(5173, Protocol::Tcp, &target),
+        ),
+        (Action::OpenAny, open_details(5173, Protocol::Tcp, &target)),
+        (
+            Action::Forward,
+            forward_details(5173, Protocol::Tcp, &target, 3000),
+        ),
+        (Action::Close, Details::new()),
+        (Action::List, Details::new()),
+    ] {
+        for key in message_keys(section_for(&policy, action.id())) {
+            assert!(
+                details.contains_key(key.as_str()),
+                "{}'s message asks polkit to substitute $({key}), which no \
+                 call site supplies",
+                action.id()
+            );
+        }
     }
 }
 
@@ -193,7 +283,7 @@ fn the_policy_is_well_formed_xml() {
     let opens = policy.matches("<action ").count();
     let closes = policy.matches("</action>").count();
     assert_eq!(opens, closes, "unbalanced <action> elements");
-    assert_eq!(opens, 4, "expected exactly the four actions");
+    assert_eq!(opens, 5, "expected exactly the five actions");
     assert!(
         policy.trim_end().ends_with("</policyconfig>"),
         "got the tail: {}",

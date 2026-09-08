@@ -12,10 +12,11 @@ use std::sync::Mutex;
 
 /// The `$(key)` substitutions available to a polkit `<message>`.
 ///
-/// Only the `open-*` actions have anything request-specific to say: `close`
-/// and `list` pass an empty map. Keys are the static names the installed
-/// policy file's messages reference (`port`, `protocol`, `target`) — see
-/// [`crate::polkit::open_details`].
+/// The `open-*` actions and `forward` have something request-specific to
+/// say; `close` and `list` pass an empty map. Keys are the static names the
+/// installed policy file's messages reference (`port`, `protocol`, `target`,
+/// and `published_port` for a forward) — see [`crate::polkit::open_details`]
+/// and [`crate::polkit::forward_details`].
 pub type Details = HashMap<&'static str, String>;
 
 /// The polkit actions this helper distinguishes.
@@ -24,10 +25,17 @@ pub type Details = HashMap<&'static str, String>;
 /// authenticates once per session, opening towards everyone authenticates
 /// every time, and closing never authenticates at all — closing reduces
 /// exposure and must never be the thing a user cannot be bothered to do.
+///
+/// [`Action::Forward`] authenticates every time as well, and unlike the two
+/// `open-*` actions it does not depend on the target: a forward makes a port
+/// published on this machine answer to another machine, which is not a thing
+/// to be carried along by an authentication given minutes ago for something
+/// else. It is the one action chosen unconditionally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     OpenSubnet,
     OpenAny,
+    Forward,
     Close,
     List,
 }
@@ -40,6 +48,7 @@ impl Action {
         match self {
             Action::OpenSubnet => "com.jacopobriccola.Porthole.open-subnet",
             Action::OpenAny => "com.jacopobriccola.Porthole.open-any",
+            Action::Forward => "com.jacopobriccola.Porthole.forward",
             Action::Close => "com.jacopobriccola.Porthole.close",
             Action::List => "com.jacopobriccola.Porthole.list",
         }

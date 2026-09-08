@@ -7,7 +7,9 @@
 //!    not have accepted from a person.
 //! 2. **Resolve the scope**, because which polkit action applies depends on
 //!    what the request actually amounts to — `0.0.0.0/0` is "everyone"
-//!    however it was spelled.
+//!    however it was spelled. `forward` resolves for the second reason
+//!    alone, the prompt: its action is the same whatever the scope turns
+//!    out to be.
 //! 3. **Authorize**, before touching anything.
 //! 4. **Take the state lock and act.** Not before: a polkit check can block
 //!    for as long as a human takes to type a password, and the lock would
@@ -59,7 +61,8 @@ use porthole_core::command::RealRunner;
 use porthole_core::engine::{is_open_any, resolve_scope, Engine, Status};
 use porthole_core::error::Error;
 use porthole_core::ipc::{CloseReason, WireDockerPort, WireError, WireRule, WireStatus};
-use porthole_core::model::Lifetime;
+use porthole_core::listening::RealProcFs;
+use porthole_core::model::{Lifetime, OpenRequest};
 use porthole_core::net;
 use porthole_core::state::StateStore;
 use porthole_core::validate;
@@ -184,6 +187,114 @@ impl Porthole {
         // 5 and 6. The journal, then the bus.
         Self::announce_reconciled(Some(&emitter), &reconciled).await;
         let rule = opened.map_err(HelperError::from)?;
+        Self::announce_open(&emitter, &rule).await;
+
+        Ok(WireRule::from_rule(&rule))
+    }
+
+    /// Redirect the external port `port` to whatever container publishes
+    /// `published_port` on this machine. `scope` and `seconds` mean exactly
+    /// what they mean to [`Porthole::open`]. `port` and `published_port` are
+    /// two ports rather than one: `port` is what the local network connects
+    /// to, `published_port` is what the person named, and a forward is the
+    /// one operation where they may differ.
+    ///
+    /// [`Action::Forward`] whatever `scope` resolves to. The `open-*` split
+    /// asks how far a permission reaches, and this question is a different
+    /// one: a forward makes a port published on this machine answer to
+    /// another machine, and the answer must not be carried over from an
+    /// authentication given minutes ago for something else. So there is no
+    /// `_keep` severity to choose between, and nothing to choose it with.
+    ///
+    /// The refusals a forward has of its own -- a firewall that cannot
+    /// redirect, UDP, Docker unreadable, a port no container publishes, an
+    /// external port already answered on -- all belong to
+    /// [`Engine::forward`], which is reached only after this has authorized.
+    // Eight arguments, two of them the macro's own header and emitter. Each
+    // of the six a client sends is a separate thing the helper has to be
+    // told, and folding them into a struct would put a type on the wire in
+    // place of the six plain arguments the interface publishes.
+    #[allow(clippy::too_many_arguments)]
+    async fn forward(
+        &self,
+        port: u16,
+        protocol: &str,
+        scope: &str,
+        seconds: u32,
+        published_port: u16,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<WireRule, HelperError> {
+        // 1. Validate, in `open`'s own order and for its own reason: nothing
+        // the client sent is trusted, and nothing is authorized until the
+        // request is one the helper would have accepted from a person.
+        if port == 0 {
+            return Err(HelperError::InvalidArgument(
+                "port 0 is not a port; valid ports are 1-65535".to_string(),
+            ));
+        }
+        if published_port == 0 {
+            return Err(HelperError::InvalidArgument(
+                "port 0 is not a port; no container can have published it".to_string(),
+            ));
+        }
+        let protocol = validate::parse_protocol(protocol).map_err(HelperError::from)?;
+        let spec = validate::parse_scope(scope).map_err(HelperError::from)?;
+        let lifetime = if seconds == 0 {
+            Lifetime::UntilReboot
+        } else {
+            Lifetime::For(
+                validate::parse_duration(&format!("{seconds}s")).map_err(HelperError::from)?,
+            )
+        };
+
+        // 2. Resolve before authorizing, so the prompt names the target
+        // porthole worked out rather than the word the client sent. Which
+        // action to ask for does not depend on it -- what the resolution is
+        // for here is the message a person reads.
+        let runner = RealRunner;
+        let target = resolve_scope(&runner, &spec).map_err(HelperError::from)?;
+        let details = crate::polkit::forward_details(port, protocol, &target, published_port);
+
+        // 3. Authorize, before anything acts.
+        self.authorizer
+            .check(Action::Forward, &details, &header)
+            .await
+            .map_err(HelperError::from)?;
+
+        let uid = caller_uid(&self.bus, &header)
+            .await
+            .map_err(HelperError::from)?;
+
+        // 4. Only now take the lock and act. Scoped for the three reasons
+        // `open`'s own block is scoped: the `Engine` is not `Send`, the
+        // exclusive lock is released before the announcement, and what
+        // reconciliation dropped comes out separately from the result.
+        let (forwarded, reconciled) = {
+            let backend = backend::detect(&runner).map_err(HelperError::from)?;
+            let state = StateStore::open_exclusive(&self.state_path).map_err(HelperError::from)?;
+            let mut engine = Engine::new(
+                backend.as_ref(),
+                &runner,
+                &SYSTEM_CLOCK,
+                state,
+                self.executable.clone(),
+            );
+            let req = OpenRequest {
+                port,
+                protocol,
+                target,
+                lifetime,
+            };
+            let forwarded = engine.forward(&req, published_port, uid, &RealProcFs);
+            (forwarded, engine.take_reconciled())
+        };
+
+        // 5 and 6. The journal, then the bus -- the same announcement an
+        // `open` makes, from the same `ManagedRule`, which is what carries
+        // the mapping a subscriber needs to tell the two apart.
+        Self::announce_reconciled(Some(&emitter), &reconciled).await;
+        let rule = forwarded.map_err(HelperError::from)?;
         Self::announce_open(&emitter, &rule).await;
 
         Ok(WireRule::from_rule(&rule))
@@ -670,14 +781,26 @@ fn status_for_undetected_backend(
 /// without capturing stderr from a live process.
 fn format_open_log(rule: &porthole_core::state::ManagedRule) -> String {
     format!(
-        "porthole: uid={} opened {}/{} towards {} until {}",
+        "porthole: uid={} opened {}/{} towards {} until {}{}",
         rule.uid,
         rule.port,
         rule.protocol,
         rule.target,
         rule.expires_at
             .map(|t| t.to_string())
-            .unwrap_or_else(|| "reboot".to_string())
+            .unwrap_or_else(|| "reboot".to_string()),
+        // A forward and an open are one line otherwise, and the audit trail
+        // is the place that can least afford to describe one as the other:
+        // what answers on the port is a container, and the mapping names
+        // which one. Only the redirect's own detail is appended, so the line
+        // an `open` writes is the line it always wrote.
+        match &rule.forward {
+            Some(to) => format!(
+                " -- redirected to {}:{}, published on this machine as {}",
+                to.container_addr, to.container_port, to.published_port
+            ),
+            None => String::new(),
+        }
     )
 }
 
@@ -869,6 +992,33 @@ mod tests {
             format_open_log(&rule(1000)).ends_with("until reboot"),
             "got: {}",
             format_open_log(&rule(1000))
+        );
+    }
+
+    #[test]
+    fn the_open_line_says_when_what_it_opened_was_a_redirect() {
+        // Both lines start the same way, so a journal read for "opened
+        // 5173/tcp" finds either. What follows is the difference: an open
+        // permits whatever on this machine already answers there, and a
+        // forward sends that port to a container instead. An audit trail
+        // that recorded them identically could not be used to tell which
+        // one happened.
+        let mut r = rule(1000);
+        r.forward = Some(porthole_core::forward::ForwardTo {
+            container_addr: "172.18.0.2".parse().unwrap(),
+            container_port: 80,
+            published_port: 3000,
+            protocol: Protocol::Tcp,
+        });
+        let line = format_open_log(&r);
+        assert!(line.contains("redirected to 172.18.0.2:80"), "got: {line}");
+        assert!(
+            line.contains("published on this machine as 3000"),
+            "got: {line}"
+        );
+        assert!(
+            !format_open_log(&rule(1000)).contains("redirected"),
+            "an open keeps the line it always had"
         );
     }
 

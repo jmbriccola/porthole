@@ -509,6 +509,10 @@ mod tests {
             opened_at,
             expires_at,
             uid: 1000,
+            // Not a forward: an empty address is what says so.
+            container_addr: String::new(),
+            container_port: 0,
+            published_port: 0,
         }
     }
 
