@@ -46,6 +46,8 @@ pub struct ManagedRule {
     pub handle: RuleHandle,
     /// Present when this rule redirects rather than merely permits. `None`
     /// for every rule `open` creates.
+    // A missing key here already deserializes as absent on its own; this
+    // attribute only starts to matter if that ever stops being true.
     #[serde(default)]
     pub forward: Option<crate::forward::ForwardTo>,
 }

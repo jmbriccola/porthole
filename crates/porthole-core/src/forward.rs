@@ -55,5 +55,6 @@ mod tests {
         assert_eq!(f.container_addr, Ipv4Addr::new(172, 18, 0, 2));
         assert_eq!(f.container_port, 8080);
         assert_eq!(f.published_port, 3000);
+        assert_eq!(f.protocol, Protocol::Tcp);
     }
 }
