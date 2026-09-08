@@ -1934,7 +1934,7 @@ nft add rule inet filter input iif lo accept";
 }
 
 // ---------------------------------------------------------------------------
-// What a firewalld forward renders to.
+// What firewalld makes of the rich rule a forward writes.
 // ---------------------------------------------------------------------------
 
 /// Every `chain <name> { ... }` block in one `nft list table` dump, as
@@ -1958,33 +1958,41 @@ fn nft_chains(ruleset: &str) -> Vec<(String, String)> {
     chains
 }
 
-/// The rules a firewalld forward really writes, read out of the kernel's own
-/// rendering rather than out of the commands porthole issued.
+/// How a real firewalld renders the redirect rich rule porthole writes:
+/// read out of the kernel's own ruleset, not out of the commands issued.
 ///
-/// This is the assertion the milestone was missing. Until it, a forward was
-/// two rich rules -- the redirect plus an accept for the external port --
-/// and every test of it asserted which `firewall-cmd` invocations were made,
-/// which all passed. What none of them could see is that the accept opens
-/// the *host's own* port on that number to the local network while carrying
-/// none of the forwarded traffic; a spike measured both halves of that with
-/// packet counters, and this is what keeps the accept from coming back.
+/// **This is not what keeps the permit from coming back.** It hand-issues
+/// the redirect string and never calls `Firewalld::forward`, so reinstating
+/// the permit inside that function leaves this passing. The guard for that
+/// is `backend/firewalld.rs`'s
+/// `a_forward_writes_no_accept_for_the_external_port`, which asserts the
+/// accept `open` writes is absent from every command a forward issues, and
+/// which fails when the permit is put back.
+///
+/// What this establishes instead, and what no unit test can: that the rule
+/// porthole writes renders to a dnat and to nothing in the zone's filter
+/// path. A unit test can only ever assert the string firewalld was handed;
+/// the question of what firewalld makes of it -- whether a `forward-port`
+/// rich rule also emits an accept somewhere -- is answerable only against a
+/// real one, and the answer is what the decision to write a single rule
+/// rests on.
 ///
 /// Two things are asserted about the same real ruleset, and the second is
 /// what makes the first mean anything:
 ///
 /// 1. With the redirect in the zone, no `filter_IN_*` chain has a rule for
-///    the external port. Nothing porthole wrote permits anything.
+///    the external port, and one rule names the container: a dnat in
+///    `nat_PRE_<zone>_allow`.
 /// 2. Adding the accept `open` writes puts a rule for that port in exactly
 ///    such a chain. Without this control, assertion 1 would pass just as
-///    well if `nft_chains` found no chains at all, or if firewalld had
-///    renamed its filter chains, or if the rule had simply failed to be
-///    added.
+///    well if `nft_chains` found no chains at all, if firewalld had renamed
+///    its filter chains, or if the rule had simply failed to be added.
 ///
 /// What this does **not** assert: that a forward works. No packet is sent
 /// here, and reachability is a separate test with a separate topology.
 #[test]
 #[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
-fn a_firewalld_forward_renders_a_redirect_and_permits_nothing() {
+fn a_redirect_rich_rule_renders_to_a_dnat_and_no_filter_rule() {
     use porthole_core::backend::firewalld::Firewalld;
     use porthole_core::forward::ForwardTo;
     use porthole_core::model::{Lifetime, OpenRequest, Protocol, Target};
@@ -2023,11 +2031,11 @@ fn a_firewalld_forward_renders_a_redirect_and_permits_nothing() {
         marker_block("WITH_ACCEPT", "nft list table inet firewalld"),
     );
 
-    eprintln!("== firewalld test: what a forward renders to ==");
+    eprintln!("== firewalld test: what the redirect rich rule renders to ==");
     let out = podman_run(FEDORA_IMAGE, &args, &script);
     eprintln!("{}", String::from_utf8_lossy(&out.stdout));
     eprintln!("{}", String::from_utf8_lossy(&out.stderr));
-    assert_container_ok(&out, "the firewalld forward-rendering container");
+    assert_container_ok(&out, "the firewalld rendering container");
 
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let redirect_only = nft_chains(extract_marker(&stdout, "REDIRECT_ONLY"));
@@ -2050,7 +2058,7 @@ fn a_firewalld_forward_renders_a_redirect_and_permits_nothing() {
     assert_eq!(
         dnat.len(),
         1,
-        "a forward is one rule; chains naming the container: {dnat:?}"
+        "the redirect renders to one rule; chains naming the container: {dnat:?}"
     );
     assert!(
         dnat[0].starts_with("nat_PRE"),
@@ -2060,7 +2068,7 @@ fn a_firewalld_forward_renders_a_redirect_and_permits_nothing() {
 
     assert!(
         filtering_the_port(&redirect_only).is_empty(),
-        "a forward wrote a rule for the external port into a filter chain: {:?}\n{}",
+        "the redirect put a rule for the external port in a filter chain: {:?}\n{}",
         filtering_the_port(&redirect_only),
         extract_marker(&stdout, "REDIRECT_ONLY"),
     );

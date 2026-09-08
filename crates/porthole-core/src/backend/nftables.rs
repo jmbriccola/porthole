@@ -54,10 +54,10 @@
 //!
 //! This backend on a host also running Docker was never measured working
 //! either way; which combinations of the forward base chains such a host
-//! carries would pass was not established. So `forward` refuses. A redirect on its own is
-//! not the smaller alternative: on a ruleset whose forward chain has `policy
-//! drop`, it was measured unreachable.
-//!
+//! carries would pass was not established. So `forward` refuses. A redirect
+//! on its own is not the smaller alternative: on a ruleset whose forward
+//! chain has `policy drop`, it was measured unreachable.
+
 use super::{BackendHealth, BackendId, FirewallBackend, Ownership, RuleHandle};
 use crate::command::{Command, CommandRunner};
 use crate::error::{Error, Result};
@@ -65,8 +65,14 @@ use crate::forward::ForwardTo;
 use crate::model::{OpenRequest, Target};
 use serde::Deserialize;
 
-/// A base chain porthole may write into, named for the hook it is used at:
-/// the input hook, the only place an inserted accept can be reached.
+/// A base chain porthole may write into: one registered at the input hook,
+/// which is where a packet addressed to a local port is accepted or dropped.
+///
+/// That is the only hook this backend writes at, and that is a fact about
+/// what porthole does here rather than about netfilter. An accept in a
+/// forward base chain is reached too -- measured -- which is why the module
+/// docs above have to give a reason for not writing one, instead of there
+/// being no such place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputChain {
     pub family: String,
@@ -1317,10 +1323,10 @@ pub(crate) mod tests {
     #[test]
     fn no_nat_chain_is_ever_written_to() {
         // The refusal above only pins that `forward` runs nothing. This
-        // drives the two calls that do write -- `open`, then `forward` --
-        // and asserts no command from either names a nat chain or a dnat.
-        // `close` is not driven here; it deletes by the handle it is given
-        // and builds no rule of its own.
+        // drives `open`, which does write, and then `forward`, and asserts
+        // that no command from either names a nat chain or a dnat. `close`
+        // is not driven here; it deletes by the handle it is given and
+        // builds no rule of its own.
         let runner = RecordingRunner::with_responses(vec![
             Output::stdout(CHAINS_ONE_INPUT),
             Output::empty(),
