@@ -28,7 +28,7 @@
 
   <action id="com.jacopobriccola.Porthole.forward">
     <description>Redirect a port to a container</description>
-    <message>Authentication is required to redirect $(protocol) port $(port) to a container that publishes port $(published_port) on this machine, making that port reachable from $(target).</message>
+    <message>Authentication is required to open $(protocol) port $(port) towards $(target) and redirect it to a container that publishes port $(published_port) on this machine.</message>
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>
