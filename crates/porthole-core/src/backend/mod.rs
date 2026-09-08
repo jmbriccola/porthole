@@ -167,6 +167,30 @@ pub trait FirewallBackend {
     /// to be a working accept for something else — see `firewalld.rs`'s
     /// `forward`.
     ///
+    /// The refusal comes from [`FirewallBackend::forward_capability`], so a
+    /// backend that cannot redirect says so in one place and a caller cannot
+    /// be given two different sentences for one fact.
+    fn forward(&self, _req: &OpenRequest, _to: &ForwardTo, _marker: &str) -> Result<RuleHandle> {
+        self.forward_capability()?;
+        // Only a backend whose capability answer is `Ok` reaches here, and
+        // such a backend is expected to have overridden this method.
+        Err(Error::Unexpected(format!(
+            "{} reports a redirect it does not implement",
+            self.id()
+        )))
+    }
+
+    /// Whether this backend can express a redirect at all: `Ok(())` if it
+    /// can, and otherwise the refusal to hand back.
+    ///
+    /// It runs nothing and reads nothing, which is what lets a caller ask it
+    /// before anything else — on a machine whose firewall cannot redirect,
+    /// no fact about Docker, the state file or `/proc` changes the answer,
+    /// and reporting one of those instead sends a user looking in the wrong
+    /// place.
+    ///
+    /// This says nothing about whether a particular redirect would succeed.
+    ///
     /// The default refuses, and says only that. Any backend can inherit it,
     /// including one whose reason for having no forward is not the reason
     /// ufw has none — so the message states the absence and stops there. A
@@ -176,7 +200,7 @@ pub trait FirewallBackend {
     /// ufw inherits the default; `ufw.rs`'s module docs carry why. nftables
     /// overrides it with a refusal of its own, for a different reason its
     /// module docs carry.
-    fn forward(&self, _req: &OpenRequest, _to: &ForwardTo, _marker: &str) -> Result<RuleHandle> {
+    fn forward_capability(&self) -> Result<()> {
         Err(Error::ForwardUnsupported(format!(
             "{} cannot redirect a port: porthole has no forward for this backend",
             self.id()
@@ -487,6 +511,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_backends_capability_answer_and_its_refusal_are_the_same_sentence() {
+        // Two ways to learn one fact: the engine asks the capability before
+        // it reads anything, and a caller that goes straight to `forward`
+        // gets the refusal. Nothing but this would notice the two drifting
+        // into saying different things, and then which one a user saw would
+        // depend on which path reached them.
+        fn one_sentence(backend: &dyn FirewallBackend, runner: &RecordingRunner) {
+            let asked = backend
+                .forward_capability()
+                .expect_err("this backend is expected to have no forward");
+            let attempted = backend
+                .forward(&forward_req(), &forward_to(), "porthole:abc")
+                .expect_err("and to refuse an attempt at one");
+            assert_eq!(asked.to_string(), attempted.to_string());
+            assert_eq!(asked.exit_code(), ExitCode::ForwardUnsupported);
+            assert_eq!(attempted.exit_code(), ExitCode::ForwardUnsupported);
+            assert!(
+                runner.recorded().is_empty(),
+                "neither way of asking may run a command"
+            );
+        }
+
+        let runner = RecordingRunner::new();
+        one_sentence(&ufw::Ufw::new(&runner), &runner);
+        one_sentence(&nftables::Nftables::new(&runner), &runner);
+
+        // The one that can. A refusal here would stop the engine before it
+        // ever called the implementation below it.
+        assert!(firewalld::Firewalld::new(&runner)
+            .forward_capability()
+            .is_ok());
     }
 
     fn forward_req() -> OpenRequest {

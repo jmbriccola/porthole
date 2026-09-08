@@ -366,6 +366,20 @@ impl<'a> Engine<'a> {
             forward: None,
         };
 
+        self.record_and_schedule(rule, lifetime)
+    }
+
+    /// Write a rule the backend has just created into the state file and
+    /// arrange for it to close, undoing the firewall change if either fails.
+    ///
+    /// One copy, called by every operation that creates a rule. The rule is
+    /// in the firewall by the time this runs, so each failure here has to
+    /// remove it again rather than return and leave it behind.
+    fn record_and_schedule(
+        &mut self,
+        rule: ManagedRule,
+        lifetime: Lifetime,
+    ) -> Result<ManagedRule> {
         if !self.runner.is_dry_run() {
             self.state.insert(rule.clone());
             if let Err(e) = self.state.save() {
@@ -419,9 +433,13 @@ impl<'a> Engine<'a> {
     /// to -- any listener on that port and protocol refuses, loopback ones
     /// included.
     ///
-    /// Two refusals sit outside that pair. A UDP request is refused before
-    /// any read, because the listening check has no UDP counterpart yet. And
-    /// a firewall that is not confirmed to be enforcing rules is refused
+    /// Ahead of all of it, reading nothing: whether the detected firewall can
+    /// express a redirect at all, and whether porthole can check what this
+    /// request needs checking. A firewall that cannot redirect makes every
+    /// later question moot, and a UDP request meets a listening check that
+    /// has no UDP counterpart yet.
+    ///
+    /// A firewall that is not confirmed to be enforcing rules is refused
     /// where `open` refuses it, in the same words.
     ///
     /// `procfs` is a parameter rather than an `Engine` field because this is
@@ -435,8 +453,15 @@ impl<'a> Engine<'a> {
     ) -> Result<ManagedRule> {
         let external = req.port;
 
-        // Ahead of every read, because it is a property of the request rather
-        // than of this machine. The check further down that looks for a local
+        // First of all, and it reads nothing: on a firewall that cannot
+        // redirect at all, no fact about Docker, the state file or /proc
+        // changes the answer. Reporting one of those instead would send a
+        // user looking for a container on a machine that could not have
+        // forwarded to it either way.
+        self.backend.forward_capability()?;
+
+        // Then this, because it is a property of the request rather than of
+        // this machine. The check further down that looks for a local
         // listener on the external port reads TCP only; for UDP it would find
         // nothing however much was there, and a check that cannot fail is not
         // one.
@@ -535,24 +560,7 @@ impl<'a> Engine<'a> {
             forward: Some(to),
         };
 
-        if !self.runner.is_dry_run() {
-            self.state.insert(rule.clone());
-            if let Err(e) = self.state.save() {
-                self.roll_back(&rule);
-                return Err(e);
-            }
-        }
-
-        if let Lifetime::For(duration) = req.lifetime {
-            if let Err(e) =
-                expiry::schedule_close(self.runner, &self.executable, &rule, duration.as_secs())
-            {
-                self.roll_back(&rule);
-                return Err(e);
-            }
-        }
-
-        Ok(rule)
+        self.record_and_schedule(rule, req.lifetime)
     }
 
     /// Undo an opening that could not be completed.
@@ -2345,6 +2353,11 @@ mod tests {
    0: 00000000:20FB 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 67371 1 0000000000000000 100 0 0 10 0
 ";
 
+    /// One `LISTEN` socket on 8443 bound to `127.0.0.1` (hex `0100007F`).
+    const PROC_NET_TCP_8443_LOOPBACK: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:20FB 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 67371 1 0000000000000000 100 0 0 10 0
+";
+
     fn nothing_listening() -> FakeProcFs {
         FakeProcFs::new(PROC_NET_TCP_EMPTY)
     }
@@ -2369,6 +2382,9 @@ mod tests {
         chain: DockerChain,
         inner: RecordingRunner,
         seen: Mutex<Vec<Command>>,
+        /// Makes every `systemd-run` fail to spawn, the way
+        /// `SystemctlMissing` does for `systemctl`.
+        no_timer: bool,
     }
 
     impl DockerRunner {
@@ -2377,7 +2393,13 @@ mod tests {
                 chain,
                 inner: RecordingRunner::with_responses(responses),
                 seen: Mutex::new(Vec::new()),
+                no_timer: false,
             }
+        }
+
+        fn with_no_timer(mut self) -> Self {
+            self.no_timer = true;
+            self
         }
     }
 
@@ -2392,6 +2414,12 @@ mod tests {
                         stdout: String::new(),
                         stderr: "iptables: Resource temporarily unavailable.".to_string(),
                     },
+                });
+            }
+            if self.no_timer && cmd.program == "systemd-run" {
+                return Err(Error::CommandSpawn {
+                    command: cmd.display(),
+                    source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
                 });
             }
             self.inner.run(cmd)
@@ -2600,6 +2628,161 @@ mod tests {
     }
 
     #[test]
+    fn forward_asks_whether_the_firewall_can_redirect_before_it_reads_anything() {
+        // On ufw or nftables the answer is unconditional, and every later
+        // question is moot. Reaching "not published by any container" or
+        // "that port is already in use" here would state a downstream fact
+        // while a more fundamental one holds, and send a user hunting for a
+        // container on a machine that could not have forwarded to it.
+        //
+        // Every one of those downstream refusals is armed below: Docker
+        // cannot be read, and something is listening on the external port.
+        let harness = Harness::new();
+        let backend = FakeBackend::without_forward();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DockerChain::Unreadable, Vec::new());
+        let procfs = FakeProcFs::new(PROC_NET_TCP_8443);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let err = engine
+            .forward(&forward_req(EXTERNAL_PORT), PUBLISHED_PORT, 1000, &procfs)
+            .unwrap_err();
+
+        assert!(matches!(err, Error::ForwardUnsupported(_)), "got {err}");
+        assert_eq!(err.exit_code(), ExitCode::ForwardUnsupported);
+        assert!(runner.recorded().is_empty(), "no command ran");
+        assert_eq!(backend.touched(), 0, "the firewall was not asked anything");
+        assert_eq!(procfs.reads(), 0, "/proc was not read");
+    }
+
+    #[test]
+    fn forward_reads_docker_before_it_asks_whether_the_firewall_is_running() {
+        // Both are true here: the firewall is stopped and Docker cannot be
+        // read. Docker is the read that comes first, so its answer is the one
+        // that comes out -- until it returns, nothing about the request has
+        // been decided.
+        let harness = Harness::new();
+        let backend = FakeBackend::inactive();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DockerChain::Unreadable, Vec::new());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let err = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &nothing_listening(),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::DockerUnreadable(_)),
+            "a stopped firewall must not answer a question about Docker: {err}"
+        );
+    }
+
+    #[test]
+    fn forward_reconciles_before_deciding_the_external_port_is_taken() {
+        // A `firewall-cmd --reload` between two porthole commands: state
+        // still claims 8443 is open, the firewall dropped it. Without the
+        // sweep this would refuse a forward that should succeed.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DockerChain::Reads(DOCKER_CHAIN_LOOPBACK), Vec::new());
+
+        let mut store = harness.store();
+        store.insert(ManagedRule {
+            id: "ghost".to_string(),
+            port: EXTERNAL_PORT,
+            protocol: Protocol::Tcp,
+            target: Target::Network {
+                cidr: "10.10.10.0/24".parse().unwrap(),
+            },
+            backend: BackendId::Firewalld,
+            opened_at: NOW,
+            expires_at: None,
+            uid: 1000,
+            handle: RuleHandle::Firewalld {
+                zone: "TestZone".to_string(),
+                rich_rule: "a rule the reload already dropped".to_string(),
+            },
+            forward: None,
+        });
+
+        let mut engine = make_engine(&backend, &runner, &clock, store);
+        let rule = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &nothing_listening(),
+            )
+            .unwrap();
+
+        assert_eq!(rule.port, EXTERNAL_PORT);
+        assert_eq!(engine.rules().len(), 1);
+        assert_eq!(engine.rules()[0].id, rule.id);
+    }
+
+    #[test]
+    fn forward_refuses_an_external_port_a_loopback_only_service_listens_on() {
+        // The check does not look at what a socket is bound to, and this is
+        // the case that would slip through if it started to: a service on
+        // 127.0.0.1 is one porthole is not able to say the redirect leaves
+        // alone.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DockerChain::Reads(DOCKER_CHAIN_LOOPBACK), Vec::new());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let err = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &FakeProcFs::new(PROC_NET_TCP_8443_LOOPBACK),
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, Error::ExternalPortInUse { .. }), "got {err}");
+    }
+
+    #[test]
+    fn a_forward_whose_timer_cannot_be_scheduled_is_taken_back_out() {
+        // The same rollback `open` gets, through the same code: a rule in the
+        // firewall that nothing will ever close is the failure porthole
+        // exists to prevent.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DockerChain::Reads(DOCKER_CHAIN_LOOPBACK), Vec::new())
+            .with_no_timer();
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let err = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &nothing_listening(),
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("could not run"), "got {err}");
+        assert!(
+            backend.handles().is_empty(),
+            "the rule must be gone from the firewall"
+        );
+        assert!(
+            StateStore::open(&harness.path).unwrap().rules().is_empty(),
+            "and gone from the state file"
+        );
+    }
+
+    #[test]
     fn forward_refuses_udp_and_says_it_is_the_check_that_does_not_reach_yet() {
         // The listening scan reads /proc/net/tcp and /proc/net/tcp6, so on a
         // UDP port it finds nothing however much is there. Creating the
@@ -2615,8 +2798,9 @@ mod tests {
 
         let mut req = forward_req(EXTERNAL_PORT);
         req.protocol = Protocol::Udp;
+        let procfs = nothing_listening();
         let err = engine
-            .forward(&req, PUBLISHED_PORT, 1000, &nothing_listening())
+            .forward(&req, PUBLISHED_PORT, 1000, &procfs)
             .unwrap_err();
 
         assert!(
@@ -2639,10 +2823,14 @@ mod tests {
             backend.forwarded().is_empty(),
             "a refusal must not have reached the firewall"
         );
-        assert!(
-            runner.recorded().is_empty(),
-            "the refusal is a property of the request, so nothing needs reading first"
-        );
+        // The refusal is a property of the request, so it is reached without
+        // consulting anything. All three seams have to say so: a command
+        // runner alone cannot, since the backend's health and the sweep's
+        // rule listing never run a command and the `/proc` fake never does
+        // either.
+        assert!(runner.recorded().is_empty(), "no command ran");
+        assert_eq!(backend.touched(), 0, "the firewall was not asked anything");
+        assert_eq!(procfs.reads(), 0, "/proc was not read");
     }
 
     #[test]

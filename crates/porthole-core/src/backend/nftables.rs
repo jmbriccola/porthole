@@ -61,7 +61,6 @@
 use super::{BackendHealth, BackendId, FirewallBackend, Ownership, RuleHandle};
 use crate::command::{Command, CommandRunner};
 use crate::error::{Error, Result};
-use crate::forward::ForwardTo;
 use crate::model::{OpenRequest, Target};
 use serde::Deserialize;
 
@@ -533,7 +532,10 @@ impl FirewallBackend for Nftables<'_> {
     /// Refused, and nothing is run at all -- not even a read.
     ///
     /// The module docs carry what was measured and what follows from it.
-    fn forward(&self, _req: &OpenRequest, _to: &ForwardTo, _marker: &str) -> Result<RuleHandle> {
+    /// `forward` is left to the trait's default, which returns this: one
+    /// sentence, whether a caller asks the capability or attempts the
+    /// redirect.
+    fn forward_capability(&self) -> Result<()> {
         Err(Error::ForwardUnsupported(
             "nftables cannot redirect a port: a redirect on its own does not reach a \
              container through a forward chain that drops, and the accept that would carry \
@@ -1347,8 +1349,8 @@ pub(crate) mod tests {
         }
     }
 
-    fn to() -> ForwardTo {
-        ForwardTo {
+    fn to() -> crate::forward::ForwardTo {
+        crate::forward::ForwardTo {
             container_addr: std::net::Ipv4Addr::new(172, 18, 0, 2),
             container_port: 8080,
             published_port: 3000,

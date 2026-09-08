@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::forward::ForwardTo;
 use crate::model::OpenRequest;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 pub const FAKE_ZONE: &str = "TestZone";
@@ -37,6 +38,15 @@ pub struct FakeBackend {
     /// Set by `fail_owned_rules`. For tests proving the safe direction's
     /// write does not depend on the unsafe direction succeeding.
     fail_owned_rules: Mutex<bool>,
+    /// Set by `without_forward`. Makes this fake answer the capability
+    /// question the way ufw does.
+    refuse_forward: bool,
+    /// How many times the firewall has been asked anything: every trait
+    /// method that would reach a real firewall counts, and the static
+    /// answers (`id`, `ownership`, `forward_capability`) do not. Lets a test
+    /// assert a refusal was reached without touching the firewall, which
+    /// `RecordingRunner` cannot show for a fake that never runs a command.
+    touched: AtomicUsize,
 }
 
 impl FakeBackend {
@@ -92,6 +102,15 @@ impl FakeBackend {
         })
     }
 
+    /// A firewall that is running, and cannot redirect a port -- the answer
+    /// ufw and nftables give.
+    pub fn without_forward() -> Self {
+        FakeBackend {
+            refuse_forward: true,
+            ..FakeBackend::new()
+        }
+    }
+
     fn with_health(health: BackendHealth) -> Self {
         FakeBackend {
             health,
@@ -103,7 +122,19 @@ impl FakeBackend {
             fail_close: Mutex::new(HashSet::new()),
             fail_list_rules: Mutex::new(false),
             fail_owned_rules: Mutex::new(false),
+            refuse_forward: false,
+            touched: AtomicUsize::new(0),
         }
+    }
+
+    /// How many times this backend has been asked something that would reach
+    /// a real firewall. Zero means it was not consulted.
+    pub fn touched(&self) -> usize {
+        self.touched.load(Ordering::SeqCst)
+    }
+
+    fn touch(&self) {
+        self.touched.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Every request passed to `open`, in order.
@@ -177,6 +208,7 @@ impl FirewallBackend for FakeBackend {
     }
 
     fn open(&self, req: &OpenRequest, marker: &str) -> Result<RuleHandle> {
+        self.touch();
         let handle = RuleHandle::Firewalld {
             zone: FAKE_ZONE.to_string(),
             rich_rule: format!(
@@ -203,7 +235,23 @@ impl FirewallBackend for FakeBackend {
     /// One rule, and an ordinary handle for it -- the same shape firewalld's
     /// real `forward` produces, so a rule created here closes and reconciles
     /// through exactly the paths an opened one does.
+    fn forward_capability(&self) -> Result<()> {
+        if self.refuse_forward {
+            return Err(Error::ForwardUnsupported(format!(
+                "{} cannot redirect a port: porthole has no forward for this backend",
+                self.id()
+            )));
+        }
+        Ok(())
+    }
+
     fn forward(&self, req: &OpenRequest, to: &ForwardTo, marker: &str) -> Result<RuleHandle> {
+        self.touch();
+        self.forward_capability()?;
+        // The same agreement the real forward requires: one rule has one
+        // protocol, so a request and a destination that disagree have no
+        // spelling.
+        super::forward_protocol(req, to)?;
         let handle = RuleHandle::Firewalld {
             zone: FAKE_ZONE.to_string(),
             rich_rule: format!(
@@ -231,6 +279,7 @@ impl FirewallBackend for FakeBackend {
     }
 
     fn close(&self, handle: &RuleHandle) -> Result<()> {
+        self.touch();
         let mut live = self.live.lock().expect("not poisoned");
         let Some(index) = live.iter().position(|(h, _)| h == handle) else {
             return Err(Error::Unexpected(format!(
@@ -259,6 +308,7 @@ impl FirewallBackend for FakeBackend {
     }
 
     fn list_rules(&self) -> Result<Vec<RuleHandle>> {
+        self.touch();
         if *self.fail_list_rules.lock().expect("not poisoned") {
             return Err(Error::Unexpected(
                 "fake backend: list_rules forced to fail".to_string(),
@@ -268,6 +318,7 @@ impl FirewallBackend for FakeBackend {
     }
 
     fn owned_rules(&self) -> Result<Option<Vec<RuleHandle>>> {
+        self.touch();
         if *self.fail_owned_rules.lock().expect("not poisoned") {
             return Err(Error::Unexpected(
                 "fake backend: owned_rules forced to fail".to_string(),
@@ -281,10 +332,12 @@ impl FirewallBackend for FakeBackend {
     }
 
     fn health(&self) -> Result<BackendHealth> {
+        self.touch();
         Ok(self.health.clone())
     }
 
     fn location(&self) -> Result<Option<String>> {
+        self.touch();
         Ok(Some(FAKE_ZONE.to_string()))
     }
 }

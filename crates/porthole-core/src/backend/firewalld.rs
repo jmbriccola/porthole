@@ -245,6 +245,12 @@ impl FirewallBackend for Firewalld<'_> {
     /// firewalld handle for it. Nothing porthole writes permits the
     /// forwarded traffic; what does was measured to be already there, and
     /// is not porthole's to write.
+    /// The one backend that can. What it writes is a rich rule; `forward`
+    /// below is what writes it.
+    fn forward_capability(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn forward(&self, req: &OpenRequest, to: &ForwardTo, _marker: &str) -> Result<RuleHandle> {
         // The marker goes nowhere, for the same reason `open` drops it: the
         // rich language has no comment element. The stored rule string is
