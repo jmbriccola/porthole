@@ -94,9 +94,10 @@ impl WireRule {
 ///
 /// A single undifferentiated "closed" would force every subscriber to guess:
 /// a rule that ran out its own clock, one a person asked to close, one the
-/// helper closed because the machine left the network it was scoped to, and
-/// one that was already gone from the firewall by the time porthole looked
-/// are four different things to tell a user about. The slug is spelled twice:
+/// helper closed because the machine left the network it was scoped to, one
+/// that was already gone from the firewall by the time porthole looked, and
+/// one whose container is no longer the one it was created against are five
+/// different things to tell a user about. The slug is spelled twice:
 /// the wire form comes from serde's `rename_all` below, the journal form from
 /// the `match` in [`CloseReason::as_str`]. Nothing in the type system makes
 /// those agree — `every_close_carries_why` checks both halves for every
@@ -125,6 +126,21 @@ pub enum CloseReason {
     /// never save, so the record is still in the state file and the next
     /// operation that does write is where it is dropped for real.
     Reconciled,
+    /// A forward whose container is no longer the one it was created
+    /// against: the mapping the rule stored is absent from Docker's own
+    /// table now -- see `porthole_core::forward::stale_forwards`.
+    ///
+    /// The forward closes rather than being re-aimed. Docker assigns
+    /// container addresses at start, so the address a restarted container
+    /// gives up can be taken by a different one; a rule re-aimed at whatever
+    /// now holds that address would carry traffic from the local network to
+    /// a service nobody authorised. This is the same principle as a rule
+    /// scoped to a subnet the machine has left.
+    ///
+    /// Never sent because Docker could not be read. Not knowing is not
+    /// knowing it changed -- see
+    /// `porthole_core::engine::Engine::close_stale_forwards`.
+    TargetGone,
 }
 
 impl CloseReason {
@@ -132,14 +148,14 @@ impl CloseReason {
     /// the wire -- `rename_all` above derives that from the variant name
     /// independently -- so the two are held equal by `every_close_carries_why`
     /// rather than by construction. Kept next to the enum all the same, so
-    /// that the four spellings are in one place rather than at each call
-    /// site.
+    /// that every spelling is in one place rather than at each call site.
     pub fn as_str(self) -> &'static str {
         match self {
             CloseReason::Expired => "expired",
             CloseReason::Requested => "requested",
             CloseReason::NetworkChanged => "network-changed",
             CloseReason::Reconciled => "reconciled",
+            CloseReason::TargetGone => "target-gone",
         }
     }
 }
@@ -366,8 +382,8 @@ pub trait Porthole {
     /// - A rule can leave `list` with no `RuleClosed` behind it.
     ///   `close --id <id> --forget` drops porthole's record of a rule
     ///   recorded under a backend this machine no longer has, without
-    ///   touching any firewall — so none of the four reasons is true of it
-    ///   and none is sent. A client that only listens goes on showing that
+    ///   touching any firewall — so none of the reasons is true of it and
+    ///   none is sent. A client that only listens goes on showing that
     ///   rule as open.
     /// - Signals are emitted after the state lock is released, so two
     ///   clients acting at once can put a `RuleClosed` on the bus ahead of
@@ -637,9 +653,10 @@ mod tests {
 
     #[test]
     fn every_close_carries_why() {
-        // "expired", "requested", "network-changed", "reconciled". The
-        // notification says something different for each, and a single
-        // undifferentiated ClosedSignal would force the agent to guess.
+        // "expired", "requested", "network-changed", "reconciled",
+        // "target-gone". The notification says something different for each,
+        // and a single undifferentiated ClosedSignal would force the agent to
+        // guess.
         //
         // Both halves are checked for every variant: the slug `as_str`
         // returns (what the journal line is built from) and the string that
@@ -655,6 +672,7 @@ mod tests {
             (CloseReason::Requested, "requested"),
             (CloseReason::NetworkChanged, "network-changed"),
             (CloseReason::Reconciled, "reconciled"),
+            (CloseReason::TargetGone, "target-gone"),
         ] {
             assert_eq!(reason.as_str(), expected);
             assert_eq!(reason.to_string(), expected);
@@ -669,6 +687,45 @@ mod tests {
             let back: CloseReason = encoded.deserialize().unwrap().0;
             assert_eq!(back, reason, "a subscriber must be able to read it back");
         }
+    }
+
+    #[test]
+    fn the_reasons_that_predate_forwarding_keep_their_slugs() {
+        // These four crossed the bus before `target-gone` existed, and
+        // subscribers match on the slug: a rename would be a silent break for
+        // anything already deployed, not a compile error anywhere. The test
+        // above covers every reason including the new one; this one exists to
+        // say that these particular strings are not free to move.
+        //
+        // Spelled as literals rather than derived from the enum, which is
+        // the point -- a test that asked `as_str` what the slug is would
+        // agree with any rename.
+        assert_eq!(CloseReason::Expired.as_str(), "expired");
+        assert_eq!(CloseReason::Requested.as_str(), "requested");
+        assert_eq!(CloseReason::NetworkChanged.as_str(), "network-changed");
+        assert_eq!(CloseReason::Reconciled.as_str(), "reconciled");
+    }
+
+    #[test]
+    fn a_new_reason_has_to_be_written_into_the_slug_test_by_hand() {
+        // Not a behavioural check: an exhaustive match that stops compiling
+        // when a variant is added, so the next reason cannot reach the bus
+        // with nobody having decided what it is called. It is deliberately
+        // not `as_str` -- reading the answer out of the code under test
+        // would agree with whatever that code says.
+        fn slug(reason: CloseReason) -> &'static str {
+            match reason {
+                CloseReason::Expired => "expired",
+                CloseReason::Requested => "requested",
+                CloseReason::NetworkChanged => "network-changed",
+                CloseReason::Reconciled => "reconciled",
+                CloseReason::TargetGone => "target-gone",
+            }
+        }
+        assert_eq!(
+            slug(CloseReason::TargetGone),
+            CloseReason::TargetGone.as_str()
+        );
     }
 
     #[test]

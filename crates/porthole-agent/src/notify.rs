@@ -68,8 +68,8 @@ pub fn should_notify(rule: &WireRule, uid: u32) -> bool {
 /// Whether a close of this kind is worth interrupting the user for.
 ///
 /// [`CloseReason::Requested`] is not: somebody asked for it, in a client that
-/// reported the result. The other three happened with nobody asking, which is
-/// the whole reason this binary exists.
+/// reported the result. Every other reason happened with nobody asking, which
+/// is the whole reason this binary exists.
 ///
 /// The signal does not say *who* asked, only that someone did, so a
 /// `requested` close of this user's rule from another account is suppressed by
@@ -80,9 +80,9 @@ pub fn is_worth_announcing(reason: CloseReason) -> bool {
 
 /// What to say about a rule that has stopped being open.
 ///
-/// Total over all four reasons, including the one [`is_worth_announcing`]
-/// filters out, so a fifth reason added to the wire enum has to come here and
-/// say what it looks like rather than falling into a catch-all.
+/// Total over every reason, including the one [`is_worth_announcing`] filters
+/// out, so a reason added to the wire enum has to come here and say what it
+/// looks like rather than falling into a catch-all.
 ///
 /// Only an expiry offers `reopen`. An expiry is the one case where nothing
 /// about the machine changed under the rule -- the clock the user set ran
@@ -91,7 +91,10 @@ pub fn is_worth_announcing(reason: CloseReason) -> bool {
 /// has left would appear to work and reach nobody. After a reconciliation
 /// something outside porthole removed the rule from the firewall, and this
 /// cannot tell what: putting it back at one click, before the user has seen
-/// what took it away, would be porthole arguing with whatever that was.
+/// what took it away, would be porthole arguing with whatever that was. And a
+/// forward whose container is gone has nothing left to point at: the request
+/// this notification is about named a service, and re-sending it would aim at
+/// an address that is now somebody else's.
 pub fn notification_for(rule: &WireRule, reason: CloseReason) -> Notification {
     let port = format!("{}/{}", rule.port, rule.protocol);
     let target = &rule.target;
@@ -121,6 +124,16 @@ pub fn notification_for(rule: &WireRule, reason: CloseReason) -> Notification {
         CloseReason::Requested => Notification {
             summary: format!("Port {port} closed"),
             body: format!("{port} towards {target} was closed on request."),
+            actions: Vec::new(),
+        },
+        CloseReason::TargetGone => Notification {
+            summary: format!("Port {port} closed"),
+            body: format!(
+                "{port} was redirected to a container that is no longer the one it was \
+                 created for, so porthole closed it. Container addresses change when a \
+                 container restarts, and the one at that address now may be a different \
+                 service."
+            ),
             actions: Vec::new(),
         },
     }
@@ -256,6 +269,7 @@ mod tests {
         assert!(is_worth_announcing(CloseReason::Reconciled));
         assert!(is_worth_announcing(CloseReason::Expired));
         assert!(is_worth_announcing(CloseReason::NetworkChanged));
+        assert!(is_worth_announcing(CloseReason::TargetGone));
         assert!(!is_worth_announcing(CloseReason::Requested));
 
         let n = notification_for(&closed_rule(5173, "tcp"), CloseReason::Reconciled);
@@ -275,6 +289,7 @@ mod tests {
             CloseReason::Requested,
             CloseReason::NetworkChanged,
             CloseReason::Reconciled,
+            CloseReason::TargetGone,
         ] {
             let n = notification_for(&closed_rule(8080, "udp"), reason);
             assert!(n.body.contains("8080/udp"), "{reason}: {}", n.body);

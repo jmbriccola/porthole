@@ -185,12 +185,12 @@ async fn opening_a_rule_emits_rule_opened_with_the_rule_that_was_created() {
 
 #[tokio::test]
 async fn every_close_carries_why() {
-    // "expired", "requested", "network-changed", "reconciled". The
-    // notification says something different for each, and a single
-    // undifferentiated ClosedSignal would force the agent to guess.
+    // "expired", "requested", "network-changed", "reconciled",
+    // "target-gone". The notification says something different for each, and
+    // a single undifferentiated ClosedSignal would force the agent to guess.
     //
-    // `porthole_core::ipc`'s own `every_close_carries_why` pins the four
-    // slugs and their encoding; this one pins them where a subscriber
+    // `porthole_core::ipc`'s own `every_close_carries_why` pins the slugs
+    // and their encoding; this one pins them where a subscriber
     // actually meets them -- on the bus, decoded by the published proxy,
     // paired with the rule they describe.
     let dir = TempDir::new().unwrap();
@@ -206,6 +206,7 @@ async fn every_close_carries_why() {
         (CloseReason::Requested, "requested"),
         (CloseReason::NetworkChanged, "network-changed"),
         (CloseReason::Reconciled, "reconciled"),
+        (CloseReason::TargetGone, "target-gone"),
     ] {
         Porthole::announce_autoclose(Some(&emitter), &rule, reason).await;
 
@@ -361,8 +362,8 @@ async fn a_record_the_firewall_no_longer_has_is_announced_by_the_operation_that_
 async fn a_forget_announces_no_close_because_nothing_was_closed() {
     // `close --id <id> --forget` drops porthole's record of a rule recorded
     // under a backend this machine no longer has, and touches no firewall at
-    // all (`Engine::forget_rule`). None of the four reasons a `RuleClosed`
-    // can carry is true of it, and a subscriber told "closed" would report a
+    // all (`Engine::forget_rule`). None of the reasons a `RuleClosed` can
+    // carry is true of it, and a subscriber told "closed" would report a
     // port as no longer reachable when porthole neither closed it nor knows
     // whether anything did. So: the journal gets its own "forgot" line, and
     // the bus gets nothing.

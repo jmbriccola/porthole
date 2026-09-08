@@ -683,7 +683,7 @@ impl<'a> Engine<'a> {
             })
             .map(|r| r.id.clone())
             .collect();
-        self.close_ids_after_network_change(ids)
+        self.close_ids_unasked(ids, "a network change")
     }
 
     /// Close every subnet-scoped rule because the machine has no usable
@@ -702,29 +702,80 @@ impl<'a> Engine<'a> {
             .filter(|r| matches!(r.target, Target::Network { .. }))
             .map(|r| r.id.clone())
             .collect();
-        self.close_ids_after_network_change(ids)
+        self.close_ids_unasked(ids, "a network change")
     }
 
-    /// Shared by [`Engine::close_rules_outside`] and
-    /// [`Engine::close_rules_on_network_loss`]: close each id, logging and
-    /// skipping whatever will not close rather than letting one stuck rule
-    /// stop the rest. No separate error list the way [`Engine::close_all`]
-    /// keeps one, on purpose -- nothing downstream of a network change reads
-    /// which rule failed and why, only that the ones that could close are
-    /// gone.
-    fn close_ids_after_network_change(&mut self, ids: Vec<String>) -> Vec<ManagedRule> {
+    /// Shared by every close nobody asked for -- [`Engine::close_rules_outside`],
+    /// [`Engine::close_rules_on_network_loss`] and
+    /// [`Engine::close_stale_forwards`]: close each id, logging and skipping
+    /// whatever will not close rather than letting one stuck rule stop the
+    /// rest. No separate error list the way [`Engine::close_all`] keeps one,
+    /// on purpose -- nothing downstream of these reads which rule failed and
+    /// why, only that the ones that could close are gone.
+    ///
+    /// `why` is the journal line's own account of what made porthole close
+    /// these without being asked, so a reader of a failure line knows which
+    /// sweep was running.
+    fn close_ids_unasked(&mut self, ids: Vec<String>, why: &str) -> Vec<ManagedRule> {
         let mut closed = Vec::new();
         for id in ids {
             match self.close_by_id_unreconciled(&id, false, false) {
                 Ok(rule) => closed.push(rule),
                 Err(e) => {
-                    eprintln!(
-                        "porthole: network change could not close rule {id}, continuing: {e}"
-                    );
+                    eprintln!("porthole: could not close rule {id} after {why}, continuing: {e}");
                 }
             }
         }
         closed
+    }
+
+    /// Close every forward whose container is no longer the one it was
+    /// created against, and return what closed.
+    ///
+    /// Docker assigns container addresses at start. A restarted container can
+    /// take a different one, and the address it gave up can pass to a
+    /// different container -- at which point a forward towards that address
+    /// carries traffic from the local network to a service nobody authorised.
+    /// The stored mapping is compared against Docker's own DNAT table (never
+    /// Docker's socket, and never `docker` group membership) and all four
+    /// fields must still match: see [`crate::forward::stale_forwards`], which
+    /// is the whole decision. Everything here is the read around it.
+    ///
+    /// **A table that could not be read closes nothing.** Not knowing is not
+    /// knowing it changed, and there is no way to spell "no answer" to
+    /// `stale_forwards`: an empty slice is the answer "no container publishes
+    /// anything", which would name every forward. So a read failure is logged
+    /// and this returns empty, leaving the next wake-up to try again --
+    /// rather than taking access away for a transient `iptables` fault. It is
+    /// the shape [`crate::net::present_networks`]'s callers already keep for a
+    /// resolution they could not make: only an answer closes anything.
+    ///
+    /// A stale forward closes. It is never re-aimed at whatever address the
+    /// container holds now, for the same reason a rule scoped to a subnet the
+    /// machine has left is not re-aimed at the subnet it is on: the request
+    /// was for one service, and porthole cannot say the new one is it.
+    ///
+    /// No `Result`, matching [`Engine::close_rules_outside`]: the one read
+    /// here answers "nothing closed" rather than failing, and a per-rule
+    /// close failure is logged and skipped like every other unasked close.
+    pub fn close_stale_forwards(&mut self) -> Vec<ManagedRule> {
+        // Read Docker before the sweep, so a table that cannot be read costs
+        // nothing at all -- the same order `forward` uses, for the same
+        // reason.
+        let published = match crate::docker::published(self.runner) {
+            Ok(published) => published,
+            Err(e) => {
+                eprintln!(
+                    "porthole: could not read Docker's published ports, so no forward was \
+                     compared against them and none was closed: {e}"
+                );
+                return Vec::new();
+            }
+        };
+
+        self.reconcile();
+        let ids = crate::forward::stale_forwards(self.state.rules(), &published);
+        self.close_ids_unasked(ids, "the container it forwards to moved")
     }
 
     /// Close a rule the currently detected backend actually created.
@@ -2363,6 +2414,7 @@ mod tests {
     }
 
     /// What `iptables -t nat -S DOCKER` answers.
+    #[derive(Clone, Copy)]
     enum DockerChain {
         /// The chain, read successfully.
         Reads(&'static str),
@@ -2379,7 +2431,13 @@ mod tests {
     /// visible too: a test that never proves the read happened would pass
     /// just as well against an engine that skipped it.
     struct DockerRunner {
-        chain: DockerChain,
+        /// Behind a lock so one runner can answer differently before and
+        /// after: a container restarts, or `iptables` stops working, while
+        /// the same engine keeps running. A test that could not change the
+        /// answer would have to build the rule it is checking by hand, and a
+        /// hand-built rule is one no backend holds -- reconciliation would
+        /// drop it before anything under test looked at it.
+        chain: Mutex<DockerChain>,
         inner: RecordingRunner,
         seen: Mutex<Vec<Command>>,
         /// Makes every `systemd-run` fail to spawn, the way
@@ -2390,7 +2448,7 @@ mod tests {
     impl DockerRunner {
         fn new(chain: DockerChain, responses: Vec<Output>) -> Self {
             DockerRunner {
-                chain,
+                chain: Mutex::new(chain),
                 inner: RecordingRunner::with_responses(responses),
                 seen: Mutex::new(Vec::new()),
                 no_timer: false,
@@ -2401,13 +2459,18 @@ mod tests {
             self.no_timer = true;
             self
         }
+
+        /// What the next `iptables -t nat -S DOCKER` answers.
+        fn answers(&self, chain: DockerChain) {
+            *self.chain.lock().expect("not poisoned") = chain;
+        }
     }
 
     impl CommandRunner for DockerRunner {
         fn run(&self, cmd: &Command) -> Result<Output> {
             self.seen.lock().expect("not poisoned").push(cmd.clone());
             if cmd.program == "iptables" {
-                return Ok(match self.chain {
+                return Ok(match *self.chain.lock().expect("not poisoned") {
                     DockerChain::Reads(text) => Output::stdout(text),
                     DockerChain::Unreadable => Output {
                         status: 4,
@@ -2943,5 +3006,147 @@ mod tests {
         assert_eq!(last.program, "systemd-run");
         assert!(last.args.contains(&"--on-active=3600s".to_string()));
         assert!(last.args.contains(&rule.id));
+    }
+
+    // --- close_stale_forwards ------------------------------------------
+
+    /// The same container, restarted onto a different address. Everything
+    /// else about the mapping is unchanged, which is exactly what makes it
+    /// dangerous: the forward still looks current if only the published port
+    /// is compared.
+    const DOCKER_CHAIN_MOVED: &str = "\
+-N DOCKER
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 3000 -j DNAT --to-destination 172.18.0.9:8080
+";
+
+    /// An engine holding one live forward towards [`CONTAINER_ADDR`], built
+    /// through `forward` so the backend really holds the rule -- a
+    /// hand-written state entry would be an orphan the first sweep drops,
+    /// and every assertion below would pass for the wrong reason.
+    fn engine_with_a_forward<'a>(
+        backend: &'a FakeBackend,
+        runner: &'a DockerRunner,
+        clock: &'a FixedClock,
+        store: StateStore,
+    ) -> Engine<'a> {
+        let mut engine = make_engine(backend, runner, clock, store);
+        engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &nothing_listening(),
+            )
+            .unwrap();
+        engine
+    }
+
+    #[test]
+    fn an_unreadable_docker_table_closes_nothing() {
+        // Not knowing is not knowing it changed. Closing on a read error
+        // takes access away for a transient fault -- the same reason a
+        // resolution failure in the network monitor closes nothing, while a
+        // confirmed "no network" closes everything scoped to a subnet.
+        //
+        // The forward is real and current when the read breaks, so an
+        // implementation that read an unreadable table as an empty one would
+        // close it here.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DockerChain::Reads(DOCKER_CHAIN_LOOPBACK), Vec::new());
+        let mut engine = engine_with_a_forward(&backend, &runner, &clock, harness.store());
+
+        runner.answers(DockerChain::Unreadable);
+        let closed = engine.close_stale_forwards();
+
+        assert!(closed.is_empty(), "a failed read must close nothing");
+        assert_eq!(engine.rules().len(), 1, "and must leave the record alone");
+        assert_eq!(
+            backend.handles().len(),
+            1,
+            "and must leave the firewall alone"
+        );
+        assert!(
+            runner
+                .recorded()
+                .iter()
+                .filter(|c| c.program == "iptables")
+                .count()
+                >= 2,
+            "the read has to have been attempted at all"
+        );
+    }
+
+    #[test]
+    fn a_forward_whose_container_moved_is_closed_and_returned() {
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DockerChain::Reads(DOCKER_CHAIN_LOOPBACK), Vec::new());
+        let mut engine = engine_with_a_forward(&backend, &runner, &clock, harness.store());
+        let opened = engine.rules()[0].clone();
+
+        runner.answers(DockerChain::Reads(DOCKER_CHAIN_MOVED));
+        let closed = engine.close_stale_forwards();
+
+        assert_eq!(closed.len(), 1, "the moved forward must close");
+        assert_eq!(closed[0].id, opened.id);
+        assert_eq!(
+            closed[0].forward.as_ref().unwrap().container_addr,
+            CONTAINER_ADDR.parse::<std::net::Ipv4Addr>().unwrap(),
+            "what is returned is the rule as it was, not as Docker is now"
+        );
+        assert!(engine.rules().is_empty(), "and must leave the state");
+        assert!(
+            backend.handles().is_empty(),
+            "and must leave the firewall -- not merely the state file"
+        );
+
+        // Gone for a fresh reader too, so a helper restart cannot resurrect
+        // a forward towards a container that is not there.
+        assert!(StateStore::open(&harness.path).unwrap().rules().is_empty());
+    }
+
+    #[test]
+    fn a_forward_whose_container_is_unchanged_survives_the_sweep() {
+        // The negative half. Without it every assertion above is satisfied by
+        // a method that closes every forward it finds.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DockerChain::Reads(DOCKER_CHAIN_LOOPBACK), Vec::new());
+        let mut engine = engine_with_a_forward(&backend, &runner, &clock, harness.store());
+
+        let closed = engine.close_stale_forwards();
+
+        assert!(closed.is_empty(), "closed: {closed:?}");
+        assert_eq!(engine.rules().len(), 1);
+        assert_eq!(backend.handles().len(), 1);
+    }
+
+    #[test]
+    fn an_ordinary_open_survives_a_sweep_that_finds_no_container_at_all() {
+        // A machine with no Docker answers an empty chain, which is an
+        // answer and not a failure. A rule that never named a container has
+        // nothing for that answer to contradict.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DockerChain::Reads("-N DOCKER\n"), subnet_open_script());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        assert!(engine.close_stale_forwards().is_empty());
+        assert_eq!(engine.rules().len(), 1);
+        assert_eq!(backend.handles().len(), 1);
     }
 }

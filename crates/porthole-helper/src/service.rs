@@ -412,7 +412,7 @@ impl Porthole {
         // journal must not say "closed", which `format_close_log` always
         // does. A different, explicit line for a different, explicit action.
         //
-        // And no `RuleClosed` either, for the same reason: none of the four
+        // And no `RuleClosed` either, for the same reason: none of the
         // reasons a `RuleClosed` can carry is true of a forget, and a
         // subscriber told "closed" would tell someone a port had stopped
         // being reachable when porthole did not touch any firewall and does
@@ -422,7 +422,7 @@ impl Porthole {
         // read it: `porthole_core::ipc`'s own `rule_closed` doc says that a
         // rule can leave `list` with no `RuleClosed` behind it, so an agent
         // that keeps its view from signals alone would go on showing a
-        // forgotten rule as open. Inventing a fifth reason, or reusing
+        // forgotten rule as open. Inventing a reason of its own, or reusing
         // `requested`, would trade that for a worse claim.
         if forget {
             Self::log_forget(&rule, closed_by);
