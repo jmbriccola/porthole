@@ -693,11 +693,11 @@ impl<'a> Engine<'a> {
         }) {
             return Err(Error::ForwardCheckUnavailable(format!(
                 "porthole will not create this forward: {published_port}/{proto} is \
-                 published by more than one container on this machine -- {}:{} and \
+                 published to more than one destination on this machine -- {}:{} and \
                  {}:{} -- and nothing in `porthole forward {published_port}` says which \
                  of them you mean. Picking one would let the order of Docker's own \
                  rules decide where your traffic went. Publish them on different host \
-                 ports, or stop the one you do not mean.",
+                 ports, or publish only the one you mean.",
                 mapping.container_addr,
                 mapping.container_port,
                 other.container_addr,

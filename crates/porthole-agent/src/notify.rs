@@ -78,38 +78,6 @@ pub fn is_worth_announcing(reason: CloseReason) -> bool {
     !matches!(reason, CloseReason::Requested)
 }
 
-/// What to say about a rule that has stopped being open.
-///
-/// Total over every reason, including the one [`is_worth_announcing`] filters
-/// out, so a reason added to the wire enum has to come here and say what it
-/// looks like rather than falling into a catch-all.
-///
-/// Two reasons offer `reopen`, and the test for which is whether re-sending
-/// the request can still mean what it meant.
-///
-/// An expiry can: nothing about the machine changed under the rule, the
-/// clock the user set ran out, so re-sending the same request restores what
-/// they asked for. [`CloseReason::TargetGone`] can too, and this is the
-/// non-obvious one. The request behind a forward names a *published port* --
-/// a service on this machine -- never a container address; the address is
-/// resolved by the helper, against Docker's own table, at the moment it
-/// acts. So a container that restarted somewhere else is not something the
-/// stored request pointed at and lost: it is something the request would
-/// find again. That is exactly what re-sending it does, and it is why the
-/// rule was closed rather than re-aimed in the first place -- porthole
-/// re-resolves, it does not assume.
-///
-/// The other two cannot. After a network change the machine is somewhere
-/// else, and a rule for a subnet it has left would appear to work and reach
-/// nobody -- the request names that subnet, and no re-resolution can make it
-/// the one this machine is on. After a reconciliation something outside
-/// porthole removed the rule from the firewall, and this cannot tell what:
-/// putting it back at one click, before the user has seen what took it away,
-/// would be porthole arguing with whatever that was.
-///
-/// A `Reopen` on a forward re-sends a **forward**, not an `open` -- see
-/// `crate::reopen_request` in `main.rs`, which is where that is decided and
-/// where the harm of getting it wrong is spelled out.
 /// What the rule was, named so that a reader can act on it: an ordinary
 /// open, or a redirect into a container.
 ///
@@ -143,6 +111,38 @@ fn subject(rule: &WireRule) -> String {
     }
 }
 
+/// What to say about a rule that has stopped being open.
+///
+/// Total over every reason, including the one [`is_worth_announcing`] filters
+/// out, so a reason added to the wire enum has to come here and say what it
+/// looks like rather than falling into a catch-all.
+///
+/// Two reasons offer `reopen`, and the test for which is whether re-sending
+/// the request can still mean what it meant.
+///
+/// An expiry can: nothing about the machine changed under the rule, the
+/// clock the user set ran out, so re-sending the same request restores what
+/// they asked for. [`CloseReason::TargetGone`] can too, and this is the
+/// non-obvious one. The request behind a forward names a *published port* --
+/// a service on this machine -- never a container address; the address is
+/// resolved by the helper, against Docker's own table, at the moment it
+/// acts. So a container that restarted somewhere else is not something the
+/// stored request pointed at and lost: it is something the request would
+/// find again. That is exactly what re-sending it does, and it is why the
+/// rule was closed rather than re-aimed in the first place -- porthole
+/// re-resolves, it does not assume.
+///
+/// The other two cannot. After a network change the machine is somewhere
+/// else, and a rule for a subnet it has left would appear to work and reach
+/// nobody -- the request names that subnet, and no re-resolution can make it
+/// the one this machine is on. After a reconciliation something outside
+/// porthole removed the rule from the firewall, and this cannot tell what:
+/// putting it back at one click, before the user has seen what took it away,
+/// would be porthole arguing with whatever that was.
+///
+/// A `Reopen` on a forward re-sends a **forward**, not an `open` -- see
+/// `crate::reopen_request` in `main.rs`, which is where that is decided and
+/// where the harm of getting it wrong is spelled out.
 pub fn notification_for(rule: &WireRule, reason: CloseReason) -> Notification {
     let port = format!("{}/{}", rule.port, rule.protocol);
     let subject = subject(rule);

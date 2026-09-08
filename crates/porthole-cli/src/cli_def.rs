@@ -41,14 +41,20 @@ Exit codes:
   10 `porthole forward` was given a port no container publishes, or
      Docker could not be read at all. The message says which.
   11 The port `porthole forward` would give the local network is
-     already carrying something a redirect would take traffic from:
-     a porthole rule, or a service listening on an address the
-     network reaches. A loopback-only listener is not one of them,
-     and does not refuse. The message names `--as <PORT>`, which is
-     what gives the local network a different port.
+     already carrying something a redirect would take traffic from.
+     Three sources are checked and the message says which found it:
+     a porthole rule, a container Docker publishes on that port at
+     an address the network reaches, or a service listening on such
+     an address. Restricted to loopback, neither the mapping nor
+     the listener refuses. The message names `--as <PORT>`, which
+     is what gives the local network a different port.
   12 This machine's firewall has no way to redirect a port.
-  13 A check porthole makes before creating a redirect has no answer
-     for what was asked. The message says which check.
+  13 Something porthole must settle before creating a redirect has
+     no answer for what was asked: the listener check reads TCP
+     only, so a UDP forward would compare against nothing, or the
+     published port has more than one destination and the request
+     does not say which is meant. The message says which of the
+     two, and what to do about it.
   14 Docker publishes that container on an address other than
      loopback, so the local network may already reach it. That is
      Docker's own rule, and porthole can neither have made it nor
