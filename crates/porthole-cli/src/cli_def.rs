@@ -41,13 +41,21 @@ Exit codes:
   10 `porthole forward` was given a port no container publishes, or
      Docker could not be read at all. The message says which.
   11 The port `porthole forward` would give the local network is
-     already carrying something.
+     already carrying something a redirect would take traffic from:
+     a porthole rule, or a service listening on an address the
+     network reaches. A loopback-only listener is not one of them,
+     and does not refuse. The message names `--as <PORT>`, which is
+     what gives the local network a different port.
   12 This machine's firewall has no way to redirect a port.
   13 A check porthole makes before creating a redirect has no answer
      for what was asked. The message says which check.
-  14 The container is already reachable from the network, because
-     Docker published it there. That is Docker's own rule, and
-     porthole can neither have made it nor close it.
+  14 Docker publishes that container on an address other than
+     loopback, so the local network may already reach it. That is
+     Docker's own rule, and porthole can neither have made it nor
+     close it. What porthole read to decide this is the `-d` flag on
+     Docker's own DNAT rule for the port, and nothing else: no `-d`
+     is every interface, and a `-d` naming any other address is that
+     address, whether or not this machine holds it.
 
 No permanent rules:
   Every rule porthole writes is a runtime rule, so a reboot closes
@@ -118,6 +126,12 @@ pub enum Commands {
     /// consequence is different: `open` permits traffic to something already
     /// listening on the network, and this redirects traffic to something
     /// that was not. It asks for permission every time.
+    ///
+    /// There is no --proto: every forward is TCP. Before creating a redirect
+    /// porthole checks whether something on this machine already answers on
+    /// the port the local network would connect to, and that check reads TCP
+    /// sockets only -- so a UDP request is refused rather than made with the
+    /// check having compared against nothing.
     Forward(ForwardArgs),
     /// Close a port porthole opened.
     Close(CloseArgs),

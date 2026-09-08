@@ -721,4 +721,92 @@ mod tests {
         };
         assert_eq!(wire_error_to_local(wire).kind(), "unexpected");
     }
+
+    /// Every arm of `static_kind` and `exit_code_from_i32`, driven from the
+    /// local `Error` that produced the wire values in the first place.
+    ///
+    /// Both functions had exactly one caller -- `wire_error_to_local`, for
+    /// `close_all`'s per-rule failures -- and `close_all` cannot produce a
+    /// forward failure, so nothing in the workspace ever exercised the six
+    /// forward arms of either. Deleting `14 => ExitCode::AlreadyReachable`
+    /// *and* the `"already_reachable"` slug together left every test green.
+    ///
+    /// Not a hand-written table of numbers: taking each pair from the local
+    /// `Error`'s own `kind()` and `exit_code()` is what makes this a
+    /// round-trip rather than a second copy of the mapping, which would agree
+    /// with a wrong one just as readily.
+    #[test]
+    fn every_kind_and_code_a_helper_can_send_maps_back_to_the_error_it_came_from() {
+        // `porthole-helper`'s `HelperError` sends each of these under a name
+        // of its own; everything else it can send collapses into `Failed`,
+        // whose kind is `unexpected` and whose code is 1.
+        let sent: &[Error] = &[
+            Error::InvalidArgument(String::new()),
+            Error::BackendUnavailable(String::new()),
+            Error::NotAuthorized(String::new()),
+            Error::AlreadyOpen {
+                port: 5173,
+                protocol: porthole_core::model::Protocol::Tcp,
+                detail: String::new(),
+            },
+            Error::DeviceUnreachable(String::new()),
+            Error::RuleNotFound(String::new()),
+            Error::NoNetwork(String::new()),
+            Error::CommandFailed {
+                command: String::new(),
+                status: 1,
+                stderr: String::new(),
+            },
+            Error::State {
+                path: String::new(),
+                detail: String::new(),
+            },
+            Error::ForwardUnsupported(String::new()),
+            Error::NotPublishedByContainer(String::new()),
+            Error::DockerUnreadable(String::new()),
+            Error::ExternalPortInUse {
+                port: 0,
+                detail: String::new(),
+            },
+            Error::ForwardCheckUnavailable(String::new()),
+            Error::AlreadyReachable(String::new()),
+        ];
+
+        for original in sent {
+            let wire = WireError {
+                message: "rendered by the helper".to_string(),
+                kind: original.kind().to_string(),
+                code: original.exit_code() as i32,
+            };
+            let back = wire_error_to_local(wire);
+            assert_eq!(
+                back.kind(),
+                original.kind(),
+                "the kind slug did not survive the bus"
+            );
+            assert_eq!(
+                back.exit_code(),
+                original.exit_code(),
+                "the exit code did not survive the bus for kind {}",
+                original.kind()
+            );
+        }
+
+        // The forward codes specifically: each is a number a script switches
+        // on, so none of them may arrive as the catch-all. Asserted apart
+        // from the loop because `command_failed` and `state_error` above
+        // legitimately carry `ExitCode::Failure` and would mask a fallback.
+        for code in [10, 11, 12, 13, 14] {
+            assert_ne!(
+                exit_code_from_i32(code),
+                ExitCode::Failure,
+                "exit code {code} fell through to the catch-all"
+            );
+        }
+
+        // And the reverse direction: a number this client has never heard of
+        // is a failure, not a panic and not a wrong code.
+        assert_eq!(exit_code_from_i32(99), ExitCode::Failure);
+        assert_eq!(exit_code_from_i32(0), ExitCode::Failure);
+    }
 }

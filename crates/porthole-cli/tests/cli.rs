@@ -1455,11 +1455,12 @@ fn each_refusal_a_forward_can_reach_has_its_own_exit_code() {
         assert_eq!(json["error"]["kind"], expected_kind, "{name}");
     }
 
-    // The external port already carries something. A real listener of this
-    // test's own, so the check has something to find that is not this
-    // machine's business: `listening::scan` reads every listening socket,
-    // whatever address it is bound to.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    // The external port already carries something the redirect would take
+    // traffic from. A real listener of this test's own, on `0.0.0.0` --
+    // which is the binding that makes the refusal right, and the one thing
+    // this case has to control. It is bound and never accepted on, for as
+    // long as one `--dry-run` takes.
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("a port on every interface");
     let taken = listener.local_addr().unwrap().port().to_string();
 
     let dir = TempDir::new().unwrap();
@@ -1476,23 +1477,146 @@ fn each_refusal_a_forward_can_reach_has_its_own_exit_code() {
     assert_eq!(code(&out), 11, "stderr: {}", stderr(&out));
     let json: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid JSON");
     assert_eq!(json["error"]["kind"], "external_port_in_use");
+    let message = json["error"]["message"].as_str().expect("a message");
     assert!(
-        json["error"]["message"]
-            .as_str()
-            .expect("a message")
-            .contains(&taken),
+        message.contains(&taken),
         "the refusal must name the port it is about: {}",
+        stdout(&out)
+    );
+    assert!(
+        message.contains("--as"),
+        "and, since the same refusal fires on `forward <PORT>` with no `--as`, \
+         say what to do about it: {}",
         stdout(&out)
     );
 }
 
+/// `porthole forward <PORT>` with no `--as`, against a container published on
+/// `127.0.0.1` with something already listening there -- which is every
+/// container this command exists for, on a default Docker install, because
+/// Docker's userland proxy is on by default and holds
+/// `127.0.0.1:<published>` itself.
+///
+/// This form returned exit 11 (`external_port_in_use`) until the check that
+/// decides it started reading where a listener is bound. `forward <PORT>
+/// --as <other>` was unaffected and passed throughout, which is why no test
+/// here saw it: every other forward case either stubs an unlistened port or
+/// passes `--as`.
+#[test]
+fn a_loopback_listener_on_the_published_port_does_not_refuse_the_ordinary_forward() {
+    if !have("firewall-cmd") || !have("ip") {
+        eprintln!("skipped: needs firewall-cmd and ip");
+        return;
+    }
+
+    // Bound first, so the number is one nothing else on this machine can
+    // take, and held for the whole run: this stands in for `docker-proxy`.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().unwrap().port();
+
+    let dir = TempDir::new().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    stub(
+        &bin,
+        "iptables",
+        &format!(
+            "echo '-N DOCKER'\n\
+             echo '-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport {port} \
+             -j DNAT --to-destination 172.17.0.9:80'"
+        ),
+    );
+
+    let number = port.to_string();
+    let mut command = porthole_command(&["forward", &number, "--dry-run", "--json"]);
+    command
+        .env("PORTHOLE_STATE_FILE", state_path(&dir))
+        .env("PATH", path_ahead_of(&bin));
+    let out = run(command, None);
+
+    assert_eq!(
+        code(&out),
+        0,
+        "the ordinary form must not be refused: stdout {} stderr {}",
+        stdout(&out),
+        stderr(&out)
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    assert_eq!(
+        json["rule"]["port"],
+        port,
+        "and the rule is the one that was asked for: {}",
+        stdout(&out)
+    );
+    assert_eq!(
+        json["rule"]["forward"]["container_port"],
+        80,
+        "towards the container the stub published: {}",
+        stdout(&out)
+    );
+}
+
+/// Which of `forward`'s two port numbers is which, read off `--help` the way
+/// a person does: from the description printed under each one.
+///
+/// The name used to be the whole of the claim. `text.contains("--as")` and
+/// four friends passed with the two descriptions swapped -- help that told a
+/// user the positional port was the one the local network would see, which is
+/// the single thing this command's surface has to get right. So each
+/// description is now looked up under the argument it belongs to, and the two
+/// are asserted apart.
 #[test]
 fn forward_help_says_which_number_is_which() {
     let dir = TempDir::new().unwrap();
     let out = porthole(&["forward", "--help"], &state_path(&dir));
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
     let text = stdout(&out);
-    for expected in ["--as", "--to", "--for", "listen"] {
+
+    // clap's long help puts each argument on its own line and its
+    // description on the next non-blank one.
+    let described = |argument: &str| -> String {
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.trim() == argument)
+            .unwrap_or_else(|| panic!("`{argument}` is not an argument line in: {text}"));
+        lines[at + 1..]
+            .iter()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or_else(|| panic!("nothing is said about `{argument}` in: {text}"))
+            .trim()
+            .to_string()
+    };
+
+    let positional = described("<PORT>");
+    let as_port = described("--as <PORT>");
+
+    assert!(
+        positional.contains("Docker published") && positional.contains("porthole listen"),
+        "the positional port is the one already on this machine: {positional}"
+    );
+    assert!(
+        !positional.contains("local network"),
+        "and it is not the one the local network sees: {positional}"
+    );
+    assert!(
+        as_port.contains("local network"),
+        "`--as` is the port the local network connects to: {as_port}"
+    );
+    assert!(
+        !as_port.contains("Docker published"),
+        "and not the one Docker published: {as_port}"
+    );
+
+    for expected in ["--to", "--for"] {
         assert!(text.contains(expected), "`{expected}` missing from: {text}");
     }
+
+    // Why there is no `--proto` was written down in a Rust doc comment on
+    // `ForwardArgs`, which clap never renders: the question a user asks after
+    // `forward --proto udp` is refused had no answer anywhere they would look.
+    assert!(
+        text.contains("--proto") && text.contains("TCP"),
+        "`--help` must say why there is no protocol to choose: {text}"
+    );
 }

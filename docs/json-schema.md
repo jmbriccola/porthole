@@ -256,10 +256,18 @@ detected firewall cannot redirect a port at all, `not_published_by_container`
 and `docker_unreadable` (both `10`, and the two are told apart by `kind`
 alone) when no container publishes the port or Docker could not be read,
 `external_port_in_use` (`11`) when the port the local network would connect
-to is already carrying something, `forward_check_unavailable` (`13`) when a
+to already carries something a redirect would take traffic from — a porthole
+rule, or a service listening on `0.0.0.0` or on one address the network
+reaches; a loopback-only listener is not one of them and does not refuse —
+`forward_check_unavailable` (`13`) when a
 check porthole makes before creating a redirect has no answer for what was
-asked, and `already_reachable` (`14`) when Docker has already published the
-container to the network. Every one of them is decided by porthole, not by
+asked, and `already_reachable` (`14`) when Docker publishes the container on
+an address other than loopback. What that last one reads is the `-d` flag on
+Docker's own DNAT rule for the port and nothing else: no `-d` is every
+interface, and a `-d` naming any other address is that one address, whether
+or not this machine holds it — so a container published on an address no
+interface here carries is refused too. Every one of them is decided by
+porthole, not by
 this CLI, and each arrives with the same `code` and `kind` whether the work
 was attempted locally under `--dry-run` or over the bus.
 

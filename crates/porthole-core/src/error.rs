@@ -36,15 +36,22 @@ pub enum ExitCode {
     /// read at all. One code for two facts: the exit status does not say
     /// which, and [`Error::kind`] and the variant are what do.
     NotForwardable = 10,
-    /// The external port a forward would use is already carrying something.
+    /// The external port a forward would use is already carrying something a
+    /// redirect would take traffic from.
     ExternalPortInUse = 11,
     /// The detected backend has no way to redirect a port.
     ForwardUnsupported = 12,
     /// A check porthole makes before creating a forward does not cover what
     /// was asked for.
     ForwardCheckUnavailable = 13,
-    /// The port a forward was asked to redirect to is already reachable from
-    /// the network, because Docker published it there.
+    /// Docker publishes the container on an address other than loopback, so
+    /// the local network may already reach the port a forward was asked to
+    /// redirect to.
+    ///
+    /// What is read to decide it is one DNAT rule's own `-d` flag: no `-d` is
+    /// every interface, and a `-d` naming an address outside `127.0.0.0/8` is
+    /// that one address. Which interface carries that address has not been
+    /// looked at.
     ///
     /// Its own code rather than one of 10-13 above, because it is a
     /// different answer from every one of them: [`ExitCode::NotForwardable`]
@@ -129,11 +136,14 @@ pub enum Error {
     #[error("{0}")]
     DockerUnreadable(String),
 
-    /// The external port a forward would use is already carrying something.
+    /// The external port a forward would use is already carrying something a
+    /// redirect would take traffic from.
     ///
     /// Two situations reach this, and `detail` is where they differ: porthole
-    /// already has a rule on that port, or a socket on this machine is
-    /// listening on it.
+    /// already has a rule on that port, or a socket bound to an address the
+    /// local network reaches is listening on it. A socket bound only to a
+    /// loopback address is neither, and does not refuse -- see
+    /// [`crate::engine::Engine::forward`].
     #[error("port {port} is already in use ({detail})")]
     ExternalPortInUse { port: u16, detail: String },
 

@@ -16,7 +16,7 @@ use crate::command::CommandRunner;
 use crate::error::{Error, Result};
 use crate::expiry;
 use crate::forward::ForwardTo;
-use crate::listening::ProcFs;
+use crate::listening::{Binding, ProcFs};
 use crate::model::{Lifetime, OpenRequest, Protocol, ScopeSpec, Target};
 use crate::net::{self, LocalNetwork};
 use crate::reconcile;
@@ -440,9 +440,15 @@ impl<'a> Engine<'a> {
     /// and then against this machine's listening sockets. Either refuses with
     /// [`Error::ExternalPortInUse`], whose `detail` says which. Both exist
     /// because a redirect claims the port: what arrives on it reaches the
-    /// container. The listening check does not look at what a socket is bound
-    /// to -- any listener on that port and protocol refuses, loopback ones
-    /// included.
+    /// container. The listening check reads what each socket is bound to. A
+    /// forward is an IPv4 rule matching traffic from the target network, so
+    /// the sockets it can take traffic from are the ones `porthole listen`
+    /// prints unlabelled: [`crate::listening::Binding::AllInterfaces`] and
+    /// [`crate::listening::Binding::Specific`]. A socket bound to a loopback
+    /// address is not one of them -- `docker-proxy` holds
+    /// `127.0.0.1:<published>` for every container published the way this
+    /// command exists to forward, so refusing on one refused
+    /// `porthole forward <PORT>` with no `--as` on a default Docker install.
     ///
     /// Ahead of all of it, reading nothing: whether the detected firewall can
     /// express a redirect at all, and whether porthole can check what this
@@ -570,17 +576,35 @@ impl<'a> Engine<'a> {
                  say whether anything already answers on {external}: {e}"
             ))
         })?;
-        if let Some(service) = listeners
-            .iter()
-            .find(|s| s.port == external && s.protocol == req.protocol)
-        {
-            let detail = match &service.process {
+        // The same predicate `porthole listen` partitions its rows with, from
+        // the same `Binding`, so the two answers cannot drift: a socket this
+        // machine shows as network-facing is one the redirect would take
+        // traffic from, and a loopback-bound or IPv6-only one is not. Only
+        // firewalld implements `forward`, and its rich rule is
+        // `family="ipv4"`, so `AllInterfaces` (`0.0.0.0`, and `::`, which
+        // accepts v4-mapped connections) and `Specific` (one non-loopback
+        // IPv4 address) are the bindings whose traffic an IPv4 redirect can
+        // divert.
+        if let Some(service) = listeners.iter().find(|s| {
+            s.port == external
+                && s.protocol == req.protocol
+                && matches!(s.binding, Binding::AllInterfaces | Binding::Specific(_))
+        }) {
+            let held = match &service.process {
                 Some(name) => format!("`{name}` is listening on it"),
                 None => "something on this machine is listening on it".to_string(),
             };
+            // Names `--as` because this refusal still fires on
+            // `porthole forward <PORT>` with no `--as`, where the external
+            // port is the published one, and "already in use" on its own
+            // reads as though the request could not be made at all.
             return Err(Error::ExternalPortInUse {
                 port: external,
-                detail,
+                detail: format!(
+                    "{held}, on {}, and the redirect would take its traffic -- \
+                     give the local network a different port with `--as <PORT>`",
+                    service.address
+                ),
             });
         }
 
@@ -2485,6 +2509,21 @@ mod tests {
    0: 0100007F:20FB 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 67371 1 0000000000000000 100 0 0 10 0
 ";
 
+    /// One `LISTEN` socket on 8443 bound to `192.168.1.5` (hex `0501A8C0`,
+    /// little-endian) -- an address on this machine's own network, which the
+    /// redirect really would take traffic from.
+    const PROC_NET_TCP_8443_ON_ONE_ADDRESS: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0501A8C0:20FB 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 67371 1 0000000000000000 100 0 0 10 0
+";
+
+    /// What a default Docker install puts on the published port: one `LISTEN`
+    /// socket on 3000 (hex `0BB8`) bound to `127.0.0.1` (hex `0100007F`),
+    /// held by `docker-proxy`. `DOCKER_CHAIN_LOOPBACK` is the DNAT rule that
+    /// goes with it.
+    const PROC_NET_TCP_3000_DOCKER_PROXY: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:0BB8 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 67372 1 0000000000000000 100 0 0 10 0
+";
+
     fn nothing_listening() -> FakeProcFs {
         FakeProcFs::new(PROC_NET_TCP_EMPTY)
     }
@@ -2751,7 +2790,11 @@ mod tests {
     #[test]
     fn forward_refuses_an_external_port_something_on_this_machine_is_listening_on() {
         // A redirect claims the port: what arrives on it goes to the
-        // container instead of to whatever answered before.
+        // container instead of to whatever answered before. `0.0.0.0` is the
+        // binding that makes that true, so the message has to name it --
+        // otherwise this test would pass just as well against a check that
+        // refused every listener, loopback ones included, which is the
+        // defect the narrowing above fixed.
         let harness = Harness::new();
         let backend = FakeBackend::new();
         let clock = FixedClock(NOW);
@@ -2772,6 +2815,15 @@ mod tests {
         assert!(
             text.contains("8443") && text.contains("nginx"),
             "the message must name the port and what holds it: {text}"
+        );
+        assert!(
+            text.contains("0.0.0.0"),
+            "and where it is bound, which is why this one refuses: {text}"
+        );
+        assert!(
+            text.contains("--as"),
+            "this refusal still fires on `forward <PORT>` with no `--as`, so it has \
+             to say what to do about it: {text}"
         );
         assert!(
             backend.forwarded().is_empty(),
@@ -2997,11 +3049,70 @@ mod tests {
     }
 
     #[test]
-    fn forward_refuses_an_external_port_a_loopback_only_service_listens_on() {
-        // The check does not look at what a socket is bound to, and this is
-        // the case that would slip through if it started to: a service on
-        // 127.0.0.1 is one porthole is not able to say the redirect leaves
-        // alone.
+    fn forward_allows_an_external_port_only_a_loopback_socket_listens_on() {
+        // A redirect matching traffic from the target network cannot take
+        // anything from a socket bound to 127.0.0.1: that socket never
+        // receives traffic from the network in the first place.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DockerChain::Reads(DOCKER_CHAIN_LOOPBACK), Vec::new());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let rule = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &FakeProcFs::new(PROC_NET_TCP_8443_LOOPBACK),
+            )
+            .expect("a loopback listener is not something a redirect can take traffic from");
+
+        assert_eq!(rule.port, EXTERNAL_PORT);
+        assert_eq!(backend.forwarded().len(), 1);
+    }
+
+    #[test]
+    fn the_ordinary_form_of_forward_survives_dockers_own_loopback_proxy() {
+        // The Critical this test exists for: Docker's userland proxy is on by
+        // default and puts `docker-proxy` on `127.0.0.1:<published>` for
+        // exactly the `-p 127.0.0.1:P:...` containers `forward` is for. With
+        // no `--as`, the external port *is* that published port, so a check
+        // that refused any listener refused the ordinary form of the command
+        // on a default install -- `porthole forward 3000` against a container
+        // published as `127.0.0.1:3000` returned exit 11.
+        //
+        // Both ports are 3000 here on purpose: that identity is what makes
+        // the default form the failing one.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DockerChain::Reads(DOCKER_CHAIN_LOOPBACK), Vec::new());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let rule = engine
+            .forward(
+                &forward_req(PUBLISHED_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &FakeProcFs::new(PROC_NET_TCP_3000_DOCKER_PROXY).with_socket(
+                    67372,
+                    9001,
+                    "docker-proxy",
+                ),
+            )
+            .expect("the ordinary form of the command must work on a default Docker install");
+
+        assert_eq!(rule.port, PUBLISHED_PORT);
+        assert_eq!(backend.forwarded().len(), 1);
+    }
+
+    #[test]
+    fn forward_refuses_an_external_port_one_reachable_address_listens_on() {
+        // The other half of the narrowing: `Specific` is not `AllInterfaces`,
+        // but it is just as network-facing, and a redirect really would take
+        // its traffic. Folding it in with the loopback case would have made
+        // the fix for the loopback one a hole.
         let harness = Harness::new();
         let backend = FakeBackend::new();
         let clock = FixedClock(NOW);
@@ -3013,11 +3124,20 @@ mod tests {
                 &forward_req(EXTERNAL_PORT),
                 PUBLISHED_PORT,
                 1000,
-                &FakeProcFs::new(PROC_NET_TCP_8443_LOOPBACK),
+                &FakeProcFs::new(PROC_NET_TCP_8443_ON_ONE_ADDRESS),
             )
             .unwrap_err();
 
         assert!(matches!(err, Error::ExternalPortInUse { .. }), "got {err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("192.168.1.5"),
+            "the message must say where the listener is bound: {text}"
+        );
+        assert!(
+            backend.forwarded().is_empty(),
+            "a refusal must not have reached the firewall"
+        );
     }
 
     #[test]

@@ -44,7 +44,7 @@ pub enum HelperError {
     /// unknown. The other half of the pair above.
     DockerUnreadable(String),
     /// The port a forward would give the local network is already carrying
-    /// something.
+    /// something a redirect would take traffic from.
     ExternalPortInUse(String),
     /// A check `forward` makes before creating a redirect has no answer for
     /// what was asked.
