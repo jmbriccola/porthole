@@ -797,6 +797,17 @@ impl<'a> Engine<'a> {
     /// the shape [`crate::net::present_networks`]'s callers already keep for a
     /// resolution they could not make: only an answer closes anything.
     ///
+    /// That covers a read failure, not every non-zero exit: [`crate::docker::
+    /// published`] already answers exit `1` -- "No chain/target/match by
+    /// that name" -- as `Ok(Vec::new())`, the same "nothing published" an
+    /// installed-but-empty chain gives, because the two are indistinguishable
+    /// from here. The `DOCKER` chain is Docker's own, written by the daemon;
+    /// while the daemon is stopped there is no chain, so a stopped daemon is
+    /// one of the things that produces exit `1`. Its `Ok(Vec::new())` never
+    /// reaches the early return above -- it goes on to `stale_forwards` as a
+    /// real answer, and every rule carrying a Docker mapping reads as
+    /// unmatched. So a Docker daemon restart closes every forward, not none.
+    ///
     /// A stale forward closes. It is never re-aimed at whatever address the
     /// container holds now, for the same reason a rule scoped to a subnet the
     /// machine has left is not re-aimed at the subnet it is on: the request
@@ -2488,6 +2499,14 @@ mod tests {
         /// as an empty chain -- unlike exit 1, which it reads as exactly
         /// that, and which would therefore test the wrong thing here.
         Unreadable,
+        /// Exit 1, "No chain/target/match by that name" -- what a stopped
+        /// Docker daemon looks like, since the `DOCKER` chain is Docker's
+        /// own and nothing declares it while the daemon is down.
+        /// `docker::published` reads this as `Ok(Vec::new())`, the same
+        /// answer an installed-but-empty chain gives, not as a read
+        /// failure -- so this is deliberately a different variant from
+        /// `Unreadable`, not the same fault at a different exit code.
+        NoSuchChain,
     }
 
     /// Answers the `DOCKER` chain read and passes everything else to an
@@ -2541,6 +2560,11 @@ mod tests {
                         status: 4,
                         stdout: String::new(),
                         stderr: "iptables: Resource temporarily unavailable.".to_string(),
+                    },
+                    DockerChain::NoSuchChain => Output {
+                        status: 1,
+                        stdout: String::new(),
+                        stderr: "iptables: No chain/target/match by that name.".to_string(),
                     },
                 });
             }
@@ -3258,6 +3282,37 @@ mod tests {
                 .count()
                 >= 2,
             "the read has to have been attempted at all"
+        );
+    }
+
+    #[test]
+    fn a_stopped_docker_daemon_closes_every_forward() {
+        // The negative half of the test above. Exit 1 is not read as a
+        // failure by `docker::published` -- it is read as "nothing
+        // published", the same answer an installed-but-empty chain gives --
+        // so it never reaches the early return `Unreadable` does, and closes
+        // the forward instead of leaving it alone. A stopped Docker daemon
+        // is one of the things that produces exit 1: the `DOCKER` chain is
+        // the daemon's own, and nothing declares it while the daemon is
+        // down.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DockerChain::Reads(DOCKER_CHAIN_LOOPBACK), Vec::new());
+        let mut engine = engine_with_a_forward(&backend, &runner, &clock, harness.store());
+
+        runner.answers(DockerChain::NoSuchChain);
+        let closed = engine.close_stale_forwards();
+
+        assert_eq!(
+            closed.len(),
+            1,
+            "exit 1 must be read as an answer, not a failure, so the forward closes"
+        );
+        assert!(engine.rules().is_empty(), "and must leave the state");
+        assert!(
+            backend.handles().is_empty(),
+            "and must leave the firewall -- not merely the state file"
         );
     }
 

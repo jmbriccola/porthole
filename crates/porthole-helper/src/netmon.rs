@@ -399,6 +399,18 @@ async fn wake_up(state_path: &Path, executable: &Path, emitter: Option<&SignalEm
         }
     };
 
+    announce_outcome(&outcome, emitter).await;
+}
+
+/// The signal half of a wake-up: what `outcome` decided, over the bus.
+///
+/// Split out of [`wake_up`] so this can be driven directly against a real
+/// emitter and a real subscriber, without also going through
+/// `wake_up_blocking`'s real backend detection -- see this module's own
+/// tests, which build an `outcome` by hand and check the reason a stale
+/// forward's close actually carries once it is decoded off the bus, not
+/// merely the `CheckOutcome` field it came from.
+async fn announce_outcome(outcome: &CheckOutcome, emitter: Option<&SignalEmitter<'_>>) {
     // First, and separately from anything about the network: these rules had
     // already stopped being open before this wake-up looked at anything.
     Porthole::announce_reconciled(emitter, &outcome.reconciled).await;
@@ -481,11 +493,15 @@ pub async fn run(bus: zbus::Connection, state_path: PathBuf, executable: PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authz::AlwaysAllow;
+    use futures_util::StreamExt;
     use porthole_core::backend::fake::FakeBackend;
     use porthole_core::clock::FixedClock;
     use porthole_core::command::{Output, RecordingRunner};
+    use porthole_core::ipc::PortholeProxy;
     use porthole_core::listening::FakeProcFs;
     use porthole_core::model::{Lifetime, OpenRequest, Protocol, ScopeSpec, Target};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     const NOW: u64 = 1_757_000_000;
@@ -1232,5 +1248,77 @@ mod tests {
         assert_eq!(engine.rules().len(), 1);
         assert_eq!(backend.handles().len(), 1);
         assert_eq!(runner.docker_reads(), 2, "the sweep has to have looked");
+    }
+
+    #[tokio::test]
+    async fn a_stale_forwards_close_reaches_the_bus_as_target_gone_not_a_network_change() {
+        // The tests above pin which list -- `stale` or `closed` -- a moved
+        // container's forward lands in. None of them call
+        // `announce_outcome`, the function that turns that list into a
+        // `CloseReason` on the wire, so none of them would notice a mutant
+        // that swapped which reason each loop announces. This one does: a
+        // real subscriber on a real bus, decoding the signal
+        // `announce_outcome` actually sent.
+        let name = "com.jacopobriccola.PortholeTestNetmonStaleReason";
+        let bus = zbus::Connection::session().await.unwrap();
+        let service = Porthole::new(
+            Box::new(Arc::new(AlwaysAllow::default())),
+            bus,
+            PathBuf::from("/nonexistent/state.json"),
+            PathBuf::from("/usr/bin/porthole"),
+        );
+        let server = zbus::connection::Builder::session()
+            .unwrap()
+            .name(name)
+            .unwrap()
+            .serve_at(PATH, service)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let emitter = SignalEmitter::new(&server, PATH).unwrap().into_owned();
+
+        let client = zbus::Connection::session().await.unwrap();
+        let proxy = PortholeProxy::builder(&client)
+            .destination(name)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let mut signals = proxy.receive_rule_closed().await.unwrap();
+
+        // A real forward, built through `forward` the same way
+        // `engine_with_a_forward` builds it for every other test in this
+        // file -- a hand-written `ManagedRule` would prove nothing about
+        // what `close_stale_forwards` itself hands `announce_outcome`.
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(dir.path().join("state.json")).unwrap();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DOCKER_CHAIN);
+        let mut engine = engine_with_a_forward(&backend, &runner, &clock, store);
+        let rule = engine.rules()[0].clone();
+
+        let outcome = CheckOutcome {
+            closed: Vec::new(),
+            transitions: Vec::new(),
+            last_known: Vec::new(),
+            reconciled: Vec::new(),
+            stale: vec![rule.clone()],
+        };
+        announce_outcome(&outcome, Some(&emitter)).await;
+
+        let signal = tokio::time::timeout(Duration::from_secs(5), signals.next())
+            .await
+            .expect("no signal arrived before the timeout")
+            .expect("the signal stream ended instead of yielding");
+        let args = signal.args().unwrap();
+        assert_eq!(
+            args.reason.as_str(),
+            "target-gone",
+            "a forward closed because its container moved must not be announced \
+             as a network change"
+        );
+        assert_eq!(args.rule.id, rule.id, "the reason travels with its rule");
     }
 }
