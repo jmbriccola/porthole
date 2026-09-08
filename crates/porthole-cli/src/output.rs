@@ -80,6 +80,17 @@ fn rule_json(rule: &ManagedRule, now: u64) -> Value {
         "expires_at": rule.expires_at,
         "expires_in_seconds": rule.expires_in(now),
         "uid": rule.uid,
+        // `null` for a rule that only permits, which is every rule `open`
+        // creates. The three members are the wire's own three
+        // (`WireRule::container_addr` and the two ports); there is no
+        // protocol among them because a forward whose two ends disagree is
+        // refused before it exists (`backend::forward_protocol`), so the
+        // rule's own `protocol` governs both.
+        "forward": rule.forward.as_ref().map(|f| json!({
+            "container_addr": f.container_addr.to_string(),
+            "container_port": f.container_port,
+            "published_port": f.published_port,
+        })),
     })
 }
 
@@ -146,33 +157,61 @@ pub fn json_error(error: &Error) -> Value {
     })
 }
 
+/// One rule's `REDIRECTS TO` cell: where a forward actually sends what
+/// arrives, and the port the container is published on -- the number the
+/// person typed, and the one `porthole listen` shows.
+///
+/// `--` for a rule that only permits. A forward rendered like an open tells a
+/// user their port permits traffic when it redirects it, and names nothing at
+/// the far end.
+fn redirect_cell(rule: &ManagedRule) -> String {
+    match &rule.forward {
+        Some(f) => format!(
+            "{}:{} (published on {})",
+            f.container_addr, f.container_port, f.published_port
+        ),
+        None => "--".to_string(),
+    }
+}
+
 pub fn print_rules(rules: &[ManagedRule], now: u64) {
     if rules.is_empty() {
         println!("No ports open.");
         return;
     }
 
-    let rows: Vec<[String; 4]> = rules
+    // The extra column appears only when there is a forward to put in it, so
+    // `list` on a machine that has never forwarded anything prints the four
+    // columns it always printed.
+    let any_forward = rules.iter().any(|r| r.forward.is_some());
+
+    let mut headers: Vec<&str> = vec!["PORT", "TOWARDS"];
+    if any_forward {
+        headers.push("REDIRECTS TO");
+    }
+    headers.extend(["BACKEND", "CLOSES IN"]);
+
+    let rows: Vec<Vec<String>> = rules
         .iter()
         .map(|r| {
-            [
-                format!("{}/{}", r.port, r.protocol),
-                r.target.to_string(),
-                r.backend.to_string(),
-                format_remaining(r.expires_in(now)),
-            ]
+            let mut row = vec![format!("{}/{}", r.port, r.protocol), r.target.to_string()];
+            if any_forward {
+                row.push(redirect_cell(r));
+            }
+            row.push(r.backend.to_string());
+            row.push(format_remaining(r.expires_in(now)));
+            row
         })
         .collect();
 
-    let headers = ["PORT", "TOWARDS", "BACKEND", "CLOSES IN"];
-    let mut widths = headers.map(str::len);
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
     for row in &rows {
         for (i, cell) in row.iter().enumerate() {
             widths[i] = widths[i].max(cell.len());
         }
     }
 
-    let line = |cells: [&str; 4]| {
+    let line = |cells: &[&str]| {
         let mut out = String::new();
         for (i, cell) in cells.iter().enumerate() {
             if i == cells.len() - 1 {
@@ -184,17 +223,10 @@ pub fn print_rules(rules: &[ManagedRule], now: u64) {
         out
     };
 
-    println!("{}", line(headers));
+    println!("{}", line(&headers));
     for row in &rows {
-        println!(
-            "{}",
-            line([
-                row[0].as_str(),
-                row[1].as_str(),
-                row[2].as_str(),
-                row[3].as_str()
-            ])
-        );
+        let cells: Vec<&str> = row.iter().map(String::as_str).collect();
+        println!("{}", line(&cells));
     }
 }
 
@@ -232,6 +264,39 @@ pub fn print_opened(rule: &ManagedRule, now: u64, docker_note: Option<&str>) {
     if let Some(note) = docker_note {
         println!();
         println!("{note}");
+    }
+}
+
+/// What `forward` did, or would do.
+///
+/// Three numbers, on two lines, because they are three different facts and a
+/// person told only the first cannot check the other two: the port the local
+/// network connects to, the address and port inside Docker that traffic
+/// actually reaches, and the port Docker published on this machine -- which
+/// is the number that was typed.
+pub fn print_forwarded(rule: &ManagedRule, now: u64, dry_run: bool) {
+    let verb = if dry_run {
+        "Would forward"
+    } else {
+        "Forwarded"
+    };
+    println!(
+        "{verb} {}/{} towards {} · closes {}",
+        rule.port,
+        rule.protocol,
+        rule.target,
+        format_remaining(rule.expires_in(now))
+    );
+    match &rule.forward {
+        Some(f) => println!(
+            "  -> {}:{} in Docker, published on this machine as {}/{}",
+            f.container_addr, f.container_port, f.published_port, rule.protocol
+        ),
+        // `Engine::forward` always records the mapping, and `client::forward`
+        // carries it back whenever the answer holds a container address. An
+        // answer that held none leaves nothing here to name, and naming one
+        // anyway would mean inventing it.
+        None => println!("  -> no container address came back with this rule"),
     }
 }
 

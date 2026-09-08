@@ -38,19 +38,35 @@ Exit codes:
   8  No usable network
   9  There was nothing to choose from. `porthole devices add` found
      no device on this network to offer.
+  10 `porthole forward` was given a port no container publishes, or
+     Docker could not be read at all. The message says which.
+  11 The port `porthole forward` would give the local network is
+     already carrying something.
+  12 This machine's firewall has no way to redirect a port.
+  13 A check porthole makes before creating a redirect has no answer
+     for what was asked. The message says which check.
+  14 The container is already reachable from the network, because
+     Docker published it there. That is Docker's own rule, and
+     porthole can neither have made it nor close it.
 
 No permanent rules:
   Every rule porthole writes is a runtime rule, so a reboot closes
   everything it opened, and a timed opening is capped at eight
-  hours. porthole does not do zones, services, NAT or port
-  forwarding; for those, use firewall-config, ufw or nft directly.
+  hours. porthole does not do zones, services or permanent rules;
+  for those, use firewall-config, ufw or nft directly. The one
+  redirect it writes is `porthole forward`'s, and that is a runtime
+  rule with a timer like every other.
 
 Docker:
   Docker publishes container ports through iptables rules of its
-  own, ahead of anything porthole writes. Such a port is reachable
-  whether or not porthole has opened it, and porthole can neither
-  open nor close it. `porthole doctor` lists the published ports it
-  can see, and `porthole listen` marks the listeners behind them.
+  own, ahead of anything porthole writes. A port published on every
+  interface is reachable whether or not porthole has opened it, and
+  porthole can neither open nor close it. A port published on this
+  machine's loopback address is reachable from this machine only,
+  and `porthole forward` is what redirects an external port to the
+  container behind it, for a bounded time. `porthole doctor` lists
+  the published ports it can see, and `porthole listen` marks the
+  listeners behind them.
 
 IPv6:
   porthole manages IPv4 rules only. On a machine with a global IPv6
@@ -95,6 +111,14 @@ pub struct Cli {
 pub enum Commands {
     /// Open a port towards the local network.
     Open(OpenArgs),
+    /// Redirect a port to a Docker container published only on this machine,
+    /// so the local network can reach it for a bounded time.
+    ///
+    /// A separate command from `open`, and not a flag on it, because the
+    /// consequence is different: `open` permits traffic to something already
+    /// listening on the network, and this redirects traffic to something
+    /// that was not. It asks for permission every time.
+    Forward(ForwardArgs),
     /// Close a port porthole opened.
     Close(CloseArgs),
     /// List the ports porthole currently has open.
@@ -152,6 +176,40 @@ pub struct OpenArgs {
 
     /// Who to open towards: subnet, any, a CIDR, an IP address, or the name
     /// of a device saved with `porthole devices add`.
+    #[arg(long, default_value = "subnet")]
+    pub to: String,
+}
+
+/// `porthole forward`'s own arguments.
+///
+/// Two port numbers, and which is which is the whole of this command's
+/// surface: `port` is the one already on this machine, `--as` is the one the
+/// local network will see.
+///
+/// There is no `--proto`. Every request this command sends is a TCP one, and
+/// there is no UDP forward to ask for: the check porthole makes before
+/// creating one -- whether something on this machine already answers on the
+/// external port -- reads TCP only, so a UDP request is refused.
+///
+/// No `--until-reboot` either, unlike `open`: a forward always runs out, and
+/// `--for` is what sets when, under `open`'s own eight-hour ceiling.
+#[derive(Debug, Args)]
+pub struct ForwardArgs {
+    /// The port to forward, as `porthole listen` shows it: the one Docker
+    /// published on this machine.
+    pub port: String,
+
+    /// The port the local network connects to. Defaults to the port being
+    /// forwarded.
+    #[arg(long = "as", value_name = "PORT")]
+    pub as_port: Option<String>,
+
+    /// How long to keep it open: 15m, 1h, 4h. Maximum 8h. Defaults to 1h.
+    #[arg(long = "for", value_name = "DURATION")]
+    pub duration: Option<String>,
+
+    /// Who to forward towards: subnet, any, a CIDR, an IP address, or the
+    /// name of a device saved with `porthole devices add`.
     #[arg(long, default_value = "subnet")]
     pub to: String,
 }

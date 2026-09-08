@@ -1142,3 +1142,357 @@ fn the_picker_hides_containers_and_shows_a_name_where_the_resolver_has_one() {
         "the resolver's answer must not reach the address book: {saved}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `porthole forward`
+// ---------------------------------------------------------------------------
+
+/// A state file holding `rules`, written by hand.
+///
+/// `porthole list` reads the state file and touches nothing else, so a rule
+/// can be put in front of it without a firewall, a helper, Docker or any
+/// privileged process at all -- which is what lets the rendering of a
+/// forward be asserted on every machine this suite runs on.
+fn write_state(path: &Path, rules: &str) {
+    std::fs::write(path, format!(r#"{{"schema_version":1,"rules":[{rules}]}}"#))
+        .expect("the temp dir is writable");
+}
+
+/// A recorded ordinary open: no `forward` member at all, which is what every
+/// rule written before forwards existed looks like on disk.
+fn recorded_open() -> String {
+    r#"{"id":"11111111-0000-4000-8000-000000000001","port":5173,"protocol":"tcp",
+        "target":{"kind":"network","cidr":"10.10.10.0/24"},"backend":"firewalld",
+        "opened_at":1757000000,"expires_at":9999999999,"uid":1000,
+        "handle":{"backend":"firewalld","zone":"public","rich_rule":"permit"}}"#
+        .to_string()
+}
+
+/// A recorded forward: 8443 on the network reaching a container's own
+/// `172.17.0.9:80`, which Docker published on this machine as 3000.
+fn recorded_forward() -> String {
+    r#"{"id":"11111111-0000-4000-8000-000000000002","port":8443,"protocol":"tcp",
+        "target":{"kind":"network","cidr":"10.10.10.0/24"},"backend":"firewalld",
+        "opened_at":1757000000,"expires_at":9999999999,"uid":1000,
+        "handle":{"backend":"firewalld","zone":"public","rich_rule":"redirect"},
+        "forward":{"container_addr":"172.17.0.9","container_port":80,
+                   "published_port":3000,"protocol":"tcp"}}"#
+        .to_string()
+}
+
+/// A `PATH` with `bin` in front of the one [`porthole_command`] sets, so a
+/// stub can shadow one program without losing the `firewall-cmd` shim that
+/// keeps firewalld off the private bus.
+fn path_ahead_of(bin: &Path) -> OsString {
+    let mut path = OsString::from(bin);
+    path.push(":");
+    path.push(&isolation().path);
+    path
+}
+
+#[test]
+fn a_forwards_row_says_both_ports_and_where_it_goes() {
+    // The defect this exists against: a forward rendered as an open tells a
+    // user the port permits traffic when it redirects it, and says nothing
+    // about which port the traffic actually reaches.
+    let dir = TempDir::new().unwrap();
+    let path = state_path(&dir);
+    write_state(
+        &path,
+        &format!("{},{}", recorded_open(), recorded_forward()),
+    );
+
+    let out = porthole(&["list"], &path);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+
+    let row = text
+        .lines()
+        .find(|l| l.starts_with("8443/tcp"))
+        .unwrap_or_else(|| panic!("no row for the forward: {text}"));
+    assert!(
+        row.contains("172.17.0.9:80"),
+        "the row must say where the traffic actually goes: {text}"
+    );
+    assert!(
+        row.contains("3000"),
+        "the row must name the published port the user knows this service by: {text}"
+    );
+
+    // The ordinary open is still an ordinary open, and says nothing about a
+    // container.
+    let open = text
+        .lines()
+        .find(|l| l.starts_with("5173/tcp"))
+        .unwrap_or_else(|| panic!("no row for the open: {text}"));
+    assert!(
+        !open.contains("172.17.0.9"),
+        "an open redirects nothing: {text}"
+    );
+}
+
+#[test]
+fn list_json_carries_a_forward_and_says_nothing_for_an_open() {
+    let dir = TempDir::new().unwrap();
+    let path = state_path(&dir);
+    write_state(
+        &path,
+        &format!("{},{}", recorded_open(), recorded_forward()),
+    );
+
+    let out = porthole(&["list", "--json"], &path);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    let rules = json["rules"].as_array().expect("an array");
+
+    let open = rules.iter().find(|r| r["port"] == 5173).expect("the open");
+    assert_eq!(
+        open["forward"],
+        serde_json::Value::Null,
+        "a rule that only permits carries no forward"
+    );
+
+    let fwd = rules
+        .iter()
+        .find(|r| r["port"] == 8443)
+        .expect("the forward");
+    assert_eq!(fwd["forward"]["container_addr"], "172.17.0.9");
+    assert_eq!(fwd["forward"]["container_port"], 80);
+    assert_eq!(fwd["forward"]["published_port"], 3000);
+}
+
+#[test]
+fn forward_defaults_the_external_port_to_the_published_one() {
+    if !have("firewall-cmd") || !have("ip") {
+        eprintln!("skipped: needs firewall-cmd and ip");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    // Docker's own DNAT rules, as `porthole_core::docker::published` reads
+    // them. A stub because this machine's real chain needs root to read and
+    // is nobody's to depend on; published on loopback because that is the
+    // only shape a forward is for.
+    stub(
+        &bin,
+        "iptables",
+        "echo '-N DOCKER'\n\
+         echo '-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 34567 \
+         -j DNAT --to-destination 172.17.0.9:80'",
+    );
+
+    let mut command = porthole_command(&["forward", "34567", "--dry-run", "--json"]);
+    command
+        .env("PORTHOLE_STATE_FILE", state_path(&dir))
+        .env("PATH", path_ahead_of(&bin));
+    let out = run(command, None);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    assert_eq!(
+        json["rule"]["port"], 34567,
+        "with no --as, the local network sees the published port"
+    );
+    assert_eq!(json["rule"]["forward"]["published_port"], 34567);
+    assert_eq!(json["rule"]["forward"]["container_addr"], "172.17.0.9");
+    assert_eq!(json["rule"]["forward"]["container_port"], 80);
+}
+
+#[test]
+fn forward_takes_a_different_external_port() {
+    if !have("firewall-cmd") || !have("ip") {
+        eprintln!("skipped: needs firewall-cmd and ip");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    stub(
+        &bin,
+        "iptables",
+        "echo '-N DOCKER'\n\
+         echo '-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 34567 \
+         -j DNAT --to-destination 172.17.0.9:80'",
+    );
+
+    let mut command =
+        porthole_command(&["forward", "34567", "--as", "34568", "--dry-run", "--json"]);
+    command
+        .env("PORTHOLE_STATE_FILE", state_path(&dir))
+        .env("PATH", path_ahead_of(&bin));
+    let out = run(command, None);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    assert_eq!(
+        json["rule"]["port"], 34568,
+        "--as is what the local network sees"
+    );
+    assert_eq!(
+        json["rule"]["forward"]["published_port"], 34567,
+        "the number typed is the port `porthole listen` shows"
+    );
+}
+
+#[test]
+fn a_forward_out_of_range_is_refused_before_anything_is_asked() {
+    let dir = TempDir::new().unwrap();
+    for args in [
+        vec!["forward", "99999"],
+        vec!["forward", "3000", "--as", "99999"],
+    ] {
+        let out = porthole(&args, &state_path(&dir));
+        assert_eq!(code(&out), 2, "{args:?}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("1-65535"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn a_forward_uses_opens_own_duration_ceiling_and_scope_grammar() {
+    let dir = TempDir::new().unwrap();
+
+    let out = porthole(&["forward", "3000", "--for", "24h"], &state_path(&dir));
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(stderr(&out).contains("8 hours"), "got: {}", stderr(&out));
+
+    let out = porthole(&["forward", "3000", "--to", "fe80::1"], &state_path(&dir));
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(
+        stderr(&out).to_lowercase().contains("ipv6"),
+        "got: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn forwarding_without_a_helper_says_the_helper_is_missing() {
+    // A real request, on the private bus this file starts -- see the module
+    // doc. Nothing owns the helper's name there, so this is what a machine
+    // without porthole installed answers: no usable backend (3), not "not
+    // authorized" (4).
+    let dir = TempDir::new().unwrap();
+    let out = porthole(&["forward", "3000"], &state_path(&dir));
+    assert_eq!(code(&out), 3, "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("doctor"), "got: {}", stderr(&out));
+}
+
+/// Every refusal `forward` can reach from this command line, with the exit
+/// code and the `kind` slug a script reads.
+///
+/// The point is not the refusals themselves -- they belong to
+/// `Engine::forward`, which has its own tests for each -- but that each one
+/// arrives at the process boundary as its own number. All of them used to
+/// come out as exit 1 and `"unexpected"`, and a table of exit codes nothing
+/// emits is worse than no table.
+///
+/// Driven by a stub `iptables`, so what Docker "publishes" is whatever the
+/// case says and this machine's own containers are neither read nor touched.
+#[test]
+fn each_refusal_a_forward_can_reach_has_its_own_exit_code() {
+    if !have("firewall-cmd") || !have("ip") {
+        eprintln!("skipped: needs firewall-cmd and ip");
+        return;
+    }
+    let published_on_loopback = "echo '-N DOCKER'\n\
+         echo '-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 34567 \
+         -j DNAT --to-destination 172.17.0.9:80'";
+
+    let cases: [(&str, &str, i64, &str); 3] = [
+        // Docker answered, and no container publishes the port.
+        (
+            "unpublished",
+            "echo '-N DOCKER'",
+            10,
+            "not_published_by_container",
+        ),
+        // Docker could not be asked at all -- the same exit code as above and
+        // a different kind, which is the only thing that tells them apart.
+        (
+            "unreadable",
+            "echo 'iptables: Permission denied' >&2\nexit 2",
+            10,
+            "docker_unreadable",
+        ),
+        // Published on every interface: already reachable, and porthole
+        // cannot close what Docker opened.
+        (
+            "reachable",
+            "echo '-N DOCKER'\n\
+             echo '-A DOCKER ! -i docker0 -p tcp -m tcp --dport 34567 \
+             -j DNAT --to-destination 172.17.0.9:80'",
+            14,
+            "already_reachable",
+        ),
+    ];
+
+    for (name, chain, expected_code, expected_kind) in cases {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        stub(&bin, "iptables", chain);
+
+        let mut command = porthole_command(&["forward", "34567", "--dry-run", "--json"]);
+        command
+            .env("PORTHOLE_STATE_FILE", state_path(&dir))
+            .env("PATH", path_ahead_of(&bin));
+        let out = run(command, None);
+
+        assert_eq!(
+            code(&out) as i64,
+            expected_code,
+            "{name}: stdout {} stderr {}",
+            stdout(&out),
+            stderr(&out)
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout(&out)).expect("the failure object is on stdout");
+        assert_eq!(json["error"]["code"], expected_code, "{name}");
+        assert_eq!(json["error"]["kind"], expected_kind, "{name}");
+    }
+
+    // The external port already carries something. A real listener of this
+    // test's own, so the check has something to find that is not this
+    // machine's business: `listening::scan` reads every listening socket,
+    // whatever address it is bound to.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let taken = listener.local_addr().unwrap().port().to_string();
+
+    let dir = TempDir::new().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    stub(&bin, "iptables", published_on_loopback);
+    let mut command =
+        porthole_command(&["forward", "34567", "--as", &taken, "--dry-run", "--json"]);
+    command
+        .env("PORTHOLE_STATE_FILE", state_path(&dir))
+        .env("PATH", path_ahead_of(&bin));
+    let out = run(command, None);
+
+    assert_eq!(code(&out), 11, "stderr: {}", stderr(&out));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    assert_eq!(json["error"]["kind"], "external_port_in_use");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains(&taken),
+        "the refusal must name the port it is about: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn forward_help_says_which_number_is_which() {
+    let dir = TempDir::new().unwrap();
+    let out = porthole(&["forward", "--help"], &state_path(&dir));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    for expected in ["--as", "--to", "--for", "listen"] {
+        assert!(text.contains(expected), "`{expected}` missing from: {text}");
+    }
+}

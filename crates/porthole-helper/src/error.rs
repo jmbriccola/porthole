@@ -25,6 +25,34 @@ pub enum HelperError {
     /// `CommandFailed`: its own name keeps the `state_error` kind slug intact
     /// across the bus.
     State(String),
+    // The six refusals `forward` has of its own, each under a name of its own
+    // for the reason `CommandFailed` and `State` have theirs: the client maps
+    // the name back to the code and the kind slug the same failure carries
+    // locally. Both ends are checked --
+    // `every_forward_refusal_crosses_under_a_name_of_its_own` below for the
+    // names sent, and `porthole-cli`'s own
+    // `every_refusal_a_forward_has_survives_the_bus_with_its_own_code_and_kind`
+    // for what they map back to.
+    /// The detected firewall cannot redirect a port at all.
+    ForwardUnsupported(String),
+    /// No container publishes the port `forward` was given. Shares a code
+    /// with `DockerUnreadable` below and differs from it by kind, exactly as
+    /// the two local variants do: one is Docker's answer, the other is the
+    /// absence of one.
+    NotPublishedByContainer(String),
+    /// Docker's table could not be read, so whether the port is published is
+    /// unknown. The other half of the pair above.
+    DockerUnreadable(String),
+    /// The port a forward would give the local network is already carrying
+    /// something.
+    ExternalPortInUse(String),
+    /// A check `forward` makes before creating a redirect has no answer for
+    /// what was asked.
+    ForwardCheckUnavailable(String),
+    /// The container is already reachable from the network because Docker
+    /// published it there. Not `AlreadyOpen`: there is no porthole rule to
+    /// close.
+    AlreadyReachable(String),
     /// Everything else: a command that could not even be spawned, a raw I/O
     /// error, or a truly unexpected condition. These have no request-specific
     /// meaning worth distinguishing on the wire, so the client reports them
@@ -35,6 +63,20 @@ pub enum HelperError {
     Failed(String),
 }
 
+/// Every core error, named one at a time.
+///
+/// **No wildcard arm, deliberately.** The six refusals `forward` has of its
+/// own were all added to [`Error`] with a code and a kind slug of their own,
+/// and every one of them arrived at a client as exit 1 and the kind
+/// `unexpected`, because a `_ => Failed` arm absorbed them silently. With
+/// the wildcard gone, the next variant [`Error`] gains stops this file from
+/// compiling until somebody decides which name it crosses the bus under --
+/// which is the only way an omission of that shape becomes visible at all,
+/// since nothing about the old arm was wrong to read.
+///
+/// Variants that map to [`HelperError::Failed`] are listed rather than
+/// collapsed for the same reason: each is a decision, and a decision is what
+/// a reader should be able to see.
 impl From<Error> for HelperError {
     fn from(e: Error) -> Self {
         let text = e.to_string();
@@ -48,7 +90,22 @@ impl From<Error> for HelperError {
             Error::NoNetwork(_) => HelperError::NoNetwork(text),
             Error::CommandFailed { .. } => HelperError::CommandFailed(text),
             Error::State { .. } => HelperError::State(text),
-            _ => HelperError::Failed(text),
+            Error::ForwardUnsupported(_) => HelperError::ForwardUnsupported(text),
+            Error::NotPublishedByContainer(_) => HelperError::NotPublishedByContainer(text),
+            Error::DockerUnreadable(_) => HelperError::DockerUnreadable(text),
+            Error::ExternalPortInUse { .. } => HelperError::ExternalPortInUse(text),
+            Error::ForwardCheckUnavailable(_) => HelperError::ForwardCheckUnavailable(text),
+            Error::AlreadyReachable(_) => HelperError::AlreadyReachable(text),
+            // `NothingToOffer` is `porthole devices add`'s, and that command
+            // is unprivileged and local; nothing here constructs one. It is
+            // named anyway because this match has no wildcard to fall into.
+            Error::NothingToOffer(_)
+            | Error::CommandSpawn { .. }
+            | Error::Unexpected(_)
+            | Error::Io(_)
+            // Already rendered by some other helper, with its own kind and
+            // code. Nothing in this process builds one.
+            | Error::Remote { .. } => HelperError::Failed(text),
         }
     }
 }
@@ -77,6 +134,55 @@ mod tests {
             detail: "boom".to_string(),
         };
         assert!(matches!(HelperError::from(err), HelperError::State(_)));
+    }
+
+    /// The wire name every forward refusal now travels under.
+    ///
+    /// The names, not just the variants: `porthole-cli`'s `from_dbus` reads
+    /// the last dotted segment of the name and nothing else, so a variant
+    /// renamed here silently stops being recognised there. These strings are
+    /// the contract between the two files.
+    #[test]
+    fn every_forward_refusal_crosses_under_a_name_of_its_own() {
+        use zbus::DBusError as _;
+
+        let cases: Vec<(Error, &str)> = vec![
+            (
+                Error::ForwardUnsupported("x".into()),
+                "com.jacopobriccola.Porthole.ForwardUnsupported",
+            ),
+            (
+                Error::NotPublishedByContainer("x".into()),
+                "com.jacopobriccola.Porthole.NotPublishedByContainer",
+            ),
+            (
+                Error::DockerUnreadable("x".into()),
+                "com.jacopobriccola.Porthole.DockerUnreadable",
+            ),
+            (
+                Error::ExternalPortInUse {
+                    port: 8443,
+                    detail: "x".into(),
+                },
+                "com.jacopobriccola.Porthole.ExternalPortInUse",
+            ),
+            (
+                Error::ForwardCheckUnavailable("x".into()),
+                "com.jacopobriccola.Porthole.ForwardCheckUnavailable",
+            ),
+            (
+                Error::AlreadyReachable("x".into()),
+                "com.jacopobriccola.Porthole.AlreadyReachable",
+            ),
+        ];
+        for (core, expected) in cases {
+            let wire = HelperError::from(core);
+            assert_eq!(
+                wire.name().as_str(),
+                expected,
+                "a forward refusal must not travel as anything else"
+            );
+        }
     }
 
     #[test]

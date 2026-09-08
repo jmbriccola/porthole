@@ -7,10 +7,10 @@ use porthole_core::backend::{self, BackendHealth, BackendId, FirewallBackend};
 use porthole_core::clock::{Clock, SystemClock};
 use porthole_core::command::{CommandRunner, DryRunRunner, RealRunner};
 use porthole_core::devices;
-use porthole_core::engine::{Engine, Status};
+use porthole_core::engine::{resolve_scope, Engine, Status};
 use porthole_core::error::{Error, ExitCode, Result};
 use porthole_core::listening::{self, RealProcFs};
-use porthole_core::model::{Lifetime, ScopeSpec, DEFAULT_DURATION};
+use porthole_core::model::{Lifetime, OpenRequest, Protocol, ScopeSpec, DEFAULT_DURATION};
 use porthole_core::net;
 use porthole_core::state::StateStore;
 use porthole_core::validate;
@@ -100,6 +100,7 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
             Ok(ExitCode::Success)
         }
         Commands::Open(args) => open(cli, args),
+        Commands::Forward(args) => forward(cli, args),
         Commands::Close(args) => close(cli, args),
         Commands::Doctor => {
             let checks = crate::doctor::run(cli.session);
@@ -167,16 +168,7 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
     // Below the duration, deliberately: resolving a device spawns `ip -4
     // neigh show` or `getent`, and `--for 999h` must be refused without
     // running either.
-    let (scope, wire_to): (ScopeSpec, String) = match crate::cli::parse_to(&args.to) {
-        crate::cli::ToSpec::Scope(scope) => (scope, args.to.clone()),
-        crate::cli::ToSpec::Invalid(err) => return Err(err),
-        crate::cli::ToSpec::Device(name) => {
-            let book = devices::Book::load(&devices::default_path())?;
-            let runner = make_runner(cli);
-            let addr = devices::resolve(&book, &name, runner.as_ref())?;
-            (ScopeSpec::Host(addr), addr.to_string())
-        }
-    };
+    let (scope, wire_to) = resolve_to(cli, &args.to)?;
 
     // A best-effort, read-only look at whether Docker already has an
     // opinion about this exact port/protocol -- see `porthole_core::docker`'s
@@ -247,6 +239,123 @@ fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {
             );
         } else {
             output::print_opened(&rule, now, docker_note.as_deref());
+        }
+        Ok(ExitCode::Success)
+    }
+}
+
+/// What `--to` names, as a scope and as the string that crosses the bus.
+///
+/// Resolution of a saved device happens here, client-side: the helper (and,
+/// under `--dry-run`, the local engine) must only ever see an already-resolved
+/// IP -- see `porthole_core::devices`'s own module doc for why. The returned
+/// string is what a real (non dry-run) request sends; for anything but a
+/// device it is `raw` unchanged.
+///
+/// One function rather than a copy in `open` and another in `forward`: the
+/// two commands take the same `--to` and must answer the same way for every
+/// string, including a device name that no longer resolves.
+fn resolve_to(cli: &Cli, raw: &str) -> Result<(ScopeSpec, String)> {
+    match crate::cli::parse_to(raw) {
+        crate::cli::ToSpec::Scope(scope) => Ok((scope, raw.to_string())),
+        crate::cli::ToSpec::Invalid(err) => Err(err),
+        crate::cli::ToSpec::Device(name) => {
+            let book = devices::Book::load(&devices::default_path())?;
+            let runner = make_runner(cli);
+            let addr = devices::resolve(&book, &name, runner.as_ref())?;
+            Ok((ScopeSpec::Host(addr), addr.to_string()))
+        }
+    }
+}
+
+/// `porthole forward`: parse, ask, render.
+///
+/// Every refusal a forward has of its own belongs to `Engine::forward` --
+/// a firewall that cannot redirect, UDP, Docker that could not be read, a
+/// port no container publishes, a container the network already reaches, an
+/// external port already carrying something. None of them is repeated here.
+/// What this function decides is the argument grammar: which of the two port
+/// numbers is which, and that both are ports at all.
+///
+/// The protocol is TCP, and is not an argument -- see `ForwardArgs`'s own
+/// doc comment.
+fn forward(cli: &Cli, args: &crate::cli::ForwardArgs) -> Result<ExitCode> {
+    // Validated before the bus is touched and before a device lookup spawns
+    // anything, for the reason `open` gives: a bad number must cost no round
+    // trip and no authentication prompt.
+    let published_port = validate::parse_port(&args.port)?;
+    // The port the local network connects to. The same number by default:
+    // `porthole forward 3000` puts 3000 in front of a container published as
+    // 3000 on this machine.
+    let external_port = match &args.as_port {
+        Some(raw) => validate::parse_port(raw)?,
+        None => published_port,
+    };
+    // A duration rather than a `Lifetime`: `forward` has no
+    // `--until-reboot`, so there is no second case to carry.
+    let duration = match &args.duration {
+        Some(raw) => validate::parse_duration(raw)?,
+        None => DEFAULT_DURATION,
+    };
+    // Below the duration, deliberately, exactly as in `open`: resolving a
+    // device spawns `ip -4 neigh show` or `getent`, and `--for 999h` must be
+    // refused without running either.
+    let (scope, wire_to) = resolve_to(cli, &args.to)?;
+
+    if cli.dry_run {
+        // Local, unprivileged, no helper -- `open --dry-run`'s own path. The
+        // engine performs every check it would perform for real; what it
+        // does not do is run the commands that would change the firewall.
+        // Note that reads still run: a dry run reads Docker's own table,
+        // which needs privilege this process does not have, and reports that
+        // it could not rather than pretending it could.
+        let runner = make_runner(cli);
+        let backend = backend::detect(runner.as_ref())?;
+        let target = resolve_scope(runner.as_ref(), &scope)?;
+        let mut engine = make_engine(backend.as_ref(), runner.as_ref())?;
+
+        let req = OpenRequest {
+            port: external_port,
+            protocol: Protocol::Tcp,
+            target,
+            lifetime: Lifetime::For(duration),
+        };
+        let rule = engine.forward(&req, published_port, requesting_uid(), &RealProcFs)?;
+        // The rule's own instant, not a second reading of the clock -- see
+        // `open` for the tick this avoids.
+        let now = rule.opened_at;
+
+        if cli.json {
+            // The same object `open --json` prints, from the same rule, whose
+            // own `forward` member is what says this one redirects. There is
+            // no `docker_note`: `open`'s note warns that Docker may already
+            // have made a port reachable, and a forward that got this far has
+            // had that same question asked and answered -- it would have
+            // failed with `already_reachable` if the answer had been yes.
+            println!(
+                "{}",
+                output::json_opened(&rule, now, true, &runner.recorded(), None)
+            );
+        } else {
+            output::print_forwarded(&rule, now, true);
+            output::print_dry_run(&runner.recorded());
+        }
+        Ok(ExitCode::Success)
+    } else {
+        let rule = client::forward(
+            cli.session,
+            external_port,
+            &Protocol::Tcp.to_string(),
+            &wire_to,
+            duration.as_secs() as u32,
+            published_port,
+        )?;
+        let now = rule.opened_at;
+
+        if cli.json {
+            println!("{}", output::json_opened(&rule, now, false, &[], None));
+        } else {
+            output::print_forwarded(&rule, now, false);
         }
         Ok(ExitCode::Success)
     }

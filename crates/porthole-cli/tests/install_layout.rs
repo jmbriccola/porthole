@@ -127,6 +127,7 @@ const EXPECTED: &[&str] = &[
     "/usr/share/man/man1/porthole-devices-rm.1",
     "/usr/share/man/man1/porthole-devices.1",
     "/usr/share/man/man1/porthole-doctor.1",
+    "/usr/share/man/man1/porthole-forward.1",
     "/usr/share/man/man1/porthole-list.1",
     "/usr/share/man/man1/porthole-listen.1",
     "/usr/share/man/man1/porthole-open.1",
@@ -454,9 +455,13 @@ fn the_long_help_documents_every_exit_code() {
 
     // The exit codes are a public interface -- scripts branch on them -- and
     // the same text is `after_long_help` on the clap command and the EXTRA
-    // section of porthole.1. Listing the variants here rather than a range
-    // means a new one has to be documented before this passes; the same
-    // shape crates/porthole-core/src/error.rs uses for its own mapping test.
+    // section of porthole.1.
+    //
+    // The list is written out rather than derived from a range, and the
+    // `match` below is what keeps it honest: a variant added to `ExitCode`
+    // stops this file compiling until it is named there, which is the prompt
+    // to add it here too. Codes 10 to 14 were added to `ExitCode` while this
+    // list still stopped at 9, and this test passed the whole time.
     let help = help_text();
     for code in [
         ExitCode::Success,
@@ -469,10 +474,37 @@ fn the_long_help_documents_every_exit_code() {
         ExitCode::RuleNotFound,
         ExitCode::NoNetwork,
         ExitCode::NothingToOffer,
+        ExitCode::NotForwardable,
+        ExitCode::ExternalPortInUse,
+        ExitCode::ForwardUnsupported,
+        ExitCode::ForwardCheckUnavailable,
+        ExitCode::AlreadyReachable,
     ] {
-        let row = format!("  {}  ", code as i32);
+        // No wildcard: this arm is here to fail to compile, not to run.
+        match code {
+            ExitCode::Success
+            | ExitCode::Failure
+            | ExitCode::InvalidArguments
+            | ExitCode::BackendUnavailable
+            | ExitCode::NotAuthorized
+            | ExitCode::AlreadyOpen
+            | ExitCode::DeviceUnreachable
+            | ExitCode::RuleNotFound
+            | ExitCode::NoNetwork
+            | ExitCode::NothingToOffer
+            | ExitCode::NotForwardable
+            | ExitCode::ExternalPortInUse
+            | ExitCode::ForwardUnsupported
+            | ExitCode::ForwardCheckUnavailable
+            | ExitCode::AlreadyReachable => {}
+        }
+        // Found by its number, not by its spacing: a two-digit code takes one
+        // space after it rather than two, so that the text stays in one
+        // column. Pinning the exact indentation is what made adding a
+        // ten-and-up row look like a test failure rather than documentation.
+        let row = format!("{} ", code as i32);
         assert!(
-            help.lines().any(|l| l.starts_with(&row)),
+            help.lines().any(|l| l.trim_start().starts_with(&row)),
             "exit code {} has no row in `porthole --help`",
             code as i32
         );
