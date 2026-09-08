@@ -475,6 +475,16 @@ porthole's tests exercise** — the test image runs Docker's default
 nowhere. It is not a bug in either half, and neither half can see it to warn
 you.
 
+The missing row is the whole of what that setting changes. It used to cost
+more: the check that refuses `--as <PORT>` when the port is already carrying
+something read only porthole's own state and this machine's listening
+sockets, so with no proxy process there was nothing to find, and a forward
+onto a port another container publishes was accepted. That check now reads
+Docker's own `DOCKER` chain as well — the same table it reads to find the
+container in the first place — so it sees a published port whether or not a
+proxy is listening on it, and the refusal names the container rather than the
+proxy.
+
 ## When the network changes
 
 A rule opened towards `10.10.10.0/24` in a café means nothing at home, and
@@ -597,7 +607,7 @@ starts user units at all: it starts the one unit, now.
 | 8 | No usable network |
 | 9 | There was nothing to choose from. `porthole devices add` found no device on this network to offer. |
 | 10 | `porthole forward` was given a port no container publishes, or Docker could not be read at all. The message says which; `--json`'s `kind` is `not_published_by_container` or `docker_unreadable`. |
-| 11 | The port `porthole forward` would give the local network is already carrying something a redirect would take traffic from: a porthole rule, or a service listening on an address the network reaches. A loopback-only listener is not one of them and does not refuse. The message names `--as <PORT>`, which is what gives the local network a different port. |
+| 11 | The port `porthole forward` would give the local network is already carrying something a redirect would take traffic from. Three sources are checked and the message says which found it: a porthole rule, a container Docker publishes on that port at an address the network reaches, or a service listening on such an address. Restricted to loopback, neither the mapping nor the listener refuses. The message names `--as <PORT>`, which is what gives the local network a different port. |
 | 12 | This machine's firewall has no way to redirect a port. Only firewalld has one; ufw and nftables refuse here, each for its own reason. |
 | 13 | A check porthole makes before creating a redirect has no answer for what was asked. The message says which check. |
 | 14 | Docker publishes that container on an address other than loopback, so the local network may already reach it. That is Docker's own rule, which porthole can neither have made nor close. What porthole read to decide it is the `-d` flag on Docker's own DNAT rule and nothing else: no `-d` is every interface, and a `-d` naming any other address is that address, whether or not this machine holds it. |

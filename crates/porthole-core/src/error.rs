@@ -203,11 +203,16 @@ pub enum Error {
     /// The external port a forward would use is already carrying something a
     /// redirect would take traffic from.
     ///
-    /// Two situations reach this, and `detail` is where they differ: porthole
-    /// already has a rule on that port, or a socket bound to an address the
-    /// local network reaches is listening on it. A socket bound only to a
-    /// loopback address is neither, and does not refuse -- see
+    /// Three sources reach this, and `detail` is where they differ: porthole
+    /// already has a rule on that port, Docker publishes a container on it
+    /// at an address the local network reaches, or a socket bound to such an
+    /// address is listening on it. Neither a Docker mapping restricted to
+    /// loopback nor a socket bound only to a loopback address is one of
+    /// them, and neither refuses -- see
     /// [`crate::engine::Engine::forward`].
+    ///
+    /// `detail` names which source found it on purpose: a person told a port
+    /// is "already in use", with nothing saying by what, cannot act on it.
     #[error("port {port} is already in use ({detail})")]
     ExternalPortInUse { port: u16, detail: String },
 

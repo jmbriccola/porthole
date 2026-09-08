@@ -441,11 +441,40 @@ impl<'a> Engine<'a> {
     /// so anything said here reaches the user only after they have already
     /// authenticated for a forward they would not have asked for.
     ///
-    /// **The external port is checked next**, against porthole's own state
-    /// and then against this machine's listening sockets. Either refuses with
-    /// [`Error::ExternalPortInUse`], whose `detail` says which. Both exist
-    /// because a redirect claims the port: what arrives on it reaches the
-    /// container. The listening check reads what each socket is bound to. A
+    /// **The external port is checked next**, against three sources: porthole's
+    /// own state, Docker's table, and this machine's listening sockets. Each
+    /// refuses with [`Error::ExternalPortInUse`], whose `detail` says which
+    /// one found the clash -- a user told "in use" without being told by what
+    /// cannot act on it. All three exist because a redirect claims the port:
+    /// what arrives on it reaches the container.
+    ///
+    /// Docker's table is read here from the same `published` this method
+    /// already holds, and asked [`crate::docker::already_reachable`]'s
+    /// question about the *external* port rather than the published one. It
+    /// is not a duplicate of the listening check: with `"userland-proxy":
+    /// false` Docker starts no proxy process, so a container published on
+    /// `0.0.0.0:<external>` has no host listener at all and `/proc` is empty
+    /// for that port -- the DNAT rule is the whole of the publication.
+    /// Without this source, `porthole forward 3000 --as 8080` was accepted
+    /// where 8080 is another container's published port, and the redirect
+    /// then competed with a mapping the user believes points elsewhere, at
+    /// the same nat-prerouting priority in a different table, with nothing
+    /// saying which wins. Under the default `"userland-proxy": true` the case
+    /// was refused only by the accident of `docker-proxy` holding the port.
+    /// Docker comes ahead of the listening check so that the more specific
+    /// answer -- a container publishes it -- is the one a user gets, rather
+    /// than `docker-proxy` is listening on it.
+    ///
+    /// A mapping restricted to a loopback address is not a clash and does not
+    /// refuse, for the reason the listening check gives below: a forward is
+    /// an IPv4 rule matching traffic from the target network, and nothing
+    /// arriving from there is addressed to `127.0.0.0/8`. That is also why
+    /// this source can never fire on the ordinary `porthole forward <PORT>`
+    /// with no `--as`: with the two ports equal, a non-loopback mapping on
+    /// the port has already been refused as [`Error::AlreadyReachable`]
+    /// above.
+    ///
+    /// The listening check reads what each socket is bound to. A
     /// forward is an IPv4 rule matching traffic from the target network, so
     /// the sockets it can take traffic from are the ones `porthole listen`
     /// prints unlabelled: [`crate::listening::Binding::AllInterfaces`] and
@@ -568,6 +597,31 @@ impl<'a> Engine<'a> {
                 detail: format!(
                     "porthole has a rule on it, towards {} (id {})",
                     existing.target, existing.id
+                ),
+            });
+        }
+
+        // The second source, from the read already in hand: Docker's own
+        // table, asked about the *external* port. With
+        // `"userland-proxy": false` there is no host listener for a
+        // published port at all, so the `/proc` scan below finds nothing and
+        // this is the only thing that can see the clash. Ahead of that scan
+        // so that "another container publishes it" is what a user is told,
+        // rather than "docker-proxy is listening on it".
+        //
+        // `already_reachable` and not "any mapping on this port": a mapping
+        // restricted to loopback cannot receive traffic from the target
+        // network, so it is not something a redirect could take traffic
+        // from -- the same distinction the listening check below draws, from
+        // the same reasoning, so that the two cannot answer differently.
+        if let Some(clash) = crate::docker::already_reachable(external, req.protocol, &published) {
+            return Err(Error::ExternalPortInUse {
+                port: external,
+                detail: format!(
+                    "{clash} A redirect claiming {external}/{} would be a second rule \
+                     matching the same traffic, and nothing says which of the two wins -- \
+                     give the local network a different port with `--as <PORT>`",
+                    req.protocol
                 ),
             });
         }
@@ -2489,6 +2543,31 @@ mod tests {
 -A DOCKER ! -i docker0 -p tcp -m tcp --dport 3000 -j DNAT --to-destination 172.18.0.2:8080
 ";
 
+    /// The forward's own container on loopback, and a **second** container
+    /// published on every interface on the port `--as` would claim. What
+    /// `docker run -p 127.0.0.1:3000:8080` and `docker run -p 8443:80`
+    /// write side by side.
+    ///
+    /// The pair the external-port check against Docker's table exists for:
+    /// with `"userland-proxy": false` nothing on this host listens on 8443,
+    /// so `/proc` is empty for it and this chain is the only place the
+    /// clash is visible.
+    const DOCKER_CHAIN_LOOPBACK_PLUS_ANOTHER_ON_THE_EXTERNAL_PORT: &str = "\
+-N DOCKER
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 3000 -j DNAT --to-destination 172.18.0.2:8080
+-A DOCKER ! -i docker0 -p tcp -m tcp --dport 8443 -j DNAT --to-destination 172.18.0.9:80
+";
+
+    /// The same two containers, except the second is published on loopback
+    /// too. Nothing arriving from the target network is addressed to
+    /// `127.0.0.0/8`, so this one is not a clash -- the control that keeps
+    /// the check above from being "any Docker mapping on the port".
+    const DOCKER_CHAIN_LOOPBACK_PLUS_A_LOOPBACK_ONE_ON_THE_EXTERNAL_PORT: &str = "\
+-N DOCKER
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 3000 -j DNAT --to-destination 172.18.0.2:8080
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 8443 -j DNAT --to-destination 172.18.0.9:80
+";
+
     /// The container behind [`DOCKER_CHAIN_LOOPBACK`], spelled out once.
     const CONTAINER_ADDR: &str = "172.18.0.2";
     const CONTAINER_PORT: u16 = 8080;
@@ -3051,6 +3130,116 @@ mod tests {
         assert_eq!(rule.port, EXTERNAL_PORT);
         assert_eq!(engine.rules().len(), 1);
         assert_eq!(engine.rules()[0].id, rule.id);
+    }
+
+    #[test]
+    fn forward_refuses_an_external_port_another_container_publishes_to_the_network() {
+        // The check the table was in hand for and nobody asked. `--as 8443`
+        // where 8443 is a *second* container's published port: the redirect
+        // and Docker's own DNAT rule would both match LAN traffic for that
+        // port, at the same nat-prerouting priority in two different
+        // tables, and whichever wins the user is told nothing.
+        //
+        // Run twice, and the first run is the one that matters: with
+        // `"userland-proxy": false` Docker starts no proxy, so nothing on
+        // this host listens on 8443 and `/proc` is empty for it. The state
+        // check has nothing either. Docker's table is the only source that
+        // can see this.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(
+            DockerChain::Reads(DOCKER_CHAIN_LOOPBACK_PLUS_ANOTHER_ON_THE_EXTERNAL_PORT),
+            Vec::new(),
+        );
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let err = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &nothing_listening(),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::ExternalPortInUse { port, .. } if port == EXTERNAL_PORT),
+            "the port a redirect would claim is already carrying a container's own \
+             publication: {err}"
+        );
+        assert_eq!(err.exit_code(), ExitCode::ExternalPortInUse);
+        let text = err.to_string();
+        assert!(
+            text.contains("Docker already publishes 8443/tcp"),
+            "the refusal must name which of the three sources found it, and what: {text}"
+        );
+        assert!(
+            text.contains("--as"),
+            "and must name the way out, as the other two sources do: {text}"
+        );
+        assert!(
+            engine.rules().is_empty(),
+            "a refused forward records nothing"
+        );
+
+        // The second run is the ordering: with `"userland-proxy": true` a
+        // `docker-proxy` also holds 0.0.0.0:8443, so both sources see a
+        // clash. Docker's is the more specific answer and must be the one a
+        // user gets.
+        let harness = Harness::new();
+        let runner = DockerRunner::new(
+            DockerChain::Reads(DOCKER_CHAIN_LOOPBACK_PLUS_ANOTHER_ON_THE_EXTERNAL_PORT),
+            Vec::new(),
+        );
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+        let err = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &FakeProcFs::new(PROC_NET_TCP_8443),
+            )
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("Docker already publishes 8443/tcp"),
+            "a container publishing the port is what to say, not that something \
+             is listening on it: {text}"
+        );
+    }
+
+    #[test]
+    fn forward_allows_an_external_port_a_loopback_docker_mapping_covers() {
+        // The control that keeps the check above from being "any Docker
+        // mapping on the external port". A mapping restricted to loopback
+        // only matches traffic already addressed to 127.0.0.1, which nothing
+        // arriving from the target network can be -- the same distinction
+        // the listening check draws for a loopback-bound socket, and the
+        // same reason.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(
+            DockerChain::Reads(DOCKER_CHAIN_LOOPBACK_PLUS_A_LOOPBACK_ONE_ON_THE_EXTERNAL_PORT),
+            Vec::new(),
+        );
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let rule = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &nothing_listening(),
+            )
+            .expect("a loopback-only mapping on the external port is not a clash");
+        assert_eq!(rule.port, EXTERNAL_PORT);
+        assert_eq!(
+            rule.forward.as_ref().unwrap().container_addr.to_string(),
+            CONTAINER_ADDR,
+            "and the rule still points at the container that was asked for"
+        );
     }
 
     #[test]

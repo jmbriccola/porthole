@@ -257,8 +257,10 @@ and `docker_unreadable` (both `10`, and the two are told apart by `kind`
 alone) when no container publishes the port or Docker could not be read,
 `external_port_in_use` (`11`) when the port the local network would connect
 to already carries something a redirect would take traffic from — a porthole
-rule, or a service listening on `0.0.0.0` or on one address the network
-reaches; a loopback-only listener is not one of them and does not refuse —
+rule, a container Docker publishes on that port at an address the network
+reaches, or a service listening on `0.0.0.0` or on one address the network
+reaches; restricted to loopback, neither the mapping nor the listener refuses,
+and the message says which of the three sources found it —
 `forward_check_unavailable` (`13`) when a
 check porthole makes before creating a redirect has no answer for what was
 asked, and `already_reachable` (`14`) when Docker publishes the container on
