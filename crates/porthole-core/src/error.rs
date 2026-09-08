@@ -67,6 +67,70 @@ pub enum ExitCode {
     AlreadyReachable = 14,
 }
 
+/// One of the refusals a forward has of its own: the code it leaves, the
+/// `kind` slug it arrives as, and the phrase that names it in prose.
+///
+/// See [`FORWARD_REFUSALS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForwardRefusal {
+    pub code: ExitCode,
+    pub kind: &'static str,
+    /// How to name it in a sentence. Written once so four doc comments in
+    /// three crates can point here instead of each keeping a list.
+    pub phrase: &'static str,
+}
+
+/// Every refusal a forward has of its own, in the order
+/// [`crate::engine::Engine::forward`] decides them.
+///
+/// **Why this exists as data.** This list used to be written out by hand in
+/// four places — `Engine::forward`'s own doc, the D-Bus proxy declaration,
+/// the helper's `forward` method, and the CLI's — and by the time anyone
+/// read all four together, two of them were missing `AlreadyReachable` and a
+/// third still opened with a count ("Five situations") that had been wrong
+/// since a sixth refusal landed. Both stale copies were the bus-facing ones,
+/// which are the two a client author reads. The four sites now point here,
+/// and `the_forward_refusals_are_exactly_the_forward_exit_codes` fails if
+/// this list and the exit codes drift apart.
+///
+/// **What is not here.** A firewall that is installed but not enforcing
+/// rules refuses a forward too, with [`ExitCode::BackendUnavailable`] — but
+/// that is `open`'s refusal, in `open`'s own words, shared rather than a
+/// forward's own. `Engine::forward`'s doc says where in the order it sits.
+pub const FORWARD_REFUSALS: [ForwardRefusal; 6] = [
+    ForwardRefusal {
+        code: ExitCode::ForwardUnsupported,
+        kind: "forward_unsupported",
+        phrase: "a firewall that cannot redirect at all",
+    },
+    ForwardRefusal {
+        code: ExitCode::ForwardCheckUnavailable,
+        kind: "forward_check_unavailable",
+        phrase: "a request porthole cannot check what it needs to check for",
+    },
+    ForwardRefusal {
+        code: ExitCode::NotForwardable,
+        kind: "docker_unreadable",
+        phrase: "Docker's table that could not be read",
+    },
+    ForwardRefusal {
+        code: ExitCode::NotForwardable,
+        kind: "not_published_by_container",
+        phrase: "a published port no container publishes",
+    },
+    ForwardRefusal {
+        code: ExitCode::AlreadyReachable,
+        kind: "already_reachable",
+        phrase: "a container the local network already reaches",
+    },
+    ForwardRefusal {
+        code: ExitCode::ExternalPortInUse,
+        kind: "external_port_in_use",
+        phrase: "an external port already carrying something a redirect would take \
+                 traffic from",
+    },
+];
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid argument: {0}")]
@@ -466,6 +530,73 @@ mod tests {
             Error::AlreadyReachable("docker published it on 0.0.0.0".into()).exit_code(),
             ExitCode::AlreadyReachable
         );
+    }
+
+    #[test]
+    fn the_forward_refusals_are_exactly_the_forward_exit_codes() {
+        // The guard that makes `FORWARD_REFUSALS` worth having instead of a
+        // fifth hand-kept list. Codes 10 and up are the ones this feature
+        // appended and they belong to `forward` alone -- 10 twice, for the
+        // two facts that share it -- so the enum, read out of this file's
+        // own source by `declared_exit_codes`, is what says how many
+        // refusals there are. Add a code for a new one and this fails until
+        // the list names it; name one here that the enum does not have and
+        // it fails the other way.
+        let mut from_the_enum: Vec<i32> = declared_exit_codes()
+            .into_iter()
+            .map(|(_, v)| v)
+            .filter(|v| *v >= ExitCode::NotForwardable as i32)
+            .collect();
+        from_the_enum.sort_unstable();
+
+        let mut from_the_list: Vec<i32> = FORWARD_REFUSALS.iter().map(|r| r.code as i32).collect();
+        from_the_list.sort_unstable();
+        from_the_list.dedup();
+
+        assert_eq!(
+            from_the_list,
+            from_the_enum,
+            "FORWARD_REFUSALS and `ExitCode` disagree about what a forward can refuse \
+             with. Every code from {} up is a forward's own.",
+            ExitCode::NotForwardable as i32
+        );
+    }
+
+    #[test]
+    fn each_forward_refusal_names_the_slug_its_own_error_carries() {
+        // The other half: the phrases are prose, but `kind` is what a script
+        // matches on, and a list that named a slug no error emits would
+        // document an answer nobody can receive. One real `Error` per entry,
+        // asked for its own code and slug.
+        let errors = [
+            Error::ForwardUnsupported("x".into()),
+            Error::ForwardCheckUnavailable("x".into()),
+            Error::DockerUnreadable("x".into()),
+            Error::NotPublishedByContainer("x".into()),
+            Error::AlreadyReachable("x".into()),
+            Error::ExternalPortInUse {
+                port: 8443,
+                detail: "x".into(),
+            },
+        ];
+        assert_eq!(errors.len(), FORWARD_REFUSALS.len());
+        for (refusal, error) in FORWARD_REFUSALS.iter().zip(errors.iter()) {
+            assert_eq!(
+                (refusal.kind, refusal.code),
+                (error.kind(), error.exit_code()),
+                "FORWARD_REFUSALS names `{}` at exit {:?}; the error it stands for is \
+                 `{}` at exit {:?}",
+                refusal.kind,
+                refusal.code,
+                error.kind(),
+                error.exit_code()
+            );
+            assert!(
+                !refusal.phrase.is_empty(),
+                "every refusal needs a phrase: four doc comments say `{}` through it",
+                refusal.kind
+            );
+        }
     }
 
     #[test]

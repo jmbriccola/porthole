@@ -322,10 +322,12 @@ pub trait Porthole {
     /// authentication given minutes earlier; this never does, and the action
     /// it asks for does not depend on `scope`.
     ///
-    /// Refusals all come from the helper, and in a fixed order: a firewall
-    /// that cannot redirect at all, a UDP request, Docker that could not be
-    /// read, a `published_port` no container publishes, and a `port`
-    /// something already answers on.
+    /// Refusals all come from the helper, in the fixed order
+    /// [`crate::error::FORWARD_REFUSALS`] lists them in — plus the one a
+    /// forward shares with `open`, a firewall that is installed but not
+    /// enforcing rules. Enumerated there rather than here: this doc comment
+    /// was one of two copies that had gone a refusal out of date while
+    /// promising "a fixed order" for a list with a hole in the middle of it.
     async fn forward(
         &self,
         port: u16,

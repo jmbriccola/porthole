@@ -413,8 +413,13 @@ impl<'a> Engine<'a> {
     /// The two are separate arguments because they are separate ports: the
     /// whole point of a forward is that they may differ.
     ///
-    /// Five situations make a forward wrong, and the order they are found in
-    /// is part of what this method promises.
+    /// The situations that make a forward wrong are enumerated once, in
+    /// [`crate::error::FORWARD_REFUSALS`], in the order this method decides
+    /// them — and that order is part of what this method promises. What
+    /// follows says why each one sits where it does; it does not keep a
+    /// second copy of the list, and the count that used to open this
+    /// paragraph is gone with it, having been wrong since the sixth refusal
+    /// landed.
     ///
     /// **Docker is read first.** Until that read returns, nothing about the
     /// request has been decided. A failed read yields

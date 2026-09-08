@@ -270,11 +270,9 @@ fn resolve_to(cli: &Cli, raw: &str) -> Result<(ScopeSpec, String)> {
 
 /// `porthole forward`: parse, ask, render.
 ///
-/// Every refusal a forward has of its own belongs to `Engine::forward` --
-/// a firewall that cannot redirect, UDP, Docker that could not be read, a
-/// port no container publishes, a container the network already reaches, an
-/// external port already carrying something a redirect would take traffic
-/// from. None of them is repeated here.
+/// Every refusal a forward has of its own belongs to `Engine::forward`, and
+/// is enumerated once in `porthole_core::error::FORWARD_REFUSALS`. None of
+/// them is repeated here, and neither is the list.
 /// What this function decides is the argument grammar: which of the two port
 /// numbers is which, and that both are ports at all.
 ///
