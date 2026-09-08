@@ -258,6 +258,64 @@ fn an_anywhere_scoped_rule_is_marked_and_a_subnet_scoped_one_is_not() -> Result<
     Ok(())
 }
 
+/// Two rules side by side, differing only in the one field that says which
+/// act created them. A forward and an open share a port number, a target, a
+/// countdown and a close button; if the row says nothing else, a user
+/// reading it believes their port permits traffic to this machine when it
+/// redirects it into a container. Both the text and the marking are checked
+/// here, for the reason the "anyone" test above checks both.
+fn a_forward_row_says_it_redirects_and_an_open_row_does_not() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.OpenNowForward",
+        move |_app| {
+            let section = OpenNowSection::with_clock(Box::new(SharedClock::at(BASE_TIME)));
+            let mut forward = wire_rule(BASE_TIME, 8443, "tcp", "10.10.10.0/24", 3600);
+            forward.container_addr = "172.18.0.2".to_string();
+            forward.container_port = 8080;
+            forward.published_port = 3000;
+            let open = wire_rule(BASE_TIME, 5173, "tcp", "10.10.10.0/24", 3600);
+            section.set_rules(&[forward, open]);
+            let rows = section.rows();
+            *seen.borrow_mut() = Some((
+                rows[0].subtitle().map(|s| s.to_string()),
+                rows[1].subtitle().map(|s| s.to_string()),
+                section.is_marked_forward(0),
+                section.is_marked_forward(1),
+            ));
+        },
+    );
+    let (forward_subtitle, open_subtitle, forward_marked, open_marked) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    let forward_subtitle = forward_subtitle.ok_or("a forward row must have a subtitle")?;
+    let open_subtitle = open_subtitle.ok_or("an open row must have a subtitle")?;
+    for fact in ["redirects to", "172.18.0.2:8080", "3000", "10.10.10.0/24"] {
+        if !forward_subtitle.contains(fact) {
+            return Err(format!(
+                "a forward's row must name {fact}: {forward_subtitle}"
+            ));
+        }
+    }
+    if forward_subtitle == open_subtitle {
+        return Err(format!(
+            "a forward and an open must not render identically: both {forward_subtitle}"
+        ));
+    }
+    if open_subtitle.contains("redirects") {
+        return Err(format!(
+            "a rule that only permits must not claim to redirect: {open_subtitle}"
+        ));
+    }
+    if !forward_marked {
+        return Err("a forward's row must carry its own marker".to_string());
+    }
+    if open_marked {
+        return Err("a rule that only permits must carry no forward marker".to_string());
+    }
+    Ok(())
+}
+
 /// A countdown that renders once and freezes is worse than no countdown: it
 /// states a specific remaining time, confidently, and is wrong. This reads
 /// `countdown_text`, which is the real `gtk::Label`'s actual displayed text
@@ -956,7 +1014,7 @@ fn a_close_with_no_helper_to_answer_it_leaves_nothing_waiting() -> Result<(), St
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 16] = [
+    let cases: [Case; 17] = [
         (
             "an_empty_list_is_a_calm_note_not_an_error",
             an_empty_list_is_a_calm_note_not_an_error,
@@ -1020,6 +1078,10 @@ fn main() {
         (
             "a_close_with_no_helper_to_answer_it_leaves_nothing_waiting",
             a_close_with_no_helper_to_answer_it_leaves_nothing_waiting,
+        ),
+        (
+            "a_forward_row_says_it_redirects_and_an_open_row_does_not",
+            a_forward_row_says_it_redirects_and_an_open_row_does_not,
         ),
     ];
 

@@ -34,7 +34,9 @@
 //! `tests/session.rs` drives this binary over a private session bus against a
 //! stand-in notification service and a stand-in helper: a close notifies, a
 //! close belonging to another uid does not, a `Reopen` click re-sends the
-//! original `open` with the original duration, and a bus with no notification
+//! original request with the original duration -- an `open` for a rule that
+//! permitted and a `forward` for one that redirected, which are two different
+//! methods and not two spellings of one -- and a bus with no notification
 //! service at all leaves the process running. What none of that touches is a
 //! real notification daemon (the stand-in answers `Notify` and emits
 //! `ActionInvoked`, it does not draw anything), the real helper, or polkit --
@@ -371,23 +373,97 @@ fn on_action(
     tokio::spawn(async move { reopen(porthole, notifications, rule).await });
 }
 
-/// Re-send the original `open`: the same port, the same protocol, the same
-/// scope, and the same length of time.
+/// Which request a `Reopen` re-sends, and everything it carries.
 ///
-/// polkit will ask again where the scope warrants it. That is the point of
-/// polkit asking, not an obstacle: this is a fresh request to open a port,
-/// made because someone clicked a button, and it is authorized as one.
+/// One shape for both acts, because everything but the last field is the
+/// same in both -- see [`reopen_request`] for why the last field is decided
+/// from the rule and not from the reason the notification was about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReopenRequest {
+    port: u16,
+    protocol: String,
+    scope: String,
+    seconds: u32,
+    /// `Some` for a rule that redirects: the port Docker publishes the
+    /// container on, which is the number the original request named and the
+    /// number the helper resolves a container address from, afresh, each
+    /// time it acts. `None` for a rule that only permits.
+    published_port: Option<u16>,
+}
+
+/// What re-sending this rule's own request means.
+///
+/// Decided from the rule, never from the [`porthole_core::ipc::CloseReason`]
+/// that put the notification on screen. The two are not interchangeable: a
+/// forward can expire like anything else, and until this existed a `Reopen`
+/// on an expired *forward* sent `open` for its external port -- permitting
+/// the local network to a port on this machine that nothing answers on,
+/// while the user believed they had restored the redirect they were looking
+/// at. `CloseReason::TargetGone` only made that path easier to reach; it did
+/// not create it.
+///
+/// An empty `container_addr` is the wire's own "this rule only permits" --
+/// see `WireRule`'s doc comment. The two ports cannot say it: `0` is also
+/// what a forward to a container port nobody could have published carries.
+fn reopen_request(rule: &WireRule) -> ReopenRequest {
+    ReopenRequest {
+        port: rule.port,
+        protocol: rule.protocol.clone(),
+        scope: reopen_scope(rule),
+        seconds: original_duration(rule),
+        published_port: if rule.container_addr.is_empty() {
+            None
+        } else {
+            Some(rule.published_port)
+        },
+    }
+}
+
+/// Re-send the original request: the same port, the same protocol, the same
+/// scope, and the same length of time -- as an `open` for a rule that only
+/// permitted, and as a `forward` for one that redirected.
+///
+/// A forward is re-sent by its **published port**, never by the container
+/// address the closed rule happened to hold. That address is the one thing
+/// about a forward that porthole refuses to carry forward on its own (see
+/// `CloseReason::TargetGone`), and the helper resolving it again from
+/// Docker's own table is the whole reason a gone container is something a
+/// click can recover from at all.
+///
+/// polkit will ask again where the scope warrants it -- and for a forward it
+/// asks every time, whatever the scope. That is the point of polkit asking,
+/// not an obstacle: this is a fresh request, made because someone clicked a
+/// button, and it is authorized as one.
 async fn reopen(
     porthole: PortholeProxy<'static>,
     notifications: NotificationsProxy<'_>,
     rule: WireRule,
 ) {
-    let scope = reopen_scope(&rule);
-    let seconds = original_duration(&rule);
-    match porthole
-        .open(rule.port, &rule.protocol, &scope, seconds)
-        .await
-    {
+    let request = reopen_request(&rule);
+    let outcome = match request.published_port {
+        Some(published_port) => {
+            porthole
+                .forward(
+                    request.port,
+                    &request.protocol,
+                    &request.scope,
+                    request.seconds,
+                    published_port,
+                )
+                .await
+        }
+        None => {
+            porthole
+                .open(
+                    request.port,
+                    &request.protocol,
+                    &request.scope,
+                    request.seconds,
+                )
+                .await
+        }
+    };
+    match outcome {
         Ok(reopened) => eprintln!(
             "porthole-agent: reopened {}/{} towards {}",
             reopened.port, reopened.protocol, reopened.target
@@ -498,6 +574,10 @@ mod tests {
         assert!(Ended::SessionBus.reason().contains("session bus"));
     }
 
+    /// An arbitrary but fixed opening time, so a duration in a check below
+    /// reads as a duration rather than as the difference of two literals.
+    const OPENED: u64 = 1_757_000_000;
+
     fn rule(scope: &str, target: &str, opened_at: u64, expires_at: u64) -> WireRule {
         WireRule {
             id: "abc".to_string(),
@@ -555,6 +635,53 @@ mod tests {
             reopen_scope(&rule("network", "10.10.10.5/32", 0, 0)),
             "10.10.10.5/32"
         );
+    }
+
+    #[test]
+    fn a_reopen_of_a_forward_re_sends_a_forward_and_never_an_open() {
+        // The harm this prevents: `open` on a forward's external port
+        // permits the local network to a port on this machine that nothing
+        // answers on -- the redirect is what made that port mean anything,
+        // and it is gone. The user clicked a button on a notification about
+        // a redirect and would have got a plain hole instead.
+        //
+        // The published port is what goes back, not the container address
+        // the closed rule held: the helper resolves the container from
+        // Docker's own table when it acts, which is the only reason a
+        // container that moved is recoverable at one click.
+        let forward = WireRule {
+            port: 8443,
+            container_addr: "172.18.0.2".to_string(),
+            container_port: 8080,
+            published_port: 3000,
+            ..rule("network", "10.10.10.0/24", OPENED, OPENED + 3600)
+        };
+        assert_eq!(
+            reopen_request(&forward),
+            ReopenRequest {
+                port: 8443,
+                protocol: "tcp".to_string(),
+                scope: "10.10.10.0/24".to_string(),
+                seconds: 3600,
+                published_port: Some(3000),
+            }
+        );
+
+        // And the other half: a rule that only permits must not acquire a
+        // forward out of the two ports, which are `0` on it and are also
+        // what a forward to a container port nobody published would carry.
+        let permit = rule("network", "10.10.10.0/24", OPENED, OPENED + 3600);
+        assert_eq!(reopen_request(&permit).published_port, None);
+
+        // And a forward carrying zeroes in both ports is still a forward.
+        // The address is the only field that can say which act a rule was,
+        // which is exactly why the wire uses it as the sentinel.
+        let odd = WireRule {
+            container_port: 0,
+            published_port: 0,
+            ..forward
+        };
+        assert_eq!(reopen_request(&odd).published_port, Some(0));
     }
 
     #[test]

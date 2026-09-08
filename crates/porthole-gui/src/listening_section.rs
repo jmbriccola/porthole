@@ -85,6 +85,29 @@
 //! `porthole_core::docker`'s own module doc is where the consequences are
 //! spelled out.
 //!
+//! ## The one loopback row that is offered something
+//!
+//! A loopback-only row published by a container on loopback carries a
+//! **Forward** button. That is a different act from Open and the row says
+//! so: `open` permits traffic to a service the network was already reaching,
+//! and a forward redirects a port on the network into one it was not. The
+//! reassurance stays as it was -- nothing outside this machine reaches that
+//! socket, and the firewall is not what is stopping it -- and
+//! [`FORWARDABLE_SUFFIX`] is the sentence that says what the button does.
+//!
+//! [`can_forward`] is the whole condition, and each of its four parts
+//! mirrors a refusal the helper makes on its own side -- so no button is
+//! offered on a row that could only ever be refused for something about
+//! *that row*. It is not a promise that pressing it succeeds, and this
+//! section must not be read as making one: the helper also refuses a
+//! backend that cannot redirect at all, a firewall that is not running, and
+//! an external port already answered on -- and that last one is a number
+//! the user types into the dialog afterwards, which this section never
+//! sees. Those refusals arrive as messages, from the helper, in its own
+//! words. An ordinary local process gets no button at all rather than a
+//! disabled one: a forward needs a container, and a disabled button
+//! explains nothing about why.
+//!
 //! An unmarked row means one of three things: Docker was asked and does not
 //! publish this port, Docker was asked and could not answer, or Docker has
 //! not been asked yet. A row carries no way to tell them apart. The group's
@@ -137,8 +160,9 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-use porthole_core::docker::Published;
+use porthole_core::docker::{already_reachable, Published};
 use porthole_core::listening::{Binding, Service};
+use porthole_core::model::Protocol;
 
 use crate::quiet::{quiet_note, TroubleNote};
 
@@ -159,6 +183,14 @@ const LOADING_NOTE: &str = "Checking what's listening…";
 /// registering again replaces it.
 type OpenRequestedCallback = Rc<dyn Fn(u16)>;
 
+/// What a caller registers through
+/// [`ListeningSection::connect_forward_requested`] to hear that a row's
+/// Forward button was pressed, carrying the port Docker publishes that
+/// service on -- which is the number `porthole forward` itself takes, not
+/// the port the local network would end up connecting to. One slot, not a
+/// list, exactly like [`OpenRequestedCallback`].
+type ForwardRequestedCallback = Rc<dyn Fn(u16)>;
+
 /// One rendered service: the widgets `Inner::rows` needs to update or
 /// remove later, plus the port a caller needs back from [`activate_open`]
 /// once the button (if any) is clicked.
@@ -171,6 +203,10 @@ struct Row {
     /// `BeyondReach`) or one that is already open -- see this module's own
     /// doc comment for why each of those has no button.
     open_button: Option<gtk::Button>,
+    /// `None` on every row [`can_forward`] answers `false` for, which is
+    /// every row but one shape: a loopback-only service a checked Docker
+    /// list publishes on loopback only.
+    forward_button: Option<gtk::Button>,
     /// The marker on a row whose port Docker publishes. `None` on every
     /// other row, and on every row at all while Docker could not be checked.
     docker_icon: Option<gtk::Image>,
@@ -231,6 +267,10 @@ struct Inner {
     /// button it finds and builds new ones, and this is what the new ones
     /// are connected to as they are built.
     on_open_requested: RefCell<Option<OpenRequestedCallback>>,
+    /// Where every Forward button's click goes, held on the section for the
+    /// same reason `on_open_requested` is: `apply` discards every button it
+    /// finds and builds new ones.
+    on_forward_requested: RefCell<Option<ForwardRequestedCallback>>,
 }
 
 /// `"node · 5173"` when the owning process is known, `"4000"` alone when it
@@ -247,6 +287,15 @@ fn title_for(service: &Service) -> String {
 /// nothing outside this machine can reach it. No warning, no "cannot open"
 /// framing: it is a fact about the service, not a problem with it.
 const LOOPBACK_SUBTITLE: &str = "listening only on this machine — the firewall does not affect it";
+
+/// What a row that can be forwarded says after [`LOOPBACK_SUBTITLE`]'s own
+/// sentence. The reassurance is unchanged and still true -- nothing outside
+/// this machine reaches that socket, and opening the firewall would not
+/// change it -- and the second half names the act the row's own button
+/// performs, which is not opening. A row offering a button whose subtitle
+/// only says the firewall cannot help says nothing about what the button
+/// does.
+const FORWARDABLE_SUFFIX: &str = ", but a forward can redirect a network port into it";
 
 /// The opposite-direction case: porthole cannot open or close this either,
 /// but because it is blind to it, not because it is safe. Deliberately
@@ -382,7 +431,10 @@ fn subtitle_for(
     open_ports: &HashSet<u16>,
     docker: Option<&[Published]>,
 ) -> String {
-    let base = subtitle_without_docker(service, open_ports);
+    let mut base = subtitle_without_docker(service, open_ports);
+    if can_forward(service, docker) {
+        base.push_str(FORWARDABLE_SUFFIX);
+    }
     let matches = docker.map(|list| docker_matches(service.port, service.protocol, list));
     match matches.as_deref() {
         Some(matches) if !matches.is_empty() => {
@@ -425,6 +477,41 @@ fn is_actionable(service: &Service, open_ports: &HashSet<u16>) -> bool {
         service.binding,
         Binding::AllInterfaces | Binding::Specific(_)
     ) && !open_ports.contains(&service.port)
+}
+
+/// Whether a forward of this service could be created at all.
+///
+/// Four conditions, each one a refusal `porthole_core::engine::Engine::
+/// forward` makes on its own side. All four are properties of the row
+/// itself, which is what makes them answerable here; the helper's other
+/// refusals are not, and this is deliberately **not** the set of everything
+/// that can go wrong -- see this module's own doc comment on what still
+/// arrives as a message:
+///
+/// - the service is [`Binding::LoopbackOnly`]. A forward redirects traffic
+///   to something the network was not reaching; a network-facing service
+///   is what `open` is for.
+/// - the protocol is TCP. The helper declines a UDP forward, because the
+///   check it makes for a local listener on the external port reads TCP.
+/// - a **checked** Docker list names this port. `None` is both ways there
+///   can fail to be one, and neither is an answer -- the same rule the
+///   Docker marker follows.
+/// - Docker publishes it on loopback only, per
+///   `porthole_core::docker::already_reachable`. A container the local
+///   network already reaches is refused a forward: it would add a second
+///   way in, and closing it later would remove only that one.
+///
+/// The last one reads Docker's own rule rather than the `/proc` scan's
+/// binding, because Docker's rule is what a forward would sit beside.
+fn can_forward(service: &Service, docker: Option<&[Published]>) -> bool {
+    if !matches!(service.binding, Binding::LoopbackOnly) || service.protocol != Protocol::Tcp {
+        return false;
+    }
+    let Some(published) = docker else {
+        return false;
+    };
+    !docker_matches(service.port, service.protocol, published).is_empty()
+        && already_reachable(service.port, service.protocol, published).is_none()
 }
 
 /// Sort key that puts the rows a user can act on first: network-facing
@@ -577,11 +664,44 @@ fn apply(inner: &Rc<Inner>) {
             None
         };
 
+        // The other act this section can offer, on the rows `open` cannot
+        // help at all: redirecting a port on the network into the container
+        // that publishes this one. Built and connected in the same
+        // statement, exactly as the Open button above is and for the same
+        // reason -- see this module's own doc comment on the wiring pass
+        // that left that one dead.
+        let forward_button = if can_forward(service, docker.checked()) {
+            let button = gtk::Button::builder()
+                .label("Forward")
+                .valign(gtk::Align::Center)
+                .tooltip_text(format!(
+                    "Redirect a port on the network to the container publishing {}",
+                    service.port
+                ))
+                .build();
+            let inner_for_click = Rc::clone(inner);
+            let published_port = service.port;
+            button.connect_clicked(move |_| {
+                // Cloned out of the cell before the call, for the reason
+                // the Open button's own handler clones its own: what the
+                // callback does can come back into this section.
+                let callback = inner_for_click.on_forward_requested.borrow().clone();
+                if let Some(callback) = callback {
+                    callback(published_port);
+                }
+            });
+            action_row.add_suffix(&button);
+            Some(button)
+        } else {
+            None
+        };
+
         inner.group.add(&action_row);
         rows.push(Row {
             port: service.port,
             row: action_row,
             open_button,
+            forward_button,
             docker_icon,
         });
     }
@@ -684,6 +804,7 @@ impl ListeningSection {
             docker: RefCell::new(DockerPorts::NotChecked),
             scanned: Cell::new(false),
             on_open_requested: RefCell::new(None),
+            on_forward_requested: RefCell::new(None),
         });
 
         Self { inner }
@@ -704,6 +825,15 @@ impl ListeningSection {
     /// dialog `f` goes on to present -- see this module's own doc comment.
     pub fn connect_open_requested(&self, f: impl Fn(u16) + 'static) {
         self.inner.on_open_requested.replace(Some(Rc::new(f)));
+    }
+
+    /// Registers what a row's Forward button does, once, for the whole life
+    /// of this section, exactly as
+    /// [`ListeningSection::connect_open_requested`] does for the other
+    /// button. `f` is called with the port Docker publishes that service
+    /// on -- the number `porthole forward` takes.
+    pub fn connect_forward_requested(&self, f: impl Fn(u16) + 'static) {
+        self.inner.on_forward_requested.replace(Some(Rc::new(f)));
     }
 
     /// The whole way a service list reaches this section -- see this
@@ -873,6 +1003,33 @@ impl ListeningSection {
     pub fn activate_open(&self, index: usize) -> Option<u16> {
         self.inner.rows.borrow().get(index).and_then(|r| {
             if r.open_button.is_some() {
+                Some(r.port)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// `None` for every row [`can_forward`] answers `false` for -- see that
+    /// function for the four things that have to hold at once.
+    pub fn forward_button_for(&self, index: usize) -> Option<gtk::Button> {
+        self.inner
+            .rows
+            .borrow()
+            .get(index)
+            .and_then(|r| r.forward_button.clone())
+    }
+
+    /// What pressing row `index`'s Forward button carries: the published
+    /// port [`ListeningSection::connect_forward_requested`]'s callback is
+    /// handed. `None` when that row has no Forward button at all.
+    ///
+    /// A pure lookup, not a simulated click -- the same limit
+    /// [`ListeningSection::activate_open`] carries, and `tests/window.rs`
+    /// is where the button itself is pressed.
+    pub fn activate_forward(&self, index: usize) -> Option<u16> {
+        self.inner.rows.borrow().get(index).and_then(|r| {
+            if r.forward_button.is_some() {
                 Some(r.port)
             } else {
                 None
@@ -1087,11 +1244,78 @@ mod tests {
             "0.0.0.0 · docker: published on every interface"
         );
 
+        // The same row also gains `FORWARDABLE_SUFFIX`: a container
+        // publishing a port on loopback is exactly the shape that gets a
+        // Forward button, and the row has to say what that button does.
         let list = [published(5432, Some("127.0.0.1"))];
         assert_eq!(
             subtitle_for(&svc(5432, None, Binding::LoopbackOnly), &open, Some(&list)),
-            format!("{LOOPBACK_SUBTITLE} · docker: published on 127.0.0.1")
+            format!("{LOOPBACK_SUBTITLE}{FORWARDABLE_SUFFIX} · docker: published on 127.0.0.1")
         );
+    }
+
+    #[test]
+    fn a_loopback_row_a_container_publishes_on_loopback_can_be_forwarded() {
+        let list = [published(3000, Some("127.0.0.1"))];
+        assert!(can_forward(
+            &svc(3000, Some("docker-proxy"), Binding::LoopbackOnly),
+            Some(&list)
+        ));
+    }
+
+    #[test]
+    fn nothing_else_can_be_forwarded() {
+        let loopback_list = [published(3000, Some("127.0.0.1"))];
+        let exposed_list = [published(3000, None)];
+
+        // No container publishes it.
+        assert!(!can_forward(
+            &svc(3000, Some("code"), Binding::LoopbackOnly),
+            Some(&[])
+        ));
+        // A container publishes a different port.
+        assert!(!can_forward(
+            &svc(9843, Some("code"), Binding::LoopbackOnly),
+            Some(&loopback_list)
+        ));
+        // No checked list at all -- neither of the two ways there can fail
+        // to be one is an answer.
+        assert!(!can_forward(
+            &svc(3000, Some("docker-proxy"), Binding::LoopbackOnly),
+            None
+        ));
+        // The network already reaches the container, which the helper
+        // refuses: a forward would add a second way in.
+        assert!(!can_forward(
+            &svc(3000, Some("docker-proxy"), Binding::LoopbackOnly),
+            Some(&exposed_list)
+        ));
+        // Network-facing, and so `open`'s business rather than this one's.
+        assert!(!can_forward(
+            &svc(3000, Some("docker-proxy"), Binding::AllInterfaces),
+            Some(&loopback_list)
+        ));
+        // UDP, which the helper declines to forward.
+        let mut udp_service = svc(3000, Some("docker-proxy"), Binding::LoopbackOnly);
+        udp_service.protocol = Protocol::Udp;
+        let mut udp_published = published(3000, Some("127.0.0.1"));
+        udp_published.protocol = Protocol::Udp;
+        assert!(!can_forward(&udp_service, Some(&[udp_published])));
+    }
+
+    #[test]
+    fn a_row_that_cannot_be_forwarded_keeps_the_reassurance_alone() {
+        // The suffix is the whole difference between the two loopback
+        // rows, and an ordinary local process must not carry it: it names
+        // an act that row cannot perform.
+        let open = HashSet::new();
+        let list = [published(3000, Some("127.0.0.1"))];
+        let plain = subtitle_for(
+            &svc(9843, Some("code"), Binding::LoopbackOnly),
+            &open,
+            Some(&list),
+        );
+        assert_eq!(plain, LOOPBACK_SUBTITLE);
     }
 
     #[test]

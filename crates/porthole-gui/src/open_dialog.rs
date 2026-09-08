@@ -85,6 +85,23 @@
 //! actually exercises: the presented alert's own two responses are answered
 //! by a person, not by CI.
 //!
+//! ## The other act this dialog performs
+//!
+//! [`OpenDialog::for_forward`] builds the same widgets for a different
+//! request: `forward` rather than `open`, for the container that publishes
+//! a given port on this machine. The two are not variants of one act --
+//! `open` permits traffic to something the network already reached, a
+//! forward redirects a port into something it did not -- and this project
+//! keeps acts with different consequences apart, down to separate polkit
+//! actions with separate messages. What is shared is only what a person has
+//! to decide: for how long, and towards whom.
+//!
+//! One control is missing in that mode rather than disabled. The helper
+//! forwards TCP only, so the protocol chooser is hidden and the port
+//! field's own description says which protocol this is -- a control that
+//! can only be refused is not a choice, and a disabled one with no
+//! explanation is worse than none.
+//!
 //! ## `on_opened`
 //!
 //! [`OpenDialog::on_opened`] is a hook a caller registers to learn a request
@@ -376,6 +393,18 @@ struct Inner {
     dialog: adw::Dialog,
     toast_overlay: adw::ToastOverlay,
     port_row: adw::EntryRow,
+    /// Held so [`OpenDialog::for_forward`] can say, under the port field,
+    /// what a forward does with what arrives there.
+    port_group: adw::PreferencesGroup,
+    /// Held for the same reason, to be hidden: the helper forwards TCP
+    /// only, and a choice that can only be refused is not one.
+    protocol_group: adw::PreferencesGroup,
+    /// The port Docker publishes the container on, when this dialog
+    /// forwards rather than opens -- `None` for an ordinary open, which is
+    /// what [`OpenDialog::new`] builds. It decides which method the button
+    /// sends and whether the Docker explanation is shown at all; the rest
+    /// of the dialog is the same either way.
+    forward: Cell<Option<u16>>,
     /// TCP is index 0/default; this is the other half of that linked pair.
     udp_toggle: gtk::ToggleButton,
     /// Fixed for the dialog's whole lifetime -- unlike `target_rows`, no
@@ -645,6 +674,14 @@ const DOCKER_RESPONSE_CANCEL: &str = "cancel";
 /// where that "could not check" fact is said instead, once, rather than at
 /// every press of this button.
 fn docker_alert_for(inner: &Inner, request: &Request) -> Option<adw::AlertDialog> {
+    // Not on a forward. This explanation exists to tell someone opening a
+    // port that Docker already publishes it, which is news; on a forward it
+    // is the premise, and the sentence it would show is `advise`'s own
+    // loopback one -- "opening this port here does not make it reachable" --
+    // about a port this dialog is not opening.
+    if inner.forward.get().is_some() {
+        return None;
+    }
     let published = inner.docker.borrow();
     let message = advise(request.port, request.protocol, published.as_deref()?)?;
 
@@ -691,6 +728,33 @@ async fn open_over_dbus(
         .map_err(|e| format!("could not reach the porthole helper: {e}"))?;
     proxy
         .open(port, protocol, scope, seconds)
+        .await
+        .map_err(|e| helper_message(&e))
+}
+
+/// [`open_over_dbus`]'s counterpart for the other act: the same bus, the
+/// same un-resolved `scope` string, and one more number -- the port Docker
+/// publishes the container on, which is what the helper resolves to a
+/// container address of its own accord. This client sends no address.
+///
+/// Sends exactly what `porthole-cli`'s own `client::forward` sends. The
+/// helper authorizes this one every time, whatever the scope; nothing here
+/// decides that, and nothing here can skip it.
+async fn forward_over_dbus(
+    port: u16,
+    protocol: &str,
+    scope: &str,
+    seconds: u32,
+    published_port: u16,
+) -> Result<WireRule, String> {
+    let connection = zbus::Connection::system()
+        .await
+        .map_err(|e| format!("could not reach the porthole helper: {e}"))?;
+    let proxy = PortholeProxy::new(&connection)
+        .await
+        .map_err(|e| format!("could not reach the porthole helper: {e}"))?;
+    proxy
+        .forward(port, protocol, scope, seconds, published_port)
         .await
         .map_err(|e| helper_message(&e))
 }
@@ -901,6 +965,9 @@ impl OpenDialog {
             dialog,
             toast_overlay,
             port_row: port_row.clone(),
+            port_group,
+            protocol_group,
+            forward: Cell::new(None),
             udp_toggle,
             duration_chips,
             custom_revealer,
@@ -969,7 +1036,16 @@ impl OpenDialog {
                 // dropped on the way out of this block, whichever way that
                 // is -- see `busy.rs`.
                 let busy = inner.busy.begin();
-                let outcome = open_over_dbus(request.port, &protocol, &scope, seconds).await;
+                // Which of the two acts this dialog is for was decided at
+                // construction and cannot change while it is on screen --
+                // see `OpenDialog::for_forward`.
+                let outcome = match inner.forward.get() {
+                    Some(published_port) => {
+                        forward_over_dbus(request.port, &protocol, &scope, seconds, published_port)
+                            .await
+                    }
+                    None => open_over_dbus(request.port, &protocol, &scope, seconds).await,
+                };
                 drop(busy);
                 match outcome {
                     Ok(rule) => {
@@ -1009,6 +1085,55 @@ impl OpenDialog {
     pub fn for_port(port: u16) -> Self {
         let dialog = Self::new();
         dialog.set_port_text(&port.to_string());
+        dialog
+    }
+
+    /// The same dialog for the other act: pressing its button sends the
+    /// helper's `forward` for the container that publishes
+    /// `published_port` on this machine, never `open`.
+    ///
+    /// What a person has to decide is the same -- for how long, and towards
+    /// whom -- so the duration chips, the target list and the saved devices
+    /// are all as they were. Four things differ on screen:
+    ///
+    /// - the port field, renamed to the port the local network connects to
+    ///   (`porthole forward --as`) and pre-filled with the published port,
+    ///   because that is what omitting `--as` means;
+    /// - a sentence under it saying where what arrives there goes, and
+    ///   naming the published port it goes to;
+    /// - the target list's heading and the button's label, so the act being
+    ///   chosen for is named at the two places a person looks;
+    /// - the protocol, which is not offered at all: the helper forwards TCP
+    ///   only, and the description above carries that fact rather than a
+    ///   control sitting there refusing.
+    ///
+    /// A fifth difference is **not** on screen and is not claimed to be: the
+    /// dialog's title. This dialog carries no `adw::HeaderBar`, so its title
+    /// is what a screen reader announces and what a test can identify it by,
+    /// never text a sighted user reads. It is set all the same, for both of
+    /// those.
+    ///
+    /// A sixth is an absence, which says nothing by itself: the Docker
+    /// explanation is suppressed -- see `docker_alert_for` for why showing
+    /// it here would be worse than showing nothing.
+    ///
+    /// The container's address is not among any of them, and never crosses
+    /// from here: the helper resolves `published_port` against Docker's own
+    /// table at the moment it acts.
+    pub fn for_forward(published_port: u16) -> Self {
+        let dialog = Self::new();
+        let inner = &dialog.inner;
+        inner.forward.set(Some(published_port));
+        inner.dialog.set_title("Forward a port");
+        inner.port_row.set_title("Port on the network");
+        inner.port_group.set_description(Some(&format!(
+            "What arrives on this port from the network is redirected to the container \
+             that publishes {published_port} on this machine. Forwards are TCP."
+        )));
+        inner.protocol_group.set_visible(false);
+        inner.target_group.set_title("Forward towards");
+        inner.open_button.set_label("Forward");
+        dialog.set_port_text(&published_port.to_string());
         dialog
     }
 
@@ -1183,6 +1308,13 @@ impl OpenDialog {
         true
     }
 
+    /// What the target list is headed -- "Open towards" or "Forward
+    /// towards", which is the heading a person reads directly above the
+    /// choice they are about to make.
+    pub fn target_group_title(&self) -> String {
+        self.inner.target_group.title().to_string()
+    }
+
     /// The group's own description line, or `None` when it has none --
     /// [`OpenDialog::set_devices_unreadable`]'s state.
     pub fn target_group_description(&self) -> Option<String> {
@@ -1191,6 +1323,44 @@ impl OpenDialog {
             .description()
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty())
+    }
+
+    /// What the port field is actually called on screen.
+    ///
+    /// Not the same thing in the two acts, and this is the one difference a
+    /// person looking at the dialog cannot miss: the number an `open` takes
+    /// is the port a service on this machine already listens on, and the
+    /// number a forward takes is a port on the network that nothing here
+    /// answers on yet. Read off the real `adw::EntryRow`, so a test checking
+    /// it is checking what is rendered.
+    ///
+    /// Worth pinning separately from [`OpenDialog::dialog`]'s own title:
+    /// this dialog has no `adw::HeaderBar`, so its title is metadata (and
+    /// what a screen reader announces), never text on screen. A check that
+    /// only compared titles would prove which constructor ran and nothing
+    /// about what a person sees.
+    pub fn port_field_title(&self) -> String {
+        self.inner.port_row.title().to_string()
+    }
+
+    /// The sentence under the port field, or `None` when there is none --
+    /// an ordinary open, where a field called "Port" needs no explaining.
+    pub fn port_group_description(&self) -> Option<String> {
+        self.inner
+            .port_group
+            .description()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Whether the protocol chooser is on screen at all.
+    ///
+    /// `false` only on a forwarding dialog: the helper forwards TCP only, so
+    /// the control is hidden rather than shown refusing, and the port
+    /// field's own description carries the fact instead. Read off the
+    /// group's own `visible` property, not a second record of the decision.
+    pub fn offers_a_protocol_choice(&self) -> bool {
+        self.inner.protocol_group.is_visible()
     }
 
     /// The scope pressing Open would send, or `None` when no selectable
@@ -1257,6 +1427,17 @@ impl OpenDialog {
     /// condition [`OpenDialog::can_submit`] reports `false` for.
     pub fn request(&self) -> Option<Request> {
         build_request(&self.inner)
+    }
+
+    /// Which of the two acts this dialog performs: `Some(published_port)`
+    /// when pressing its button sends the helper's `forward` for the
+    /// container publishing that port, `None` when it sends `open`.
+    ///
+    /// This is the value the click handler itself reads, not a second
+    /// record of the same decision -- so a caller checking it is checking
+    /// what would actually be sent.
+    pub fn forwards(&self) -> Option<u16> {
+        self.inner.forward.get()
     }
 
     /// The real "Open" button, for a test that wants to check its own state

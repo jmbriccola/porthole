@@ -84,17 +84,32 @@ pub fn is_worth_announcing(reason: CloseReason) -> bool {
 /// out, so a reason added to the wire enum has to come here and say what it
 /// looks like rather than falling into a catch-all.
 ///
-/// Only an expiry offers `reopen`. An expiry is the one case where nothing
-/// about the machine changed under the rule -- the clock the user set ran
-/// out -- so re-sending the same request restores what they asked for. After
-/// a network change the machine is somewhere else, and a rule for a subnet it
-/// has left would appear to work and reach nobody. After a reconciliation
-/// something outside porthole removed the rule from the firewall, and this
-/// cannot tell what: putting it back at one click, before the user has seen
-/// what took it away, would be porthole arguing with whatever that was. And a
-/// forward whose container is gone has nothing left to point at: the request
-/// this notification is about named a service, and re-sending it would aim at
-/// an address that is now somebody else's.
+/// Two reasons offer `reopen`, and the test for which is whether re-sending
+/// the request can still mean what it meant.
+///
+/// An expiry can: nothing about the machine changed under the rule, the
+/// clock the user set ran out, so re-sending the same request restores what
+/// they asked for. [`CloseReason::TargetGone`] can too, and this is the
+/// non-obvious one. The request behind a forward names a *published port* --
+/// a service on this machine -- never a container address; the address is
+/// resolved by the helper, against Docker's own table, at the moment it
+/// acts. So a container that restarted somewhere else is not something the
+/// stored request pointed at and lost: it is something the request would
+/// find again. That is exactly what re-sending it does, and it is why the
+/// rule was closed rather than re-aimed in the first place -- porthole
+/// re-resolves, it does not assume.
+///
+/// The other two cannot. After a network change the machine is somewhere
+/// else, and a rule for a subnet it has left would appear to work and reach
+/// nobody -- the request names that subnet, and no re-resolution can make it
+/// the one this machine is on. After a reconciliation something outside
+/// porthole removed the rule from the firewall, and this cannot tell what:
+/// putting it back at one click, before the user has seen what took it away,
+/// would be porthole arguing with whatever that was.
+///
+/// A `Reopen` on a forward re-sends a **forward**, not an `open` -- see
+/// `crate::reopen_request` in `main.rs`, which is where that is decided and
+/// where the harm of getting it wrong is spelled out.
 pub fn notification_for(rule: &WireRule, reason: CloseReason) -> Notification {
     let port = format!("{}/{}", rule.port, rule.protocol);
     let target = &rule.target;
@@ -130,11 +145,12 @@ pub fn notification_for(rule: &WireRule, reason: CloseReason) -> Notification {
             summary: format!("Port {port} closed"),
             body: format!(
                 "{port} was redirected to a container that is no longer the one it was \
-                 created for, so porthole closed it. Container addresses change when a \
-                 container restarts, and the one at that address now may be a different \
-                 service."
+                 created for, so porthole closed it rather than re-aiming it: container \
+                 addresses change when a container restarts, and the one at that address \
+                 now may be a different service. Reopening asks for the forward again and \
+                 resolves the container as it is now."
             ),
-            actions: Vec::new(),
+            actions: vec![(REOPEN.to_string(), "Reopen".to_string())],
         },
     }
 }
@@ -217,6 +233,18 @@ mod tests {
         }
     }
 
+    /// The only kind of rule `TargetGone` is ever sent for: one that
+    /// redirects. `container_addr` non-empty is what says so on the wire.
+    fn forward_rule(port: u16, published_port: u16) -> WireRule {
+        WireRule {
+            port,
+            container_addr: "172.18.0.2".to_string(),
+            container_port: 8080,
+            published_port,
+            ..closed_rule(port, "tcp")
+        }
+    }
+
     fn signal_from_uid(uid: u32) -> WireRule {
         WireRule {
             uid,
@@ -245,6 +273,45 @@ mod tests {
         assert!(notification_for(&r, CloseReason::NetworkChanged)
             .actions
             .is_empty());
+    }
+
+    #[test]
+    fn a_gone_container_offers_reopen_and_a_network_change_still_does_not() {
+        // Both halves, deliberately, in one check: the two reasons are
+        // adjacent in the enum and share the shape of their notification,
+        // and the temptation to "make them consistent" is exactly what this
+        // exists to stop. They are not the same case. A forward's request
+        // names a published port and the helper resolves the container
+        // afresh every time it acts, so re-sending it finds the container
+        // wherever it is now. A network-scoped rule's request names the
+        // subnet itself, and nothing re-resolves that: reopening after a
+        // network change would build a rule for a subnet this machine has
+        // left, which would appear to work and reach nobody.
+        let forward = forward_rule(8443, 3000);
+        let gone = notification_for(&forward, CloseReason::TargetGone);
+        assert!(
+            gone.actions.iter().any(|a| a.0 == REOPEN),
+            "a container that moved can be found again: {:?}",
+            gone.actions
+        );
+        assert!(
+            gone.body.contains("Reopening"),
+            "the body must say what the button will do: {}",
+            gone.body
+        );
+
+        assert!(
+            notification_for(&forward, CloseReason::NetworkChanged)
+                .actions
+                .is_empty(),
+            "a subnet this machine has left cannot be resolved afresh"
+        );
+        assert!(
+            notification_for(&forward, CloseReason::Reconciled)
+                .actions
+                .is_empty(),
+            "porthole must not argue at one click with whatever removed the rule"
+        );
     }
 
     #[test]

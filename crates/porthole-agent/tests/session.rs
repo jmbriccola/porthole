@@ -10,8 +10,10 @@
 //!
 //! What this proves is the wiring: a `RuleClosed` becomes a `Notify` with the
 //! right words on it, one for another uid becomes nothing, an `ActionInvoked`
-//! becomes an `Open` carrying the original request, and a bus where nothing
-//! answers `Notify` leaves the process running. What it does not prove is
+//! becomes an `Open` carrying the original request -- or a `Forward`, when
+//! the rule was one, which the stand-in helper records separately so a test
+//! can fail for the difference -- and a bus where nothing answers `Notify`
+//! leaves the process running. What it does not prove is
 //! anything about a real notification daemon -- the stand-in below answers
 //! the method and emits the signal, it does not draw a bubble or wait for a
 //! human to click it -- nor anything about the real helper or polkit.
@@ -182,6 +184,18 @@ impl FakeNotifications {
     }
 }
 
+/// A rule that redirects rather than permits, as `list` reports one. A
+/// non-empty `container_addr` is the wire's own way of saying which of the
+/// two acts created it -- see `WireRule`'s doc comment.
+fn wire_forward(port: u16, published_port: u16, uid: u32) -> WireRule {
+    WireRule {
+        container_addr: "172.18.0.2".to_string(),
+        container_port: 8080,
+        published_port,
+        ..wire_rule(port, uid)
+    }
+}
+
 /// One `Open` call, as the stand-in helper received it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Opened {
@@ -191,8 +205,22 @@ struct Opened {
     seconds: u32,
 }
 
+/// One `Forward` call. A separate record from [`Opened`], deliberately: a
+/// test that could not tell the two methods apart could not fail for the
+/// thing this file most needs it to fail for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Forwarded {
+    port: u16,
+    protocol: String,
+    scope: String,
+    seconds: u32,
+    published_port: u16,
+}
+
+#[derive(Default)]
 struct FakeHelper {
     opens: Arc<Mutex<Vec<Opened>>>,
+    forwards: Arc<Mutex<Vec<Forwarded>>>,
 }
 
 #[zbus::interface(name = "com.jacopobriccola.Porthole1")]
@@ -211,6 +239,26 @@ impl FakeHelper {
             seconds,
         });
         let mut rule = wire_rule(port, OUR_UID);
+        rule.protocol = protocol;
+        rule
+    }
+
+    async fn forward(
+        &self,
+        port: u16,
+        protocol: String,
+        scope: String,
+        seconds: u32,
+        published_port: u16,
+    ) -> WireRule {
+        self.forwards.lock().expect("not poisoned").push(Forwarded {
+            port,
+            protocol: protocol.clone(),
+            scope,
+            seconds,
+            published_port,
+        });
+        let mut rule = wire_forward(port, published_port, OUR_UID);
         rule.protocol = protocol;
         rule
     }
@@ -268,6 +316,7 @@ async fn a_close_notifies_its_own_user_only_and_a_reopen_re_sends_the_original_o
             PATH,
             FakeHelper {
                 opens: opens.clone(),
+                ..Default::default()
             },
         )
         .unwrap()
@@ -352,6 +401,196 @@ async fn a_close_notifies_its_own_user_only_and_a_reopen_re_sends_the_original_o
 }
 
 #[tokio::test]
+async fn a_gone_container_offers_reopen_and_the_click_sends_a_forward_not_an_open() {
+    // Two things at once, and both matter.
+    //
+    // `TargetGone` offers `Reopen` where a network change does not, because
+    // a forward's request names a published port and the helper resolves the
+    // container from Docker's own table each time it acts -- so a container
+    // that restarted somewhere else is found again rather than lost. That is
+    // the *only* reason the button can be honest here.
+    //
+    // And the click has to send `forward`. Sending `open` for a forward's
+    // external port would permit the local network to a port on this machine
+    // that nothing answers on: the redirect was the whole of what that port
+    // meant. Recording the two methods separately in the stand-in helper is
+    // what lets this fail for that, rather than merely observing that
+    // *something* reached the helper.
+    let bus = Bus::start();
+    let uid = our_uid();
+
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let opens = Arc::new(Mutex::new(Vec::new()));
+    let forwards = Arc::new(Mutex::new(Vec::new()));
+    let notification_id = 11;
+
+    let notifications = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(NOTIFICATIONS_SERVICE)
+        .unwrap()
+        .serve_at(
+            NOTIFICATIONS_PATH,
+            FakeNotifications {
+                shown: shown.clone(),
+                id: notification_id,
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let helper = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(SERVICE)
+        .unwrap()
+        .serve_at(
+            PATH,
+            FakeHelper {
+                opens: opens.clone(),
+                forwards: forwards.clone(),
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let mut agent = Agent::start(&bus);
+    until("the agent to start listening", || {
+        agent.journal().contains("listening for uid").then_some(())
+    })
+    .await;
+
+    helper
+        .emit_signal(
+            None::<()>,
+            PATH,
+            INTERFACE,
+            "RuleClosed",
+            &(wire_forward(8443, 3000, uid), CloseReason::TargetGone),
+        )
+        .await
+        .unwrap();
+
+    let notice = until("a notification", || shown.lock().unwrap().first().cloned()).await;
+    assert!(notice.body.contains("8443/tcp"), "{notice:?}");
+    assert_eq!(
+        notice.actions,
+        vec!["reopen".to_string(), "Reopen".to_string()],
+        "a container that moved can be found again, so this one offers the button"
+    );
+
+    notifications
+        .emit_signal(
+            None::<()>,
+            NOTIFICATIONS_PATH,
+            NOTIFICATIONS_INTERFACE,
+            "ActionInvoked",
+            &(notification_id, "reopen"),
+        )
+        .await
+        .unwrap();
+
+    let sent = until("the reopen to reach the helper", || {
+        forwards.lock().unwrap().first().cloned()
+    })
+    .await;
+    assert_eq!(
+        sent,
+        Forwarded {
+            port: 8443,
+            protocol: "tcp".to_string(),
+            scope: "10.10.10.0/24".to_string(),
+            seconds: (EXPIRES_AT - OPENED_AT) as u32,
+            // The published port, never the container address the closed
+            // rule happened to hold: the helper resolves that afresh, which
+            // is the whole point of closing rather than re-aiming.
+            published_port: 3000,
+        }
+    );
+    assert!(
+        opens.lock().unwrap().is_empty(),
+        "the click opened the external port instead of re-creating the redirect: {:?}",
+        opens.lock().unwrap()
+    );
+    assert!(agent.is_running());
+}
+
+#[tokio::test]
+async fn a_network_change_is_announced_without_a_button_that_could_not_work() {
+    // The other half of the pair above, kept as its own check so that making
+    // the two reasons "consistent" cannot pass silently. A rule scoped to a
+    // subnet this machine has left names that subnet in its own request, and
+    // nothing re-resolves it: a `Reopen` would build a rule that appears to
+    // work and reaches nobody. The notification still happens -- the user
+    // has to be told the port closed -- it simply offers nothing.
+    let bus = Bus::start();
+    let uid = our_uid();
+
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let opens = Arc::new(Mutex::new(Vec::new()));
+    let forwards = Arc::new(Mutex::new(Vec::new()));
+
+    let _notifications = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(NOTIFICATIONS_SERVICE)
+        .unwrap()
+        .serve_at(
+            NOTIFICATIONS_PATH,
+            FakeNotifications {
+                shown: shown.clone(),
+                id: 13,
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let helper = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(SERVICE)
+        .unwrap()
+        .serve_at(
+            PATH,
+            FakeHelper {
+                opens: opens.clone(),
+                forwards: forwards.clone(),
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let mut agent = Agent::start(&bus);
+    until("the agent to start listening", || {
+        agent.journal().contains("listening for uid").then_some(())
+    })
+    .await;
+
+    helper
+        .emit_signal(
+            None::<()>,
+            PATH,
+            INTERFACE,
+            "RuleClosed",
+            &(wire_rule(5173, uid), CloseReason::NetworkChanged),
+        )
+        .await
+        .unwrap();
+
+    let notice = until("a notification", || shown.lock().unwrap().first().cloned()).await;
+    assert!(notice.body.contains("5173/tcp"), "{notice:?}");
+    assert!(
+        notice.actions.is_empty(),
+        "a rule for a subnet this machine has left must offer no button: {notice:?}"
+    );
+    assert!(agent.is_running());
+}
+
+#[tokio::test]
 async fn a_missing_notification_service_does_not_kill_the_agent() {
     // A headless login or a session without a notification daemon must not
     // leave a crash-looping user unit behind. Nothing owns
@@ -369,6 +608,7 @@ async fn a_missing_notification_service_does_not_kill_the_agent() {
             PATH,
             FakeHelper {
                 opens: opens.clone(),
+                ..Default::default()
             },
         )
         .unwrap()
@@ -452,6 +692,7 @@ async fn a_second_agent_in_one_session_stops_instead_of_doubling_every_notice() 
             PATH,
             FakeHelper {
                 opens: opens.clone(),
+                ..Default::default()
             },
         )
         .unwrap()
@@ -522,6 +763,7 @@ async fn a_click_after_the_notification_service_restarted_never_reopens_a_stale_
             PATH,
             FakeHelper {
                 opens: opens.clone(),
+                ..Default::default()
             },
         )
         .unwrap()
