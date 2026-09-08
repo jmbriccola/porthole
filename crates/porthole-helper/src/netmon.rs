@@ -4,8 +4,10 @@
 //! one wake-up checks both: the subnet a rule is scoped to, and the container
 //! a forward redirects to -- both in one pass, and
 //! [`porthole_core::engine::Engine::close_stale_forwards`] for the second.
-//! Everything below is about the first, which is the one that needs the
-//! bookkeeping.
+//! The second runs only when the state file actually holds a forward: it
+//! costs a Docker read and a reconciliation sweep, and on a machine that has
+//! never forwarded anything it can only ever answer "nothing". Everything
+//! below is about the first, which is the one that needs the bookkeeping.
 //!
 //! `org.freedesktop.NetworkManager`'s `StateChanged` signal fires on connect
 //! and disconnect, not when the machine stays connected but roams onto a
@@ -283,7 +285,19 @@ fn check(
     previous: &[Ipv4Net],
 ) -> CheckOutcome {
     let mut outcome = check_network(engine, runner, previous);
-    outcome.stale = engine.close_stale_forwards();
+    // Only when there is something for it to compare. `close_stale_forwards`
+    // runs `iptables -t nat -S DOCKER` and a full reconciliation sweep, and
+    // this wakes every 60 seconds forever: on a machine holding one ordinary
+    // `open` and no forward, that was a second sweep and a Docker read on
+    // every tick, permanently, for an answer that cannot be anything but
+    // "nothing". The empty-state shortcut in `wake_up_tracking` covers the
+    // idle machine and covers nothing here.
+    //
+    // Reads the state file this engine already has open and nothing else, so
+    // the guard costs nothing it saves.
+    if engine.rules_hold_a_forward() {
+        outcome.stale = engine.close_stale_forwards();
+    }
     outcome.reconciled.extend(engine.take_reconciled());
     outcome
 }
@@ -1224,6 +1238,76 @@ mod tests {
             2,
             "one read to create the forward and one for the sweep -- without the \
              second this test would pass against a wake-up that never checked"
+        );
+    }
+
+    #[test]
+    fn a_wake_up_reads_docker_only_when_a_forward_exists_to_compare() {
+        // The monitor wakes every 60 seconds forever. On a machine holding
+        // one ordinary `open` and no forward, the stale-forward sweep ran on
+        // every one of those wake-ups -- an `iptables -t nat -S DOCKER` and
+        // a second full reconciliation, permanently, for an answer that
+        // cannot be anything but "nothing". The empty-state shortcut in
+        // `wake_up_tracking` covers a machine with no rules at all and
+        // covers this not at all.
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(dir.path().join("state.json")).unwrap();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DOCKER_CHAIN);
+
+        // An ordinary open and nothing else. `DockerRunner` passes anything
+        // that is not `iptables` through, so this is the same open every
+        // other test here makes.
+        let mut engine = Engine::new(
+            &backend,
+            &runner,
+            &clock,
+            store,
+            PathBuf::from("/usr/bin/porthole"),
+        );
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::Network("10.10.10.0/24".parse().unwrap()),
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        let outcome = check(
+            &mut engine,
+            &subnet_unchanged(),
+            &["10.10.10.0/24".parse().unwrap()],
+        );
+
+        assert!(outcome.stale.is_empty());
+        assert_eq!(engine.rules().len(), 1, "the open is untouched");
+        assert_eq!(
+            runner.docker_reads(),
+            0,
+            "nothing in state redirects, so there is nothing to compare and \
+             nothing to read"
+        );
+
+        // The control, and it is the point: with a forward in state the same
+        // wake-up does read. Without it this test would pass just as well
+        // against a monitor that had stopped sweeping altogether.
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(dir.path().join("state.json")).unwrap();
+        let runner = DockerRunner::new(DOCKER_CHAIN);
+        let mut engine = engine_with_a_forward(&backend, &runner, &clock, store);
+        let before = runner.docker_reads();
+        check(
+            &mut engine,
+            &subnet_unchanged(),
+            &["10.10.10.0/24".parse().unwrap()],
+        );
+        assert_eq!(
+            runner.docker_reads(),
+            before + 1,
+            "a forward in state is what the sweep is for"
         );
     }
 

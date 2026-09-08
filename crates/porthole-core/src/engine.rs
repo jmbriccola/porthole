@@ -128,6 +128,19 @@ impl<'a> Engine<'a> {
         self.state.rules()
     }
 
+    /// Whether the state file holds any rule that redirects.
+    ///
+    /// Reads the state this engine already has open and nothing else: no
+    /// reconciliation, no command, no `/proc`. It exists so a caller can
+    /// skip [`Engine::close_stale_forwards`] entirely, which is not free --
+    /// it runs `iptables -t nat -S DOCKER` and a full reconciliation sweep.
+    /// The helper's network monitor wakes every 60 seconds forever, and on a
+    /// machine that has never forwarded anything there is nothing for that
+    /// sweep to compare.
+    pub fn rules_hold_a_forward(&self) -> bool {
+        self.state.rules().iter().any(|r| r.forward.is_some())
+    }
+
     /// Take the records this engine's reconciliation has dropped from state
     /// so far, leaving none behind.
     ///
