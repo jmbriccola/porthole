@@ -21,6 +21,15 @@ rule porthole did not create is never touched. What differs between them —
 what each one can do, what it cannot, and the caveat that would otherwise
 surprise you later — is everything below.
 
+**Only one of the three can redirect.** `porthole forward` is implemented on
+firewalld and nowhere else. ufw and nftables refuse it, with exit code 12 and
+a message of their own; the two refusals have different reasons and say
+different things, and each backend's section below gives its own. A machine
+whose firewall cannot redirect is told so before porthole reads Docker, the
+state file or `/proc` — nothing about any of those changes the answer, and
+reporting one of them instead would send you looking for a container on a
+machine that could not have forwarded to it either way.
+
 Reconciliation runs before every command, `--dry-run` included, so the list of
 commands a dry-run `open` prints can contain one you did not ask for: an
 orphan close (a `ufw --force delete ...` or `nft delete rule ...`) for a
@@ -55,6 +64,17 @@ port and protocol. Two things follow from that directly:
   on ufw and nftables, where a `porthole:<uuid>` marker makes ownership
   provable — see below.
 
+**All of that is equally true of a forward.** A `forward-port` rich rule
+carries no comment element either, so porthole cannot prove one is its own any
+more than it can an accept, and the orphan sweep is just as unavailable for
+it. Do not read the extra machinery around forwards — the mapping recorded in
+the state file, the wake-up that compares it against Docker's table — as
+closer tracking of the rule in the firewall: it is tracking of the
+*container*, and it acts through the same state file every other rule uses. A
+`firewall-cmd --reload` drops a redirect exactly as it drops an accept, and
+the record of it is corrected on the next porthole command by the same
+reconciliation, in the same direction, with the same silence in the other.
+
 That same asymmetry reaches `porthole close --id <id> --forget` (the escape
 hatch for a rule recorded under a backend this machine no longer has — see
 `porthole close --help`). Forgetting a **ufw or nftables** rule is not
@@ -66,6 +86,43 @@ the rule waits for something that opens or closes. Forgetting a **firewalld** ru
 firewalld can never prove a rich rule is its own, so that sweep never runs
 for it, on any account — nothing ever closes it automatically, even after
 firewalld is current again.
+
+### The one backend that can redirect
+
+`porthole forward` writes **one** rich rule here: the `forward-port` redirect,
+scoped to the same `source address` an ordinary open would carry. Not two.
+
+That is a measurement, not a reading of the manual. A redirect plus an accept
+for the external port was the original design, and a spike with firewalld
+2.4.4, nftables 1.1.6 and Docker 29.8.0 — packet counters at each netfilter
+hook, a client in its own network namespace — took it apart in both
+directions:
+
+- **The accept is unnecessary.** With the redirect in the zone, *zero* packets
+  reach the input hook at all: the DNAT has already happened in prerouting, so
+  the connection arrives at the forward hook instead, where firewalld's own
+  `filter_FORWARD` accepts `ct status dnat` traffic ahead of the jump to any
+  zone chain. Setting the zone's target to `DROP` did not stop it. With and
+  without the accept, every counter was identical. (Docker's own chains permit
+  it too, for their own reason: Docker writes an ACCEPT keyed on the container
+  address and port for every published mapping, and porthole only ever
+  redirects to a mapping Docker has published.)
+- **The accept is not inert.** With a service of the host's own bound to
+  `0.0.0.0` on that port, the accept *alone* makes **that service** reachable
+  from the local network. It is a working accept for something else. Writing
+  one beside every redirect would quietly open the host's own port each time.
+
+So there is nothing to roll back in two steps, no removal order to get right,
+and no second rule to look for: `porthole close` removes the one rule it
+wrote. The container test
+`a_forward_is_one_rich_rule_and_closing_takes_exactly_it_back_out` is what
+holds this, against a real firewalld, and
+`a_client_on_the_lan_reaches_the_container_through_the_forward_and_not_through_the_input_hook`
+is what shows the traffic really travels the forward path.
+
+porthole writes nothing into Docker's own chains — not `DOCKER`, not
+`DOCKER-USER`. It has never needed to, and an unmarked rule in another
+daemon's chain is not something it would leave behind.
 
 ## ufw
 
@@ -97,6 +154,22 @@ rule that is already there, deleting a rule that is not, and checking status
 while ufw is disabled all exit `0`. porthole reads ufw's stdout instead, the
 same way it already has to for firewalld's own exit-0-for-everything
 shortcuts.
+
+**`porthole forward` refuses here, and the reason is the permanence above.**
+ufw has no forwarding command at all: its port forwarding is a hand-edited
+`*nat` block in `/etc/ufw/before.rules`, a file ufw reloads at every boot.
+Writing one would be writing a permanent firewall rule, which is the one thing
+porthole never does — and unlike an `ufw allow`, reconciliation could not sweep
+it away afterwards, because a `before.rules` block carries no
+`porthole:<uuid>` comment and is not a rule ufw lists at all. So there is no
+temporary redirect for ufw to offer, and porthole says so:
+
+```
+$ porthole forward 3000
+porthole: ufw cannot redirect a port: porthole has no forward for this backend
+$ echo $?
+12
+```
 
 ## nftables
 
@@ -137,3 +210,35 @@ someone into feeling safe, so `porthole doctor` and `porthole status` say it
 plainly — but they say no more than they checked. The wording is
 deliberately this weaker, true claim, never the stronger and potentially
 false "closing a port here makes it unreachable".
+
+**`porthole forward` refuses here too, and not for ufw's reason.** Nothing
+about permanence is in the way: nftables rules are as runtime-only as
+firewalld's. What is in the way is the *accept*. A redirect on its own was
+measured unreachable on a ruleset whose forward chain drops — and unlike
+firewalld, plain nftables has no `ct status dnat accept` underneath to carry
+it. The accept that would carry it has to sit in a base chain registered at
+the **forward** hook, which is not the hook porthole writes at: this backend
+finds the single chain at the *input* hook and inserts there, and an accept
+put there does nothing for a redirect (measured: identical counters, still
+unreachable). An accept in a table of porthole's own does not help either, for
+the same reason an isolated accept never does — a drop in any forward base
+chain decides the packet.
+
+Applying the "exactly one chain, or refuse" discipline to the forward hook is
+the shape a future implementation would take. It was not built, because the
+ruleset a forward actually meets on a machine that also runs Docker has a
+second forward base chain of Docker's own (`ip filter FORWARD`, at nft
+priority 0, jumping to `DOCKER-USER` before anything porthole inserted would
+be reached), and which combinations of those chains would work was never
+measured. A forward that silently does not forward is the worst of the
+available outcomes, so this backend says what it cannot do instead:
+
+```
+$ porthole forward 3000
+porthole: nftables cannot redirect a port: a redirect on its own does not
+reach a container through a forward chain that drops, and the accept that
+would carry it belongs in the chain deciding forwarded traffic, where porthole
+does not write
+$ echo $?
+12
+```

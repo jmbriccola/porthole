@@ -1,0 +1,92 @@
+# The firewalld-and-Docker image: the only one that carries a container
+# runtime of its own.
+#
+# `Containerfile.fedora` already carries firewalld, and every firewalld test
+# but the forward ones runs there. This image exists because a forward needs
+# something `Containerfile.fedora` cannot provide: a **real Docker daemon**,
+# writing its own DNAT rules into the `nat` table's `DOCKER` chain, which is
+# the only thing `porthole_core::docker` ever reads. A fabricated `DOCKER`
+# chain would prove the parser and nothing else -- and the parser already has
+# unit tests against a captured chain.
+#
+# Docker 29.8.0 from Docker's own Fedora repository, the identical version
+# this project's development host runs, so what the forward tests measure is
+# what a user of that host would get. Pinned to a version rather than taken
+# from `latest`: a forward's whole correctness argument rests on which rules
+# Docker writes, and a silent upgrade changing them should fail here rather
+# than be absorbed.
+#
+# No Rust toolchain and no copy of the porthole binaries, exactly as the
+# other three images: they are built once on the host as static musl binaries
+# and bind-mounted in at container-run time.
+FROM registry.fedoraproject.org/fedora:44
+
+# `busybox` is here as the *contents of a Docker image*, not as a tool for
+# this container. Every podman container in this suite runs `--network=none`,
+# so the Docker daemon inside one cannot pull anything: the test builds its
+# target image offline instead, by `docker import`ing a tarball whose only
+# executable is this statically linked binary. Fedora's busybox is static
+# (checked with `ldd`: "not a dynamic executable"), which is what makes it
+# usable inside a `FROM scratch`-equivalent image with no libc.
+#
+# `iptables-nft` is Docker's own dependency, pulled in with it, but named
+# here because porthole reads the `DOCKER` chain through the `iptables`
+# binary and a missing one would look like "Docker publishes nothing".
+#
+# `systemd` is here for one reason and it is not init-in-a-container for its
+# own sake: `porthole forward` has no `--until-reboot`. Every forward is
+# `--for <duration>` and therefore schedules its own close with
+# `systemd-run`, and `Engine::record_and_schedule` rolls the whole forward
+# back when that fails. The other three images work around the absence of
+# systemd by opening `--until-reboot` instead; a forward has no such spelling,
+# so the tests that use this image run it with systemd as PID 1 and get a
+# real transient timer (visible in `systemctl list-timers`) rather than a
+# stubbed `systemd-run`.
+RUN dnf install -y --setopt=install_weak_deps=False \
+      firewalld \
+      dbus-daemon \
+      dbus-tools \
+      iproute \
+      iptables-nft \
+      nftables \
+      procps-ng \
+      util-linux \
+      busybox \
+      curl \
+      systemd \
+      dnf-plugins-core \
+    && dnf config-manager addrepo \
+         --from-repofile=https://download.docker.com/linux/fedora/docker-ce.repo \
+    && dnf install -y --setopt=install_weak_deps=False \
+         docker-ce docker-ce-cli containerd.io \
+    && dnf clean all
+
+# `vfs` rather than `overlay2`: an overlay mount inside a rootless podman
+# container fails (the kernel refuses an overlay upper layer on the fuse-
+# overlayfs podman itself put there). vfs is slow and space-hungry and
+# neither matters for one imported image of a few megabytes.
+#
+# `iptables: true` is the default and is stated anyway: it is the whole
+# reason this image exists, and a future default flipping to the nftables
+# firewall backend would change which chains porthole reads.
+#
+# `native.cgroupdriver=cgroupfs` is not the default here and has to be
+# forced. With systemd as PID 1, Docker picks the systemd cgroup driver and
+# then asks systemd for a transient scope per container, which was measured
+# to fail inside rootless podman ("unable to start unit ... Launch helper
+# exited with unknown return code 1"). cgroupfs sidesteps systemd for
+# Docker's own cgroups and changes nothing porthole reads: the DNAT rules in
+# the `nat` table are written the same either way.
+#
+# `userland-proxy` is left at its default (`true`), which is what a stock
+# Docker install has and therefore what the forward tests should meet: it is
+# also what puts a `docker-proxy` listener on `127.0.0.1:<published>`, the
+# loopback-bound listener `Engine::forward` deliberately does not refuse on.
+RUN mkdir -p /etc/docker && printf '%s\n' \
+      '{' \
+      '  "storage-driver": "vfs",' \
+      '  "iptables": true,' \
+      '  "ip6tables": false,' \
+      '  "bridge": "docker0",' \
+      '  "exec-opts": ["native.cgroupdriver=cgroupfs"]' \
+      '}' > /etc/docker/daemon.json

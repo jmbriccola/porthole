@@ -2,9 +2,13 @@
 
 `porthole` — the CLI — is one binary and needs nothing else: `porthole list`,
 `porthole status` and anything with `--dry-run` work as soon as it is on your
-`$PATH`. `porthole open` and `porthole close` are different: they ask a
-privileged helper to act, and that helper has to be installed once, as root,
-before they work. This is that installation.
+`$PATH`. `porthole open`, `porthole forward` and `porthole close` are
+different: they ask a privileged helper to act, and that helper has to be
+installed once, as root, before they work. `porthole listen` and `porthole
+doctor` need it too, though only for one part of what they report — reading
+Docker's own rules needs root, and without the helper they say they could not
+check rather than reporting that Docker touches nothing. This is that
+installation.
 
 porthole is in no distribution's repositories yet, and there is no release to
 download. What the repository does carry is the packaging for three formats,
@@ -57,13 +61,13 @@ yourself.
 
 | Piece | Goes to | What it does |
 |---|---|---|
-| `target/release/porthole` (built, not in `data/` — install it per the top-level README, not by the commands below) | `/usr/local/bin/porthole` (a packaged install may instead use `/usr/bin/porthole`) | The CLI. Listed here, not just in the README, because its path is no longer only a `$PATH` convenience: `porthole open --for` schedules its own close with a transient systemd timer whose `ExecStart` is this exact absolute path, run **as root**. The helper looks for it at `/usr/bin/porthole` first, then `/usr/local/bin/porthole`, and refuses to start at all if neither is a regular file owned by root and unwritable by anyone else — so install it at one of those two paths, not somewhere else. |
+| `target/release/porthole` (built, not in `data/` — install it per the top-level README, not by the commands below) | `/usr/local/bin/porthole` (a packaged install may instead use `/usr/bin/porthole`) | The CLI. Listed here, not just in the README, because its path is no longer only a `$PATH` convenience: `porthole open --for` schedules its own close with a transient systemd timer whose `ExecStart` is this exact absolute path, run **as root**, and `porthole forward` does so unconditionally — it has no `--until-reboot`, so every forward gets a timer. The helper looks for it at `/usr/bin/porthole` first, then `/usr/local/bin/porthole`, and refuses to start at all if neither is a regular file owned by root and unwritable by anyone else — so install it at one of those two paths, not somewhere else. |
 | `target/release/porthole-helper` (built, not in `data/`) | `/usr/libexec/porthole-helper` | The privileged binary itself. It is never setuid and never run directly — only D-Bus activation or systemd starts it, always as root. |
 | `target/release/porthole-gui` (built with `cargo build --release -p porthole-gui`, not in `data/`) | `/usr/local/bin/porthole-gui` (a packaged install may instead use `/usr/bin/porthole-gui`) | The GTK4/libadwaita application. Unlike `porthole`'s own install path, nothing else on the system reads this one back — it only has to be on `$PATH` for the desktop file below to find it. |
 | `data/com.jacopobriccola.Porthole.service` | `/usr/share/dbus-1/system-services/` | Tells the system bus daemon how to start the helper the first time something addresses `com.jacopobriccola.Porthole`: which binary to run, and — via `SystemdService=` — which systemd unit actually owns the process. |
 | `data/porthole-helper.service` | `/usr/lib/systemd/system/` | The systemd unit the activation file names. `Type=dbus` plus `BusName=` makes systemd wait until the name is actually claimed before treating the service as started; `RuntimeDirectory=porthole` creates `/run/porthole` mode `0755` so an unprivileged `porthole list` can read the state file that only the helper writes, and `RuntimeDirectoryPreserve=yes` keeps `state.json` there across a restart or a crash instead of systemd deleting it with the directory; the unit has no `WantedBy=`, so nothing starts it at boot — D-Bus activation starts it the first time something addresses the bus name. It does not exit on its own once running: it stops only when something stops it. |
 | `data/com.jacopobriccola.Porthole.conf` | `/usr/share/dbus-1/system.d/` | The bus's own policy: only `root` may own the name — a bus-level guard against anything else posing as the helper — and any user may address it, because deciding *who may do what* is the next file's job, not the bus's. It also lets any user *receive* what the helper sends, which is the direction the `RuleOpened`, `RuleClosed` and `NetworkChanged` signals travel in. On a stock system bus that clause changes nothing — `/usr/share/dbus-1/system.conf`'s own default policy already allows every user to receive signals — but it is what carries them on a bus configured more strictly, and it says in porthole's own file that these signals are meant to be listened to. |
-| `data/com.jacopobriccola.Porthole.policy` | `/usr/share/polkit-1/actions/` | The polkit actions and their severities: opening towards your own subnet asks once per session, opening towards everyone (`--to any`) asks every time, and closing or listing never ask. Without this file, polkit falls back to its own default for an unrecognised action and every one of those severity choices disappears — `porthole doctor` is what notices and says so. |
+| `data/com.jacopobriccola.Porthole.policy` | `/usr/share/polkit-1/actions/` | The polkit actions and their severities — five of them. Opening towards your own subnet (`open-subnet`) asks once per session (`auth_admin_keep`); opening towards everyone (`open-any`, `--to any`) asks every time (`auth_admin`); **redirecting a port to a container (`forward`) asks every time too (`auth_admin`), whatever its scope** — there is no `_keep` variant of it to choose, because an answer given minutes ago for an ordinary open must not carry over to making a port answer to something that was not on the network at all; and closing (`close`) or listing (`list`) never ask (`yes` for `allow_any`, `allow_active` and `allow_inactive` alike), which is also what lets a non-interactive package removal run `porthole close --all` without a prompt. Without this file, polkit falls back to its own default for an unrecognised action and every one of those severity choices disappears — `porthole doctor` is what notices and says so. |
 | `data/com.jacopobriccola.Porthole.desktop` | `/usr/share/applications/` | The desktop entry: what `Name=`, icon and `Exec=` line a launcher (GNOME's Activities overview, an app grid, `gtk-launch`) uses to show and start the GUI. Unrelated to the D-Bus files above — this is what makes the app *appear*, not what lets it *talk to the helper*, which it still does exactly as the CLI does, over the system bus. |
 | `data/icons/hicolor/scalable/apps/com.jacopobriccola.Porthole.svg` | `/usr/share/icons/hicolor/scalable/apps/` | The full-colour app icon the desktop file's `Icon=com.jacopobriccola.Porthole` resolves to via the freedesktop icon theme spec — the basename is what has to match, not the path. |
 | `data/icons/hicolor/symbolic/apps/com.jacopobriccola.Porthole-symbolic.svg` | `/usr/share/icons/hicolor/symbolic/apps/` | The single-colour variant the same spec expects alongside the full-colour icon, used in menus, lists and high-contrast themes rather than shown standalone. |
@@ -106,8 +110,11 @@ sudo systemctl reload dbus-broker.service 2>/dev/null || sudo systemctl reload d
 
 Nothing here needs to be started or enabled by hand: `porthole-helper.service`
 has no `WantedBy=`, so it only ever runs because D-Bus activated it. The next
-`porthole open` or `porthole close` is what actually starts it for the first
-time.
+command that addresses the bus name is what actually starts it for the first
+time — `porthole open`, `forward`, `close`, `listen` or `doctor`, or the
+session agent below, whose start-up `List` exists partly to do exactly that.
+`porthole list` and `porthole status` are not among them: they answer from the
+state file and never touch the bus.
 
 Verify with `porthole doctor`: a fresh install should show `Firewall`, `State`
 and `Network` unaffected by any of this, `Helper` going from "not answering on
@@ -125,10 +132,20 @@ longer the one it was created against — filtered to rules opened by that
 session's own uid. It has nothing to listen to until the helper above is
 installed. It closes nothing and keeps no view of what is open.
 
-**What it can cause on the system bus**, which is the whole of it: a `Reopen`
-click on a notification it is currently showing. Two of the four reasons above
-carry that button — an expiry, and a container that moved — and what it
-re-sends depends on the rule the notification was about:
+**What it can cause on the system bus**, in full, and it is two things.
+
+The first is a bare `List` at start-up, once, whose answer it throws away.
+Calling the helper is what D-Bus-activates it, and the agent has already
+subscribed by then, so whatever the helper's own start-up sweep announces
+arrives at a listener instead of being sent to nobody. `List` is `yes` in the
+policy above for everyone, reads the state file and changes nothing; a failure
+is ordinary (no helper installed, or none activatable) and the agent goes on
+listening. It is worth naming rather than glossing over, because it means the
+agent starting is enough to start the privileged helper.
+
+The second is a `Reopen` click on a notification it is currently showing. Two
+of the four reasons above carry that button — an expiry, and a container that
+moved — and what it re-sends depends on the rule the notification was about:
 
 - a rule that only permitted re-sends `open`, with the same port, protocol,
   scope and duration;
@@ -141,9 +158,13 @@ re-sends depends on the rule the notification was about:
 Both go through polkit like any other request, and a `forward` is
 `auth_admin` **every time**, whatever its scope — so a click on that button
 always produces an administrator prompt. The agent cannot skip it and does
-not decide it. Nothing else it does reaches the helper at all.
+not decide it. Those two calls are the whole of what it sends: everything else
+it does is *receiving* — the helper's `RuleClosed`, and the notification
+service's own `ActionInvoked`, `NotificationClosed` and owner changes. It
+subscribes to no other porthole signal: `RuleOpened` and `NetworkChanged` go
+past it unread.
 
-Three files, and one of the three commands below is **not** run as root:
+Three files. The last two commands below are **not** run as root:
 
 ```bash
 sudo install -Dm755 target/release/porthole-agent \
@@ -282,10 +303,11 @@ the app there, not just a bare name.
 ## Uninstalling: what closes the ports, and when it does not
 
 The three packages each close every port porthole has open before their files
-go, and only on a real removal — `%preun` guarded by `$1 -eq 0` (RPM),
-`prerm remove` (Debian), `pre_remove` (Arch). An upgrade closes nothing; the
-same scripts run, and each distinguishes the two cases the way its packaging
-system provides for.
+go — every redirect `porthole forward` made included, since a forward is an
+ordinary porthole rule to `close --all` — and only on a real removal: `%preun`
+guarded by `$1 -eq 0` (RPM), `prerm remove` (Debian), `pre_remove` (Arch). An
+upgrade closes nothing; the same scripts run, and each distinguishes the two
+cases the way its packaging system provides for.
 
 What each of them runs is `porthole close --all`, not a shell that guesses at
 rules. The helper owns the firewall and holds the record of what it opened,

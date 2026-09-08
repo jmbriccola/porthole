@@ -40,14 +40,23 @@ that port. That call is best-effort — no helper, no answer, no complaint, and
 the dry run goes ahead. Once the helper is installed, opening towards
 your own subnet asks polkit to authenticate the first time and not again that
 session; opening towards everyone (`--to any`) asks every time, because it is
-the more dangerous request; closing never asks, because closing only ever
-reduces what is exposed.
+the more dangerous request; `porthole forward` asks every time too, whatever
+its scope, because it makes a port answer to something that was not on the
+network at all; closing never asks, because closing only ever reduces what is
+exposed.
 
 ## What it is not
 
-porthole is not a firewall manager. It does not do zones, services, NAT, port
-forwarding or permanent rules. If you need those, use `firewall-config`, `ufw`
-or `nft` directly.
+porthole is not a firewall manager. It does not do zones, services, NAT or
+permanent rules. If you need those, use `firewall-config`, `ufw` or `nft`
+directly.
+
+It does one kind of redirect, and only one: `porthole forward` puts a port in
+front of a Docker container that is published on this machine's loopback
+address and nowhere else — see [Forwarding to a
+container](#forwarding-to-a-container). It is a runtime rule with a timer like
+every other, it exists only while it is open, and it is not a port-forwarding
+feature you can point anywhere you like.
 
 **It never writes a permanent rule.** A reboot closes everything porthole
 opened. That is the whole design, not a limitation.
@@ -74,8 +83,9 @@ act on.
 
 Everything above is also a window. `porthole-gui` shows what is open now with
 a live countdown, shows what is listening on this machine so you can open a
-port without typing a number, opens one in two clicks, and saves a device to
-open towards. It talks to the
+port without typing a number, opens one in two clicks, offers a **Forward**
+button on the rows Docker has published only on loopback, and saves a device
+to open towards. It talks to the
 same privileged helper over the same D-Bus interface the CLI uses, so it
 inherits the 8-hour ceiling and the polkit prompts without restating either —
 nothing about *what* porthole will do changes depending on which one you run.
@@ -140,8 +150,8 @@ piece by hand.
 
 ### Removing it
 
-Removing the package closes every port porthole still has open, first. That is
-not a courtesy: uninstalling is the one action that ends every other way a
+Removing the package closes every port porthole still has open — every
+redirect `porthole forward` made included — first. That is not a courtesy: uninstalling is the one action that ends every other way a
 porthole rule could close. The timer that would have closed it re-executes
 `/usr/bin/porthole`; `close`, the network-change monitor and reconciliation
 all go through the helper. Take those away and the rule stays in the firewall,
@@ -182,6 +192,8 @@ closes nothing — close first, by hand.
 ```
 porthole open <PORT> [--proto tcp|udp] [--for 30m | --until-reboot]
                      [--to subnet|any|<CIDR>|<IP>|<device name>]
+porthole forward <PORT> [--as <PORT>] [--for 30m]
+                        [--to subnet|any|<CIDR>|<IP>|<device name>]
 porthole close <PORT> | --id <ID> | --all
 porthole list
 porthole status
@@ -311,9 +323,10 @@ evaluated before firewalld, ufw or nftables ever see the packet. So a
 container published on `0.0.0.0` is already reachable and `porthole close`
 will not close it, and a container published on `127.0.0.1` is not made
 reachable by `porthole open`, because the firewall was never what was stopping
-it. **porthole only ever diagnoses this. It never changes a Docker rule.**
+it. **porthole never changes a Docker rule** — not to open one, not to close
+one, not to move one.
 
-Three commands say so:
+Three commands say what Docker has done:
 
 - `porthole listen` marks each published row `docker: published on
   <address>`, or `published on every interface`.
@@ -321,7 +334,12 @@ Three commands say so:
   port and protocol. It still opens the rule.
 - `porthole doctor`'s `Docker` check names the published ports it could read.
 
-All three read the `DOCKER` chain of iptables' `nat` table directly. porthole
+And one command acts on it — `porthole forward`, below, which puts a port of
+its own in front of a loopback-published container. That is a rule in *your*
+firewall pointing at the container; Docker's own rules are read and never
+touched.
+
+All of them read the `DOCKER` chain of iptables' `nat` table directly. porthole
 never runs `docker` and never looks at `docker` group membership, so it
 behaves the same whether or not you can query Docker at all. That read needs
 root, so it goes through the privileged helper. **With the helper not
@@ -336,6 +354,98 @@ configured with no default bridge reads as absent there.
 
 Publish container ports on `127.0.0.1` in your compose files if you do not
 want them reachable from the network. porthole cannot do that for you.
+
+## Forwarding to a container
+
+A container published on `127.0.0.1` is reachable from this machine and
+nowhere else, and no firewall rule changes that: Docker's own DNAT rule only
+matches traffic already addressed to `127.0.0.1`, which nothing on the network
+can send. Opening the port does nothing. The usual answer is to republish the
+container on `0.0.0.0` and then remember to put it back.
+
+`porthole forward` is the other answer: a redirect that sends traffic arriving
+on this machine's own network address to the container, for a bounded time,
+and then removes itself.
+
+```console
+$ porthole listen
+Listening on this machine
+
+Loopback only — opening the firewall for these changes nothing:
+  3000/tcp  docker-proxy  127.0.0.1:3000  pid 4711  docker: published on 127.0.0.1
+
+$ porthole forward 3000 --for 30m
+Forwarded 3000/tcp towards 10.10.10.0/24 · closes 30m 0s
+  -> 172.17.0.2:8080 in Docker, published on this machine as 3000/tcp
+
+$ porthole close 3000
+Closed 3000/tcp towards 10.10.10.0/24
+```
+
+`3000` is the port **Docker published on this machine** — the number
+`porthole listen` shows. `--as <PORT>` gives the local network a different
+one, for when something on this machine already answers on it. `--to` takes
+the same scopes `open` does and defaults to your own subnet. There is no
+`--proto`: every forward is TCP, because the check porthole makes first —
+whether something on this machine already answers on the port the network
+would connect to — reads TCP sockets only, and a check that cannot fail is not
+one. There is no `--until-reboot` either: a forward always runs out, under
+`open`'s own eight-hour ceiling.
+
+**It is Docker-only, and that is not a packaging choice.** porthole needs a
+container address to point at, and it gets one by reading Docker's own DNAT
+rules out of the `DOCKER` chain of iptables' `nat` table — the same read
+`listen` and `doctor` already make. Nothing else on the machine publishes a
+mapping in a place porthole knows how to read, so there is nothing to redirect
+*to* for podman, for a VM, or for a service you started by hand. For those,
+`porthole open` on the port they already listen on is the whole of what
+porthole has.
+
+**It asks every time.** `forward` is its own polkit action, `auth_admin` in
+every case, with no "and not again this session" variant to choose. Opening a
+port permits traffic to something already listening on the network; a forward
+makes a port answer to something that was not. That is a different question,
+and an answer given minutes ago for something else must not carry over to it.
+
+**On firewalld only.** A forward is one firewalld rich rule — the
+`forward-port` redirect — and firewalld is the only backend porthole
+implements one for. On ufw and on nftables `porthole forward` refuses, with
+exit code 12 and a message naming the backend it found; each refuses for its
+own reason, and [docs/backends.md](docs/backends.md) gives both.
+
+**What ends a forward**, besides `porthole close`: its own timer, the same
+transient systemd timer every `open --for` gets; the machine leaving the
+subnet the forward was scoped to; and the container ceasing to be the one the
+forward was created against. That last one is checked against Docker's table
+on the helper's own wake-up, and all four parts of the mapping have to still
+match — published port, protocol, container address and container port. A
+container that restarts commonly comes back at a *different* address, and the
+address it gave up can pass to a different container, so porthole closes the
+forward rather than quietly re-aiming it at whatever is there now. The close
+is announced as `target-gone`, and the desktop notification for it carries a
+`Reopen` button: the original request names a published port, not a container
+address, so re-sending it finds the container wherever it now is. Stopping the
+Docker daemon closes every forward too — with no daemon there is no `DOCKER`
+chain, and "no container publishes anything" is an answer, not a silence. A
+table porthole could not read at all *is* a silence, and closes nothing.
+
+**Removing the package closes forwards exactly as it closes ports.** Each of
+the three packages runs `porthole close --all` on the way out, and a forward
+is an ordinary porthole rule to that command — see [Removing
+it](#removing-it), including the warning printed when the close cannot be
+made.
+
+**One thing the GUI cannot offer, and the command line can.** The window's
+"Listening" list is built by scanning `/proc`, so a container port only gets a
+**Forward** button when something on this machine is actually listening on it.
+With Docker's default `userland-proxy` that is true — `docker-proxy` holds
+`127.0.0.1:<port>` — but a daemon configured with `"userland-proxy": false`
+has no host listener at all: the DNAT rule is the whole of the publication.
+Such a container has no row, and therefore no button, even though it is
+published and forwardable. `porthole forward 3000` on the command line works
+normally in that configuration, because it reads Docker's table rather than
+`/proc`. That follows from the GUI being row-driven; it is not a bug in
+either half, and neither half can see it to warn you.
 
 ## When the network changes
 
@@ -458,9 +568,16 @@ starts user units at all: it starts the one unit, now.
 | 7 | No porthole-managed rule matches |
 | 8 | No usable network |
 | 9 | There was nothing to choose from. `porthole devices add` found no device on this network to offer. |
+| 10 | `porthole forward` was given a port no container publishes, or Docker could not be read at all. The message says which; `--json`'s `kind` is `not_published_by_container` or `docker_unreadable`. |
+| 11 | The port `porthole forward` would give the local network is already carrying something a redirect would take traffic from: a porthole rule, or a service listening on an address the network reaches. A loopback-only listener is not one of them and does not refuse. The message names `--as <PORT>`, which is what gives the local network a different port. |
+| 12 | This machine's firewall has no way to redirect a port. Only firewalld has one; ufw and nftables refuse here, each for its own reason. |
+| 13 | A check porthole makes before creating a redirect has no answer for what was asked. The message says which check. |
+| 14 | Docker publishes that container on an address other than loopback, so the local network may already reach it. That is Docker's own rule, which porthole can neither have made nor close. What porthole read to decide it is the `-d` flag on Docker's own DNAT rule and nothing else: no `-d` is every interface, and a `-d` naming any other address is that address, whether or not this machine holds it. |
 
 These are a public interface. New codes are added at the end; existing ones are
-never renumbered.
+never renumbered. `porthole --help` prints the same table, and two tests in
+`porthole-core`'s `error.rs` fail when `ExitCode` gains a variant this table
+does not name, or when this table keeps a row the enum no longer has.
 
 ## Limitations
 
@@ -484,6 +601,13 @@ never renumbered.
   close it; one published on `127.0.0.1` is not made reachable by opening the
   firewall. porthole reports this and never changes a Docker rule — and the
   report itself needs the privileged helper. See [Docker](#docker) above.
+- **`porthole forward` is Docker-only and firewalld-only.** It reads Docker's
+  own DNAT rules to find a container address, so there is nothing for it to
+  redirect to on a machine running podman, a VM or a hand-started service; and
+  only firewalld can express the redirect, so ufw and nftables refuse it. It
+  also refuses a container the network can already reach, since a redirect
+  onto one would add a second way in and close only the one porthole made.
+  See [Forwarding to a container](#forwarding-to-a-container).
 - **A network change is noticed, not guaranteed to be.** The helper closes
   rules tied to a subnet the machine has left, but only for subnets it
   observed itself, and only while the helper process is running. A subnet

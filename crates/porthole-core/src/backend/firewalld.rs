@@ -221,6 +221,13 @@ impl FirewallBackend for Firewalld<'_> {
         self.add_rich_rule(zone, &rule, req.port, req.protocol)
     }
 
+    /// The one backend that can redirect. What it writes is a rich rule;
+    /// [`Firewalld::forward`] below is what writes it, and carries the
+    /// measurement that decided there is exactly one.
+    fn forward_capability(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// One rich rule: the `forward-port` redirect.
     ///
     /// Measured on firewalld 2.4.4 in a container, against a real Docker
@@ -245,12 +252,14 @@ impl FirewallBackend for Firewalld<'_> {
     /// firewalld handle for it. Nothing porthole writes permits the
     /// forwarded traffic; what does was measured to be already there, and
     /// is not porthole's to write.
-    /// The one backend that can. What it writes is a rich rule; `forward`
-    /// below is what writes it.
-    fn forward_capability(&self) -> Result<()> {
-        Ok(())
-    }
-
+    ///
+    /// The container suite has since reproduced both halves against a real
+    /// firewalld and a real Docker, on this same design rather than on a
+    /// spike's throwaway one:
+    /// `a_client_on_the_lan_reaches_the_container_through_the_forward_and_not_through_the_input_hook`
+    /// counts zero packets at the input hook while the forward hook carries
+    /// the connection, and writing the accept *instead of* the redirect
+    /// leaves the client unable to reach the container at all.
     fn forward(&self, req: &OpenRequest, to: &ForwardTo, _marker: &str) -> Result<RuleHandle> {
         // The marker goes nowhere, for the same reason `open` drops it: the
         // rich language has no comment element. The stored rule string is

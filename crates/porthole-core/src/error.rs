@@ -291,6 +291,108 @@ mod tests {
         assert_eq!(ExitCode::AlreadyReachable as i32, 14);
     }
 
+    /// Every `Name = N,` inside `pub enum ExitCode { ... }`, read out of this
+    /// file's own source.
+    ///
+    /// Rust has no way to enumerate a plain enum's variants, and a hand-kept
+    /// list of them is exactly the thing that goes stale while the enum
+    /// grows -- this feature added five codes to an enum whose README table
+    /// stopped at 9, and an earlier draft of the plan for it said three.
+    /// Reading the source is the one way to make the list grow by itself:
+    /// adding a variant adds a line here with no second edit to remember.
+    ///
+    /// `include_str!` rather than a runtime read, so a path that stops
+    /// resolving is a compile error rather than a test that quietly finds
+    /// nothing.
+    fn declared_exit_codes() -> Vec<(String, i32)> {
+        let source = include_str!("error.rs");
+        let body = source
+            .split_once("pub enum ExitCode {")
+            .expect("this file declares `pub enum ExitCode`")
+            .1
+            .split_once("\n}")
+            .expect("the enum's body ends at a closing brace in column 0")
+            .0;
+        let found: Vec<(String, i32)> = body
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| {
+                let (name, rest) = line.split_once(" = ")?;
+                let value = rest.strip_suffix(',')?.parse().ok()?;
+                name.chars()
+                    .all(|c| c.is_ascii_alphanumeric())
+                    .then(|| (name.to_string(), value))
+            })
+            .collect();
+        assert!(
+            found.len() >= 10,
+            "the enum body was parsed as {} variants, which is fewer than this enum \
+             has had since milestone 1 -- the parse above has stopped matching the \
+             source rather than the enum having shrunk: {found:?}",
+            found.len()
+        );
+        found
+    }
+
+    /// The body of README.md's `## Exit codes` section, and nothing else.
+    ///
+    /// **Scoped to the one section deliberately.** Two guards in this project
+    /// were found reading a whole document and being satisfied by a
+    /// neighbouring sentence about something else -- a search for "12" over
+    /// the whole README finds the eight-hour ceiling, a port number, a
+    /// version. Ending at the next `## ` is what makes a hit here mean the
+    /// table.
+    fn readme_exit_code_section() -> &'static str {
+        let readme = include_str!("../../../README.md");
+        let after = readme
+            .split_once("\n## Exit codes\n")
+            .expect("README.md has an `## Exit codes` section")
+            .1;
+        match after.split_once("\n## ") {
+            Some((section, _)) => section,
+            None => after,
+        }
+    }
+
+    #[test]
+    fn the_readme_exit_code_table_names_every_variant_of_the_enum() {
+        let section = readme_exit_code_section();
+        for (name, value) in declared_exit_codes() {
+            let row = format!("| {value} |");
+            assert!(
+                section.contains(&row),
+                "README.md's `## Exit codes` table has no row `{row}` for \
+                 ExitCode::{name}. Exit codes are a public interface; a code the enum \
+                 has and the README does not name is a code nobody can look up."
+            );
+        }
+    }
+
+    #[test]
+    fn the_readme_exit_code_table_invents_no_code_the_enum_does_not_have() {
+        // The other direction, which the test above cannot see: a row left
+        // behind by a variant that was removed or renumbered documents an
+        // exit status no invocation can produce.
+        let declared: Vec<i32> = declared_exit_codes().into_iter().map(|(_, v)| v).collect();
+        for line in readme_exit_code_section().lines() {
+            let Some(rest) = line.strip_prefix("| ") else {
+                continue;
+            };
+            let Some((first, _)) = rest.split_once(" |") else {
+                continue;
+            };
+            let Ok(value) = first.parse::<i32>() else {
+                continue; // the header row, and its `|---|---|` separator.
+            };
+            assert!(
+                declared.contains(&value),
+                "README.md's `## Exit codes` table documents exit {value}, which \
+                 `ExitCode` does not have. Codes are never renumbered, so this is a row \
+                 left behind rather than one that moved."
+            );
+        }
+    }
+
     #[test]
     fn each_error_maps_to_its_exit_code() {
         assert_eq!(

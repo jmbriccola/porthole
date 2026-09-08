@@ -306,6 +306,7 @@ fn ensure_image(tag: &str, containerfile: &str) {
 const DEBIAN_IMAGE: &str = "localhost/porthole-container-test-debian";
 const FEDORA_IMAGE: &str = "localhost/porthole-container-test-fedora";
 const ARCH_IMAGE: &str = "localhost/porthole-container-test-arch";
+const DOCKER_IMAGE: &str = "localhost/porthole-container-test-docker";
 
 /// A podman volume, removed again when the guard drops -- including on a
 /// failed assertion via an unwinding panic, so a test that fails partway
@@ -364,6 +365,112 @@ fn podman_run(image: &str, extra_args: &[String], script: &str) -> Output {
         .arg(script)
         .output()
         .unwrap_or_else(|e| panic!("could not run `podman run`: {e}"))
+}
+
+/// The capabilities the Docker image's container needs on top of the
+/// `NET_ADMIN` the other three ask for. Everything past `SYS_PTRACE` is what
+/// a container runtime wants of the runtime hosting it -- measured by
+/// removing them one at a time until `dockerd` stopped starting.
+///
+/// `seccomp=unconfined` and `label=disable` are passed alongside for the same
+/// reason: Docker's own runtime applies a seccomp profile and SELinux labels
+/// to the containers *it* creates, and it cannot do either from inside a
+/// podman container that is itself confined.
+const DOCKER_CONTAINER_ARGS: [&str; 5] = [
+    "--cap-add=NET_ADMIN,NET_RAW,SYS_ADMIN,SYS_PTRACE,MKNOD,AUDIT_WRITE,SYS_CHROOT,SETFCAP,DAC_OVERRIDE",
+    "--security-opt",
+    "seccomp=unconfined",
+    "--security-opt",
+    "label=disable",
+];
+
+/// A detached container running **systemd as PID 1**, `podman rm -f`'d when
+/// the guard drops -- including through an unwinding panic, so a failed
+/// assertion still leaves nothing behind.
+///
+/// Every other test in this file uses [`podman_run`], which is one
+/// `--rm`-ed process and no lifecycle to manage. The forward tests cannot:
+/// `porthole forward` has no `--until-reboot`, so every forward schedules a
+/// close with `systemd-run`, and `Engine::record_and_schedule` rolls the
+/// whole forward back if that fails -- there is no spelling of a forward that
+/// skips the timer the way `open --until-reboot` skips it. Measured inside
+/// this image: with systemd as PID 1, `systemd-run` creates a real transient
+/// timer (`systemctl list-timers` names
+/// `porthole-close-<id>.timer`), so what these tests exercise is the
+/// production path rather than a stub standing in for it.
+///
+/// `start` clears any same-named leftover first, for the reason [`Volume`]
+/// does: a hard abort skips `Drop`, and `podman run --name` would then fail
+/// on the next run with "name already in use".
+struct SystemdContainer(String);
+
+impl SystemdContainer {
+    fn start(name: &str, image: &str, extra_args: &[String]) -> Self {
+        let _ = Command::new("podman").args(["rm", "-f", name]).status();
+        let out = Command::new("podman")
+            .args([
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--network=none",
+                "--systemd=always",
+            ])
+            .args(DOCKER_CONTAINER_ARGS)
+            .args(extra_args)
+            .arg(image)
+            .arg("/sbin/init")
+            .output()
+            .unwrap_or_else(|e| panic!("could not run `podman run -d`: {e}"));
+        assert!(
+            out.status.success(),
+            "could not start the systemd container {name}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let container = SystemdContainer(name.to_string());
+        container.wait_for_systemd();
+        container
+    }
+
+    /// Wait until PID 1 has finished starting, rather than sleeping a guessed
+    /// fixed time. `degraded` is the expected steady state, not a problem:
+    /// `dbus.socket` and `systemd-logind.service` fail in this image (no
+    /// `dbus-broker` package, and no seat to manage), and neither is anything
+    /// these tests use -- the system bus firewalld needs is started by hand
+    /// by [`FIREWALLD_DAEMON_SETUP`], exactly as in the three non-systemd
+    /// images.
+    fn wait_for_systemd(&self) {
+        for _ in 0..120 {
+            let out = self.exec("systemctl is-system-running 2>&1 || true");
+            let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if matches!(state.as_str(), "running" | "degraded" | "maintenance") {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        panic!(
+            "systemd never finished starting in container {}; `podman logs` may say why",
+            self.0
+        );
+    }
+
+    fn exec(&self, script: &str) -> Output {
+        Command::new("podman")
+            .args(["exec", &self.0, "bash", "-c", script])
+            .output()
+            .unwrap_or_else(|e| panic!("could not run `podman exec`: {e}"))
+    }
+}
+
+impl Drop for SystemdContainer {
+    fn drop(&mut self) {
+        let status = Command::new("podman").args(["rm", "-f", &self.0]).status();
+        match status {
+            Ok(s) if s.success() => eprintln!("cleaned up container {}", self.0),
+            other => eprintln!("warning: could not remove container {}: {other:?}", self.0),
+        }
+    }
 }
 
 fn bind_ro(host: &Path, container_path: &str) -> [String; 2] {
@@ -2103,5 +2210,930 @@ fn a_redirect_rich_rule_renders_to_a_dnat_and_no_filter_rule() {
         "the accept `open` writes did not show up in any filter_IN chain, so the \
          assertion above proves nothing about where rules land:\n{}",
         extract_marker(&stdout, "WITH_ACCEPT"),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `porthole forward` against a real firewalld and a real Docker.
+// ---------------------------------------------------------------------------
+//
+// Six of the eight tests below need a Docker daemon: `porthole_core::docker`
+// reads the `DOCKER` chain of iptables' `nat` table and nothing else, so the
+// only way to exercise it against anything but a captured fixture is to have
+// a daemon write that chain. `Containerfile.docker` carries Docker 29.8.0
+// from Docker's own repository -- the version this project's development host
+// runs -- alongside the same firewalld the other Fedora tests use.
+//
+// The remaining two need no Docker at all, and that is the point of them:
+// `Engine::forward` asks `FirewallBackend::forward_capability` before it
+// reads anything, so on ufw and on nftables the refusal happens with Docker
+// never consulted.
+
+/// The LAN these tests forward towards, and the client that connects over it.
+///
+/// **The router side is deliberately named `eth0`.** It is a veth, but
+/// `porthole_core::net::default_route_interface` filters by interface *name*
+/// -- `veth*`, `docker*`, `br-*` and the rest are excluded -- and
+/// `Firewalld::managed_zone` needs a default route on an interface that
+/// survives that filter. Measured: with the pair named `veth0`/`veth1`, as
+/// [`NFT_RULESET_AND_NETNS_SETUP`] names its own, every porthole command in
+/// this container fails with exit 8, "no default route on a physical
+/// interface". The nftables tests do not hit this because that backend finds
+/// its chain instead of asking which interface carries the route.
+///
+/// The default route points at the client, which never answers it. Nothing
+/// here needs a working gateway: it is there so `net` can resolve a subnet,
+/// exactly as [`FAKE_LAN_INTERFACE`]'s own fabricated gateway is.
+///
+/// `ip netns` does not work in rootless podman, so the client is
+/// `unshare --net` plus `nsenter -t <pid> -n`, the same technique
+/// [`NFT_RULESET_AND_NETNS_SETUP`] uses.
+///
+/// The `mount -t proc proc /proc` is not decoration. podman masks parts of
+/// `/proc` read-only, and Docker cannot bring up a container's own interface
+/// without writing `net.ipv6.conf.<iface>.disable_ipv6`: measured, without
+/// this line every `docker run` here fails with `failed to configure ipv6`.
+const DOCKER_LAN_SETUP: &str = r#"
+set -e
+mount -t proc proc /proc
+
+ip link add eth0 type veth peer name lan1
+ip addr add 10.10.10.1/24 dev eth0
+ip link set eth0 up
+ip link set lo up
+ip route add default via 10.10.10.42 dev eth0
+
+unshare --net sleep 3000 &
+PEER_PID=$!
+sleep 0.5
+ip link set lan1 netns "$PEER_PID"
+nsenter -t "$PEER_PID" -n ip addr add 10.10.10.42/24 dev lan1
+nsenter -t "$PEER_PID" -n ip link set lan1 up
+nsenter -t "$PEER_PID" -n ip link set lo up
+
+# The client's own request, from its own network namespace. It asks for a
+# body rather than a bare TCP connect: the body is the container's, so a
+# connection answered by anything else on this machine cannot satisfy it.
+client_get() {
+  nsenter -t "$PEER_PID" -n curl -sS --max-time 4 "http://10.10.10.1:$1/" 2>/dev/null \
+    || echo CLIENT_UNREACHABLE
+}
+# `with_helper` writes its body to a file and runs it under `dbus-run-session
+# -- bash`, which is a *different* bash: a function defined here is not in it
+# unless it is exported. Same for PEER_PID.
+export PEER_PID
+export -f client_get
+"#;
+
+/// Start `dockerd` and build, offline, the one image these tests run.
+///
+/// Every container in this file is `--network=none`, so the Docker daemon
+/// inside one can pull nothing. `docker import` of a tarball needs no
+/// registry: the tarball's only executable is Fedora's statically linked
+/// `busybox`, and `busybox httpd` serves one file whose contents are the
+/// evidence a client is really talking to the container.
+const DOCKER_DAEMON_SETUP: &str = r#"
+dockerd >/tmp/dockerd.log 2>&1 &
+docker_ready=0
+for i in $(seq 1 120); do
+  if docker info >/dev/null 2>&1; then
+    docker_ready=1
+    break
+  fi
+  sleep 1
+done
+if [ "$docker_ready" != 1 ]; then
+  echo "DOCKERD_NEVER_READY" >&2
+  tail -50 /tmp/dockerd.log >&2
+  exit 94
+fi
+
+mkdir -p /img/bin /img/www
+cp /usr/sbin/busybox /img/bin/busybox
+echo 'PORTHOLE-TARGET-OK' > /img/www/index.html
+tar -C /img -c . | docker import - porthole-target >/dev/null
+
+# One place that knows how the target is run, so the two tests that restart
+# it cannot drift from the four that do not. $1 is extra `docker run` flags.
+start_target() {
+  docker run -d --name target $1 -p 127.0.0.1:3000:8080 porthole-target \
+    /bin/busybox httpd -f -p 8080 -h /www >/dev/null
+  # Give httpd a moment to bind. Not a guess about the daemon: `docker run`
+  # has already returned, so this waits only for the process inside.
+  for i in $(seq 1 50); do
+    if curl -sS --max-time 2 http://127.0.0.1:3000/ >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "TARGET_NEVER_ANSWERED_ON_LOOPBACK" >&2
+  docker logs target >&2 || true
+  exit 93
+}
+export -f start_target
+"#;
+
+/// A rich rule the user added by hand, so every before/after listing compares
+/// two non-empty listings rather than two empty ones, and so that "porthole
+/// removed its own rule" can be told apart from "porthole flushed the zone".
+const USERS_OWN_RICH_RULE: &str = "firewall-cmd --add-rich-rule='rule family=\"ipv4\" \
+source address=\"192.168.77.0/24\" port port=\"9999\" protocol=\"tcp\" accept'";
+
+/// The lines of `firewall-cmd --list-rich-rules` that are not the user's own
+/// rule from [`USERS_OWN_RICH_RULE`].
+fn porthole_rich_rules(listing: &str) -> Vec<&str> {
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.contains(r#"port="9999""#))
+        .collect()
+}
+
+/// Build the Docker image and start a systemd container of it, with the
+/// binaries bound in. `extra` is inserted before the image name.
+fn docker_container(name: &str, cli: &Path, helper: &Path, extra: &[String]) -> SystemdContainer {
+    ensure_image(DOCKER_IMAGE, "Containerfile.docker");
+    let mut args = cli_mounts(cli, helper);
+    args.extend(extra.iter().cloned());
+    SystemdContainer::start(name, DOCKER_IMAGE, &args)
+}
+
+fn report(out: &Output, what: &str) -> String {
+    eprintln!("{}", String::from_utf8_lossy(&out.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&out.stderr));
+    assert_container_ok(out, what);
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// A forward is **one** rich rule -- the `forward-port` redirect -- and
+/// closing it takes exactly that one rule back out.
+///
+/// The design this asserts was settled by measurement, not by reading
+/// firewalld's documentation: an accept for the external port beside the
+/// redirect carries none of the forwarded traffic (zero packets at the input
+/// hook, with and without it, byte-identical counters) and *is* a working
+/// accept for something else -- with a service of the host's own bound to
+/// `0.0.0.0:<external>`, that accept alone makes the host's own service
+/// reachable from the LAN. So porthole writes one rule, and this is the test
+/// that fails if a second ever appears.
+///
+/// What this can prove that `backend/firewalld.rs`'s own
+/// `a_forward_is_one_rule_and_its_handle_is_that_rule` cannot: that unit test
+/// counts the `--add-rich-rule` invocations porthole *issued* against a
+/// `RecordingRunner`. This counts the rules a real firewalld is *holding*
+/// afterwards, which is a different claim -- firewalld normalises what it is
+/// given, and a single `forward-port` rich rule could in principle have
+/// become two lines in the zone.
+///
+/// The expected rule string is built by `Firewalld::forward_rich_rule`
+/// itself, from the container address read out of the running Docker, rather
+/// than retyped here: a retyped copy goes on passing after the code that
+/// builds it changes.
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn a_forward_is_one_rich_rule_and_closing_takes_exactly_it_back_out() {
+    use porthole_core::backend::firewalld::Firewalld;
+    use porthole_core::forward::ForwardTo;
+    use porthole_core::model::{Lifetime, OpenRequest, Protocol, Target};
+
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    let container = docker_container("porthole-container-test-forward-rule", &cli, &helper, &[]);
+
+    let body = format!(
+        "porthole --session forward 3000 --to 10.10.10.0/24 --for 15m\n{}\n{}\n\
+         porthole --session close 3000\n",
+        marker_block("RULES_WHILE_FORWARDED", "firewall-cmd --list-rich-rules"),
+        marker_block("LIST_WHILE_FORWARDED", "porthole --session list --json"),
+    );
+
+    let script = format!(
+        "{DOCKER_LAN_SETUP}\n{FIREWALLD_DAEMON_SETUP}\n{DOCKER_DAEMON_SETUP}\n\
+         start_target ''\n\
+         {USERS_OWN_RICH_RULE}\n\
+         {}\n\
+         {}\n\
+         {}\n\
+         {}\n",
+        marker_block(
+            "CONTAINER_ADDR",
+            "docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' target"
+        ),
+        marker_block("RULES_BEFORE", "firewall-cmd --list-rich-rules"),
+        with_helper(&body),
+        marker_block("RULES_AFTER_CLOSE", "firewall-cmd --list-rich-rules"),
+    );
+
+    eprintln!("== forward test: one rich rule, and closing removes exactly it ==");
+    let stdout = report(&container.exec(&script), "the forward rich-rule container");
+
+    let addr: std::net::Ipv4Addr = extract_marker(&stdout, "CONTAINER_ADDR")
+        .parse()
+        .unwrap_or_else(|e| {
+            panic!(
+                "Docker reported no address for the target container ({e}): {:?}",
+                extract_marker(&stdout, "CONTAINER_ADDR")
+            )
+        });
+
+    let before = porthole_rich_rules(extract_marker(&stdout, "RULES_BEFORE"));
+    assert!(
+        before.is_empty(),
+        "nothing but the user's own rule may be in the zone before the forward: {before:?}"
+    );
+
+    let while_forwarded = extract_marker(&stdout, "RULES_WHILE_FORWARDED");
+    let ours = porthole_rich_rules(while_forwarded);
+    // The assertion the whole design rests on. Two rules here -- a redirect
+    // and a permit -- is the shape a spike measured to expose the *host's*
+    // own service on the external port.
+    assert_eq!(
+        ours.len(),
+        1,
+        "a forward is one rich rule; firewalld is holding {}: {while_forwarded}",
+        ours.len()
+    );
+
+    let expected = Firewalld::forward_rich_rule(
+        &OpenRequest {
+            port: 3000,
+            protocol: Protocol::Tcp,
+            target: Target::Network {
+                cidr: "10.10.10.0/24".parse().unwrap(),
+            },
+            lifetime: Lifetime::For(std::time::Duration::from_secs(900)),
+        },
+        &ForwardTo {
+            container_addr: addr,
+            container_port: 8080,
+            published_port: 3000,
+            protocol: Protocol::Tcp,
+        },
+        Protocol::Tcp,
+    );
+    assert_eq!(
+        ours[0], expected,
+        "the rule firewalld is holding must be the one Firewalld::forward_rich_rule builds"
+    );
+    assert!(
+        !ours[0].contains("accept"),
+        "a forward wrote an accept for the external port: {}",
+        ours[0]
+    );
+    assert!(
+        while_forwarded.contains(r#"port="9999""#),
+        "the user's own rule must still be there: {while_forwarded}"
+    );
+
+    let listed = extract_marker(&stdout, "LIST_WHILE_FORWARDED");
+    assert!(
+        listed.contains(r#""port":3000"#)
+            && listed.contains(&format!(r#""container_addr":"{addr}""#)),
+        "porthole must name the forward it made, container address and all: {listed}"
+    );
+
+    let after = extract_marker(&stdout, "RULES_AFTER_CLOSE");
+    assert!(
+        porthole_rich_rules(after).is_empty(),
+        "the close must take the redirect back out: {after}"
+    );
+    assert!(
+        after.contains(r#"port="9999""#),
+        "and must leave the user's own rule where it was: {after}"
+    );
+}
+
+/// A client on the local network reaches the container **through** the
+/// forward, and stops reaching it when the forward closes.
+///
+/// The container is published on `127.0.0.1` only, so nothing outside this
+/// machine can reach it: that is the situation `porthole forward` exists for,
+/// and phase 1 below is the proof it holds before porthole does anything.
+///
+/// **Three things are asserted, and the third is what the spike asked for.**
+///
+/// 1. The client gets the container's own body, not merely a TCP connect. A
+///    connect-only check would pass against anything at all listening on the
+///    external port.
+/// 2. Reachability really begins with the forward and ends with the close.
+/// 3. The traffic travels the **forward** path, not the input path. A
+///    counter-only table of this test's own (`inet probe`, at hook priority
+///    -400 in both directions -- firewalld's own table carries
+///    `flags owner,persist` and cannot be written into) counts packets at
+///    each hook. Before the forward, the client's SYN is counted at the
+///    *input* hook and nothing at the forward hook; with the forward, the
+///    DNAT has already happened in prerouting, so the input hook counts
+///    **zero** and the forward hook counts the connection. That asymmetry is
+///    the whole reason porthole writes no accept for the external port, and
+///    this is what fails loudly if a firewalld release ever stops accepting
+///    DNAT'd traffic in `filter_FORWARD`.
+///
+/// Phase 1's non-zero input counter is the control: without it, "input == 0"
+/// in phase 2 would be satisfied just as well by a probe table that counts
+/// nothing at all.
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn a_client_on_the_lan_reaches_the_container_through_the_forward_and_not_through_the_input_hook() {
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    let container = docker_container("porthole-container-test-forward-reach", &cli, &helper, &[]);
+
+    // Rebuilt between the phases rather than reset: `nft` spells a rule
+    // counter reset differently across releases, and deleting the table is
+    // unambiguous in every one of them.
+    let probe = "\
+nft add table inet probe
+nft 'add chain inet probe pin { type filter hook input priority -400; }'
+nft 'add chain inet probe pfwd { type filter hook forward priority -400; }'
+nft add rule inet probe pin tcp dport 3000 counter
+nft add rule inet probe pfwd ct status dnat counter";
+
+    let body = format!(
+        "{}\n\
+         nft delete table inet probe\n{probe}\n\
+         porthole --session forward 3000 --to 10.10.10.0/24 --for 15m\n\
+         {}\n\
+         {}\n\
+         porthole --session close 3000\n\
+         {}\n\
+         {}\n",
+        marker_block("PROBE_BEFORE", "nft list table inet probe"),
+        marker_block("PHASE2_CLIENT", "client_get 3000"),
+        marker_block("PROBE_WHILE", "nft list table inet probe"),
+        marker_block("PHASE3_CLIENT", "client_get 3000"),
+        marker_block(
+            "LOOPBACK_AFTER_CLOSE",
+            "curl -sS --max-time 4 http://127.0.0.1:3000/ || echo LOOPBACK_BROKEN"
+        ),
+    );
+
+    let script = format!(
+        "{DOCKER_LAN_SETUP}\n{FIREWALLD_DAEMON_SETUP}\n{DOCKER_DAEMON_SETUP}\n\
+         start_target ''\n{probe}\n\
+         {}\n\
+         {}\n",
+        marker_block("PHASE1_CLIENT", "client_get 3000"),
+        with_helper(&body),
+    );
+
+    eprintln!("== forward test: the LAN reaches the container, through the forward hook ==");
+    let stdout = report(
+        &container.exec(&script),
+        "the forward reachability container",
+    );
+
+    assert_eq!(
+        extract_marker(&stdout, "PHASE1_CLIENT"),
+        "CLIENT_UNREACHABLE",
+        "a container published on loopback must not be reachable from the LAN before \
+         porthole forwards anything -- otherwise phase 2 proves nothing"
+    );
+    assert_eq!(
+        extract_marker(&stdout, "PHASE2_CLIENT"),
+        "PORTHOLE-TARGET-OK",
+        "the client must get the container's own body through the forward"
+    );
+    assert_eq!(
+        extract_marker(&stdout, "PHASE3_CLIENT"),
+        "CLIENT_UNREACHABLE",
+        "closing the forward must take the LAN's access away again"
+    );
+    assert_eq!(
+        extract_marker(&stdout, "LOOPBACK_AFTER_CLOSE"),
+        "PORTHOLE-TARGET-OK",
+        "closing a forward must not disturb Docker's own publication on loopback"
+    );
+
+    let (input_before, forward_before) = probe_counters(extract_marker(&stdout, "PROBE_BEFORE"));
+    let (input_while, forward_while) = probe_counters(extract_marker(&stdout, "PROBE_WHILE"));
+
+    // The control: the probe can count, and an un-forwarded connection to the
+    // external port really does arrive at the input hook.
+    assert!(
+        input_before > 0,
+        "the probe counted nothing at the input hook for a refused connection, so \
+         `input == 0` below would prove nothing: {}",
+        extract_marker(&stdout, "PROBE_BEFORE")
+    );
+    assert_eq!(
+        forward_before,
+        0,
+        "nothing was DNAT'd before the forward existed: {}",
+        extract_marker(&stdout, "PROBE_BEFORE")
+    );
+
+    // The assertion the design rests on.
+    assert_eq!(
+        input_while,
+        0,
+        "the forwarded connection reached the input hook, so an accept in a zone's \
+         input chain would after all be part of what carries it -- which is the claim \
+         porthole's one-rule forward denies: {}",
+        extract_marker(&stdout, "PROBE_WHILE")
+    );
+    assert!(
+        forward_while > 0,
+        "the forwarded connection was counted at neither hook: {}",
+        extract_marker(&stdout, "PROBE_WHILE")
+    );
+}
+
+/// `(input hook packets, forward hook packets)` out of one `nft list table
+/// inet probe` dump.
+///
+/// Each chain holds exactly one rule and that rule ends in `counter packets N
+/// bytes M`, so the two numbers are read positionally within each chain's own
+/// body rather than by matching the whole rule text.
+fn probe_counters(dump: &str) -> (u64, u64) {
+    fn packets(chains: &[(String, String)], name: &str, dump: &str) -> u64 {
+        let body = chains
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| b.clone())
+            .unwrap_or_else(|| panic!("no chain {name} in the probe table:\n{dump}"));
+        let after = body
+            .split("counter packets ")
+            .nth(1)
+            .unwrap_or_else(|| panic!("chain {name} has no counter:\n{dump}"));
+        after
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("chain {name}'s counter is unreadable:\n{dump}"))
+    }
+    let chains = nft_chains(dump);
+    (
+        packets(&chains, "pin", dump),
+        packets(&chains, "pfwd", dump),
+    )
+}
+
+/// A container that stops closes the forward that pointed at it, with the
+/// reason `target-gone` and no other.
+///
+/// The wake-up is `porthole_helper::netmon`'s own poll, whose interval is a
+/// production constant (60s) a test may not shorten -- which is why this test
+/// takes over two and a half minutes. `-e PORTHOLE_NETMON=1` is what lets the
+/// monitor run under `--session` at all; see `netmon::should_run`.
+///
+/// **The first wait is the control.** One whole poll passes with the
+/// container still running, and the forward has to still be there afterwards.
+/// Without it, "the rule is gone after 140 seconds" would be satisfied by a
+/// helper that closed every forward on its first wake-up regardless.
+///
+/// A `--for 15m` lifetime, so nothing in the two waits comes near expiry: an
+/// expiry would close the rule too, and announce `expired` rather than
+/// `target-gone`. The reason on the bus is what tells the two apart, and it
+/// is asserted rather than inferred from the rule having gone.
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn stopping_the_container_closes_the_forward_and_says_the_target_is_gone() {
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    let container = docker_container(
+        "porthole-container-test-forward-gone",
+        &cli,
+        &helper,
+        &["-e".to_string(), "PORTHOLE_NETMON=1".to_string()],
+    );
+
+    let body = format!(
+        r#"
+stdbuf -oL dbus-monitor --session "type='signal',interface='com.jacopobriccola.Porthole1'" \
+  > /tmp/signals.txt 2>&1 &
+MONPID=$!
+for i in $(seq 1 100); do [ -s /tmp/signals.txt ] && break; sleep 0.1; done
+
+porthole --session forward 3000 --to 10.10.10.0/24 --for 15m
+
+# One whole poll interval with the container still running.
+sleep 70
+{}
+
+docker stop target >/dev/null
+
+sleep 70
+{}
+{}
+{}
+sleep 1
+kill "$MONPID" 2>/dev/null || true
+"#,
+        marker_block("STILL_THERE", "porthole --session list --json"),
+        marker_block("AFTER_STOP", "porthole --session list --json"),
+        marker_block("RULES_AFTER_STOP", "firewall-cmd --list-rich-rules"),
+        marker_block("CLIENT_AFTER_STOP", "client_get 3000"),
+    );
+
+    let script = format!(
+        "{DOCKER_LAN_SETUP}\n{FIREWALLD_DAEMON_SETUP}\n{DOCKER_DAEMON_SETUP}\n\
+         start_target ''\n{USERS_OWN_RICH_RULE}\n{}\n{}\n",
+        with_helper(&body),
+        marker_block("SIGNALS", "cat /tmp/signals.txt"),
+    );
+
+    eprintln!(
+        "== forward test: a stopped container closes its forward (this one takes ~2.5 minutes) =="
+    );
+    let stdout = report(
+        &container.exec(&script),
+        "the forward target-gone container",
+    );
+
+    let still = extract_marker(&stdout, "STILL_THERE");
+    assert!(
+        still.contains(r#""port":3000"#),
+        "one poll passed with the container still up and the forward closed anyway, so \
+         nothing below would distinguish `target-gone` from `closes on every wake-up`: \
+         {still}"
+    );
+
+    let after = extract_marker(&stdout, "AFTER_STOP");
+    assert!(
+        after.contains(r#""rules":[]"#),
+        "the forward must be gone once its container is: {after}"
+    );
+    let rules = extract_marker(&stdout, "RULES_AFTER_STOP");
+    assert!(
+        porthole_rich_rules(rules).is_empty(),
+        "the redirect must be out of firewalld too, not merely out of the state file: {rules}"
+    );
+    assert!(
+        rules.contains(r#"port="9999""#),
+        "the user's own rule must survive an unasked close: {rules}"
+    );
+    assert_eq!(
+        extract_marker(&stdout, "CLIENT_AFTER_STOP"),
+        "CLIENT_UNREACHABLE",
+        "the LAN must have lost the redirect along with the record of it"
+    );
+
+    let signals = extract_marker(&stdout, "SIGNALS");
+    assert_eq!(
+        signals.matches("member=RuleClosed").count(),
+        1,
+        "exactly one close, for the forward whose container went: {signals}"
+    );
+    assert!(
+        signals.contains(r#"string "target-gone""#),
+        "the close must say the container is no longer the one it was created against: \
+         {signals}"
+    );
+    for wrong in ["requested", "expired", "network-changed", "reconciled"] {
+        assert!(
+            !signals.contains(&format!(r#"string "{wrong}""#)),
+            "nothing may report this close as `{wrong}`: {signals}"
+        );
+    }
+}
+
+/// A container that comes back at a **different address** closes the forward
+/// rather than being followed to it.
+///
+/// This is the case `forward::stale_forwards` exists for and the one a
+/// weaker check would miss: the published port is the same, the protocol is
+/// the same, the container port is the same, and only the container's own
+/// address has moved. porthole re-resolves rather than assuming, so the
+/// request is closed and the user is invited to make it again -- see
+/// `porthole-agent`'s `Reopen` on a `target-gone` notification.
+///
+/// A user-defined Docker network with explicit `--ip` addresses, because the
+/// address has to be *known* to be different: on the default bridge Docker
+/// hands out whatever is free, and a replacement container commonly gets the
+/// address the old one gave up, which would make this test assert nothing.
+/// Both addresses are read back and asserted to differ before anything else
+/// is concluded.
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn a_container_that_came_back_elsewhere_closes_the_forward_rather_than_being_followed() {
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    let container = docker_container(
+        "porthole-container-test-forward-moved",
+        &cli,
+        &helper,
+        &["-e".to_string(), "PORTHOLE_NETMON=1".to_string()],
+    );
+
+    let body = format!(
+        r#"
+stdbuf -oL dbus-monitor --session "type='signal',interface='com.jacopobriccola.Porthole1'" \
+  > /tmp/signals.txt 2>&1 &
+MONPID=$!
+for i in $(seq 1 100); do [ -s /tmp/signals.txt ] && break; sleep 0.1; done
+
+porthole --session forward 3000 --to 10.10.10.0/24 --for 15m
+{}
+
+docker rm -f target >/dev/null
+start_target '--network pt-net --ip 172.28.0.6'
+{}
+
+sleep 70
+{}
+{}
+sleep 1
+kill "$MONPID" 2>/dev/null || true
+"#,
+        marker_block("BEFORE_MOVE", "porthole --session list --json"),
+        marker_block(
+            "NEW_ADDR",
+            "docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' target"
+        ),
+        marker_block("AFTER_MOVE", "porthole --session list --json"),
+        marker_block("RULES_AFTER_MOVE", "firewall-cmd --list-rich-rules"),
+    );
+
+    let script = format!(
+        "{DOCKER_LAN_SETUP}\n{FIREWALLD_DAEMON_SETUP}\n{DOCKER_DAEMON_SETUP}\n\
+         docker network create --subnet=172.28.0.0/16 pt-net >/dev/null\n\
+         start_target '--network pt-net --ip 172.28.0.5'\n{USERS_OWN_RICH_RULE}\n\
+         {}\n{}\n",
+        with_helper(&body),
+        marker_block("SIGNALS", "cat /tmp/signals.txt"),
+    );
+
+    eprintln!(
+        "== forward test: a container that moved is not followed (this one takes ~1.5 minutes) =="
+    );
+    let stdout = report(
+        &container.exec(&script),
+        "the forward moved-container container",
+    );
+
+    let before = extract_marker(&stdout, "BEFORE_MOVE");
+    assert!(
+        before.contains(r#""container_addr":"172.28.0.5""#),
+        "the forward must have been created against the first address: {before}"
+    );
+    assert_eq!(
+        extract_marker(&stdout, "NEW_ADDR"),
+        "172.28.0.6",
+        "the replacement container has to be somewhere else, or this test compares \
+         an address with itself"
+    );
+
+    let after = extract_marker(&stdout, "AFTER_MOVE");
+    assert!(
+        after.contains(r#""rules":[]"#),
+        "the forward must close rather than follow the container: {after}"
+    );
+    let rules = extract_marker(&stdout, "RULES_AFTER_MOVE");
+    assert!(
+        porthole_rich_rules(rules).is_empty(),
+        "and nothing may be left in firewalld: {rules}"
+    );
+    assert!(
+        !rules.contains("172.28.0.6"),
+        "porthole must never re-aim a redirect at whatever holds the port now: {rules}"
+    );
+
+    let signals = extract_marker(&stdout, "SIGNALS");
+    assert!(
+        signals.contains(r#"string "target-gone""#),
+        "an address that moved is the same fact as a container that stopped, and must \
+         carry the same reason: {signals}"
+    );
+    assert!(
+        !signals.contains("172.28.0.6"),
+        "the close announces the mapping the rule held, never the one that replaced it: \
+         {signals}"
+    );
+}
+
+/// A Docker table that **cannot be read** closes nothing.
+///
+/// Not knowing is not knowing it changed. `Engine::close_stale_forwards` has
+/// no way to spell "no answer" to `forward::stale_forwards` -- an empty slice
+/// is the answer "no container publishes anything", which would name every
+/// forward -- so a read failure returns empty and leaves the next wake-up to
+/// try again.
+///
+/// The failure is made by taking the `iptables` binary away, so what
+/// `docker::published` meets is a real spawn failure rather than a
+/// fabricated exit status. It must not be confused with the neighbouring
+/// case: exit **1** is `iptables(8)`'s "No chain/target/match by that name",
+/// which is what a *stopped Docker daemon* produces, and that is an answer --
+/// "nothing published" -- which does close every forward. This test is about
+/// the other half.
+///
+/// **The control is in the helper's own log.** "Nothing closed" is what a
+/// wake-up that never happened also looks like, so the assertion is not the
+/// absence of a close but the presence of the line
+/// `close_stale_forwards` prints on exactly this path.
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn a_docker_table_that_cannot_be_read_closes_no_forward() {
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    let container = docker_container(
+        "porthole-container-test-forward-unreadable",
+        &cli,
+        &helper,
+        &["-e".to_string(), "PORTHOLE_NETMON=1".to_string()],
+    );
+
+    let body = format!(
+        r#"
+porthole --session forward 3000 --to 10.10.10.0/24 --for 15m
+{}
+
+# A read that fails, not a read that answers "nothing". Moving the binary
+# makes `docker::published` fail to spawn it at all; deleting the DOCKER
+# chain instead would exit 1, which porthole reads as an answer.
+mv /usr/sbin/iptables /usr/sbin/iptables-taken-away
+
+sleep 70
+{}
+{}
+"#,
+        marker_block("BEFORE", "porthole --session list --json"),
+        marker_block("AFTER", "porthole --session list --json"),
+        marker_block("RULES_AFTER", "firewall-cmd --list-rich-rules"),
+    );
+
+    let script = format!(
+        "{DOCKER_LAN_SETUP}\n{FIREWALLD_DAEMON_SETUP}\n{DOCKER_DAEMON_SETUP}\n\
+         start_target ''\n{}\n{}\n",
+        with_helper(&body),
+        marker_block("HELPER_LOG", "cat /tmp/porthole-helper.log"),
+    );
+
+    eprintln!("== forward test: an unreadable Docker table closes nothing (this one takes ~1.5 minutes) ==");
+    let stdout = report(&container.exec(&script), "the unreadable-Docker container");
+
+    assert!(
+        extract_marker(&stdout, "BEFORE").contains(r#""port":3000"#),
+        "the forward has to exist before the table is taken away: {}",
+        extract_marker(&stdout, "BEFORE")
+    );
+
+    // The control, first: without it, everything below is also satisfied by a
+    // wake-up that never ran.
+    let log = extract_marker(&stdout, "HELPER_LOG");
+    assert!(
+        log.contains("could not read Docker's published ports"),
+        "the monitor must have woken, tried to read Docker's table and failed -- \
+         otherwise `nothing closed` says nothing about why: {log}"
+    );
+
+    let after = extract_marker(&stdout, "AFTER");
+    assert!(
+        after.contains(r#""port":3000"#),
+        "a table porthole could not read is not evidence the container moved, and must \
+         take nobody's access away: {after}"
+    );
+    let rules = extract_marker(&stdout, "RULES_AFTER");
+    assert_eq!(
+        porthole_rich_rules(rules).len(),
+        1,
+        "the redirect must still be in firewalld: {rules}"
+    );
+}
+
+/// ufw refuses a forward, in a message that names ufw.
+///
+/// ufw has no forwarding command at all: its port forwarding is a hand-edited
+/// `*nat` block in `/etc/ufw/before.rules`, a file ufw reloads at boot.
+/// Writing one would be writing a permanent firewall rule, which porthole
+/// never does -- so this backend inherits `FirewallBackend::forward`'s
+/// refusing default.
+///
+/// A separate test from the nftables one on purpose. They refuse for
+/// different reasons and say different things, and one test covering both
+/// would let either of them start succeeding, or start saying the other's
+/// sentence, without anything noticing.
+///
+/// Nothing about Docker is set up here, and that is itself the point:
+/// `Engine::forward` asks `forward_capability` before it reads anything at
+/// all, so a machine whose firewall cannot redirect is told that rather than
+/// sent looking for a container.
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn on_ufw_a_forward_is_refused_with_a_message_that_names_ufw() {
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    ensure_image(DEBIAN_IMAGE, "Containerfile.debian");
+
+    let mut args: Vec<String> = vec!["--cap-add=NET_ADMIN".to_string()];
+    args.extend(cli_mounts(&cli, &helper));
+
+    let body = "\
+set +e
+porthole --session forward 3000 --to 10.10.10.0/24 --for 15m --json
+echo \"EXIT=$?\"
+set -e";
+
+    let script = format!(
+        "set -e\n{FAKE_LAN_INTERFACE}\nufw --force enable\n\
+         ufw allow 2222/tcp comment 'not-porthole'\n\
+         {}\n{}\n{}\n",
+        marker_block("BEFORE", "ufw status numbered"),
+        with_helper(&marker_block("REFUSAL", body)),
+        marker_block("AFTER", "ufw status numbered"),
+    );
+
+    eprintln!("== forward test: ufw refuses ==");
+    let out = podman_run(DEBIAN_IMAGE, &args, &script);
+    let stdout = report(&out, "the ufw forward-refusal container");
+
+    let refusal = extract_marker(&stdout, "REFUSAL");
+    assert!(
+        refusal.contains("EXIT=12"),
+        "a backend with no redirect must exit ForwardUnsupported (12): {refusal}"
+    );
+    assert!(
+        refusal.contains(r#""kind":"forward_unsupported""#),
+        "and must say so in --json's own machine-readable slug: {refusal}"
+    );
+    assert!(
+        refusal.contains("ufw cannot redirect a port"),
+        "the refusal must name the backend the machine actually has: {refusal}"
+    );
+    assert!(
+        !refusal.contains("nftables"),
+        "ufw's refusal must not be nftables' -- the two exist separately so that \
+         either one changing is visible: {refusal}"
+    );
+    assert_eq!(
+        extract_marker(&stdout, "BEFORE"),
+        extract_marker(&stdout, "AFTER"),
+        "a refused forward may leave nothing behind in ufw"
+    );
+}
+
+/// nftables refuses a forward, in a message that names why nftables cannot.
+///
+/// Its reason is not ufw's. A redirect on its own was measured unreachable on
+/// a ruleset whose forward chain drops, and the accept that would carry it
+/// belongs in the chain deciding forwarded traffic -- where porthole does not
+/// write, and where an accept of porthole's would land ahead of
+/// `DOCKER-USER` on a host that also runs Docker. So the refusal is the
+/// backend's own sentence, not the trait's default.
+///
+/// The two refusal tests assert *different* strings, which is what makes
+/// keeping them apart worth the second container.
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn on_nftables_a_forward_is_refused_with_a_message_that_names_why_nftables_cannot() {
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    ensure_image(ARCH_IMAGE, "Containerfile.arch");
+
+    let mut args: Vec<String> =
+        vec!["--cap-add=NET_ADMIN,NET_RAW,SYS_ADMIN,SYS_PTRACE".to_string()];
+    args.extend(cli_mounts(&cli, &helper));
+
+    let ruleset_setup = "\
+nft add table inet filter
+nft 'add chain inet filter input { type filter hook input priority 0; policy drop; }'
+nft add rule inet filter input ct state established,related accept
+nft add rule inet filter input iif lo accept";
+
+    let body = "\
+set +e
+porthole --session forward 3000 --to 10.10.10.0/24 --for 15m --json
+echo \"EXIT=$?\"
+set -e";
+
+    let script = [
+        "set -e".to_string(),
+        ruleset_setup.to_string(),
+        marker_block("BEFORE", "nft -a list ruleset"),
+        with_helper(&marker_block("REFUSAL", body)),
+        marker_block("AFTER", "nft -a list ruleset"),
+    ]
+    .join("\n");
+
+    eprintln!("== forward test: nftables refuses ==");
+    let out = podman_run(ARCH_IMAGE, &args, &script);
+    let stdout = report(&out, "the nftables forward-refusal container");
+
+    let refusal = extract_marker(&stdout, "REFUSAL");
+    assert!(
+        refusal.contains("EXIT=12"),
+        "a backend with no redirect must exit ForwardUnsupported (12): {refusal}"
+    );
+    assert!(
+        refusal.contains(r#""kind":"forward_unsupported""#),
+        "and must say so in --json's own machine-readable slug: {refusal}"
+    );
+    assert!(
+        refusal.contains("nftables cannot redirect a port"),
+        "the refusal must name the backend the machine actually has: {refusal}"
+    );
+    assert!(
+        refusal.contains("forward chain that drops"),
+        "and must give nftables' own reason, not the trait's default sentence: {refusal}"
+    );
+    assert!(
+        !refusal.contains("porthole has no forward for this backend"),
+        "the trait default is ufw's answer; nftables overrides it and must keep doing \
+         so: {refusal}"
+    );
+    assert_eq!(
+        extract_marker(&stdout, "BEFORE"),
+        extract_marker(&stdout, "AFTER"),
+        "a refused forward may leave nothing behind in the ruleset, handles included"
     );
 }
