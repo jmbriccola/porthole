@@ -239,12 +239,14 @@ grep -qx 'Restart=on-failure' \
 # its bus from the environment.
 unset RUSTFLAGS
 
-# One private bus, standing in for both. crates/porthole-agent/tests/session.rs
-# spawns its own session bus per test and does not need this; what this adds
-# is a system-bus address for `porthole doctor` to reach, so its helper check
-# reports a bus on which nothing owns the name -- which is the state
-# crates/porthole-cli/tests/cli.rs asserts the remedy for. Without it that one
-# test sees no bus at all and fails.
+# One private bus, standing in for both, in a chroot that has neither.
+# crates/porthole-agent/tests/session.rs spawns its own session bus per test
+# and crates/porthole-cli/tests/cli.rs gives every porthole process it starts
+# a private one of its own, so neither depends on this; what is left needing
+# a session bus is the helper's own service tests and the CLI-to-helper
+# round trip, which run `porthole-helper --session` on it. The system-bus
+# address is exported alongside so nothing that asks for a system bus in this
+# chroot finds none.
 #
 # porthole-gui is excluded: its test targets open a GTK display.
 dbus-run-session -- sh -c '

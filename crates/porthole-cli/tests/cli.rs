@@ -3,29 +3,250 @@
 //! Everything here runs unprivileged. Tests that would need root, or a
 //! firewall that is not installed, skip themselves rather than fail: this file
 //! has to be runnable on a developer laptop and in a bare CI container alike.
+//!
+//! # Why every process started here is given a bus of its own
+//!
+//! `porthole open` and `porthole close` change no firewall themselves. They
+//! send a D-Bus request to the privileged helper on the system bus, and the
+//! helper runs `firewall-cmd` in its own process. On a machine with the
+//! porthole package installed, three tests below — each written to assert
+//! that there is no helper to ask — reached the real one: `porthole open
+//! 5173` sat on a polkit password prompt for over eight minutes, the person
+//! who eventually answered it authorized the open, and a rich rule was left
+//! on that machine's firewall. A `PATH` shim counting `firewall-cmd`
+//! invocations recorded none of it, because the process that runs
+//! `firewall-cmd` is the helper, not anything this file starts.
+//!
+//! So [`isolation`] starts one private `dbus-run-session` daemon for this
+//! test binary, and every porthole process below is given
+//! `DBUS_SYSTEM_BUS_ADDRESS` and `DBUS_SESSION_BUS_ADDRESS` pointing at it.
+//! Nothing owns `com.jacopobriccola.Porthole` on that daemon, and the
+//! helper's activation file is a *system*-bus one, which a session daemon
+//! does not read — so a request for the helper comes back as
+//! `ServiceUnknown`, which is what a machine without porthole installed
+//! answers and what these tests were written against.
+//! [`the_bus_redirection_is_what_the_binary_actually_reads`] is the negative
+//! control: it names the address it sets and fails on any machine, with a
+//! helper or without one, if that address stops being the one the binary
+//! reads.
+//!
+//! `firewall-cmd` reaches firewalld over that same variable. Redirecting it
+//! process-wide was measured making `firewall-cmd --state` print "Waiting on
+//! dbus connection..." for eleven seconds and then "not running", with
+//! `porthole open --dry-run --json` still running after thirty. So the
+//! `firewall-cmd` first on these processes' `PATH` is [a shim](shimmed_path)
+//! that unsets both variables and execs the real one: firewalld is reached,
+//! the helper is not.
+//!
+//! # Nothing here waits
+//!
+//! Every porthole process started below is killed at [`DEADLINE`] and its
+//! test fails. The two runs described above hung for more than five hundred
+//! seconds each, on a machine whose owner was somewhere else.
 
-use std::path::Path;
-use std::process::{Command, Output};
+use std::ffi::OsString;
+use std::io::{BufRead as _, Read as _, Write as _};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-fn porthole(args: &[&str], state: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_porthole"))
-        .args(args)
-        .env("PORTHOLE_STATE_FILE", state)
+/// How long a porthole process started here may run before it is killed and
+/// its test fails. Long enough that a loaded machine running the whole
+/// workspace's tests in parallel is not what trips it.
+const DEADLINE: Duration = Duration::from_secs(60);
+
+/// The bus every porthole process below talks to, and the `PATH` that keeps
+/// `firewall-cmd` off it.
+struct Isolation {
+    /// `dbus-run-session`, alive for as long as the pipe its inner shell
+    /// reads stays open. This process exiting closes that pipe, the shell
+    /// exits, and the daemon goes down with it — so nothing is left behind
+    /// even though this value is never dropped.
+    _daemon: Child,
+    address: String,
+    path: OsString,
+}
+
+fn isolation() -> &'static Isolation {
+    static ISOLATION: OnceLock<Isolation> = OnceLock::new();
+    ISOLATION.get_or_init(|| {
+        // Asserted, not skipped. A test that cannot get its own bus must
+        // fail rather than quietly run against this machine's.
+        let mut daemon = Command::new("dbus-run-session")
+            .args([
+                "--",
+                "sh",
+                "-c",
+                r#"echo "$DBUS_SESSION_BUS_ADDRESS"; exec cat >/dev/null"#,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("dbus-run-session is installed");
+        let mut address = String::new();
+        std::io::BufReader::new(daemon.stdout.take().expect("stdout was piped"))
+            .read_line(&mut address)
+            .expect("the private bus prints its address");
+        let address = address.trim().to_string();
+        assert!(!address.is_empty(), "dbus-run-session printed no address");
+        Isolation {
+            _daemon: daemon,
+            address,
+            path: shimmed_path(),
+        }
+    })
+}
+
+/// A `PATH` whose `firewall-cmd` still reaches this machine's real firewalld.
+///
+/// firewalld is spoken to over `DBUS_SYSTEM_BUS_ADDRESS`, the same variable
+/// that points every porthole process here at a bus with no helper on it.
+/// The shim written here unsets it and execs the real binary, so the two
+/// uses of one variable stop fighting: the tests that assert firewalld's own
+/// `--add-rich-rule` wording get firewalld, and no porthole process gets a
+/// helper.
+///
+/// The directory is beside the test binary rather than in a temporary one,
+/// so nothing outlives `cargo clean`, and the shim is renamed into place so
+/// a concurrently starting test binary never reads a half-written file.
+fn shimmed_path() -> OsString {
+    let dir = PathBuf::from(env!("CARGO_BIN_EXE_porthole")).with_file_name("cli-test-path");
+    std::fs::create_dir_all(&dir).expect("the build directory is writable");
+    if let Some(real) = which("firewall-cmd") {
+        let staging = dir.join(format!("firewall-cmd.{}", std::process::id()));
+        std::fs::write(
+            &staging,
+            format!(
+                "#!/bin/sh\n\
+                 # Written by `shimmed_path` in crates/porthole-cli/tests/cli.rs.\n\
+                 unset DBUS_SYSTEM_BUS_ADDRESS\n\
+                 unset DBUS_SESSION_BUS_ADDRESS\n\
+                 exec {} \"$@\"\n",
+                real.display()
+            ),
+        )
+        .expect("the build directory is writable");
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))
+            .expect("the shim can be made executable");
+        std::fs::rename(&staging, dir.join("firewall-cmd")).expect("the shim can be put in place");
+    }
+    let mut path = dir.into_os_string();
+    if let Some(inherited) = std::env::var_os("PATH") {
+        path.push(":");
+        path.push(inherited);
+    }
+    path
+}
+
+/// Where `program` is, on the `PATH` this test binary itself inherited.
+fn which(program: &str) -> Option<PathBuf> {
+    let out = Command::new("sh")
+        .args(["-c", &format!("command -v {program}")])
         .output()
-        .expect("porthole binary runs")
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let found = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!found.is_empty()).then(|| PathBuf::from(found))
+}
+
+/// A `porthole` invocation pointed at the private bus. A caller that needs a
+/// `PATH` of its own sets one afterwards, which replaces the one set here;
+/// the bus stays redirected either way.
+fn porthole_command(args: &[&str]) -> Command {
+    let isolation = isolation();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_porthole"));
+    command
+        .args(args)
+        .env("DBUS_SYSTEM_BUS_ADDRESS", &isolation.address)
+        .env("DBUS_SESSION_BUS_ADDRESS", &isolation.address)
+        .env_remove("DBUS_STARTER_ADDRESS")
+        .env_remove("DBUS_STARTER_BUS_TYPE")
+        .env("PATH", &isolation.path);
+    command
+}
+
+/// Runs `command` to completion, killing it at [`DEADLINE`]. `stdin`, when
+/// given, is written and the pipe closed before the wait begins.
+///
+/// The two pipes are drained on threads of their own rather than after the
+/// wait, so a child that fills one cannot deadlock against the deadline that
+/// is supposed to be watching it.
+fn run(mut command: Command, stdin: Option<&[u8]>) -> Output {
+    command
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("porthole binary runs");
+    if let Some(bytes) = stdin {
+        child
+            .stdin
+            .take()
+            .expect("stdin was piped")
+            .write_all(bytes)
+            .expect("the child reads its input");
+    }
+    let mut out = child.stdout.take().expect("stdout was piped");
+    let mut err = child.stderr.take().expect("stderr was piped");
+    let out = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = out.read_to_end(&mut buffer);
+        buffer
+    });
+    let err = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = err.read_to_end(&mut buffer);
+        buffer
+    });
+
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("the child is waitable") {
+            break status;
+        }
+        if started.elapsed() >= DEADLINE {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "a porthole process was still running after {} seconds and was killed. \
+                 Nothing started by this file may wait for anything; reaching a real \
+                 helper, and through it a polkit prompt, is how that has happened before.",
+                DEADLINE.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    Output {
+        status,
+        stdout: out.join().expect("the stdout reader finishes"),
+        stderr: err.join().expect("the stderr reader finishes"),
+    }
+}
+
+fn porthole(args: &[&str], state: &Path) -> Output {
+    let mut command = porthole_command(args);
+    command.env("PORTHOLE_STATE_FILE", state);
+    run(command, None)
 }
 
 /// `porthole` with the address book pointed at a file of this test's own.
 /// `PORTHOLE_DEVICES_FILE` is honoured in debug builds only, which is what
 /// a test binary always is.
 fn porthole_with_devices(args: &[&str], state: &Path, devices: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_porthole"))
-        .args(args)
+    let mut command = porthole_command(args);
+    command
         .env("PORTHOLE_STATE_FILE", state)
-        .env("PORTHOLE_DEVICES_FILE", devices)
-        .output()
-        .expect("porthole binary runs")
+        .env("PORTHOLE_DEVICES_FILE", devices);
+    run(command, None)
 }
 
 /// A book with one device in it, written straight to disk -- `devices add`
@@ -49,11 +270,7 @@ fn stderr(out: &Output) -> String {
 }
 
 fn have(program: &str) -> bool {
-    Command::new("sh")
-        .args(["-c", &format!("command -v {program}")])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    which(program).is_some()
 }
 
 fn is_root() -> bool {
@@ -148,11 +365,56 @@ fn an_empty_list_is_an_empty_array() {
     assert_eq!(json["rules"].as_array().unwrap().len(), 0);
 }
 
+/// The negative control for [`porthole_command`]'s bus redirection.
+///
+/// Three tests below assert that no helper answers. They are only worth
+/// anything if the bus they reach is the one this file chose; on the machine
+/// where this defect was found, all three had quietly started asserting
+/// something else against a live system helper, and one of them opened a
+/// port to prove it.
+///
+/// So this points `DBUS_SYSTEM_BUS_ADDRESS` at a socket that does not exist
+/// and requires `doctor` to name *that address* in what it says about the
+/// Helper check. A binary that read the variable can only say this; a binary
+/// that ignored it says "answering" where a helper is installed, "not
+/// answering on the bus" where one is not, and names the system socket in
+/// neither case. Nothing about this machine makes it pass.
+#[test]
+fn the_bus_redirection_is_what_the_binary_actually_reads() {
+    let dir = TempDir::new().unwrap();
+    let absent = format!("unix:path={}", dir.path().join("no-bus-here").display());
+    let mut command = porthole_command(&["doctor", "--json"]);
+    command
+        .env("PORTHOLE_STATE_FILE", state_path(&dir))
+        .env("DBUS_SYSTEM_BUS_ADDRESS", &absent)
+        .env("DBUS_SESSION_BUS_ADDRESS", &absent);
+    let out = run(command, None);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    let helper = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "Helper")
+        .expect("a Helper check");
+    assert_eq!(helper["ok"], false, "got: {helper}");
+    let detail = helper["detail"].as_str().unwrap();
+    assert!(
+        detail.contains(&absent),
+        "the binary went somewhere other than the address it was given: {detail}"
+    );
+}
+
 #[test]
 fn opening_without_a_helper_says_the_helper_is_missing() {
     // Milestone 2 removed the root requirement: the CLI holds no privilege at
     // all now. Without a helper on the bus there is nothing to ask, which is
     // "no usable backend" (3), not "not authorized" (4).
+    //
+    // `porthole open 5173` is a real request, not a rehearsal: it is what
+    // this test runs and there is no flag that makes it less than that. What
+    // keeps it from reaching a helper is the bus `porthole` below is pointed
+    // at -- see this file's module doc, and the control test above.
     let dir = TempDir::new().unwrap();
     let out = porthole(&["open", "5173"], &state_path(&dir));
     assert_eq!(code(&out), 3, "stderr: {}", stderr(&out));
@@ -273,6 +535,11 @@ fn closing_without_a_helper_says_the_helper_is_missing() {
     // Same change as `open`, and for the same reason: without a helper on the
     // bus there is no one to authorize or deny the request, so this is
     // "no usable backend" (3), not "not authorized" (4).
+    //
+    // And, as with `open`, this is a real close of whatever the helper it
+    // reaches has: `com.jacopobriccola.Porthole.close` carries no polkit
+    // prompt, so nothing would have stopped it on the machine where this was
+    // found. The bus is what stops it.
     let dir = TempDir::new().unwrap();
     let out = porthole(&["close", "5173"], &state_path(&dir));
     assert_eq!(code(&out), 3, "stderr: {}", stderr(&out));
@@ -337,11 +604,9 @@ fn a_dry_run_works_without_a_writable_state_directory() {
         eprintln!("skipped: needs firewall-cmd and ip");
         return;
     }
-    let out = Command::new(env!("CARGO_BIN_EXE_porthole"))
-        .args(["open", "5173", "--dry-run", "--json"])
-        .env_remove("PORTHOLE_STATE_FILE")
-        .output()
-        .expect("porthole binary runs");
+    let mut command = porthole_command(&["open", "5173", "--dry-run", "--json"]);
+    command.env_remove("PORTHOLE_STATE_FILE");
+    let out = run(command, None);
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -367,11 +632,9 @@ fn status_works_without_a_writable_state_directory() {
         eprintln!("skipped: needs firewall-cmd and ip");
         return;
     }
-    let out = Command::new(env!("CARGO_BIN_EXE_porthole"))
-        .args(["status", "--json"])
-        .env_remove("PORTHOLE_STATE_FILE")
-        .output()
-        .expect("porthole binary runs");
+    let mut command = porthole_command(&["status", "--json"]);
+    command.env_remove("PORTHOLE_STATE_FILE");
+    let out = run(command, None);
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -500,8 +763,11 @@ fn doctor_notices_docker_on_a_machine_that_has_it() {
 
 #[test]
 fn doctor_says_the_helper_is_missing_when_it_is() {
-    // No helper is running in the test environment, so this check must fail —
-    // and its remedy must name both things that could be missing.
+    // The bus this doctor is pointed at is up and owns no helper name, so
+    // this check must fail with the "not answering on the bus" verdict
+    // rather than the "cannot reach a bus" one — and its remedy must name
+    // both things that could be missing. Whether a helper is installed on
+    // the machine running this makes no difference to which bus is asked.
     let dir = TempDir::new().unwrap();
     let out = porthole(&["doctor", "--json"], &state_path(&dir));
     let json: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
@@ -532,12 +798,11 @@ fn doctor_names_all_three_backends_when_none_is_found() {
     // somewhere empty is the only way to reach this deterministically without
     // uninstalling firewalld from the machine running the test suite.
     let dir = TempDir::new().unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_porthole"))
-        .args(["doctor", "--json"])
+    let mut command = porthole_command(&["doctor", "--json"]);
+    command
         .env("PORTHOLE_STATE_FILE", state_path(&dir))
-        .env("PATH", "/nonexistent-porthole-test-path")
-        .output()
-        .expect("porthole binary runs");
+        .env("PATH", "/nonexistent-porthole-test-path");
+    let out = run(command, None);
     let json: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid JSON");
     let firewall = json["checks"]
         .as_array()
@@ -731,13 +996,12 @@ fn devices_add_with_nothing_to_offer_honours_json_and_exits_nine() {
     let book = dir.path().join("devices.toml");
     write_book(&book, "");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_porthole"))
-        .args(["--json", "devices", "add"])
+    let mut command = porthole_command(&["--json", "devices", "add"]);
+    command
         .env("PORTHOLE_STATE_FILE", state_path(&dir))
         .env("PORTHOLE_DEVICES_FILE", &book)
-        .env("PATH", &bin)
-        .output()
-        .expect("porthole binary runs");
+        .env("PATH", &bin);
+    let out = run(command, None);
 
     assert_eq!(code(&out), 9, "{}", stderr(&out));
     let json: serde_json::Value = serde_json::from_str(&stdout(&out))
@@ -772,13 +1036,12 @@ fn devices_add_with_nothing_to_offer_is_not_reported_as_an_unexpected_failure() 
     let book = dir.path().join("devices.toml");
     write_book(&book, "");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_porthole"))
-        .args(["devices", "add"])
+    let mut command = porthole_command(&["devices", "add"]);
+    command
         .env("PORTHOLE_STATE_FILE", state_path(&dir))
         .env("PORTHOLE_DEVICES_FILE", &book)
-        .env("PATH", &bin)
-        .output()
-        .expect("porthole binary runs");
+        .env("PATH", &bin);
+    let out = run(command, None);
 
     assert_eq!(code(&out), 9, "{}", stderr(&out));
     assert!(stdout(&out).is_empty(), "got: {}", stdout(&out));
@@ -836,28 +1099,14 @@ fn the_picker_hides_containers_and_shows_a_name_where_the_resolver_has_one() {
     let book = dir.path().join("devices.toml");
     write_book(&book, "");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_porthole"))
-        .args(["devices", "add"])
+    let mut command = porthole_command(&["devices", "add"]);
+    command
         .env("PORTHOLE_STATE_FILE", state_path(&dir))
         .env("PORTHOLE_DEVICES_FILE", &book)
-        .env("PATH", &bin)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("porthole binary runs");
-    {
-        use std::io::Write as _;
-        // Pick row 1 and name it. Row 1 is the gateway only because the two
-        // container rows are gone; before the filter it was `172.18.0.2`.
-        child
-            .stdin
-            .as_mut()
-            .expect("stdin was piped")
-            .write_all(b"1\nrouter\n")
-            .unwrap();
-    }
-    let out = child.wait_with_output().expect("porthole exits");
+        .env("PATH", &bin);
+    // Pick row 1 and name it. Row 1 is the gateway only because the two
+    // container rows are gone; before the filter it was `172.18.0.2`.
+    let out = run(command, Some(b"1\nrouter\n"));
     let prompt = stderr(&out);
 
     assert_eq!(code(&out), 0, "{prompt}");
