@@ -771,6 +771,7 @@ mod tests {
                 zone: "FedoraWorkstation".to_string(),
                 rich_rule: "rule ...".to_string(),
             },
+            forward: None,
         }
     }
 

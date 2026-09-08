@@ -142,6 +142,8 @@ fn to_local(wire: &WireRule) -> Result<ManagedRule> {
             zone: String::new(),
             rich_rule: String::new(),
         },
+        // The wire does not carry a forward yet.
+        forward: None,
     })
 }
 

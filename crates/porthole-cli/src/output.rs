@@ -750,6 +750,7 @@ mod tests {
                 zone: "FedoraWorkstation".into(),
                 rich_rule: "rule ...".into(),
             },
+            forward: None,
         }
     }
 

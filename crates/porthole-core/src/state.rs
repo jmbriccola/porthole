@@ -44,6 +44,10 @@ pub struct ManagedRule {
     /// The uid that asked for this. Logged, and shown by `porthole list`.
     pub uid: u32,
     pub handle: RuleHandle,
+    /// Present when this rule redirects rather than merely permits. `None`
+    /// for every rule `open` creates.
+    #[serde(default)]
+    pub forward: Option<crate::forward::ForwardTo>,
 }
 
 impl ManagedRule {
@@ -384,6 +388,7 @@ mod tests {
                     r#"rule family="ipv4" port port="{port}" protocol="tcp" accept"#
                 ),
             },
+            forward: None,
         }
     }
 
@@ -530,6 +535,23 @@ mod tests {
             state_path_from(Some("/tmp/somewhere-else/state.json")),
             PathBuf::from(STATE_FILE)
         );
+    }
+
+    #[test]
+    fn a_state_file_written_before_forwards_existed_still_loads() {
+        // Shipped state files have no `forward` key. Failing to read one would
+        // strand every rule a running helper had open, with nothing able to
+        // close them.
+        let json = r#"{"schema_version":1,"rules":[{
+            "id":"abc","port":5173,"protocol":"tcp",
+            "target":{"kind":"network","cidr":"10.10.10.0/24"},
+            "backend":"firewalld","opened_at":1757000000,"expires_at":1757003600,
+            "uid":1000,
+            "handle":{"backend":"firewalld","zone":"FedoraWorkstation","rich_rule":"rule x"}
+        }]}"#;
+        let parsed: State = serde_json::from_str(json).expect("old state file must load");
+        assert_eq!(parsed.rules.len(), 1);
+        assert!(parsed.rules[0].forward.is_none());
     }
 
     #[test]

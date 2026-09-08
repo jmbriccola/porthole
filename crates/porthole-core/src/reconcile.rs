@@ -297,6 +297,7 @@ mod tests {
                 // Distinct per port, so two entries never collide as equal.
                 rich_rule: format!("a rule no backend in this test actually has, for {port}"),
             },
+            forward: None,
         }
     }
 

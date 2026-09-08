@@ -352,6 +352,7 @@ impl<'a> Engine<'a> {
             },
             uid,
             handle,
+            forward: None,
         };
 
         if !self.runner.is_dry_run() {
@@ -765,6 +766,7 @@ mod tests {
                 zone: "FedoraWorkstation".to_string(),
                 rich_rule: "a rule the firewall no longer has".to_string(),
             },
+            forward: None,
         }
     }
 
@@ -1134,6 +1136,7 @@ mod tests {
                 zone: "TestZone".to_string(),
                 rich_rule: "a rule the reload already dropped".to_string(),
             },
+            forward: None,
         });
 
         let mut engine = make_engine(&backend, &runner, &clock, store);
@@ -1254,6 +1257,7 @@ mod tests {
                 chain: "input".to_string(),
                 marker: "porthole:foreign".to_string(),
             },
+            forward: None,
         }
     }
 
@@ -1654,6 +1658,7 @@ mod tests {
             expires_at: None,
             uid: 1000,
             handle: stuck.clone(),
+            forward: None,
         });
 
         let mut engine = make_engine(&backend, &runner, &clock, store);
@@ -1886,6 +1891,7 @@ mod tests {
                 zone: "TestZone".to_string(),
                 rich_rule: "a rule nothing in this test actually has".to_string(),
             },
+            forward: None,
         });
         store.save().unwrap();
 
