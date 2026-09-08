@@ -22,7 +22,8 @@
 use super::{BackendHealth, BackendId, FirewallBackend, Ownership, RuleHandle};
 use crate::command::{Command, CommandRunner, Output};
 use crate::error::{Error, Result};
-use crate::model::{OpenRequest, Target};
+use crate::forward::ForwardTo;
+use crate::model::{OpenRequest, Protocol, Target};
 use crate::net;
 
 pub struct Firewalld<'a> {
@@ -76,6 +77,121 @@ impl<'a> Firewalld<'a> {
         }
     }
 
+    /// The rich rule for a forward's redirect half. Deterministic, like
+    /// [`Firewalld::rich_rule`].
+    ///
+    /// firewalld's rich language spells a redirect as `forward-port`, and a
+    /// `forward-port` rule takes the same `source address` element an accept
+    /// rule does — so unlike the zone-wide `--add-forward-port` option, this
+    /// scopes the redirect itself to `req.target`.
+    ///
+    /// `port` is the external port, what the local network connects to.
+    /// `to-addr` is the container's own address on Docker's network.
+    /// Loopback cannot stand there: a redirect to `127.0.0.0/8` is only
+    /// delivered when `route_localnet` is set, and porthole changes no
+    /// sysctl.
+    pub fn forward_rich_rule(req: &OpenRequest, to: &ForwardTo, protocol: Protocol) -> String {
+        let redirect = format!(
+            r#"forward-port port="{port}" protocol="{protocol}" to-port="{to_port}" to-addr="{to_addr}""#,
+            port = req.port,
+            to_port = to.container_port,
+            to_addr = to.container_addr,
+        );
+        match req.target {
+            Target::Network { cidr } => {
+                format!(r#"rule family="ipv4" source address="{cidr}" {redirect}"#)
+            }
+            Target::Anywhere => format!(r#"rule family="ipv4" {redirect}"#),
+        }
+    }
+
+    /// Add one rich rule to `zone` and return the handle that removes it.
+    ///
+    /// `port` and `protocol` are the clauses the read-back matches on, not
+    /// necessarily anything about the rule's effect: both an accept rule and
+    /// a `forward-port` rule name the external port and the protocol that
+    /// way, which is what lets one read-back serve `open` and `forward`
+    /// alike.
+    fn add_rich_rule(
+        &self,
+        zone: String,
+        rule: &str,
+        port: u16,
+        protocol: Protocol,
+    ) -> Result<RuleHandle> {
+        let before = self.list_rich_rules(&zone)?;
+
+        let add = Command::mutate(
+            "firewall-cmd",
+            [format!("--zone={zone}"), format!("--add-rich-rule={rule}")],
+        );
+        self.runner.run(&add)?.into_ok(&add)?;
+
+        if self.runner.is_dry_run() {
+            // Nothing was added, so there is nothing to read back. Return the
+            // rule as constructed; a dry run is not going to remove it anyway.
+            return Ok(RuleHandle::Firewalld {
+                zone,
+                rich_rule: rule.to_string(),
+            });
+        }
+
+        let after = self.list_rich_rules(&zone)?;
+        // Only a line mentioning this port and protocol can be the rule we just
+        // asked for. Without this, a rule another process added in the same
+        // window would be adopted — and porthole would then schedule a timer to
+        // delete a rule it did not create.
+        let port_clause = format!(r#"port="{port}""#);
+        let proto_clause = format!(r#"protocol="{protocol}""#);
+        let added: Vec<&String> = after
+            .iter()
+            .filter(|r| !before.contains(r))
+            .filter(|r| r.contains(&port_clause) && r.contains(&proto_clause))
+            .collect();
+
+        match added.as_slice() {
+            [one] => Ok(RuleHandle::Firewalld {
+                zone,
+                rich_rule: (*one).clone(),
+            }),
+            // Reachable because firewall-cmd downgrades ALREADY_ENABLED to exit 0
+            // for a single-item invocation, so the add above succeeds and simply
+            // adds no new line. Verified in firewall/command.py, __cmd_sequence.
+            [] => Err(Error::AlreadyOpen {
+                port,
+                protocol,
+                detail: format!("an identical rich rule already exists in zone {zone}"),
+            }),
+            _ => Err(Error::Unexpected(format!(
+                "zone {zone} gained {} rich rules while porthole added one; \
+                 something else is changing the firewall at the same time",
+                added.len()
+            ))),
+        }
+    }
+
+    /// Remove one rich rule from `zone`, treating an already-absent rule as
+    /// the desired end state.
+    fn remove_rich_rule(&self, zone: &str, rich_rule: &str) -> Result<()> {
+        let cmd = Command::mutate(
+            "firewall-cmd",
+            [
+                format!("--zone={zone}"),
+                format!("--remove-rich-rule={rich_rule}"),
+            ],
+        );
+        let out = self.runner.run(&cmd)?;
+        if out.success() || is_already_absent(&out) {
+            Ok(())
+        } else {
+            Err(Error::CommandFailed {
+                command: cmd.display(),
+                status: out.status,
+                stderr: out.stderr.trim().to_string(),
+            })
+        }
+    }
+
     fn list_rich_rules(&self, zone: &str) -> Result<Vec<String>> {
         let cmd = Command::read(
             "firewall-cmd",
@@ -102,79 +218,77 @@ impl FirewallBackend for Firewalld<'_> {
         // marker; this is exactly why `ownership()` reports `Unprovable`.
         let zone = self.managed_zone()?;
         let rule = Self::rich_rule(req);
+        self.add_rich_rule(zone, &rule, req.port, req.protocol)
+    }
 
-        let before = self.list_rich_rules(&zone)?;
+    /// The one backend that can redirect. What it writes is a rich rule;
+    /// [`Firewalld::forward`] below is what writes it, and carries the
+    /// measurement that decided there is exactly one.
+    fn forward_capability(&self) -> Result<()> {
+        Ok(())
+    }
 
-        let add = Command::mutate(
-            "firewall-cmd",
-            [format!("--zone={zone}"), format!("--add-rich-rule={rule}")],
-        );
-        self.runner.run(&add)?.into_ok(&add)?;
-
-        if self.runner.is_dry_run() {
-            // Nothing was added, so there is nothing to read back. Return the
-            // rule as constructed; a dry run is not going to remove it anyway.
-            return Ok(RuleHandle::Firewalld {
-                zone,
-                rich_rule: rule,
-            });
-        }
-
-        let after = self.list_rich_rules(&zone)?;
-        // Only a line mentioning this port and protocol can be the rule we just
-        // asked for. Without this, a rule another process added in the same
-        // window would be adopted — and porthole would then schedule a timer to
-        // delete a rule it did not create.
-        let port_clause = format!(r#"port="{}""#, req.port);
-        let proto_clause = format!(r#"protocol="{}""#, req.protocol);
-        let added: Vec<&String> = after
-            .iter()
-            .filter(|r| !before.contains(r))
-            .filter(|r| r.contains(&port_clause) && r.contains(&proto_clause))
-            .collect();
-
-        match added.as_slice() {
-            [one] => Ok(RuleHandle::Firewalld {
-                zone,
-                rich_rule: (*one).clone(),
-            }),
-            // Reachable because firewall-cmd downgrades ALREADY_ENABLED to exit 0
-            // for a single-item invocation, so the add above succeeds and simply
-            // adds no new line. Verified in firewall/command.py, __cmd_sequence.
-            [] => Err(Error::AlreadyOpen {
-                port: req.port,
-                protocol: req.protocol,
-                detail: format!("an identical rich rule already exists in zone {zone}"),
-            }),
-            _ => Err(Error::Unexpected(format!(
-                "zone {zone} gained {} rich rules while porthole added one; \
-                 something else is changing the firewall at the same time",
-                added.len()
-            ))),
-        }
+    /// One rich rule: the `forward-port` redirect.
+    ///
+    /// Measured on firewalld 2.4.4 in a container, against a real Docker
+    /// 29.8.0 container published on loopback and a client in its own
+    /// network namespace, with counter-only rules at the input and forward
+    /// hooks:
+    ///
+    /// - With the redirect in the zone, the client's connection completed
+    ///   and **zero** packets were counted at the input hook. The SYN
+    ///   arrived at the forward hook already carrying `ct status dnat`, and
+    ///   `filter_FORWARD`'s second rule is `ct status dnat accept`, ahead of
+    ///   the jump to any zone chain. Setting the zone's target to `DROP` did
+    ///   not stop it.
+    /// - Adding an accept for the external port beside the redirect changed
+    ///   nothing: the two arrangements were byte-for-byte identical in every
+    ///   counter.
+    /// - That accept on its own, with a service of the host's own bound to
+    ///   `0.0.0.0` on the external port, let a client on the local network
+    ///   reach *that* service. It is a working accept for something else.
+    ///
+    /// So a forward here is one rule, and its handle is the ordinary
+    /// firewalld handle for it. Nothing porthole writes permits the
+    /// forwarded traffic; what does was measured to be already there, and
+    /// is not porthole's to write.
+    ///
+    /// **What the container suite reproduces, and what it does not.**
+    /// `the_lan_reaches_the_container_through_the_forward_hook_and_only_on_the_port_it_was_given`
+    /// counts **zero packets addressed to the external port** at the input
+    /// hook while the forward hook carries the connection. That is the first
+    /// bullet above, on this same design rather than on a spike's throwaway
+    /// one, and it is the half that matters for whether an accept in a zone's
+    /// input chain could be carrying anything.
+    ///
+    /// The second and third bullets are the spike's alone. Nothing committed
+    /// compares packet counters with and without the accept, and nothing
+    /// committed binds a host service to `0.0.0.0` to show the accept
+    /// exposing it. One committed test does write an accept beside a
+    /// redirect — `a_redirect_rich_rule_renders_to_a_dnat_and_no_filter_rule`
+    /// adds it as the control that makes its first assertion mean something —
+    /// but it sends no packet and nothing listens behind that port, so it
+    /// shows where the accept lands in the ruleset, not what it exposes.
+    /// What keeps that accept from coming back is the unit test
+    /// `a_forward_writes_no_accept_for_the_external_port` below, which
+    /// asserts it is absent from every command a forward issues.
+    fn forward(&self, req: &OpenRequest, to: &ForwardTo, _marker: &str) -> Result<RuleHandle> {
+        // The marker goes nowhere, for the same reason `open` drops it: the
+        // rich language has no comment element. The stored rule string is
+        // the identity, and `ownership()` reports `Unprovable`.
+        let protocol = super::forward_protocol(req, to)?;
+        let zone = self.managed_zone()?;
+        self.add_rich_rule(
+            zone,
+            &Self::forward_rich_rule(req, to, protocol),
+            req.port,
+            protocol,
+        )
     }
 
     fn close(&self, handle: &RuleHandle) -> Result<()> {
         match handle {
-            RuleHandle::Firewalld { zone, rich_rule } => {
-                let cmd = Command::mutate(
-                    "firewall-cmd",
-                    [
-                        format!("--zone={zone}"),
-                        format!("--remove-rich-rule={rich_rule}"),
-                    ],
-                );
-                let out = self.runner.run(&cmd)?;
-                if out.success() || is_already_absent(&out) {
-                    Ok(())
-                } else {
-                    Err(Error::CommandFailed {
-                        command: cmd.display(),
-                        status: out.status,
-                        stderr: out.stderr.trim().to_string(),
-                    })
-                }
-            }
+            RuleHandle::Firewalld { zone, rich_rule } => self.remove_rich_rule(zone, rich_rule),
             // A caller bug, not a firewall state: the engine only ever hands a
             // backend the handle it itself produced. Enumerated rather than a
             // wildcard so the next variant this enum gains breaks the build
@@ -482,6 +596,335 @@ pub(crate) mod tests {
             RuleHandle::Firewalld {
                 zone: ZONE.to_string(),
                 rich_rule: SUBNET_RULE.to_string(),
+            }
+        );
+        assert_eq!(runner.recorded().len(), 1, "one withheld mutation");
+    }
+
+    // --- forward -------------------------------------------------------
+
+    /// Captured verbatim from firewalld 2.4.4 in a container: this is the
+    /// string `--list-rich-rules` prints back after adding the rule
+    /// `forward` builds, byte for byte. If `forward_rich_rule` ever stops
+    /// producing it, firewalld is being asked for something other than what
+    /// was measured.
+    pub(crate) const FORWARD_REDIRECT: &str = r#"rule family="ipv4" source address="10.10.10.0/24" forward-port port="3000" protocol="tcp" to-port="8080" to-addr="172.18.0.2""#;
+
+    /// The accept a forward must **not** write, spelled as firewalld would
+    /// print it back. It is exactly what `open` writes for the same request
+    /// -- `a_forward_writes_no_accept_for_the_external_port` asserts that
+    /// equality rather than trusting this literal -- and adding it beside
+    /// the redirect was measured to carry none of the forwarded traffic
+    /// while exposing a host service on the external port to the local
+    /// network.
+    const THE_ACCEPT_A_FORWARD_MUST_NOT_WRITE: &str = r#"rule family="ipv4" source address="10.10.10.0/24" port port="3000" protocol="tcp" accept"#;
+
+    fn forward_request() -> OpenRequest {
+        OpenRequest {
+            port: 3000,
+            ..subnet_request()
+        }
+    }
+
+    fn forward_to() -> ForwardTo {
+        ForwardTo {
+            container_addr: std::net::Ipv4Addr::new(172, 18, 0, 2),
+            container_port: 8080,
+            published_port: 3000,
+            protocol: Protocol::Tcp,
+        }
+    }
+
+    /// Scripted responses for a successful `forward`: the zone lookup, then
+    /// one add-and-read-back.
+    fn forward_script() -> Vec<Output> {
+        vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ZONE),
+            Output::stdout(""),               // --list-rich-rules, before
+            Output::stdout("success"),        // --add-rich-rule
+            Output::stdout(FORWARD_REDIRECT), // after
+        ]
+    }
+
+    /// `porthole forward 3000 --as 4000`: the local network connects to
+    /// **4000** and Docker published **3000**. Every other fixture in this
+    /// file has the two equal, which is the one arrangement in which a
+    /// confusion between them is invisible.
+    ///
+    /// Three numbers, three roles, and the rule has to put each in its own
+    /// place: `port=` is the external port (4000, what the LAN connects to),
+    /// `to-port=` is the **container's** port (8080), and the published port
+    /// (3000) appears **nowhere at all** -- it is how porthole found the
+    /// container, not part of what it writes.
+    ///
+    /// This is what closes the hole. Before it, no test at any level asserted
+    /// the rule built for a differing pair: the host test for `--as` checks
+    /// two JSON fields that both come from the `OpenRequest`, the container
+    /// tests all forwarded 3000 to a container published as 3000, and every
+    /// fixture here used `published_port == req.port`. `forward_rich_rule`
+    /// could have read `to.published_port` where it reads `req.port` and the
+    /// entire workspace would have stayed green while `--as` silently
+    /// forwarded the wrong number.
+    fn forward_request_as_4000() -> OpenRequest {
+        OpenRequest {
+            port: 4000,
+            ..subnet_request()
+        }
+    }
+
+    #[test]
+    fn a_forward_writes_the_external_port_not_the_published_one() {
+        let rule = Firewalld::forward_rich_rule(
+            &forward_request_as_4000(),
+            &forward_to(), // published_port: 3000, container_port: 8080
+            Protocol::Tcp,
+        );
+        assert_eq!(
+            rule,
+            r#"rule family="ipv4" source address="10.10.10.0/24" forward-port port="4000" protocol="tcp" to-port="8080" to-addr="172.18.0.2""#,
+            "the rule must match on the port the local network connects to and send to \
+             the container's own port"
+        );
+        // The discriminating assertion, and the reason the numbers were
+        // chosen so that no two roles share one: the published port is not
+        // part of the rule in any position. Swap `req.port` for
+        // `to.published_port` anywhere in `forward_rich_rule` and 3000
+        // appears here.
+        assert!(
+            !rule.contains("3000"),
+            "the published port has no place in the rule -- it is how the container was \
+             found, not what the rule matches or sends to: {rule}"
+        );
+    }
+
+    #[test]
+    fn a_forward_with_differing_ports_asks_firewalld_for_that_same_rule() {
+        // The rule string above is what `forward` must actually hand
+        // firewall-cmd, and what `add_rich_rule` must then match its
+        // read-back on -- which it does by `req.port`, so a confusion there
+        // would leave `forward` unable to recognise its own new rule at all.
+        const REDIRECT_AS_4000: &str = r#"rule family="ipv4" source address="10.10.10.0/24" forward-port port="4000" protocol="tcp" to-port="8080" to-addr="172.18.0.2""#;
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ZONE),
+            Output::stdout(""),
+            Output::stdout("success"),
+            Output::stdout(REDIRECT_AS_4000),
+        ]);
+        let handle = Firewalld::new(&runner)
+            .forward(&forward_request_as_4000(), &forward_to(), "porthole:test")
+            .expect("the read-back names port 4000, which is what add_rich_rule matches on");
+
+        assert_eq!(
+            handle,
+            RuleHandle::Firewalld {
+                zone: ZONE.to_string(),
+                rich_rule: REDIRECT_AS_4000.to_string(),
+            }
+        );
+        let adds: Vec<String> = runner
+            .recorded()
+            .iter()
+            .filter(|c| c.args.iter().any(|a| a.starts_with("--add-rich-rule=")))
+            .map(|c| c.display())
+            .collect();
+        assert_eq!(adds.len(), 1, "still one rule: {adds:#?}");
+        assert!(
+            adds[0].contains(r#"port="4000""#) && adds[0].contains(r#"to-port="8080""#),
+            "the issued command must carry the external port and the container port: {}",
+            adds[0]
+        );
+        assert!(
+            !adds[0].contains("3000"),
+            "the issued command must not carry the published port anywhere: {}",
+            adds[0]
+        );
+    }
+
+    #[test]
+    fn a_forward_names_the_container_address_not_loopback() {
+        // The whole point: traffic goes to the container's own address on
+        // Docker's network. 127.0.0.1 would need route_localnet, which
+        // porthole does not touch.
+        let runner = RecordingRunner::with_responses(forward_script());
+        Firewalld::new(&runner)
+            .forward(&forward_request(), &forward_to(), "porthole:test")
+            .unwrap();
+
+        let issued = runner.recorded();
+        assert!(
+            issued
+                .iter()
+                .any(|c| c.display().contains(r#"to-addr="172.18.0.2""#)),
+            "no command named the container's address: {issued:#?}",
+        );
+        assert!(
+            !issued.iter().any(|c| c.display().contains("127.0.0.1")),
+            "a command named loopback, which cannot be a redirect destination here: {issued:#?}",
+        );
+    }
+
+    #[test]
+    fn a_forward_is_one_rule_and_its_handle_is_that_rule() {
+        let runner = RecordingRunner::with_responses(forward_script());
+        let handle = Firewalld::new(&runner)
+            .forward(&forward_request(), &forward_to(), "porthole:test")
+            .unwrap();
+
+        assert_eq!(
+            handle,
+            RuleHandle::Firewalld {
+                zone: ZONE.to_string(),
+                rich_rule: FORWARD_REDIRECT.to_string(),
+            },
+            "a forward's handle is the ordinary handle for the one rule it wrote"
+        );
+        let adds: Vec<String> = runner
+            .recorded()
+            .iter()
+            .filter(|c| c.args.iter().any(|a| a.starts_with("--add-rich-rule=")))
+            .map(|c| c.display())
+            .collect();
+        assert_eq!(adds.len(), 1, "a forward is one rule: {adds:#?}");
+        assert!(adds[0].contains("forward-port"), "got: {}", adds[0]);
+    }
+
+    #[test]
+    fn a_forward_writes_no_accept_for_the_external_port() {
+        // The rule this asserts the absence of is a real accept: measured
+        // on firewalld 2.4.4, with a service of the host's own bound to
+        // `0.0.0.0:3000` and only this rule installed, a client on the
+        // local network reached that service. Measured in the same
+        // container, it carries none of the forwarded traffic -- with the
+        // redirect present, zero packets reach the input hook at all.
+        //
+        // So this is the whole difference between a forward and a forward
+        // that also opens the host's own port 3000 to the local network,
+        // and nothing about which commands are issued would show it. Note
+        // what this does *not* assert: that the forward works. No packet
+        // was sent here.
+        assert_eq!(
+            THE_ACCEPT_A_FORWARD_MUST_NOT_WRITE,
+            Firewalld::rich_rule(&forward_request()),
+            "the literal below must stay the rule `open` writes, or this test \
+             asserts the absence of something porthole never wrote anyway"
+        );
+
+        let runner = RecordingRunner::with_responses(forward_script());
+        Firewalld::new(&runner)
+            .forward(&forward_request(), &forward_to(), "porthole:test")
+            .unwrap();
+
+        for cmd in runner.recorded() {
+            let shown = cmd.display();
+            assert!(
+                !shown.contains(THE_ACCEPT_A_FORWARD_MUST_NOT_WRITE),
+                "a forward wrote the accept that opens the host's own port: {shown}"
+            );
+            assert!(
+                !shown.contains("--add-rich-rule=") || shown.contains("forward-port"),
+                "a forward added a rich rule that is not the redirect: {shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_forward_never_writes_a_permanent_rule() {
+        let runner = RecordingRunner::with_responses(forward_script());
+        Firewalld::new(&runner)
+            .forward(&forward_request(), &forward_to(), "porthole:test")
+            .unwrap();
+        for cmd in runner.recorded() {
+            assert!(
+                !cmd.args.iter().any(|a| a.contains("--permanent")),
+                "porthole must never write a permanent rule: {}",
+                cmd.display()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unscoped_forward_omits_the_source_address() {
+        // firewalld accepts a `forward-port` rich rule with no source
+        // element -- measured, same container -- and porthole must not
+        // invent a `source address="0.0.0.0/0"` it never verified.
+        let req = OpenRequest {
+            target: Target::Anywhere,
+            ..forward_request()
+        };
+        assert_eq!(
+            Firewalld::forward_rich_rule(&req, &forward_to(), Protocol::Tcp),
+            r#"rule family="ipv4" forward-port port="3000" protocol="tcp" to-port="8080" to-addr="172.18.0.2""#
+        );
+    }
+
+    #[test]
+    fn a_forward_whose_outside_and_inside_protocols_disagree_is_refused() {
+        // One rich rule carries one `protocol=`, and it governs both the
+        // match on the external port and the destination. There is no
+        // spelling for a disagreement, so it must not be silently resolved.
+        let to = ForwardTo {
+            protocol: Protocol::Udp,
+            ..forward_to()
+        };
+        let runner = RecordingRunner::with_responses(forward_script());
+        let err = Firewalld::new(&runner)
+            .forward(&forward_request(), &to, "porthole:test")
+            .unwrap_err();
+        assert_eq!(err.exit_code(), crate::error::ExitCode::InvalidArguments);
+        assert!(
+            runner.recorded().is_empty(),
+            "refusing must not run any command: {:#?}",
+            runner.recorded()
+        );
+    }
+
+    #[test]
+    fn closing_a_forward_removes_the_one_rule_it_wrote() {
+        let runner = RecordingRunner::new();
+        Firewalld::new(&runner).close(&forward_handle()).unwrap();
+
+        let cmds = runner.recorded();
+        assert_eq!(cmds.len(), 1, "a forward is one rule: {cmds:#?}");
+        assert_eq!(
+            cmds[0].display(),
+            format!("firewall-cmd --zone={ZONE} '--remove-rich-rule={FORWARD_REDIRECT}'")
+        );
+    }
+
+    fn forward_handle() -> RuleHandle {
+        RuleHandle::Firewalld {
+            zone: ZONE.to_string(),
+            rich_rule: FORWARD_REDIRECT.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_forward_under_dry_run_withholds_its_add() {
+        use crate::command::DryRunRunner;
+        let inner = RecordingRunner::with_responses(vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ZONE),
+            Output::stdout(""), // --list-rich-rules, before
+        ]);
+        let runner = DryRunRunner::new(Box::new(inner));
+        let handle = Firewalld::new(&runner)
+            .forward(&forward_request(), &forward_to(), "porthole:test")
+            .unwrap();
+
+        // Under dry-run nothing is added, so the read-back is skipped and
+        // the handle carries the rule as constructed rather than as
+        // firewalld would normalise it.
+        assert_eq!(
+            handle,
+            RuleHandle::Firewalld {
+                zone: ZONE.to_string(),
+                rich_rule: Firewalld::forward_rich_rule(
+                    &forward_request(),
+                    &forward_to(),
+                    Protocol::Tcp
+                ),
             }
         );
         assert_eq!(runner.recorded().len(), 1, "one withheld mutation");

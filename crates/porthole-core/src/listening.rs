@@ -435,6 +435,10 @@ pub struct FakeProcFs {
     /// being empty, which simulates the file existing and genuinely having
     /// no listeners in it.
     tcp6_unreadable: bool,
+    /// How many times anything under `/proc` has been read. Lets a test
+    /// assert a refusal was reached without reading `/proc` at all -- which
+    /// no other seam here can show, since this fake runs no command.
+    reads: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeProcFs {
@@ -484,14 +488,26 @@ impl FakeProcFs {
         self.tcp6_unreadable = true;
         self
     }
+
+    /// How many times this fake `/proc` has been read. Zero means it was not
+    /// consulted.
+    pub fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn read(&self) {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl ProcFs for FakeProcFs {
     fn net_tcp(&self) -> Result<String> {
+        self.read();
         Ok(self.tcp.clone())
     }
 
     fn net_tcp6(&self) -> Result<String> {
+        self.read();
         if self.tcp6_unreadable {
             return Err(Error::Unexpected(
                 "permission denied reading /proc/net/tcp6 (fake)".to_string(),
@@ -501,6 +517,7 @@ impl ProcFs for FakeProcFs {
     }
 
     fn pids(&self) -> Result<Vec<u32>> {
+        self.read();
         let mut pids: Vec<u32> = self.sockets.iter().map(|(_, pid, _)| *pid).collect();
         pids.extend(&self.extra_pids);
         pids.sort_unstable();
@@ -509,6 +526,7 @@ impl ProcFs for FakeProcFs {
     }
 
     fn fd_links(&self, pid: u32) -> Result<Vec<String>> {
+        self.read();
         if self.deny_fd_access {
             return Err(Error::Unexpected(format!(
                 "permission denied reading fd for pid {pid} (fake)"
@@ -523,6 +541,7 @@ impl ProcFs for FakeProcFs {
     }
 
     fn comm(&self, pid: u32) -> Result<String> {
+        self.read();
         self.sockets
             .iter()
             .find(|(_, p, _)| *p == pid)

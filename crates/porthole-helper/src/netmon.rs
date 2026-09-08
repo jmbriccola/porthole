@@ -1,6 +1,13 @@
-//! Notices when the machine's subnet changes, so a rule scoped to one is
-//! closed rather than left open, re-aimed at the new network, or reported as
-//! still valid when it is not.
+//! Notices when the machine's surroundings stop matching what a rule was
+//! opened against, so the rule is closed rather than left open, re-aimed, or
+//! reported as still valid when it is not. Two things can stop matching, and
+//! one wake-up checks both: the subnet a rule is scoped to, and the container
+//! a forward redirects to -- both in one pass, and
+//! [`porthole_core::engine::Engine::close_stale_forwards`] for the second.
+//! The second runs only when the state file actually holds a forward: it
+//! costs a Docker read and a reconciliation sweep, and on a machine that has
+//! never forwarded anything it can only ever answer "nothing". Everything
+//! below is about the first, which is the one that needs the bookkeeping.
 //!
 //! `org.freedesktop.NetworkManager`'s `StateChanged` signal fires on connect
 //! and disconnect, not when the machine stays connected but roams onto a
@@ -184,6 +191,12 @@ struct CheckOutcome {
     /// [`CloseReason::Reconciled`], never as a network-change close. See
     /// [`porthole_core::engine::Engine::take_reconciled`].
     reconciled: Vec<ManagedRule>,
+    /// Forwards closed because the container they named is no longer the one
+    /// they were created against. Kept apart from `closed` because they are
+    /// announced as [`CloseReason::TargetGone`], and a user told "the network
+    /// changed" about a container that restarted would go looking at their
+    /// wifi. See [`porthole_core::engine::Engine::close_stale_forwards`].
+    stale: Vec<ManagedRule>,
 }
 
 /// Re-resolve every subnet this machine currently holds, decide which of
@@ -226,6 +239,7 @@ fn check_network(
                 transitions,
                 last_known: present.all,
                 reconciled: Vec::new(),
+                stale: Vec::new(),
             }
         }
         Err(Error::NoNetwork(_)) => CheckOutcome {
@@ -236,12 +250,14 @@ fn check_network(
                 .collect(),
             last_known: Vec::new(),
             reconciled: Vec::new(),
+            stale: Vec::new(),
         },
         Err(_) => CheckOutcome {
             closed: Vec::new(),
             transitions: Vec::new(),
             last_known: previous.to_vec(),
             reconciled: Vec::new(),
+            stale: Vec::new(),
         },
     };
     // Taken after the match, not inside it: only the two arms that close
@@ -251,8 +267,43 @@ fn check_network(
     outcome
 }
 
+/// Everything one wake-up decides: the subnet check, then the forwards whose
+/// container is no longer the one they named.
+///
+/// Two independent questions sharing one wake-up, because the work around
+/// them -- detecting the backend, taking the state lock, building an engine
+/// -- is the expensive part and is the same for both. They are kept as
+/// separate closes in the outcome because they are announced differently.
+///
+/// The subnet check runs first, so a rule that is closing anyway because the
+/// machine left its network is not also read against Docker's table. The
+/// second sweep reconciles again and can drop records of its own, so what it
+/// found is collected on top of what the first did rather than replacing it.
+fn check(
+    engine: &mut Engine<'_>,
+    runner: &dyn CommandRunner,
+    previous: &[Ipv4Net],
+) -> CheckOutcome {
+    let mut outcome = check_network(engine, runner, previous);
+    // Only when there is something for it to compare. `close_stale_forwards`
+    // runs `iptables -t nat -S DOCKER` and a full reconciliation sweep, and
+    // this wakes every 60 seconds forever: on a machine holding one ordinary
+    // `open` and no forward, that was a second sweep and a Docker read on
+    // every tick, permanently, for an answer that cannot be anything but
+    // "nothing". The empty-state shortcut in `wake_up_tracking` covers the
+    // idle machine and covers nothing here.
+    //
+    // Reads the state file this engine already has open and nothing else, so
+    // the guard costs nothing it saves.
+    if engine.rules_hold_a_forward() {
+        outcome.stale = engine.close_stale_forwards();
+    }
+    outcome.reconciled.extend(engine.take_reconciled());
+    outcome
+}
+
 /// One wake-up's synchronous half: detect the backend, take the state lock,
-/// run [`check_network`]. Runs only inside `tokio::task::spawn_blocking` (see
+/// run [`check`]. Runs only inside `tokio::task::spawn_blocking` (see
 /// [`wake_up`]) -- `backend::detect`'s subprocesses, the state lock's own
 /// bounded retry loop, and a `close` that can sit on firewalld's polkit
 /// timeout are all real blocking work, and this crate already documents why
@@ -296,6 +347,7 @@ fn wake_up_tracking(
         closed: Vec::new(),
         transitions: Vec::new(),
         last_known: previous.clone(),
+        stale: Vec::new(),
     };
 
     // Nothing recorded means nothing a network change could invalidate --
@@ -336,7 +388,7 @@ fn wake_up_tracking(
         state,
         executable.to_path_buf(),
     );
-    let outcome = check_network(&mut engine, &runner, &previous);
+    let outcome = check(&mut engine, &runner, &previous);
     tracked.clone_from(&outcome.last_known);
     outcome
 }
@@ -361,6 +413,18 @@ async fn wake_up(state_path: &Path, executable: &Path, emitter: Option<&SignalEm
         }
     };
 
+    announce_outcome(&outcome, emitter).await;
+}
+
+/// The signal half of a wake-up: what `outcome` decided, over the bus.
+///
+/// Split out of [`wake_up`] so this can be driven directly against a real
+/// emitter and a real subscriber, without also going through
+/// `wake_up_blocking`'s real backend detection -- see this module's own
+/// tests, which build an `outcome` by hand and check the reason a stale
+/// forward's close actually carries once it is decoded off the bus, not
+/// merely the `CheckOutcome` field it came from.
+async fn announce_outcome(outcome: &CheckOutcome, emitter: Option<&SignalEmitter<'_>>) {
     // First, and separately from anything about the network: these rules had
     // already stopped being open before this wake-up looked at anything.
     Porthole::announce_reconciled(emitter, &outcome.reconciled).await;
@@ -376,6 +440,9 @@ async fn wake_up(state_path: &Path, executable: &Path, emitter: Option<&SignalEm
     }
     for rule in &outcome.closed {
         Porthole::announce_autoclose(emitter, rule, CloseReason::NetworkChanged).await;
+    }
+    for rule in &outcome.stale {
+        Porthole::announce_autoclose(emitter, rule, CloseReason::TargetGone).await;
     }
 }
 
@@ -440,10 +507,15 @@ pub async fn run(bus: zbus::Connection, state_path: PathBuf, executable: PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authz::AlwaysAllow;
+    use futures_util::StreamExt;
     use porthole_core::backend::fake::FakeBackend;
     use porthole_core::clock::FixedClock;
     use porthole_core::command::{Output, RecordingRunner};
-    use porthole_core::model::{Lifetime, Protocol, ScopeSpec};
+    use porthole_core::ipc::PortholeProxy;
+    use porthole_core::listening::FakeProcFs;
+    use porthole_core::model::{Lifetime, OpenRequest, Protocol, ScopeSpec, Target};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     const NOW: u64 = 1_757_000_000;
@@ -980,5 +1052,357 @@ mod tests {
             vec!["192.168.1.0/24".parse::<Ipv4Net>().unwrap()]
         );
         assert!(engine.rules().is_empty());
+    }
+
+    /// What `iptables -t nat -S DOCKER` answers, or `None` for a read that
+    /// did not happen. Exit 4 is `iptables(8)`'s "resource problem", which
+    /// `porthole_core::docker::published` refuses to read as an empty chain
+    /// -- unlike exit 1, which it reads as exactly that.
+    struct DockerRunner {
+        chain: Mutex<Option<&'static str>>,
+        inner: RecordingRunner,
+        /// Its own recording, so the intercepted read is visible too: a test
+        /// asserting only that nothing closed would pass just as well
+        /// against a wake-up that never ran the read at all.
+        seen: Mutex<Vec<porthole_core::command::Command>>,
+    }
+
+    impl DockerRunner {
+        fn new(chain: &'static str) -> Self {
+            DockerRunner {
+                chain: Mutex::new(Some(chain)),
+                inner: RecordingRunner::new(),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// How many times the `DOCKER` chain has been read.
+        fn docker_reads(&self) -> usize {
+            self.seen
+                .lock()
+                .expect("not poisoned")
+                .iter()
+                .filter(|c| c.program == "iptables" && c.args.iter().any(|a| a == "DOCKER"))
+                .count()
+        }
+
+        fn answers(&self, chain: Option<&'static str>) {
+            *self.chain.lock().expect("not poisoned") = chain;
+        }
+    }
+
+    impl CommandRunner for DockerRunner {
+        fn run(
+            &self,
+            cmd: &porthole_core::command::Command,
+        ) -> porthole_core::error::Result<Output> {
+            self.seen.lock().expect("not poisoned").push(cmd.clone());
+            if cmd.program == "iptables" {
+                return Ok(match *self.chain.lock().expect("not poisoned") {
+                    Some(text) => Output::stdout(text),
+                    None => Output {
+                        status: 4,
+                        stdout: String::new(),
+                        stderr: "iptables: Resource temporarily unavailable.".to_string(),
+                    },
+                });
+            }
+            self.inner.run(cmd)
+        }
+
+        fn recorded(&self) -> Vec<porthole_core::command::Command> {
+            self.seen.lock().expect("not poisoned").clone()
+        }
+    }
+
+    /// One container publishing 3000 on loopback, towards 172.18.0.2:8080.
+    const DOCKER_CHAIN: &str = "\
+-N DOCKER
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 3000 -j DNAT --to-destination 172.18.0.2:8080
+";
+
+    /// The same host port, published again, by a container at a different
+    /// address -- a restart that took a new lease.
+    const DOCKER_CHAIN_MOVED: &str = "\
+-N DOCKER
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 3000 -j DNAT --to-destination 172.18.0.9:8080
+";
+
+    /// `/proc/net/tcp`'s header, which is all a machine with nothing
+    /// listening has.
+    const PROC_NET_TCP_EMPTY: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+";
+
+    /// An engine holding one live forward on 8443 towards the container in
+    /// [`DOCKER_CHAIN`], created through `forward` so the backend really
+    /// holds the rule.
+    fn engine_with_a_forward<'a>(
+        backend: &'a FakeBackend,
+        runner: &'a DockerRunner,
+        clock: &'a FixedClock,
+        store: StateStore,
+    ) -> Engine<'a> {
+        let mut engine = Engine::new(
+            backend,
+            runner,
+            clock,
+            store,
+            PathBuf::from("/usr/bin/porthole"),
+        );
+        engine
+            .forward(
+                &OpenRequest {
+                    port: 8443,
+                    protocol: Protocol::Tcp,
+                    target: "10.10.10.0/24"
+                        .parse::<Ipv4Net>()
+                        .map(|cidr| Target::Network { cidr })
+                        .unwrap(),
+                    lifetime: Lifetime::UntilReboot,
+                },
+                3000,
+                1000,
+                &FakeProcFs::new(PROC_NET_TCP_EMPTY),
+            )
+            .unwrap();
+        engine
+    }
+
+    /// The two `ip` reads one wake-up makes, answering with the subnet the
+    /// forward above was opened on -- so nothing in the network half of the
+    /// check moves.
+    fn subnet_unchanged() -> RecordingRunner {
+        RecordingRunner::with_responses(vec![Output::stdout(ROUTE_JSON), Output::stdout(ADDR_JSON)])
+    }
+
+    #[test]
+    fn a_wake_up_closes_a_forward_whose_container_moved_and_does_not_call_it_a_network_change() {
+        // The wiring, not the decision -- `porthole_core::engine`'s own tests
+        // own that. What this pins is that the timer's wake-up reaches the
+        // check at all, and that what it closes is reported apart from the
+        // network-change closes: a user told "the network changed" about a
+        // container that restarted would go looking at their wifi.
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(dir.path().join("state.json")).unwrap();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DOCKER_CHAIN);
+        let mut engine = engine_with_a_forward(&backend, &runner, &clock, store);
+
+        runner.answers(Some(DOCKER_CHAIN_MOVED));
+        let outcome = check(
+            &mut engine,
+            &subnet_unchanged(),
+            &["10.10.10.0/24".parse().unwrap()],
+        );
+
+        assert_eq!(outcome.stale.len(), 1, "the moved forward must close");
+        assert_eq!(outcome.stale[0].port, 8443);
+        assert!(
+            outcome.closed.is_empty(),
+            "and must not be reported as a network change: {:?}",
+            outcome.closed
+        );
+        assert!(outcome.transitions.is_empty(), "the subnet did not move");
+        assert!(engine.rules().is_empty());
+        assert!(backend.handles().is_empty(), "gone from the firewall too");
+    }
+
+    #[test]
+    fn a_wake_up_that_cannot_read_docker_closes_no_forward() {
+        // Not knowing is not knowing it changed. The same property
+        // `porthole_core::engine`'s own `an_unreadable_docker_table_closes_nothing`
+        // pins, checked once more where the timer actually reaches it: a
+        // wake-up that ran the read and got nothing must leave the rule
+        // exactly where it was.
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(dir.path().join("state.json")).unwrap();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DOCKER_CHAIN);
+        let mut engine = engine_with_a_forward(&backend, &runner, &clock, store);
+
+        runner.answers(None);
+        let outcome = check(
+            &mut engine,
+            &subnet_unchanged(),
+            &["10.10.10.0/24".parse().unwrap()],
+        );
+
+        assert!(outcome.stale.is_empty(), "a failed read must close nothing");
+        assert!(outcome.closed.is_empty());
+        assert_eq!(engine.rules().len(), 1, "the record must survive");
+        assert_eq!(backend.handles().len(), 1, "and so must the rule itself");
+        assert_eq!(
+            runner.docker_reads(),
+            2,
+            "one read to create the forward and one for the sweep -- without the \
+             second this test would pass against a wake-up that never checked"
+        );
+    }
+
+    #[test]
+    fn a_wake_up_reads_docker_only_when_a_forward_exists_to_compare() {
+        // The monitor wakes every 60 seconds forever. On a machine holding
+        // one ordinary `open` and no forward, the stale-forward sweep ran on
+        // every one of those wake-ups -- an `iptables -t nat -S DOCKER` and
+        // a second full reconciliation, permanently, for an answer that
+        // cannot be anything but "nothing". The empty-state shortcut in
+        // `wake_up_tracking` covers a machine with no rules at all and
+        // covers this not at all.
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(dir.path().join("state.json")).unwrap();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DOCKER_CHAIN);
+
+        // An ordinary open and nothing else. `DockerRunner` passes anything
+        // that is not `iptables` through, so this is the same open every
+        // other test here makes.
+        let mut engine = Engine::new(
+            &backend,
+            &runner,
+            &clock,
+            store,
+            PathBuf::from("/usr/bin/porthole"),
+        );
+        engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::Network("10.10.10.0/24".parse().unwrap()),
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+
+        let outcome = check(
+            &mut engine,
+            &subnet_unchanged(),
+            &["10.10.10.0/24".parse().unwrap()],
+        );
+
+        assert!(outcome.stale.is_empty());
+        assert_eq!(engine.rules().len(), 1, "the open is untouched");
+        assert_eq!(
+            runner.docker_reads(),
+            0,
+            "nothing in state redirects, so there is nothing to compare and \
+             nothing to read"
+        );
+
+        // The control, and it is the point: with a forward in state the same
+        // wake-up does read. Without it this test would pass just as well
+        // against a monitor that had stopped sweeping altogether.
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(dir.path().join("state.json")).unwrap();
+        let runner = DockerRunner::new(DOCKER_CHAIN);
+        let mut engine = engine_with_a_forward(&backend, &runner, &clock, store);
+        let before = runner.docker_reads();
+        check(
+            &mut engine,
+            &subnet_unchanged(),
+            &["10.10.10.0/24".parse().unwrap()],
+        );
+        assert_eq!(
+            runner.docker_reads(),
+            before + 1,
+            "a forward in state is what the sweep is for"
+        );
+    }
+
+    #[test]
+    fn a_wake_up_leaves_a_forward_towards_a_container_that_has_not_moved_alone() {
+        // Without this every assertion above is satisfied by a wake-up that
+        // closes every forward it finds.
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(dir.path().join("state.json")).unwrap();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DOCKER_CHAIN);
+        let mut engine = engine_with_a_forward(&backend, &runner, &clock, store);
+
+        let outcome = check(
+            &mut engine,
+            &subnet_unchanged(),
+            &["10.10.10.0/24".parse().unwrap()],
+        );
+
+        assert!(outcome.stale.is_empty(), "stale: {:?}", outcome.stale);
+        assert_eq!(engine.rules().len(), 1);
+        assert_eq!(backend.handles().len(), 1);
+        assert_eq!(runner.docker_reads(), 2, "the sweep has to have looked");
+    }
+
+    #[tokio::test]
+    async fn a_stale_forwards_close_reaches_the_bus_as_target_gone_not_a_network_change() {
+        // The tests above pin which list -- `stale` or `closed` -- a moved
+        // container's forward lands in. None of them call
+        // `announce_outcome`, the function that turns that list into a
+        // `CloseReason` on the wire, so none of them would notice a mutant
+        // that swapped which reason each loop announces. This one does: a
+        // real subscriber on a real bus, decoding the signal
+        // `announce_outcome` actually sent.
+        let name = "com.jacopobriccola.PortholeTestNetmonStaleReason";
+        let bus = zbus::Connection::session().await.unwrap();
+        let service = Porthole::new(
+            Box::new(Arc::new(AlwaysAllow::default())),
+            bus,
+            PathBuf::from("/nonexistent/state.json"),
+            PathBuf::from("/usr/bin/porthole"),
+        );
+        let server = zbus::connection::Builder::session()
+            .unwrap()
+            .name(name)
+            .unwrap()
+            .serve_at(PATH, service)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let emitter = SignalEmitter::new(&server, PATH).unwrap().into_owned();
+
+        let client = zbus::Connection::session().await.unwrap();
+        let proxy = PortholeProxy::builder(&client)
+            .destination(name)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let mut signals = proxy.receive_rule_closed().await.unwrap();
+
+        // A real forward, built through `forward` the same way
+        // `engine_with_a_forward` builds it for every other test in this
+        // file -- a hand-written `ManagedRule` would prove nothing about
+        // what `close_stale_forwards` itself hands `announce_outcome`.
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(dir.path().join("state.json")).unwrap();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DOCKER_CHAIN);
+        let mut engine = engine_with_a_forward(&backend, &runner, &clock, store);
+        let rule = engine.rules()[0].clone();
+
+        let outcome = CheckOutcome {
+            closed: Vec::new(),
+            transitions: Vec::new(),
+            last_known: Vec::new(),
+            reconciled: Vec::new(),
+            stale: vec![rule.clone()],
+        };
+        announce_outcome(&outcome, Some(&emitter)).await;
+
+        let signal = tokio::time::timeout(Duration::from_secs(5), signals.next())
+            .await
+            .expect("no signal arrived before the timeout")
+            .expect("the signal stream ended instead of yielding");
+        let args = signal.args().unwrap();
+        assert_eq!(
+            args.reason.as_str(),
+            "target-gone",
+            "a forward closed because its container moved must not be announced \
+             as a network change"
+        );
+        assert_eq!(args.rule.id, rule.id, "the reason travels with its rule");
     }
 }

@@ -20,6 +20,7 @@ pub mod docker;
 pub mod engine;
 pub mod error;
 pub mod expiry;
+pub mod forward;
 pub mod ipc;
 pub mod listening;
 pub mod model;

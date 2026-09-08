@@ -88,6 +88,13 @@
 //! Docker's rules; every one of these surfaces only ever reads and
 //! explains.
 //!
+//! That same list is what puts a **Forward** button on the one row shape it
+//! can work for, and this file registers what pressing it does:
+//! [`OpenDialog::for_forward`], with the port Docker publishes the
+//! container on. Registered exactly as the Open button's own callback is,
+//! and for the identical reason -- neither section knows what dialog it
+//! reaches.
+//!
 //! ## Writing the address book
 //!
 //! Until [`present_devices_dialog`] existed, that book could only be read
@@ -412,6 +419,28 @@ impl PortholeWindow {
             present_open_dialog(&sections_for_row, &OpenDialog::for_port(port));
         });
 
+        // And what a "Listening" row's own Forward button does, registered
+        // the same way and for the same reason. It carries the port Docker
+        // publishes the container on, which is the number
+        // `OpenDialog::for_forward` needs and the number `porthole forward`
+        // itself takes.
+        let sections_for_forward = Sections {
+            window: window.clone(),
+            open_now: open_now.clone(),
+            listening: listening.clone(),
+            status_bar: status_bar.clone(),
+            devices: devices.clone(),
+            docker: docker.clone(),
+            refresh_pending: refresh_pending.clone(),
+            busy: busy.clone(),
+        };
+        listening.connect_forward_requested(move |published_port| {
+            present_open_dialog(
+                &sections_for_forward,
+                &OpenDialog::for_forward(published_port),
+            );
+        });
+
         // What the menu entry above actually does. A `gio::SimpleAction` on
         // the window rather than a click handler on a widget: that is what a
         // `gio::Menu` item can point at, and it is the same action whether
@@ -563,9 +592,10 @@ impl PortholeWindow {
     /// a structural readback, not a hand-maintained list: the header bar's
     /// own "Open a port" button and its main menu, plus every
     /// currently-rendered close button in "Open now" and every
-    /// currently-rendered Open button in "Listening" (rows with neither --
-    /// an unopenable "Listening" row, an unopened "Open now" list --
-    /// contribute nothing, since there is nothing there to reach).
+    /// currently-rendered Open **and Forward** button in "Listening" (rows
+    /// with none of them -- a "Listening" row that can be neither opened nor
+    /// forwarded, an unopened "Open now" list -- contribute nothing, since
+    /// there is nothing there to reach).
     /// `tests/window.rs`'s own keyboard-reachability test checks
     /// `is_focusable()` on each of these: a GNOME app that needs a mouse is
     /// not a GNOME app.
@@ -585,6 +615,9 @@ impl PortholeWindow {
         }
         for index in 0..self.listening.rows().len() {
             if let Some(button) = self.listening.open_button_for(index) {
+                widgets.push(button.upcast());
+            }
+            if let Some(button) = self.listening.forward_button_for(index) {
                 widgets.push(button.upcast());
             }
         }

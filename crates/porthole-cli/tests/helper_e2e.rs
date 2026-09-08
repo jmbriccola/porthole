@@ -244,13 +244,74 @@ fn start_helper(state: &std::path::Path) -> Result<Helper, StartFailure> {
         else {
             continue;
         };
-        if String::from_utf8_lossy(&out.stdout).contains("com.jacopobriccola.Porthole") {
+        if listing_names_the_helper(&String::from_utf8_lossy(&out.stdout)) {
             return Ok(Helper(child));
         }
     }
     let _ = child.kill();
     let _ = child.wait();
     Err(StartFailure::NeverAppearedOnTheBus)
+}
+
+/// Does this `busctl --user list --no-legend` listing show the helper's own
+/// well-known name?
+///
+/// Each row is a name, space-padded, followed by the pid and the rest, so the
+/// name is the row's first field and is compared whole.
+///
+/// [`start_helper`] used to ask `listing.contains("com.jacopobriccola.Porthole")`
+/// instead, and `com.jacopobriccola.PortholeAgent` contains that string. The
+/// notification agent owns that name on the session bus of every machine
+/// where porthole is installed and someone has logged in, so the probe was
+/// answered by a service that implements none of the calls these tests go on
+/// to make: it returned on its first pass, before the helper had claimed
+/// anything at all. [`the_readiness_probe_is_not_satisfied_by_the_notification_agent`]
+/// is that exact case, pinned.
+///
+/// [`porthole_core::ipc::SERVICE`] rather than a literal, so this is the same
+/// string the helper requests rather than a second copy of it.
+fn listing_names_the_helper(listing: &str) -> bool {
+    listing
+        .lines()
+        .any(|row| row.split_whitespace().next() == Some(porthole_core::ipc::SERVICE))
+}
+
+#[test]
+fn the_readiness_probe_is_not_satisfied_by_the_notification_agent() {
+    // Real `busctl --user list --no-legend` output from the machine this was
+    // found on, with porthole-agent running and no helper anywhere.
+    let agent_only = "\
+:1.48                              5145 porthole-agent  jmbriccola :1.48 user@1000.service - -
+com.jacopobriccola.PortholeAgent   5145 porthole-agent  jmbriccola :1.48 user@1000.service - -
+";
+    assert!(
+        agent_only.contains(porthole_core::ipc::SERVICE),
+        "the agent's name contains the helper's, which is why a substring \
+         check passed on it -- if this ever stops holding, the case below \
+         stops being the one worth pinning"
+    );
+    assert!(
+        !listing_names_the_helper(agent_only),
+        "a probe waiting for the helper must not be satisfied by the agent"
+    );
+
+    // And it still says yes to the thing it is actually waiting for.
+    let with_helper = format!(
+        "{agent_only}{}   6001 porthole-helper jmbriccola :1.49 - - -\n",
+        porthole_core::ipc::SERVICE
+    );
+    assert!(
+        listing_names_the_helper(&with_helper),
+        "the helper's own row must satisfy it: {with_helper}"
+    );
+
+    // A name is a whole field, never part of one: the unique-name rows above
+    // carry `porthole-agent` in a later column, and a row for some future
+    // `com.jacopobriccola.PortholeSomethingElse` must not count either.
+    assert!(
+        !listing_names_the_helper("com.jacopobriccola.PortholeSomethingElse 7 x y :1.50 - - -\n"),
+        "only the exact name counts"
+    );
 }
 
 /// Starts the helper or reports precisely why not, then returns from the

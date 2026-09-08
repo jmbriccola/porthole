@@ -148,6 +148,54 @@ async fn opening_towards_everyone_asks_for_the_stronger_action() {
     );
 }
 
+/// `a_forward_asks_every_time_whatever_it_is_towards` used to sit here. It
+/// moved to `tests/forward_gate.rs`, whose own module doc says why: a
+/// forward now asks the detected firewall whether it can redirect *before*
+/// it authorizes, so "a forward reaches the authorizer" holds only where
+/// that firewall can. The moved test puts a stub `firewall-cmd` on `PATH`
+/// and asserts the same thing on every machine.
+
+#[tokio::test]
+async fn a_forward_of_a_port_no_container_could_publish_is_refused_unauthorized() {
+    // published_port 0 is not a port. Refused where every other invalid
+    // argument is -- before anything is authorized, so a client cannot make
+    // the helper put a prompt on someone's screen for a request it was never
+    // going to act on.
+    let dir = TempDir::new().unwrap();
+    let (_server, authz, name) = serve("ForwardZero", &dir.path().join("state.json")).await;
+
+    let client = zbus::Connection::session().await.unwrap();
+    let proxy = PortholeProxy::builder(&client)
+        .destination(name)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    for (port, published) in [(0u16, 3000u16), (18080, 0)] {
+        let err = proxy
+            .forward(port, "tcp", "subnet", 60, published)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("InvalidArgument"),
+            "expected a typed InvalidArgument for {port}/{published}, got: {err:?}"
+        );
+    }
+    let err = proxy
+        .forward(18080, "sctp", "subnet", 60, 3000)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("InvalidArgument"),
+        "got: {err:?}"
+    );
+    assert!(
+        authz.asked().is_empty(),
+        "nothing may be authorized before the input is known to be valid"
+    );
+}
+
 /// `docker_ports` reaches the real `Porthole::docker_ports` method over a
 /// real bus, exactly the way `list` does above -- what this actually proves
 /// is that the method is wired onto the interface and authorized the same

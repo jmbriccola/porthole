@@ -5,8 +5,10 @@
 
 use super::{BackendHealth, BackendId, FirewallBackend, Ownership, RuleHandle};
 use crate::error::{Error, Result};
+use crate::forward::ForwardTo;
 use crate::model::OpenRequest;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 pub const FAKE_ZONE: &str = "TestZone";
@@ -14,6 +16,10 @@ pub const FAKE_ZONE: &str = "TestZone";
 pub struct FakeBackend {
     health: BackendHealth,
     opened: Mutex<Vec<OpenRequest>>,
+    /// (request, destination) for every `forward`, in order. Separate from
+    /// `opened`: a forward is not an open, and a test asserting what `open`
+    /// received must not see one.
+    forwarded: Mutex<Vec<(OpenRequest, ForwardTo)>>,
     handles: Mutex<Vec<RuleHandle>>,
     markers: Mutex<Vec<String>>,
     /// (handle, marker) for every rule currently open, kept in sync with
@@ -32,6 +38,15 @@ pub struct FakeBackend {
     /// Set by `fail_owned_rules`. For tests proving the safe direction's
     /// write does not depend on the unsafe direction succeeding.
     fail_owned_rules: Mutex<bool>,
+    /// Set by `without_forward`. Makes this fake answer the capability
+    /// question the way ufw does.
+    refuse_forward: bool,
+    /// How many times the firewall has been asked anything: every trait
+    /// method that would reach a real firewall counts, and the static
+    /// answers (`id`, `ownership`, `forward_capability`) do not. Lets a test
+    /// assert a refusal was reached without touching the firewall, which
+    /// `RecordingRunner` cannot show for a fake that never runs a command.
+    touched: AtomicUsize,
 }
 
 impl FakeBackend {
@@ -87,17 +102,39 @@ impl FakeBackend {
         })
     }
 
+    /// A firewall that is running, and cannot redirect a port -- the answer
+    /// ufw and nftables give.
+    pub fn without_forward() -> Self {
+        FakeBackend {
+            refuse_forward: true,
+            ..FakeBackend::new()
+        }
+    }
+
     fn with_health(health: BackendHealth) -> Self {
         FakeBackend {
             health,
             opened: Mutex::new(Vec::new()),
+            forwarded: Mutex::new(Vec::new()),
             handles: Mutex::new(Vec::new()),
             markers: Mutex::new(Vec::new()),
             live: Mutex::new(Vec::new()),
             fail_close: Mutex::new(HashSet::new()),
             fail_list_rules: Mutex::new(false),
             fail_owned_rules: Mutex::new(false),
+            refuse_forward: false,
+            touched: AtomicUsize::new(0),
         }
+    }
+
+    /// How many times this backend has been asked something that would reach
+    /// a real firewall. Zero means it was not consulted.
+    pub fn touched(&self) -> usize {
+        self.touched.load(Ordering::SeqCst)
+    }
+
+    fn touch(&self) {
+        self.touched.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Every request passed to `open`, in order.
@@ -105,13 +142,20 @@ impl FakeBackend {
         self.opened.lock().expect("not poisoned").clone()
     }
 
+    /// Every request passed to `forward`, with the destination it was given,
+    /// in order.
+    pub fn forwarded(&self) -> Vec<(OpenRequest, ForwardTo)> {
+        self.forwarded.lock().expect("not poisoned").clone()
+    }
+
     /// Handles that are currently open.
     pub fn handles(&self) -> Vec<RuleHandle> {
         self.handles.lock().expect("not poisoned").clone()
     }
 
-    /// Every marker passed to `open`, in order. Lets later tasks' tests assert
-    /// the `porthole:<uuid>` marker actually reached the backend.
+    /// Every marker passed to `open` or `forward`, in order. Lets later
+    /// tasks' tests assert the `porthole:<uuid>` marker actually reached the
+    /// backend.
     pub fn markers(&self) -> Vec<String> {
         self.markers.lock().expect("not poisoned").clone()
     }
@@ -164,6 +208,7 @@ impl FirewallBackend for FakeBackend {
     }
 
     fn open(&self, req: &OpenRequest, marker: &str) -> Result<RuleHandle> {
+        self.touch();
         let handle = RuleHandle::Firewalld {
             zone: FAKE_ZONE.to_string(),
             rich_rule: format!(
@@ -187,7 +232,54 @@ impl FirewallBackend for FakeBackend {
         Ok(handle)
     }
 
+    /// One rule, and an ordinary handle for it -- the same shape firewalld's
+    /// real `forward` produces, so a rule created here closes and reconciles
+    /// through exactly the paths an opened one does.
+    fn forward_capability(&self) -> Result<()> {
+        if self.refuse_forward {
+            return Err(Error::ForwardUnsupported(format!(
+                "{} cannot redirect a port: porthole has no forward for this backend",
+                self.id()
+            )));
+        }
+        Ok(())
+    }
+
+    fn forward(&self, req: &OpenRequest, to: &ForwardTo, marker: &str) -> Result<RuleHandle> {
+        self.touch();
+        self.forward_capability()?;
+        // The same agreement the real forward requires: one rule has one
+        // protocol, so a request and a destination that disagree have no
+        // spelling.
+        super::forward_protocol(req, to)?;
+        let handle = RuleHandle::Firewalld {
+            zone: FAKE_ZONE.to_string(),
+            rich_rule: format!(
+                "fake forward for {}/{} towards {} to {}:{}",
+                req.port, req.protocol, req.target, to.container_addr, to.container_port
+            ),
+        };
+        self.forwarded
+            .lock()
+            .expect("not poisoned")
+            .push((req.clone(), to.clone()));
+        self.handles
+            .lock()
+            .expect("not poisoned")
+            .push(handle.clone());
+        self.markers
+            .lock()
+            .expect("not poisoned")
+            .push(marker.to_string());
+        self.live
+            .lock()
+            .expect("not poisoned")
+            .push((handle.clone(), marker.to_string()));
+        Ok(handle)
+    }
+
     fn close(&self, handle: &RuleHandle) -> Result<()> {
+        self.touch();
         let mut live = self.live.lock().expect("not poisoned");
         let Some(index) = live.iter().position(|(h, _)| h == handle) else {
             return Err(Error::Unexpected(format!(
@@ -216,6 +308,7 @@ impl FirewallBackend for FakeBackend {
     }
 
     fn list_rules(&self) -> Result<Vec<RuleHandle>> {
+        self.touch();
         if *self.fail_list_rules.lock().expect("not poisoned") {
             return Err(Error::Unexpected(
                 "fake backend: list_rules forced to fail".to_string(),
@@ -225,6 +318,7 @@ impl FirewallBackend for FakeBackend {
     }
 
     fn owned_rules(&self) -> Result<Option<Vec<RuleHandle>>> {
+        self.touch();
         if *self.fail_owned_rules.lock().expect("not poisoned") {
             return Err(Error::Unexpected(
                 "fake backend: owned_rules forced to fail".to_string(),
@@ -238,10 +332,12 @@ impl FirewallBackend for FakeBackend {
     }
 
     fn health(&self) -> Result<BackendHealth> {
+        self.touch();
         Ok(self.health.clone())
     }
 
     fn location(&self) -> Result<Option<String>> {
+        self.touch();
         Ok(Some(FAKE_ZONE.to_string()))
     }
 }
@@ -277,6 +373,32 @@ mod tests {
         let backend = FakeBackend::new();
         backend.open(&request(5173), "porthole:abc-123").unwrap();
         assert_eq!(backend.markers(), vec!["porthole:abc-123".to_string()]);
+    }
+
+    #[test]
+    fn forward_records_the_request_and_its_destination_apart_from_opens() {
+        let backend = FakeBackend::new();
+        let to = ForwardTo {
+            container_addr: "172.18.0.2".parse().unwrap(),
+            container_port: 8080,
+            published_port: 3000,
+            protocol: Protocol::Tcp,
+        };
+        let handle = backend
+            .forward(&request(8443), &to, "porthole:abc-123")
+            .unwrap();
+
+        assert_eq!(backend.forwarded(), vec![(request(8443), to)]);
+        assert!(
+            backend.opened().is_empty(),
+            "a forward is not an open, and must not show up as one"
+        );
+        assert_eq!(backend.handles(), vec![handle.clone()]);
+        assert_eq!(backend.markers(), vec!["porthole:abc-123".to_string()]);
+
+        // The handle is an ordinary one: closing it works the same way.
+        backend.close(&handle).unwrap();
+        assert!(backend.handles().is_empty());
     }
 
     #[test]

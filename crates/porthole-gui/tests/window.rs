@@ -23,6 +23,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
+use porthole_core::docker::Published;
 use porthole_core::ipc::WireRule;
 use porthole_core::listening::{Binding, Service};
 use porthole_core::model::Protocol;
@@ -141,6 +142,10 @@ fn wire_rule_fixture() -> WireRule {
         opened_at: 1_757_100_000,
         expires_at: 1_757_103_600,
         uid: 1000,
+        // Not a forward: an empty address is what says so.
+        container_addr: String::new(),
+        container_port: 0,
+        published_port: 0,
     }
 }
 
@@ -154,6 +159,20 @@ fn listening_service_fixture() -> Service {
         address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         binding: Binding::AllInterfaces,
         process: Some("node".to_string()),
+        pid: None,
+    }
+}
+
+/// The one shape a row can be forwarded from: bound to loopback, and (once
+/// the Docker list below names it) published by a container on loopback
+/// only.
+fn forwardable_service_fixture() -> Service {
+    Service {
+        port: 3000,
+        protocol: Protocol::Tcp,
+        address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        binding: Binding::LoopbackOnly,
+        process: Some("docker-proxy".to_string()),
         pid: None,
     }
 }
@@ -493,6 +512,55 @@ fn pressing_a_listening_rows_open_button_opens_the_dialog() -> Result<(), String
     }
 }
 
+/// The other button a "Listening" row can carry, and the dialog it must
+/// reach.
+///
+/// Pressing it has to present the *forwarding* dialog, not the ordinary
+/// one: the two send different requests to the helper, and a Forward button
+/// that opened an "Open a port" dialog would permit traffic to a port
+/// nothing on this machine answers on -- which is neither what the button
+/// says nor what the user asked for. The dialog's own title is what
+/// separates them here.
+fn pressing_a_listening_rows_forward_button_opens_the_forward_dialog() -> Result<(), String> {
+    let seen = Rc::new(RefCell::new(None));
+    let result = seen.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.RowForwardButtonClick",
+        move |app| {
+            let win = PortholeWindow::new(app);
+            win.present();
+            win.listening()
+                .set_services(&[forwardable_service_fixture()]);
+            win.listening().set_docker_ports(&[Published {
+                host_addr: Some(Ipv4Addr::LOCALHOST),
+                host_port: 3000,
+                protocol: Protocol::Tcp,
+                container_addr: "172.18.0.2".parse().unwrap(),
+                container_port: 8080,
+            }]);
+            let Some(button) = win.listening().forward_button_for(0) else {
+                *result.borrow_mut() = Some((false, None));
+                return;
+            };
+            button.emit_clicked();
+            pump_main_context();
+            let title = win.visible_dialog().map(|d| d.title().to_string());
+            *result.borrow_mut() = Some((true, title));
+        },
+    );
+    let (had_button, title) = seen.borrow_mut().take().ok_or("activation never ran")?;
+    if !had_button {
+        return Err("the container-published loopback row carried no Forward button".to_string());
+    }
+    match title.as_deref() {
+        Some(title) if title.to_lowercase().contains("forward") => Ok(()),
+        Some(other) => Err(format!(
+            "pressing Forward presented the wrong dialog: {other:?}"
+        )),
+        None => Err("pressing a Listening row's Forward button presented no dialog".to_string()),
+    }
+}
+
 /// The same press, after the answer about Docker has landed.
 ///
 /// That answer arrives on every launch -- a list of published ports, or
@@ -682,7 +750,7 @@ fn main() {
     // A plain array, not `vec![]`: the list is fixed at compile time and
     // never grows, so there is nothing a `Vec` buys here, independently of
     // what clippy does or does not flag.
-    let cases: [Case; 14] = [
+    let cases: [Case; 15] = [
         (
             "the_window_is_actually_realized_not_merely_constructed",
             the_window_is_actually_realized_not_merely_constructed,
@@ -730,6 +798,10 @@ fn main() {
         (
             "pressing_a_listening_rows_open_button_opens_the_dialog",
             pressing_a_listening_rows_open_button_opens_the_dialog,
+        ),
+        (
+            "pressing_a_listening_rows_forward_button_opens_the_forward_dialog",
+            pressing_a_listening_rows_forward_button_opens_the_forward_dialog,
         ),
         (
             "a_rows_open_button_survives_the_docker_answer",

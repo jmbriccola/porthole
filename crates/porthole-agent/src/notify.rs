@@ -68,8 +68,8 @@ pub fn should_notify(rule: &WireRule, uid: u32) -> bool {
 /// Whether a close of this kind is worth interrupting the user for.
 ///
 /// [`CloseReason::Requested`] is not: somebody asked for it, in a client that
-/// reported the result. The other three happened with nobody asking, which is
-/// the whole reason this binary exists.
+/// reported the result. Every other reason happened with nobody asking, which
+/// is the whole reason this binary exists.
 ///
 /// The signal does not say *who* asked, only that someone did, so a
 /// `requested` close of this user's rule from another account is suppressed by
@@ -78,50 +78,112 @@ pub fn is_worth_announcing(reason: CloseReason) -> bool {
     !matches!(reason, CloseReason::Requested)
 }
 
+/// What the rule was, named so that a reader can act on it: an ordinary
+/// open, or a redirect into a container.
+///
+/// **One subject, four sentences.** A forward expires, is closed on
+/// request, is closed when the machine leaves the subnet it was scoped to,
+/// and is dropped by reconciliation, exactly as an open is — and until this
+/// existed, only the first of those four said so. The other three read as
+/// an open: a person is told traffic was being let through to something on
+/// this machine when it was being redirected into a container. That is the
+/// identical collapse `porthole-gui`'s own `open_now.rs` was changed to stop
+/// making on the row, beside this very button.
+///
+/// It is one function rather than a second arm per reason for the reason
+/// `anyone_note` is one function: four wordings of one distinction are four
+/// things that can go stale separately, and this file already carried two of
+/// them.
+///
+/// The em dashes are inside the phrase so that every sentence below reads
+/// with or without it: `{subject} has expired`, `{subject} was closed on
+/// request`.
+fn subject(rule: &WireRule) -> String {
+    let port = format!("{}/{}", rule.port, rule.protocol);
+    if rule.redirects() {
+        format!(
+            "{port} towards {} — a redirect into the container publishing {} on this \
+             machine — ",
+            rule.target, rule.published_port
+        )
+    } else {
+        format!("{port} towards {} ", rule.target)
+    }
+}
+
 /// What to say about a rule that has stopped being open.
 ///
-/// Total over all four reasons, including the one [`is_worth_announcing`]
-/// filters out, so a fifth reason added to the wire enum has to come here and
-/// say what it looks like rather than falling into a catch-all.
+/// Total over every reason, including the one [`is_worth_announcing`] filters
+/// out, so a reason added to the wire enum has to come here and say what it
+/// looks like rather than falling into a catch-all.
 ///
-/// Only an expiry offers `reopen`. An expiry is the one case where nothing
-/// about the machine changed under the rule -- the clock the user set ran
-/// out -- so re-sending the same request restores what they asked for. After
-/// a network change the machine is somewhere else, and a rule for a subnet it
-/// has left would appear to work and reach nobody. After a reconciliation
-/// something outside porthole removed the rule from the firewall, and this
-/// cannot tell what: putting it back at one click, before the user has seen
-/// what took it away, would be porthole arguing with whatever that was.
+/// Two reasons offer `reopen`, and the test for which is whether re-sending
+/// the request can still mean what it meant.
+///
+/// An expiry can: nothing about the machine changed under the rule, the
+/// clock the user set ran out, so re-sending the same request restores what
+/// they asked for. [`CloseReason::TargetGone`] can too, and this is the
+/// non-obvious one. The request behind a forward names a *published port* --
+/// a service on this machine -- never a container address; the address is
+/// resolved by the helper, against Docker's own table, at the moment it
+/// acts. So a container that restarted somewhere else is not something the
+/// stored request pointed at and lost: it is something the request would
+/// find again. That is exactly what re-sending it does, and it is why the
+/// rule was closed rather than re-aimed in the first place -- porthole
+/// re-resolves, it does not assume.
+///
+/// The other two cannot. After a network change the machine is somewhere
+/// else, and a rule for a subnet it has left would appear to work and reach
+/// nobody -- the request names that subnet, and no re-resolution can make it
+/// the one this machine is on. After a reconciliation something outside
+/// porthole removed the rule from the firewall, and this cannot tell what:
+/// putting it back at one click, before the user has seen what took it away,
+/// would be porthole arguing with whatever that was.
+///
+/// A `Reopen` on a forward re-sends a **forward**, not an `open` -- see
+/// `crate::reopen_request` in `main.rs`, which is where that is decided and
+/// where the harm of getting it wrong is spelled out.
 pub fn notification_for(rule: &WireRule, reason: CloseReason) -> Notification {
     let port = format!("{}/{}", rule.port, rule.protocol);
-    let target = &rule.target;
+    let subject = subject(rule);
     match reason {
         CloseReason::Expired => Notification {
             summary: format!("Port {port} closed"),
-            body: format!("{port} towards {target} has expired and is closed again."),
+            body: format!("{subject}has expired and is closed again."),
             actions: vec![(REOPEN.to_string(), "Reopen".to_string())],
         },
         CloseReason::NetworkChanged => Notification {
             summary: format!("Port {port} closed"),
             body: format!(
-                "{port} was open towards {target}, a network this machine is no longer on, \
-                 so porthole closed it."
+                "{subject}was for a network this machine is no longer on, so porthole \
+                 closed it."
             ),
             actions: Vec::new(),
         },
         CloseReason::Reconciled => Notification {
             summary: format!("Port {port} was already closed"),
             body: format!(
-                "{port} towards {target} had stopped being open before porthole looked: the \
-                 firewall no longer had the rule, so porthole dropped its record of it. \
-                 Nothing was removed from the firewall."
+                "{subject}was gone from the firewall before porthole looked: the rule was \
+                 no longer there, so porthole dropped its record of it. Nothing was \
+                 removed from the firewall."
             ),
             actions: Vec::new(),
         },
         CloseReason::Requested => Notification {
             summary: format!("Port {port} closed"),
-            body: format!("{port} towards {target} was closed on request."),
+            body: format!("{subject}was closed on request."),
             actions: Vec::new(),
+        },
+        CloseReason::TargetGone => Notification {
+            summary: format!("Port {port} closed"),
+            body: format!(
+                "{port} was redirected to a container that is no longer the one it was \
+                 created for, so porthole closed it rather than re-aiming it: container \
+                 addresses change when a container restarts, and the one at that address \
+                 now may be a different service. Reopening asks for the forward again and \
+                 resolves the container as it is now."
+            ),
+            actions: vec![(REOPEN.to_string(), "Reopen".to_string())],
         },
     }
 }
@@ -197,6 +259,22 @@ mod tests {
             opened_at: 1_757_000_000,
             expires_at: 1_757_003_600,
             uid: 1000,
+            // Not a forward: an empty address is what says so.
+            container_addr: String::new(),
+            container_port: 0,
+            published_port: 0,
+        }
+    }
+
+    /// The only kind of rule `TargetGone` is ever sent for: one that
+    /// redirects. `container_addr` non-empty is what says so on the wire.
+    fn forward_rule(port: u16, published_port: u16) -> WireRule {
+        WireRule {
+            port,
+            container_addr: "172.18.0.2".to_string(),
+            container_port: 8080,
+            published_port,
+            ..closed_rule(port, "tcp")
         }
     }
 
@@ -231,6 +309,117 @@ mod tests {
     }
 
     #[test]
+    fn every_reason_a_forward_reaches_says_it_was_a_redirect() {
+        // Told only "8443/tcp towards 10.10.10.0/24 has expired", or "was
+        // open towards 10.10.10.0/24, a network this machine is no longer
+        // on", a person believes traffic was being let through to something
+        // on this machine when it was being redirected into a container.
+        // `porthole-gui`'s `open_now.rs` was changed to stop making exactly
+        // this collapse on the row; the notification beside the button made
+        // it too, and for a while it was repaired for `Expired` alone while
+        // the other three arms went on making it.
+        //
+        // All four reasons a rule of either kind can reach, in one loop, so
+        // a fifth arm added to the enum cannot be written as an open by
+        // being written somewhere this test does not look.
+        let permit = closed_rule(5173, "tcp");
+        let forward = forward_rule(8443, 3000);
+
+        for reason in [
+            CloseReason::Expired,
+            CloseReason::NetworkChanged,
+            CloseReason::Reconciled,
+            CloseReason::Requested,
+        ] {
+            let plain = notification_for(&permit, reason);
+            let redirected = notification_for(&forward, reason);
+
+            assert!(
+                redirected.body.contains("redirect"),
+                "{reason:?}: a forward must say it redirected: {}",
+                redirected.body
+            );
+            assert!(
+                redirected.body.contains("3000"),
+                "{reason:?}: and name the published port it redirected to, which is \
+                 the number the person knows the service by: {}",
+                redirected.body
+            );
+            assert!(
+                !plain.body.contains("redirect"),
+                "{reason:?}: a rule that only permitted must claim no redirect: {}",
+                plain.body
+            );
+            assert!(
+                !plain.body.contains("3000"),
+                "{reason:?}: and must name no container's port: {}",
+                plain.body
+            );
+            // Each still says the thing its own notification is for: this
+            // changed which act is named, not what happened.
+            let own_words = match reason {
+                CloseReason::Expired => "expired",
+                CloseReason::NetworkChanged => "no longer on",
+                CloseReason::Reconciled => "dropped its record",
+                CloseReason::Requested => "on request",
+                CloseReason::TargetGone => unreachable!("not in the loop above"),
+            };
+            for n in [&plain, &redirected] {
+                assert!(n.body.contains(own_words), "{reason:?}: {}", n.body);
+                assert!(n.body.contains("8443/tcp") || n.body.contains("5173/tcp"));
+            }
+        }
+
+        // And the offer is unchanged by any of it: an expiry still carries
+        // the button, both kinds of rule.
+        for rule in [&permit, &forward] {
+            assert!(notification_for(rule, CloseReason::Expired)
+                .actions
+                .iter()
+                .any(|a| a.0 == REOPEN));
+        }
+    }
+
+    #[test]
+    fn a_gone_container_offers_reopen_and_a_network_change_still_does_not() {
+        // Both halves, deliberately, in one check: the two reasons are
+        // adjacent in the enum and share the shape of their notification,
+        // and the temptation to "make them consistent" is exactly what this
+        // exists to stop. They are not the same case. A forward's request
+        // names a published port and the helper resolves the container
+        // afresh every time it acts, so re-sending it finds the container
+        // wherever it is now. A network-scoped rule's request names the
+        // subnet itself, and nothing re-resolves that: reopening after a
+        // network change would build a rule for a subnet this machine has
+        // left, which would appear to work and reach nobody.
+        let forward = forward_rule(8443, 3000);
+        let gone = notification_for(&forward, CloseReason::TargetGone);
+        assert!(
+            gone.actions.iter().any(|a| a.0 == REOPEN),
+            "a container that moved can be found again: {:?}",
+            gone.actions
+        );
+        assert!(
+            gone.body.contains("Reopening"),
+            "the body must say what the button will do: {}",
+            gone.body
+        );
+
+        assert!(
+            notification_for(&forward, CloseReason::NetworkChanged)
+                .actions
+                .is_empty(),
+            "a subnet this machine has left cannot be resolved afresh"
+        );
+        assert!(
+            notification_for(&forward, CloseReason::Reconciled)
+                .actions
+                .is_empty(),
+            "porthole must not argue at one click with whatever removed the rule"
+        );
+    }
+
+    #[test]
     fn a_signal_for_another_user_is_ignored() {
         // The system bus broadcasts to every agent on the machine. Notifying
         // a second user about the first user's ports is noise, and hands
@@ -252,6 +441,7 @@ mod tests {
         assert!(is_worth_announcing(CloseReason::Reconciled));
         assert!(is_worth_announcing(CloseReason::Expired));
         assert!(is_worth_announcing(CloseReason::NetworkChanged));
+        assert!(is_worth_announcing(CloseReason::TargetGone));
         assert!(!is_worth_announcing(CloseReason::Requested));
 
         let n = notification_for(&closed_rule(5173, "tcp"), CloseReason::Reconciled);
@@ -264,6 +454,137 @@ mod tests {
         assert!(n.actions.is_empty());
     }
 
+    /// One document this binary is described to a person in, read from
+    /// disk. Neither is compiled, so nothing else in this workspace notices
+    /// when the code they describe changes underneath them -- which is
+    /// exactly what happened: `TargetGone` gaining a `Reopen` made both of
+    /// them false, and both were caught by a reviewer rather than by any
+    /// check. The same coupling `tests/units.rs` keeps between this
+    /// binary's `ExecStart=` and its install instructions.
+    fn document(name: &str) -> String {
+        let path = format!("{}/../../{name}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    /// The one `##` section of `text` that describes this binary, from its
+    /// heading to the next one, whitespace collapsed.
+    ///
+    /// **The section, not the file, and that is not tidiness.** Both checks
+    /// below were first written against whole documents, and their own
+    /// negative controls exposed it: deleting the sentence that names
+    /// `forward` among what a `Reopen` can send left the check green,
+    /// because `docs/installing.md` says "`forward`" elsewhere; deleting
+    /// "every time" left it green too, because the polkit table above says
+    /// "asks every time" about a different action entirely. A guard that a
+    /// nearby paragraph can satisfy is not guarding the paragraph it was
+    /// written for.
+    ///
+    /// Whitespace is collapsed *after* slicing, and that is also load-
+    /// bearing: both files are hard-wrapped prose, so a phrase looked for
+    /// here is routinely split across a line break. The first run of the
+    /// reason check failed on `"no longer had"` for exactly that -- the
+    /// words present, a newline between them -- which is a guard a reader
+    /// would otherwise have weakened rather than a defect in the document.
+    fn section(text: &str, heading: &str) -> String {
+        let start = text
+            .find(heading)
+            .unwrap_or_else(|| panic!("no section starting {heading:?}"));
+        let body = &text[start + heading.len()..];
+        let end = body.find("\n## ").unwrap_or(body.len());
+        body[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// `docs/installing.md`'s account of this binary.
+    fn installing_sections_on_the_agent() -> String {
+        section(&document("docs/installing.md"), "## The agent")
+    }
+
+    /// `README.md`'s.
+    fn readme_section_on_the_agent() -> String {
+        section(&document("README.md"), "## Desktop notifications")
+    }
+
+    /// How each reason is named to a person, as opposed to how it is named
+    /// on the wire.
+    ///
+    /// Exhaustive over the enum on purpose, exactly as `notification_for`
+    /// is and for the same reason: a reason added to the wire has to come
+    /// here and say what a reader is told about it, rather than being
+    /// announced on screen and mentioned in no document at all.
+    fn documented_as(reason: CloseReason) -> &'static str {
+        match reason {
+            CloseReason::Expired => "expiry",
+            CloseReason::NetworkChanged => "network change",
+            CloseReason::Reconciled => "no longer had",
+            CloseReason::TargetGone => "no longer the one it was created against",
+            // Not announced at all, so no document owes it an entry -- the
+            // check below skips it through `is_worth_announcing`.
+            CloseReason::Requested => "",
+        }
+    }
+
+    #[test]
+    fn both_documents_name_every_close_this_binary_announces() {
+        // `README.md`'s "Desktop notifications" section and
+        // `docs/installing.md`'s "The agent" section each enumerate what
+        // this binary announces. Both enumerations were written when there
+        // were three reasons and silently became wrong when there were
+        // four.
+        let readme = readme_section_on_the_agent();
+        let installing = installing_sections_on_the_agent();
+        for reason in [
+            CloseReason::Expired,
+            CloseReason::Requested,
+            CloseReason::NetworkChanged,
+            CloseReason::Reconciled,
+            CloseReason::TargetGone,
+        ] {
+            if !is_worth_announcing(reason) {
+                continue;
+            }
+            let phrase = documented_as(reason);
+            assert!(
+                readme.contains(phrase),
+                "README.md never names the {reason} close (looked for {phrase:?})"
+            );
+            assert!(
+                installing.contains(phrase),
+                "docs/installing.md never names the {reason} close (looked for {phrase:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn the_install_document_still_states_the_whole_of_what_a_reopen_can_provoke() {
+        // This one is a *security* statement, not a description: it is what
+        // an administrator reads to learn the full extent of what this
+        // unprivileged session agent can cause on the system bus. It said
+        // the button "re-sends an ordinary `open` request" at a commit
+        // where the button could already send a `forward` -- an
+        // `auth_admin`-every-time operation -- so it understated the agent
+        // to the one reader who most needed it not to be understated.
+        //
+        // What this pins is that both methods stay named, in that section,
+        // and that the stronger authorization stays stated. It cannot
+        // notice a *third* method appearing; `reopen`'s own `match` in
+        // `main.rs` is where that would be added, and its two arms are what
+        // these two names correspond to.
+        let installing = installing_sections_on_the_agent();
+        for method in ["`open`", "`forward`"] {
+            assert!(
+                installing.contains(method),
+                "docs/installing.md's agent section must name {method} among what a Reopen \
+                 can send"
+            );
+        }
+        assert!(
+            installing.contains("every time"),
+            "docs/installing.md's agent section must say a forward is authorized every \
+             time, whatever its scope: that is what makes the agent's reach worth stating \
+             at all"
+        );
+    }
+
     #[test]
     fn every_notification_names_the_port_and_pairs_its_actions() {
         for reason in [
@@ -271,6 +592,7 @@ mod tests {
             CloseReason::Requested,
             CloseReason::NetworkChanged,
             CloseReason::Reconciled,
+            CloseReason::TargetGone,
         ] {
             let n = notification_for(&closed_rule(8080, "udp"), reason);
             assert!(n.body.contains("8080/udp"), "{reason}: {}", n.body);

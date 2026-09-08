@@ -17,7 +17,8 @@ pub mod ufw;
 
 use crate::command::CommandRunner;
 use crate::error::{Error, Result};
-use crate::model::OpenRequest;
+use crate::forward::ForwardTo;
+use crate::model::{OpenRequest, Protocol};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,6 +156,57 @@ pub trait FirewallBackend {
     fn open(&self, req: &OpenRequest, marker: &str) -> Result<RuleHandle>;
     fn close(&self, handle: &RuleHandle) -> Result<()>;
 
+    /// Redirect `req.port` to `to`.
+    ///
+    /// `req.port` is the external port — what the local network connects to.
+    /// `to` says where that traffic goes: a container's own address and port
+    /// on Docker's network, never loopback.
+    ///
+    /// One rule, and an ordinary handle for it. A permit for `req.port`
+    /// alongside it was measured to carry none of the redirected traffic and
+    /// to be a working accept for something else — see `firewalld.rs`'s
+    /// `forward`.
+    ///
+    /// The refusal comes from [`FirewallBackend::forward_capability`], so a
+    /// backend that cannot redirect says so in one place and a caller cannot
+    /// be given two different sentences for one fact.
+    fn forward(&self, _req: &OpenRequest, _to: &ForwardTo, _marker: &str) -> Result<RuleHandle> {
+        self.forward_capability()?;
+        // Only a backend whose capability answer is `Ok` reaches here, and
+        // such a backend is expected to have overridden this method.
+        Err(Error::Unexpected(format!(
+            "{} reports a redirect it does not implement",
+            self.id()
+        )))
+    }
+
+    /// Whether this backend can express a redirect at all: `Ok(())` if it
+    /// can, and otherwise the refusal to hand back.
+    ///
+    /// It runs nothing and reads nothing, which is what lets a caller ask it
+    /// before anything else — on a machine whose firewall cannot redirect,
+    /// no fact about Docker, the state file or `/proc` changes the answer,
+    /// and reporting one of those instead sends a user looking in the wrong
+    /// place.
+    ///
+    /// This says nothing about whether a particular redirect would succeed.
+    ///
+    /// The default refuses, and says only that. Any backend can inherit it,
+    /// including one whose reason for having no forward is not the reason
+    /// ufw has none — so the message states the absence and stops there. A
+    /// backend with something more specific to tell a user overrides this
+    /// and says it itself.
+    ///
+    /// ufw inherits the default; `ufw.rs`'s module docs carry why. nftables
+    /// overrides it with a refusal of its own, for a different reason its
+    /// module docs carry.
+    fn forward_capability(&self) -> Result<()> {
+        Err(Error::ForwardUnsupported(format!(
+            "{} cannot redirect a port: porthole has no forward for this backend",
+            self.id()
+        )))
+    }
+
     /// Every rule visible in the place porthole writes to.
     ///
     /// **This is diagnostic information, not evidence of ownership.** On
@@ -170,6 +222,7 @@ pub trait FirewallBackend {
     /// [`Ownership::Unprovable`]. Reconciliation's orphan sweep consumes this,
     /// so on such a backend there is no way to obtain a list to sweep — the
     /// mistake is unavailable rather than merely discouraged.
+    ///
     fn owned_rules(&self) -> Result<Option<Vec<RuleHandle>>>;
 
     /// The static answer to "can this backend identify its own rules?", for
@@ -184,6 +237,24 @@ pub trait FirewallBackend {
     fn location(&self) -> Result<Option<String>> {
         Ok(None)
     }
+}
+
+/// The one protocol a forward is written for.
+///
+/// `OpenRequest` and `ForwardTo` each carry a protocol, and they are built
+/// from different sources — the request from what the user asked for, the
+/// mapping from what Docker published. A redirect is a single rule whose one
+/// protocol governs both the match on `req.port` and the destination `to`
+/// names, so a disagreement between the two has no spelling: it can only be
+/// resolved by picking one and discarding the other. Refuse instead.
+pub(crate) fn forward_protocol(req: &OpenRequest, to: &ForwardTo) -> Result<Protocol> {
+    if req.protocol != to.protocol {
+        return Err(Error::InvalidArgument(format!(
+            "a forward cannot be {} on the outside and {} on the inside",
+            req.protocol, to.protocol
+        )));
+    }
+    Ok(req.protocol)
 }
 
 /// The exact message [`detect`] fails with when no firewall is installed at
@@ -240,12 +311,14 @@ pub fn detect<'a>(runner: &'a dyn CommandRunner) -> Result<Box<dyn FirewallBacke
 #[cfg(test)]
 mod tests {
     use super::firewalld;
-    use super::firewalld::tests::{ROUTE_JSON, SUBNET_RULE, ZONE};
+    use super::firewalld::tests::{FORWARD_REDIRECT, ROUTE_JSON, SUBNET_RULE, ZONE};
     use super::nftables;
     use super::ufw;
-    use super::{detect, BackendId, FirewallBackend, Ownership};
+    use super::{detect, BackendId, FirewallBackend, Ownership, RuleHandle};
     use crate::command::{Command, CommandRunner, Output, RecordingRunner};
     use crate::error::{Error, ExitCode};
+    use crate::forward::ForwardTo;
+    use crate::model::{Lifetime, OpenRequest, Target};
 
     #[test]
     fn firewalld_cannot_prove_ownership_and_says_so() {
@@ -375,6 +448,146 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn of_the_backends_detect_returns_only_firewalld_has_a_forward() {
+        // Which of the three backends `detect` can hand back implements a
+        // forward, pinned so that a change to the set is a change to this
+        // test rather than a surprise at a call site. Two of the three
+        // refuse, for different reasons their own module docs carry.
+        //
+        // The match on BackendId is exhaustive on purpose: adding a variant
+        // there breaks the build here. That covers a new backend that also
+        // adds an id, which is how all three arrived; it does not cover a
+        // second backend reusing an existing id, which is what `fake.rs`
+        // does -- FakeBackend reports `BackendId::Firewalld` and inherits
+        // the refusing default, and no match on ids can see it.
+        fn refuses(backend: &dyn FirewallBackend, runner: &RecordingRunner) {
+            let err = backend
+                .forward(&forward_req(), &forward_to(), "porthole:abc")
+                .expect_err("this backend is expected to have no forward");
+            assert_eq!(err.exit_code(), ExitCode::ForwardUnsupported);
+            assert!(
+                err.to_string().contains(&backend.id().to_string()),
+                "the refusal must name the backend: {err}"
+            );
+            assert!(
+                runner.recorded().is_empty(),
+                "refusing must not run any command"
+            );
+        }
+
+        for id in [BackendId::Firewalld, BackendId::Ufw, BackendId::Nftables] {
+            match id {
+                // The one that implements `forward`, so it never reaches the
+                // default. Called with an empty script it fails somewhere in
+                // its own implementation -- what matters here is only that
+                // the failure is not a refusal.
+                BackendId::Firewalld => {
+                    let runner = RecordingRunner::new();
+                    let err = firewalld::Firewalld::new(&runner)
+                        .forward(&forward_req(), &forward_to(), "porthole:abc")
+                        .expect_err("an empty script cannot complete a forward");
+                    assert_ne!(err.exit_code(), ExitCode::ForwardUnsupported);
+                }
+                // nftables refuses with a message of its own rather than the
+                // default's, so `refuses` is not what checks it -- see
+                // `nftables.rs`'s own test, which pins the sentence.
+                BackendId::Nftables => {
+                    let runner = RecordingRunner::new();
+                    let err = nftables::Nftables::new(&runner)
+                        .forward(&forward_req(), &forward_to(), "porthole:abc")
+                        .expect_err("this backend is expected to have no forward");
+                    assert_eq!(err.exit_code(), ExitCode::ForwardUnsupported);
+                    assert!(
+                        runner.recorded().is_empty(),
+                        "refusing must not run any command"
+                    );
+                }
+                BackendId::Ufw => {
+                    let runner = RecordingRunner::new();
+                    refuses(&ufw::Ufw::new(&runner), &runner);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_backends_capability_answer_and_its_refusal_are_the_same_sentence() {
+        // Two ways to learn one fact: the engine asks the capability before
+        // it reads anything, and a caller that goes straight to `forward`
+        // gets the refusal. Nothing but this would notice the two drifting
+        // into saying different things, and then which one a user saw would
+        // depend on which path reached them.
+        fn one_sentence(backend: &dyn FirewallBackend, runner: &RecordingRunner) {
+            let asked = backend
+                .forward_capability()
+                .expect_err("this backend is expected to have no forward");
+            let attempted = backend
+                .forward(&forward_req(), &forward_to(), "porthole:abc")
+                .expect_err("and to refuse an attempt at one");
+            assert_eq!(asked.to_string(), attempted.to_string());
+            assert_eq!(asked.exit_code(), ExitCode::ForwardUnsupported);
+            assert_eq!(attempted.exit_code(), ExitCode::ForwardUnsupported);
+            assert!(
+                runner.recorded().is_empty(),
+                "neither way of asking may run a command"
+            );
+        }
+
+        let runner = RecordingRunner::new();
+        one_sentence(&ufw::Ufw::new(&runner), &runner);
+        one_sentence(&nftables::Nftables::new(&runner), &runner);
+
+        // The one that can. A refusal here would stop the engine before it
+        // ever called the implementation below it.
+        assert!(firewalld::Firewalld::new(&runner)
+            .forward_capability()
+            .is_ok());
+    }
+
+    fn forward_req() -> OpenRequest {
+        OpenRequest {
+            port: 3000,
+            protocol: crate::model::Protocol::Tcp,
+            target: Target::Network {
+                cidr: "10.10.10.0/24".parse().unwrap(),
+            },
+            lifetime: Lifetime::For(std::time::Duration::from_secs(300)),
+        }
+    }
+
+    fn forward_to() -> ForwardTo {
+        ForwardTo {
+            container_addr: std::net::Ipv4Addr::new(172, 18, 0, 2),
+            container_port: 8080,
+            published_port: 3000,
+            protocol: crate::model::Protocol::Tcp,
+        }
+    }
+
+    #[test]
+    fn a_forward_handle_survives_the_state_file_round_trip() {
+        // `RuleHandle` is serialised into /run/porthole/state.json, and a
+        // handle that cannot be read back is a rule nothing can ever remove.
+        // A forward's handle is an ordinary one -- the firewalld variant,
+        // holding the redirect rich rule as firewalld normalised it -- so
+        // what is asserted here is that a rule string full of quotes
+        // survives the round trip, not that a shape of its own does.
+        let handle = RuleHandle::Firewalld {
+            zone: ZONE.to_string(),
+            rich_rule: FORWARD_REDIRECT.to_string(),
+        };
+        let json = serde_json::to_string(&handle).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RuleHandle>(&json).unwrap(),
+            handle,
+            "serialised as: {json}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["backend"], "firewalld");
+        assert_eq!(v["rich_rule"], FORWARD_REDIRECT);
     }
 
     /// Delegates every call to an inner [`RecordingRunner`], except for named

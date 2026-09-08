@@ -198,6 +198,14 @@ pub fn sweep(
             report.foreign_backend.push(rule.clone());
             continue;
         }
+        // A direct comparison, and it stays correct only while every handle
+        // porthole stores names one rule a backend would list. A forward
+        // does: it is one rich rule in the zone, listed like any other. A
+        // handle standing for two rules would be false against every entry
+        // in `present` and would drop the record on the first sweep -- see
+        // `a_live_forward_is_not_swept_away`, which goes through the real
+        // backend at both ends so a handle that stopped being listable
+        // fails there.
         if !present.contains(&rule.handle) {
             stale_ids.push(rule.id.clone());
         }
@@ -260,9 +268,11 @@ mod tests {
     use super::*;
     use crate::backend::fake::FakeBackend;
     use crate::backend::firewalld;
-    use crate::backend::firewalld::tests::{ROUTE_JSON, ZONE};
+    use crate::backend::firewalld::tests::{FORWARD_REDIRECT, ROUTE_JSON, ZONE};
     use crate::backend::BackendId;
+    use crate::backend::FirewallBackend;
     use crate::command::{CommandRunner, Effect, Output, RecordingRunner};
+    use crate::forward::ForwardTo;
     use crate::model::{Lifetime, OpenRequest, Protocol, Target};
     use std::time::Duration;
     use tempfile::TempDir;
@@ -297,6 +307,7 @@ mod tests {
                 // Distinct per port, so two entries never collide as equal.
                 rich_rule: format!("a rule no backend in this test actually has, for {port}"),
             },
+            forward: None,
         }
     }
 
@@ -323,6 +334,118 @@ mod tests {
         }
         store.save().unwrap();
         (dir, store)
+    }
+
+    // --- a live forward, against the sweep --------------------------------
+
+    /// The state entry a completed `forward` produces, with the handle taken
+    /// from the backend itself rather than retyped here.
+    ///
+    /// That is the whole point of building it this way: what the sweep
+    /// compares against `list_rules` is whatever `forward` stored, and a
+    /// hand-written handle could go on matching a stale idea of the shape
+    /// long after `forward` stopped producing it.
+    fn forward_recorded_by(backend: &firewalld::Firewalld) -> ManagedRule {
+        let to = ForwardTo {
+            container_addr: std::net::Ipv4Addr::new(172, 18, 0, 2),
+            container_port: 8080,
+            published_port: 3000,
+            protocol: Protocol::Tcp,
+        };
+        let handle = backend
+            .forward(&request(3000), &to, "porthole:fwd")
+            .expect("the script above completes a forward");
+        ManagedRule {
+            backend: BackendId::Firewalld,
+            handle,
+            forward: Some(to),
+            ..managed("fwd", 3000)
+        }
+    }
+
+    /// The zone lookup and the add-and-read-back one `forward` performs.
+    fn forward_script() -> Vec<Output> {
+        vec![
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ZONE),
+            Output::stdout(""),
+            Output::stdout("success"),
+            Output::stdout(FORWARD_REDIRECT),
+        ]
+    }
+
+    #[test]
+    fn a_live_forward_is_not_swept_away() {
+        // The failure this rules out is not a firewall bug but an
+        // accounting one, and it is silent: the sweep decides the record is
+        // stale, drops it, and porthole then holds no reference to a
+        // redirect that is still in the zone. Nothing would ever come back
+        // for it, and `list` would stop naming it.
+        //
+        // Both ends go through the real backend -- the handle from
+        // `forward`, the rules the sweep sees from `list_rules` reading a
+        // captured `--list-rich-rules` line. Firewalld normalises what it
+        // is given, so a handle built from anything but the read-back would
+        // fail here.
+        let mut script = forward_script();
+        // The sweep's own zone lookup and listing.
+        script.extend([
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ZONE),
+            Output::stdout(FORWARD_REDIRECT),
+        ]);
+        let runner = RecordingRunner::with_responses(script);
+        let backend = firewalld::Firewalld::new(&runner);
+        let (_dir, mut store) = store_with(vec![forward_recorded_by(&backend)]);
+        let writes_by_forward = runner
+            .recorded()
+            .iter()
+            .filter(|c| c.effect == Effect::Mutate)
+            .count();
+        assert_eq!(writes_by_forward, 1, "the forward wrote its one rule");
+
+        let report = sweep(&backend, &mut store, APPLY).unwrap();
+
+        assert!(
+            report.dropped_from_state.is_empty(),
+            "a forward still in the zone is not stale: {:?}",
+            report.dropped_from_state
+        );
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(store.rules().len(), 1, "the record must survive");
+        assert_eq!(
+            runner
+                .recorded()
+                .iter()
+                .filter(|c| c.effect == Effect::Mutate)
+                .count(),
+            writes_by_forward,
+            "a sweep over a healthy forward must not change the firewall"
+        );
+    }
+
+    #[test]
+    fn a_forward_is_dropped_from_state_once_its_rule_is_gone() {
+        // The negative control for the test above: without it, a staleness
+        // check that never drops anything would pass that one too. Keeping
+        // a record whose rule is gone is the mirror failure -- a timer that
+        // will never find anything, and a `list` naming a forward that is
+        // not there.
+        let mut script = forward_script();
+        // A `--reload` wiped it: the zone lists no rich rules at all.
+        script.extend([
+            Output::stdout(ROUTE_JSON),
+            Output::stdout(ZONE),
+            Output::stdout(""),
+        ]);
+        let runner = RecordingRunner::with_responses(script);
+        let backend = firewalld::Firewalld::new(&runner);
+        let (_dir, mut store) = store_with(vec![forward_recorded_by(&backend)]);
+
+        let report = sweep(&backend, &mut store, APPLY).unwrap();
+
+        assert_eq!(report.dropped_from_state.len(), 1);
+        assert!(store.rules().is_empty());
     }
 
     #[test]

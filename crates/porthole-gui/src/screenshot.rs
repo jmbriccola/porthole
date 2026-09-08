@@ -5,12 +5,13 @@
 //! that to `path` as a PNG, and exits. `docs/screenshot.png` is its output.
 //!
 //! `--screenshot-dialog <path>` ([`run_dialog`]) does the same for the open
-//! dialog and the Docker explanation it presents before opening a
-//! Docker-managed port -- two images, since only one of the two can be in
-//! front at a time. Nothing in the repository is its output; it exists so a
-//! change to the dialog can be looked at, which is how this project found a
-//! truncated row, a window forced wide by a single unwrapped line, and an
-//! unmarked "open to anyone" that no test had caught.
+//! dialog, the Docker explanation it presents before opening a
+//! Docker-managed port, and the same dialog making the other request --
+//! three images, since only one of them can be in front at a time. Nothing
+//! in the repository is their output; they exist so a change to the dialog
+//! can be looked at, which is how this project found a truncated row, a
+//! window forced wide by a single unwrapped line, and an unmarked "open to
+//! anyone" that no test had caught.
 //!
 //! `--screenshot-devices <path>` ([`run_devices`]) renders the saved-devices
 //! dialog three times: populated, on a machine with nothing saved and
@@ -71,10 +72,11 @@ const DIALOG_APP_ID: &str = "com.jacopobriccola.Porthole.ScreenshotDialog";
 /// [`run_devices`]'s own id, for the same reason again.
 const DEVICES_APP_ID: &str = "com.jacopobriccola.Porthole.ScreenshotDevices";
 
-/// Two open rules: one mid-countdown towards the current subnet, one
+/// Three open rules: one mid-countdown towards the current subnet, one
 /// towards "anyone" and until reboot -- between them, both scope words
 /// `open_now.rs` renders and both of the two ways it renders a remaining
-/// duration.
+/// duration -- and one that redirects rather than permits, which is the
+/// only row shape carrying an address and two ports on top of all that.
 fn fixture_rules() -> Vec<WireRule> {
     let now = SystemClock.now();
     vec![
@@ -88,6 +90,10 @@ fn fixture_rules() -> Vec<WireRule> {
             opened_at: now.saturating_sub(600),
             expires_at: now + 1_800,
             uid: 1000,
+            // Not a forward: an empty address is what says so.
+            container_addr: String::new(),
+            container_port: 0,
+            published_port: 0,
         },
         WireRule {
             id: "8080/tcp".to_string(),
@@ -99,19 +105,43 @@ fn fixture_rules() -> Vec<WireRule> {
             opened_at: now.saturating_sub(60),
             expires_at: 0, // the wire's own until-reboot sentinel
             uid: 1000,
+            // Not a forward: an empty address is what says so.
+            container_addr: String::new(),
+            container_port: 0,
+            published_port: 0,
+        },
+        // The third kind of row: one that redirects rather than permits.
+        // Its own three numbers are the longest thing this section renders
+        // -- an address and two ports on top of the target -- which is the
+        // case a picture is for.
+        WireRule {
+            id: "8443/tcp".to_string(),
+            port: 8443,
+            protocol: "tcp".to_string(),
+            target: "10.10.10.0/24".to_string(),
+            scope: "network".to_string(),
+            backend: "firewalld".to_string(),
+            opened_at: now.saturating_sub(120),
+            expires_at: now + 3_300,
+            uid: 1000,
+            container_addr: "172.18.0.2".to_string(),
+            container_port: 8080,
+            published_port: 3000,
         },
     ]
 }
 
-/// Six listening services, one of each thing `listening_section.rs` can
+/// Seven listening services, one of each thing `listening_section.rs` can
 /// render: a network-facing one already open above (so its own "already
 /// open" wording shows, not a second Open button for a port `fixture_rules`
 /// already opened); a network-facing one still actionable; one published by
-/// a container, which [`fixture_docker`] then marks; one reachable only over
-/// IPv6 (`Binding::BeyondReach`, the warning icon); and two loopback-only
-/// ones, one with a resolved process name and one without, the same
-/// distinction `porthole listen`'s own module doc measures as the common
-/// case on an ordinary desktop.
+/// a container on every interface, which [`fixture_docker`] then marks and
+/// which is offered no forward; one published by a container on loopback
+/// only, which is the one shape that *is* offered one; one reachable only
+/// over IPv6 (`Binding::BeyondReach`, the warning icon); and two
+/// loopback-only ones, one with a resolved process name and one without,
+/// the same distinction `porthole listen`'s own module doc measures as the
+/// common case on an ordinary desktop.
 fn fixture_services() -> Vec<Service> {
     let beyond_reach_addr: Ipv6Addr = "2001:db8::1".parse().unwrap();
     vec![
@@ -148,6 +178,14 @@ fn fixture_services() -> Vec<Service> {
             pid: Some(842),
         },
         Service {
+            port: 3000,
+            protocol: Protocol::Tcp,
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            binding: Binding::LoopbackOnly,
+            process: Some("docker-proxy".to_string()),
+            pid: Some(3118),
+        },
+        Service {
             port: 46715,
             protocol: Protocol::Tcp,
             address: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -166,19 +204,33 @@ fn fixture_services() -> Vec<Service> {
     ]
 }
 
-/// One published container port, matching the `docker-proxy · 9000` service
-/// in [`fixture_services`] so the marker and the published address have a
-/// real row to land on. Invented, like everything else here; the shape is
-/// what `porthole_core::docker::parse_docker_chain` produces for a
-/// `-p 0.0.0.0:9000:80` publish.
+/// Two published container ports, matching the two `docker-proxy` services
+/// in [`fixture_services`] so the marker and the published address have
+/// real rows to land on. Invented, like everything else here; the shapes
+/// are what `porthole_core::docker::parse_docker_chain` produces for a
+/// `-p 0.0.0.0:9000:80` and a `-p 127.0.0.1:3000:8080` publish.
 fn fixture_docker() -> Vec<Published> {
-    vec![Published {
-        host_addr: None,
-        host_port: 9000,
-        protocol: Protocol::Tcp,
-        container_addr: "172.17.0.2".parse().unwrap(),
-        container_port: 80,
-    }]
+    vec![
+        Published {
+            host_addr: None,
+            host_port: 9000,
+            protocol: Protocol::Tcp,
+            container_addr: "172.17.0.2".parse().unwrap(),
+            container_port: 80,
+        },
+        // The second one is what `-p 127.0.0.1:3000:8080` writes, and it is
+        // the only shape a row can be forwarded from -- so the Forward
+        // button has a row to appear on. The 9000 rule above is published
+        // on every interface, which is exactly the case that is offered no
+        // forward, so both answers are in the picture.
+        Published {
+            host_addr: Some(Ipv4Addr::LOCALHOST),
+            host_port: 3000,
+            protocol: Protocol::Tcp,
+            container_addr: "172.18.0.2".parse().unwrap(),
+            container_port: 8080,
+        },
+    ]
 }
 
 /// Three saved devices: two that resolve and one that does not, so the
@@ -373,7 +425,7 @@ pub fn run(path: &Path) -> gtk::glib::ExitCode {
         win.status_bar().set_status(&fixture_status());
 
         // Taller than `PortholeWindow::build`'s own 480x560 default: this
-        // flag's own fixture data -- two "Open now" rows plus six
+        // flag's own fixture data -- three "Open now" rows plus seven
         // "Listening" ones, deliberately one of every state those sections
         // can render -- does not fit the ordinary default without the
         // `gtk::ScrolledWindow` around them scrolling, which would leave the
@@ -382,7 +434,7 @@ pub fn run(path: &Path) -> gtk::glib::ExitCode {
         // first `present()`, never after -- see `window.rs`'s own module
         // doc on why a breakpoint (and, the same way, an allocation) only
         // ever reflects a size set before that first `present()`.
-        win.set_default_size(480, 700);
+        win.set_default_size(480, 860);
         win.present();
         pump_main_context();
 
@@ -400,28 +452,15 @@ pub fn run(path: &Path) -> gtk::glib::ExitCode {
     outcome.get()
 }
 
-/// `<stem>-alert.png` beside `path` -- where [`run_dialog`] writes its
-/// second image. Two images from one flag because the Docker explanation is
-/// a second dialog on top of the first, and a single snapshot can only show
-/// whichever is in front.
-fn alert_path(path: &Path) -> PathBuf {
-    let stem = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "screenshot".to_string());
-    let extension = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_string())
-        .unwrap_or_else(|| "png".to_string());
-    path.with_file_name(format!("{stem}-alert.{extension}"))
-}
-
 /// `main.rs`'s debug-only `--screenshot-dialog <path>` flag: the same
 /// fixture window as [`run`], with an [`OpenDialog`] presented over it --
 /// saved devices in its target list, and the Docker list that makes its
-/// "Open Anyway" explanation appear. Writes two images: `path` for the
-/// dialog itself, and [`alert_path`] for the Docker explanation on top of
-/// it.
+/// "Open Anyway" explanation appear. Writes three images: `path` for the
+/// dialog itself, `<stem>-alert` for the Docker explanation on top of it
+/// (a second dialog over the first, which one snapshot cannot show),
+/// and `<stem>-forward` for [`OpenDialog::for_forward`] -- the same widgets
+/// sending the other request, which is the image that shows whether the two
+/// can be told apart.
 ///
 /// Neither one is `docs/screenshot.png`. This exists so a change to the
 /// dialog can be *looked at*, which is how this project found a truncated
@@ -479,15 +518,18 @@ pub fn run_dialog(path: &Path) -> gtk::glib::ExitCode {
 
         // The same alert pressing Open would present, built by the same
         // function the click handler calls -- not a lookalike assembled
-        // here.
-        let alert_ok = match dialog.docker_alert() {
+        // here. Held in a variable rather than matched on in place, so the
+        // third image below can close this exact presented alert instead of
+        // building a second one that was never on screen.
+        let presented_alert = dialog.docker_alert();
+        let alert_ok = match &presented_alert {
             Some(alert) => {
                 // Over the open dialog, which is what the Open button's own
                 // handler presents it over -- not over the window, which
                 // would place it somewhere no user ever sees it.
                 alert.present(Some(dialog.dialog()));
                 settle();
-                let alert_path = alert_path(&path);
+                let alert_path = beside(&path, "alert");
                 match capture_with_dialogs(&win, &alert_path) {
                     Ok(()) => {
                         eprintln!(
@@ -511,7 +553,37 @@ pub fn run_dialog(path: &Path) -> gtk::glib::ExitCode {
             }
         };
 
-        if dialog_ok && alert_ok {
+        // The third image: the same dialog making the other request. It is
+        // rendered from a closed screen rather than on top of the two
+        // above, so what it shows is the dialog a Forward button actually
+        // presents and nothing else.
+        if let Some(alert) = &presented_alert {
+            alert.close();
+        }
+        dialog.dialog().close();
+        settle();
+        let forwarding = OpenDialog::for_forward(3000);
+        forwarding.set_current_network("10.10.10.0/24".parse().unwrap());
+        forwarding.set_devices(&fixture_devices());
+        forwarding.set_docker_ports(&fixture_docker());
+        forwarding.present(Some(&*win));
+        settle();
+        let forward_path = beside(&path, "forward");
+        let forward_ok = match capture_with_dialogs(&win, &forward_path) {
+            Ok(()) => {
+                eprintln!(
+                    "porthole-gui: wrote a screenshot to {}",
+                    forward_path.display()
+                );
+                true
+            }
+            Err(message) => {
+                eprintln!("porthole-gui: --screenshot-dialog failed: {message}");
+                false
+            }
+        };
+
+        if dialog_ok && alert_ok && forward_ok {
             outcome_for_activate.set(gtk::glib::ExitCode::SUCCESS);
         }
         app.quit();
@@ -578,8 +650,10 @@ fn fixture_neighbours() -> Vec<NeighbourChoice> {
 }
 
 /// `<stem>-<suffix>.<ext>` beside `path`, for the extra images a flag
-/// writes. [`alert_path`]'s own job, generalised: `--screenshot-devices`
-/// writes three.
+/// writes: `--screenshot-dialog` writes two extras, `--screenshot-devices`
+/// three. There was a second copy of this function, `alert_path`, twenty
+/// lines from the first and identical to `beside(path, "alert")` character
+/// for character -- its own doc comment said so.
 fn beside(path: &Path, suffix: &str) -> PathBuf {
     let stem = path
         .file_stem()
@@ -716,11 +790,40 @@ mod tests {
     // automated assertion.
 
     #[test]
-    fn one_fixture_rule_counts_down_and_the_other_is_until_reboot() {
+    fn the_fixture_rules_cover_both_a_countdown_and_until_reboot() {
+        // No exact count: the picture gained a third rule (the forward
+        // below) and a hard length would have failed for that alone, which
+        // is not what this check is about. The two `any`s already require
+        // at least two rules, and they require the two that matter.
         let rules = fixture_rules();
-        assert_eq!(rules.len(), 2);
         assert!(rules.iter().any(|r| r.expires_at != 0));
         assert!(rules.iter().any(|r| r.expires_at == 0));
+    }
+
+    #[test]
+    fn one_fixture_rule_redirects_rather_than_permits() {
+        // Otherwise the picture shows only rows that permit, and the whole
+        // question a reader is looking at the image to answer -- whether a
+        // forward reads differently from an open -- is not in it.
+        let rules = fixture_rules();
+        assert!(rules.iter().any(|r| !r.container_addr.is_empty()));
+        assert!(rules.iter().any(|r| r.container_addr.is_empty()));
+    }
+
+    #[test]
+    fn one_fixture_service_can_actually_be_forwarded() {
+        // A loopback-only service a fixture Docker rule publishes on
+        // loopback: the one shape that gets a Forward button, so the image
+        // has one to show.
+        let published_on_loopback: Vec<u16> = fixture_docker()
+            .iter()
+            .filter(|p| p.host_addr.is_some_and(|a| a.is_loopback()))
+            .map(|p| p.host_port)
+            .collect();
+        assert!(fixture_services()
+            .iter()
+            .any(|s| matches!(s.binding, Binding::LoopbackOnly)
+                && published_on_loopback.contains(&s.port)));
     }
 
     #[test]
@@ -794,7 +897,7 @@ mod tests {
     #[test]
     fn the_alert_image_sits_beside_the_dialog_image() {
         assert_eq!(
-            alert_path(Path::new("/tmp/dialog.png")),
+            beside(Path::new("/tmp/dialog.png"), "alert"),
             PathBuf::from("/tmp/dialog-alert.png")
         );
     }

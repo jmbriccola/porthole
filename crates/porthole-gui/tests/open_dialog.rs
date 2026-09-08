@@ -498,8 +498,30 @@ fn the_note_on_anyone_is_one_dry_sentence_with_no_scolding() -> Result<(), Strin
             return Err(format!("note scolds (\"{scolding}\"): {note}"));
         }
     }
-    if !note.contains("anyone your machine can reach") {
+    if !note.contains("anyone who can reach this machine") {
         return Err(format!("note must say what it means: {note}"));
+    }
+    // The direction, on the real widget's own string. "anyone your machine
+    // can reach" is outbound reachability; what a rule changes is which
+    // sources this machine answers, because the rich rule drops its
+    // `source address` clause.
+    if note.contains("your machine can reach") {
+        return Err(format!(
+            "the note points the wrong way -- it must say who reaches the \
+             machine, not who the machine reaches: {note}"
+        ));
+    }
+    // The same act-neutrality the unit guard holds, on the string the real
+    // widget actually carries. This row appears on a forwarding dialog too,
+    // where a sentence saying "opens the port" describes the accept
+    // `firewalld.rs`'s own `forward` was measured into never writing.
+    let lowered = note.to_lowercase();
+    for act in ["open", "forward", "redirect"] {
+        if lowered.contains(act) {
+            return Err(format!(
+                "the note is shared by both acts and must name neither (\"{act}\"): {note}"
+            ));
+        }
     }
     Ok(())
 }
@@ -884,13 +906,233 @@ fn no_alert_for_a_port_docker_has_no_rule_for_or_could_not_be_checked() -> Resul
     Ok(())
 }
 
+/// Everything one dialog reports about itself, so the two acts can be
+/// compared field by field rather than through a tuple nobody can read.
+struct DialogFacts {
+    forwards: Option<u16>,
+    title: String,
+    button_label: Option<String>,
+    port: Option<u16>,
+    port_field_title: String,
+    port_explanation: Option<String>,
+    offers_a_protocol_choice: bool,
+    target_group_title: String,
+    shows_a_docker_alert: bool,
+}
+
+fn facts_about(dialog: &OpenDialog) -> DialogFacts {
+    DialogFacts {
+        forwards: dialog.forwards(),
+        title: dialog.dialog().title().to_string(),
+        button_label: dialog.open_button().label().map(|l| l.to_string()),
+        port: dialog.port(),
+        port_field_title: dialog.port_field_title(),
+        port_explanation: dialog.port_group_description(),
+        offers_a_protocol_choice: dialog.offers_a_protocol_choice(),
+        target_group_title: dialog.target_group_title(),
+        shows_a_docker_alert: dialog.docker_alert().is_some(),
+    }
+}
+
+/// The forwarding dialog is the same widgets making a different request,
+/// and every part of that difference is on screen: what the port field is
+/// called and what it means, that there is no protocol to choose, what the
+/// target list is headed, and what the button says.
+///
+/// The title is checked too, but it is deliberately *not* the only thing
+/// checked: this dialog carries no `adw::HeaderBar`, so its title is
+/// metadata and a screen reader's announcement rather than text a person
+/// reads. Every other field below is something visible in the rendered
+/// image.
+///
+/// `forwards()` is the value the button's own handler reads to decide which
+/// method to send, so a dialog that looked right and sent an `open` would
+/// fail here too.
+/// "Forwards are TCP" is written under the port field of a forwarding
+/// dialog. Until `selected_protocol_of` was taught about it, that sentence
+/// was true because `for_forward` hides the protocol row and nothing can
+/// activate a hidden toggle -- true by the order the widgets are built in,
+/// not by anything holding it true.
+///
+/// The control is the second half: the same press on an ordinary dialog
+/// does select UDP, so this cannot pass against a toggle that stopped
+/// working.
+fn a_forward_sends_tcp_even_with_the_hidden_udp_toggle_active() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ForwardProtocol",
+        move |_app| {
+            let forwarding = OpenDialog::for_forward(3000);
+            forwarding.udp_button().set_active(true);
+
+            let opening = OpenDialog::for_port(3000);
+            opening.udp_button().set_active(true);
+
+            *seen.borrow_mut() = Some((
+                forwarding.protocol(),
+                forwarding.request().map(|r| r.protocol),
+                opening.protocol(),
+                opening.request().map(|r| r.protocol),
+            ));
+        },
+    );
+    let (forward_protocol, forward_request, open_protocol, open_request) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+
+    if forward_protocol != Protocol::Tcp || forward_request != Some(Protocol::Tcp) {
+        return Err(format!(
+            "a forward is TCP whatever the hidden toggle says, got {forward_protocol:?} \
+             and {forward_request:?}"
+        ));
+    }
+    if open_protocol != Protocol::Udp || open_request != Some(Protocol::Udp) {
+        return Err(format!(
+            "the control: on an ordinary dialog the same press must select UDP, or the \
+             assertion above proves nothing. Got {open_protocol:?} and {open_request:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn the_forward_dialog_says_it_redirects_and_sends_a_forward() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ForwardDialog",
+        move |_app| {
+            let forwarding = OpenDialog::for_forward(3000);
+            // The Docker list a real window hands every dialog it presents.
+            // On this one it must produce no explanation: that alert tells
+            // someone opening a port that Docker publishes it, which is the
+            // premise here, and its wording is about opening.
+            forwarding.set_docker_ports(&[published_on_all(3000)]);
+
+            let opening = OpenDialog::for_port(3000);
+            opening.set_docker_ports(&[published_on_all(3000)]);
+
+            *seen.borrow_mut() = Some((facts_about(&forwarding), facts_about(&opening)));
+        },
+    );
+    let (forward, open) = result.borrow_mut().take().ok_or("activation never ran")?;
+
+    if forward.forwards != Some(3000) {
+        return Err(format!(
+            "the forwarding dialog must send a forward for the published port, got {:?}",
+            forward.forwards
+        ));
+    }
+    if open.forwards.is_some() {
+        return Err("an ordinary open dialog must not send a forward".to_string());
+    }
+    if !forward.title.to_lowercase().contains("forward") {
+        return Err(format!(
+            "a dialog that redirects must not be titled like one that permits: {:?}",
+            forward.title
+        ));
+    }
+    if forward.title == open.title {
+        return Err(format!(
+            "the two dialogs must not share a title: both {:?}",
+            forward.title
+        ));
+    }
+    match forward.button_label.as_deref() {
+        Some(label) if label.to_lowercase().contains("forward") => {}
+        other => {
+            return Err(format!(
+                "the button must say which act it performs, got {other:?}"
+            ))
+        }
+    }
+    if forward.port != Some(3000) {
+        return Err(format!(
+            "omitting `--as` forwards to the same number, so the field starts there: {:?}",
+            forward.port
+        ));
+    }
+
+    // The visible half. A person never sees either dialog's title, so if
+    // these were to converge the two would be indistinguishable on screen
+    // while every check above still passed.
+    if forward.port_field_title == open.port_field_title {
+        return Err(format!(
+            "the field takes a different number in the two acts and must not share a name: \
+             both {:?}",
+            forward.port_field_title
+        ));
+    }
+    if !forward.port_field_title.to_lowercase().contains("network") {
+        return Err(format!(
+            "the forwarding field takes the port the *network* connects to: {:?}",
+            forward.port_field_title
+        ));
+    }
+    match forward.port_explanation.as_deref() {
+        Some(text) if text.contains("3000") && text.to_lowercase().contains("container") => {}
+        other => {
+            return Err(format!(
+                "the field must say where what arrives on it goes, and name the published \
+                 port it goes to: {other:?}"
+            ))
+        }
+    }
+    if open.port_explanation.is_some() {
+        return Err(format!(
+            "an ordinary open's port field needs no explaining: {:?}",
+            open.port_explanation
+        ));
+    }
+    if forward.offers_a_protocol_choice {
+        return Err(
+            "the helper forwards TCP only, so the protocol chooser must be hidden rather \
+             than offered and refused"
+                .to_string(),
+        );
+    }
+    if !open.offers_a_protocol_choice {
+        return Err("fixture setup: an ordinary open still chooses a protocol".to_string());
+    }
+    if !forward
+        .target_group_title
+        .to_lowercase()
+        .contains("forward")
+    {
+        return Err(format!(
+            "the target list heads the act it is choosing for: {:?}",
+            forward.target_group_title
+        ));
+    }
+    if forward.target_group_title == open.target_group_title {
+        return Err(format!(
+            "the two target lists must not share a heading: both {:?}",
+            forward.target_group_title
+        ));
+    }
+
+    if forward.shows_a_docker_alert {
+        return Err(
+            "the Docker explanation must not be shown on a dialog whose whole premise is a \
+             Docker-published port"
+                .to_string(),
+        );
+    }
+    if !open.shows_a_docker_alert {
+        return Err(
+            "fixture setup: the same list must still explain itself on an ordinary open"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below -- see `tests/window.rs`'s own
 /// `Case` alias for why this is a type alias rather than spelled out
 /// inline.
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 24] = [
+    let cases: [Case; 26] = [
         (
             "the_duration_chips_are_the_five_fixed_ones_and_a_custom_field",
             the_duration_chips_are_the_five_fixed_ones_and_a_custom_field,
@@ -986,6 +1228,14 @@ fn main() {
         (
             "no_alert_for_a_port_docker_has_no_rule_for_or_could_not_be_checked",
             no_alert_for_a_port_docker_has_no_rule_for_or_could_not_be_checked,
+        ),
+        (
+            "the_forward_dialog_says_it_redirects_and_sends_a_forward",
+            the_forward_dialog_says_it_redirects_and_sends_a_forward,
+        ),
+        (
+            "a_forward_sends_tcp_even_with_the_hidden_udp_toggle_active",
+            a_forward_sends_tcp_even_with_the_hidden_udp_toggle_active,
         ),
     ];
 

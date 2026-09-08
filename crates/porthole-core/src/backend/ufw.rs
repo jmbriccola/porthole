@@ -15,6 +15,13 @@
 //! Deletion is **by specification, never by number**. `ufw status numbered`
 //! numbers shift as soon as any other rule is removed, so a stored number
 //! deletes whatever later occupies that slot — the user's rules included.
+//!
+//! **There is no `forward` here.** ufw's port forwarding is not a command at
+//! all: it is a hand-edited `*nat` block in `/etc/ufw/before.rules`, a file
+//! ufw reloads at boot. Writing one is writing a permanent firewall rule, and
+//! porthole never writes a permanent firewall rule. So this backend inherits
+//! `FirewallBackend::forward`'s refusing default rather than implementing one
+//! — see `ufw_refuses_to_forward_and_runs_nothing_at_all`.
 
 use super::{BackendHealth, BackendId, FirewallBackend, Ownership, RuleHandle};
 use crate::command::{Command, CommandRunner};
@@ -408,6 +415,7 @@ mod tests {
     use super::*;
     use crate::command::{CommandRunner, Output, RecordingRunner};
     use crate::error::ExitCode;
+    use crate::forward::ForwardTo;
     use crate::model::{Lifetime, Protocol, Target};
     use std::time::Duration;
 
@@ -744,5 +752,39 @@ mod tests {
             .close(&handle)
             .expect("a withheld close must not be reported as a failure");
         assert_eq!(close_runner.recorded().len(), 1, "one withheld mutation");
+    }
+
+    #[test]
+    fn ufw_refuses_to_forward_and_runs_nothing_at_all() {
+        // ufw's forwarding lives in /etc/ufw/before.rules, a file that
+        // survives a reboot, and porthole never writes a permanent firewall
+        // rule. So ufw takes the trait's refusing default rather than an
+        // implementation of its own.
+        //
+        // "runs nothing" is half the assertion: a refusal that had already
+        // shelled out somewhere would have changed the firewall before
+        // deciding it could not.
+        let runner = RecordingRunner::new();
+        let to = ForwardTo {
+            container_addr: std::net::Ipv4Addr::new(172, 18, 0, 2),
+            container_port: 8080,
+            published_port: 3000,
+            protocol: Protocol::Tcp,
+        };
+        let err = Ufw::new(&runner)
+            .forward(&request(3000, subnet()), &to, "porthole:abc")
+            .unwrap_err();
+
+        let text = err.to_string();
+        assert!(
+            text.contains("ufw"),
+            "the message must name the backend: {text}"
+        );
+        assert_eq!(err.exit_code(), ExitCode::ForwardUnsupported);
+        assert!(
+            runner.recorded().is_empty(),
+            "refusing must not run any command: {:#?}",
+            runner.recorded()
+        );
     }
 }

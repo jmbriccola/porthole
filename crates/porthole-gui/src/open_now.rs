@@ -118,6 +118,21 @@
 //! to anyone, here, now used the same icon as neither. Every anywhere-
 //! scoped row gets it too, dry -- no scolding tooltip, matching the spec's
 //! own tone rule for "Anyone" (`open_dialog.rs`'s `anyone_note`).
+//!
+//! ## A forward is not an open, and its row says so
+//!
+//! Every rule the helper reports arrives here, and two kinds of rule can
+//! arrive: one that permits traffic to something already listening on this
+//! machine, and one that redirects a port into a container. They share a
+//! port number, a target, a countdown and a close button, and until
+//! [`subtitle_for`] told them apart they shared a row: same title, same
+//! "open to 10.10.10.0/24", with nothing saying that what answers is a
+//! container rather than this machine. A forward's row names where the
+//! traffic actually goes, and carries its own marker, for the reason the
+//! "open to anyone" one does -- a subtitle is read, a marker is seen.
+//! [`porthole_core::ipc::WireRule::redirects`] is what decides, from the one
+//! field that can say it -- the method on the type that defines the
+//! sentinel, rather than a copy of the line here.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -177,6 +192,11 @@ struct Row {
     /// `TargetRow::significant_icon` for the identical pattern, and the
     /// reason it exists).
     significant_icon: Option<gtk::Image>,
+    /// `Some` only for a rule that redirects rather than permits, and
+    /// checked through its own `parent()` for the same reason
+    /// `significant_icon` is. The same icon `listening_section.rs` puts on
+    /// a row Docker publishes, which is what a forward's far end is.
+    forward_icon: Option<gtk::Image>,
 }
 
 struct Inner {
@@ -387,11 +407,35 @@ const UNREACHABLE_TITLE: &str = "Porthole helper unreachable";
 /// `HelperFailure` doc comment.
 const ERRORED_TITLE: &str = "Porthole helper reported an error";
 
-fn subtitle_for(rule: &WireRule) -> String {
+/// Who the rule lets in: the scope word, or the network it names.
+fn towards_for(rule: &WireRule) -> &str {
     if rule.scope == "anywhere" {
-        "open to anyone".to_string()
+        "anyone"
     } else {
-        format!("open to {}", rule.target)
+        &rule.target
+    }
+}
+
+/// What one row says under its port.
+///
+/// A rule that only permits says who may reach it: "open to anyone", "open
+/// to 10.10.10.0/24". A forward says that **and** where what reaches it
+/// goes, because the two are different acts and a row that named only the
+/// first would read as an open -- a user would believe traffic is being let
+/// through to something on this machine when it is being redirected into a
+/// container. `porthole list`'s own `REDIRECTS TO` column carries the same
+/// three facts in the same words (the container's address and port, and the
+/// port it is published on); nothing enforces that the two strings agree,
+/// they are separate strings in separate crates.
+fn subtitle_for(rule: &WireRule) -> String {
+    let towards = towards_for(rule);
+    if rule.redirects() {
+        format!(
+            "redirects to {}:{} (published on {}) · reachable from {towards}",
+            rule.container_addr, rule.container_port, rule.published_port
+        )
+    } else {
+        format!("open to {towards}")
     }
 }
 
@@ -399,9 +443,14 @@ fn subtitle_for(rule: &WireRule) -> String {
 // own `anyone_note()` for its tooltip, called directly rather than kept as
 // a second, separate copy of the sentence -- an earlier version of this
 // module did exactly that, as a private constant worded slightly
-// differently ("Open to anyone…" vs. `anyone_note()`'s own "Opens the port
-// to anyone…"), which is precisely the drift `open_dialog.rs`'s own module
+// differently, which is precisely the drift `open_dialog.rs`'s own module
 // doc says keeping this sentence to one function is meant to rule out.
+//
+// Sharing it is also what makes it correct here now. This section renders
+// forwards as well as opens, so an anywhere-scoped *forward*'s icon gets
+// this tooltip too -- which is why `anyone_note()` names neither act. A
+// copy kept locally and worded for opens would have been wrong on half the
+// rows this section can now draw.
 
 /// The helper's own rendered text from a D-Bus method error, verbatim.
 ///
@@ -498,6 +547,26 @@ fn apply(inner: &Rc<Inner>, rules: &[WireRule], listed_at: u64) {
             None
         };
 
+        // A forward's own marker, for the same reason the one above exists:
+        // the subtitle already says this row redirects, and text alone
+        // reads as the same weight at a glance. Not a warning icon -- a
+        // forward is something the user asked for and authorized, not a
+        // state to be alarmed by -- but the package icon
+        // `listening_section.rs` marks a container-published row with, on
+        // the row that is now pointing at one.
+        let forward_icon = if rule.redirects() {
+            let icon = gtk::Image::from_icon_name("package-x-generic-symbolic");
+            icon.set_valign(gtk::Align::Center);
+            icon.set_tooltip_text(Some(&format!(
+                "Redirected to {}:{}, published on {}",
+                rule.container_addr, rule.container_port, rule.published_port
+            )));
+            action_row.add_prefix(&icon);
+            Some(icon)
+        } else {
+            None
+        };
+
         let countdown_label = gtk::Label::builder()
             .valign(gtk::Align::Center)
             .css_classes(["dim-label"])
@@ -555,6 +624,7 @@ fn apply(inner: &Rc<Inner>, rules: &[WireRule], listed_at: u64) {
             close_button,
             close_busy,
             significant_icon,
+            forward_icon,
         });
     }
     inner.rows.replace(rows);
@@ -903,6 +973,18 @@ impl OpenNowSection {
         })
     }
 
+    /// Whether row `index` carries the marker that says it redirects rather
+    /// than permits -- checked against the live widget tree the same way
+    /// [`OpenNowSection::is_marked_significant`] is, and for the same
+    /// reason.
+    pub fn is_marked_forward(&self, index: usize) -> bool {
+        self.inner.rows.borrow().get(index).is_some_and(|r| {
+            r.forward_icon
+                .as_ref()
+                .is_some_and(|icon| icon.parent().is_some())
+        })
+    }
+
     /// The countdown text as it actually reads on screen right now --
     /// `row.countdown_label`'s real, currently-displayed `gtk::Label` text,
     /// not a value recomputed independently of it. A countdown that is
@@ -1073,6 +1155,66 @@ mod tests {
             helper_message(&e),
             "com.jacopobriccola.Porthole.RuleNotFound"
         );
+    }
+
+    /// A rule as `list` reports one that only permits.
+    fn permitting_rule() -> WireRule {
+        WireRule {
+            id: "abc".to_string(),
+            port: 5173,
+            protocol: "tcp".to_string(),
+            target: "10.10.10.0/24".to_string(),
+            scope: "network".to_string(),
+            backend: "firewalld".to_string(),
+            opened_at: 1_757_000_000,
+            expires_at: 1_757_003_600,
+            uid: 1000,
+            // Not a forward: an empty address is what says so.
+            container_addr: String::new(),
+            container_port: 0,
+            published_port: 0,
+        }
+    }
+
+    #[test]
+    fn a_forward_does_not_read_as_an_open() {
+        // The two rules differ in one field the old subtitle never looked
+        // at, so both rendered "open to 10.10.10.0/24" -- a row claiming
+        // traffic is permitted to this machine while it is redirected into
+        // a container.
+        let permit = permitting_rule();
+        let forward = WireRule {
+            port: 8443,
+            container_addr: "172.18.0.2".to_string(),
+            container_port: 8080,
+            published_port: 3000,
+            ..permitting_rule()
+        };
+        assert_eq!(subtitle_for(&permit), "open to 10.10.10.0/24");
+        assert_eq!(
+            subtitle_for(&forward),
+            "redirects to 172.18.0.2:8080 (published on 3000) · reachable from 10.10.10.0/24"
+        );
+        assert!(!permit.redirects());
+        assert!(forward.redirects());
+    }
+
+    #[test]
+    fn a_forward_to_anyone_still_names_who_can_reach_it() {
+        let forward = WireRule {
+            scope: "anywhere".to_string(),
+            target: "anywhere".to_string(),
+            container_addr: "172.18.0.2".to_string(),
+            container_port: 8080,
+            published_port: 3000,
+            ..permitting_rule()
+        };
+        let subtitle = subtitle_for(&forward);
+        assert!(
+            subtitle.contains("redirects to 172.18.0.2:8080"),
+            "{subtitle}"
+        );
+        assert!(subtitle.contains("anyone"), "{subtitle}");
     }
 
     #[test]

@@ -70,6 +70,105 @@ mod tests {
     use super::*;
     use porthole_core::model::ScopeSpec;
 
+    /// Every code `AFTER_LONG_HELP`'s own `Exit codes:` block names.
+    ///
+    /// Scoped to that block, not to the whole string, for the reason
+    /// `porthole-core`'s README guard is scoped to one section: the same text
+    /// goes on to talk about an eight-hour ceiling and about IPv6, and a
+    /// bare search for `12` would find something eventually.
+    fn codes_named_in_help() -> Vec<i32> {
+        let block = AFTER_LONG_HELP
+            .split_once("Exit codes:\n")
+            .expect("the help text has an `Exit codes:` block")
+            .1;
+        // The block ends at the first line that is not indented -- the next
+        // heading (`No permanent rules:`).
+        let block = block
+            .split_once("\n\n")
+            .map(|(head, _)| head)
+            .unwrap_or(block);
+        block
+            .lines()
+            .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+            .collect()
+    }
+
+    /// The third guard on the exit-code table, and the one on this side of
+    /// the workspace.
+    ///
+    /// `porthole-core`'s `error.rs` holds two tests that keep README.md and
+    /// `ExitCode` in step. Neither can see this string -- and this string is
+    /// what `porthole --help` prints and what `build.rs` renders into
+    /// `porthole.1`, so a code added to the enum and to the README could
+    /// still be missing from the two places a user is most likely to look.
+    /// That is exactly the drift this feature already produced once: the
+    /// codes reached the man page before the README, and an earlier draft of
+    /// the plan named three of the five.
+    ///
+    /// The enum is read out of `porthole-core`'s own source rather than
+    /// enumerated by hand, for the reason its own guard gives: Rust cannot
+    /// enumerate a plain enum's variants, and a hand-kept list is the thing
+    /// that goes stale. The parse is a second copy of a small one, which is
+    /// the price of the two crates not being able to share a `#[cfg(test)]`
+    /// helper; `include_str!` makes a moved file a compile error rather than
+    /// a test that finds nothing.
+    #[test]
+    fn the_help_text_names_every_exit_code_the_enum_has() {
+        let source = include_str!("../../porthole-core/src/error.rs");
+        let body = source
+            .split_once("pub enum ExitCode {")
+            .expect("porthole-core declares `pub enum ExitCode`")
+            .1
+            .split_once("\n}")
+            .expect("the enum's body ends at a closing brace in column 0")
+            .0;
+        let declared: Vec<(String, i32)> = body
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| {
+                let (name, rest) = line.split_once(" = ")?;
+                let value: i32 = rest.strip_suffix(',')?.parse().ok()?;
+                name.chars()
+                    .all(|c| c.is_ascii_alphanumeric())
+                    .then(|| (name.to_string(), value))
+            })
+            .collect();
+        // The same ratcheting floor `error.rs` carries, for the same reason:
+        // without it, a parse that stopped matching would check nothing and
+        // pass.
+        assert!(
+            declared.len() >= 15,
+            "parsed {} ExitCode variants out of porthole-core's source, fewer than the \
+             15 it had when this was written; codes are only ever appended, so the \
+             parse has stopped matching: {declared:?}",
+            declared.len()
+        );
+
+        let in_help = codes_named_in_help();
+        assert!(
+            in_help.len() >= 15,
+            "the help text's `Exit codes:` block was parsed as naming {} codes, which \
+             is fewer than the enum has -- the block parse has stopped matching the \
+             text: {in_help:?}",
+            in_help.len()
+        );
+        for (name, value) in &declared {
+            assert!(
+                in_help.contains(value),
+                "`porthole --help` (and therefore porthole.1) does not name exit \
+                 {value}, which ExitCode::{name} has. Codes named nowhere a user \
+                 looks are codes nobody can act on."
+            );
+        }
+        for value in &in_help {
+            assert!(
+                declared.iter().any(|(_, v)| v == value),
+                "`porthole --help` names exit {value}, which ExitCode does not have. \
+                 Codes are never renumbered, so this is a line left behind."
+            );
+        }
+    }
+
     /// `--to` has exactly three outcomes and they are decided here, before
     /// `porthole_core::devices` ever sees the string. `devices::resolve` is
     /// well covered; which of the three branches a string lands in was not

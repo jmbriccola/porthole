@@ -72,6 +72,7 @@ FISHCOMPDIR ?= $(DATADIR)/fish/vendor_completions.d
 # failing loudly is what catches a generation step that stopped running.
 MAN1 = porthole.1 \
        porthole-open.1 \
+       porthole-forward.1 \
        porthole-close.1 \
        porthole-list.1 \
        porthole-status.1 \

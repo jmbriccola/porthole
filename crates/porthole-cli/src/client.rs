@@ -78,6 +78,20 @@ fn from_dbus(e: zbus::Error) -> Error {
             "NoNetwork" => ("no_network", ExitCode::NoNetwork),
             "CommandFailed" => ("command_failed", ExitCode::Failure),
             "State" => ("state_error", ExitCode::Failure),
+            // `forward`'s own refusals. Each has a name of its own on the
+            // wire so that the code and slug a caller sees are the ones
+            // `Error::exit_code`/`Error::kind` give for the same failure
+            // locally -- `every_kind_slug_matches_the_local_variants_own_kind`
+            // below is what checks the two halves against each other.
+            "ForwardUnsupported" => ("forward_unsupported", ExitCode::ForwardUnsupported),
+            "NotPublishedByContainer" => ("not_published_by_container", ExitCode::NotForwardable),
+            "DockerUnreadable" => ("docker_unreadable", ExitCode::NotForwardable),
+            "ExternalPortInUse" => ("external_port_in_use", ExitCode::ExternalPortInUse),
+            "ForwardCheckUnavailable" => (
+                "forward_check_unavailable",
+                ExitCode::ForwardCheckUnavailable,
+            ),
+            "AlreadyReachable" => ("already_reachable", ExitCode::AlreadyReachable),
             // Not the helper: the bus itself answered, but nothing owns
             // `com.jacopobriccola.Porthole` and nothing can be activated to.
             // That is a live system bus with no helper installed — the
@@ -112,10 +126,12 @@ fn to_local(wire: &WireRule) -> Result<ManagedRule> {
     use porthole_core::backend::{BackendId, RuleHandle};
     use porthole_core::model::Target;
 
+    let protocol = porthole_core::validate::parse_protocol(&wire.protocol)?;
+
     Ok(ManagedRule {
         id: wire.id.clone(),
         port: wire.port,
-        protocol: porthole_core::validate::parse_protocol(&wire.protocol)?,
+        protocol,
         target: if wire.scope == "anywhere" {
             Target::Anywhere
         } else {
@@ -142,6 +158,31 @@ fn to_local(wire: &WireRule) -> Result<ManagedRule> {
             zone: String::new(),
             rich_rule: String::new(),
         },
+        // `WireRule::redirects` is the wire's own question, asked through
+        // the method on the type that defines the sentinel rather than by
+        // reading `container_addr` here. Without this the CLI would render
+        // every forward the helper reports as an open: same port, same
+        // target, and nothing saying what the traffic actually reaches.
+        //
+        // The protocol is the rule's own. `ForwardTo` carries one of its
+        // own and the wire does not, because a forward whose two ends
+        // disagree is refused before it can exist
+        // (`backend::forward_protocol`).
+        forward: if wire.redirects() {
+            Some(porthole_core::forward::ForwardTo {
+                container_addr: wire.container_addr.parse().map_err(|_| {
+                    Error::Unexpected(format!(
+                        "the helper sent `{}` as a container address",
+                        wire.container_addr
+                    ))
+                })?,
+                container_port: wire.container_port,
+                published_port: wire.published_port,
+                protocol,
+            })
+        } else {
+            None
+        },
     })
 }
 
@@ -156,6 +197,32 @@ pub fn open(
         let p = proxy(session).await?;
         let wire = p
             .open(port, protocol, scope, seconds)
+            .await
+            .map_err(from_dbus)?;
+        to_local(&wire)
+    })
+}
+
+/// Ask the helper to redirect `port` to whatever publishes `published_port`
+/// on this machine.
+///
+/// Every refusal a forward has belongs to the helper and to
+/// `Engine::forward` behind it; nothing is pre-checked here. `scope` crosses
+/// as the user typed it, exactly as it does for `open`, except for a saved
+/// device -- which `run::forward` resolves to an address before calling this,
+/// for the reason `porthole_core::devices` gives.
+pub fn forward(
+    session: bool,
+    port: u16,
+    protocol: &str,
+    scope: &str,
+    seconds: u32,
+    published_port: u16,
+) -> Result<ManagedRule> {
+    block_on(async {
+        let p = proxy(session).await?;
+        let wire = p
+            .forward(port, protocol, scope, seconds, published_port)
             .await
             .map_err(from_dbus)?;
         to_local(&wire)
@@ -196,6 +263,12 @@ fn static_kind(kind: &str) -> &'static str {
         "no_network" => "no_network",
         "command_failed" => "command_failed",
         "state_error" => "state_error",
+        "forward_unsupported" => "forward_unsupported",
+        "not_published_by_container" => "not_published_by_container",
+        "docker_unreadable" => "docker_unreadable",
+        "external_port_in_use" => "external_port_in_use",
+        "forward_check_unavailable" => "forward_check_unavailable",
+        "already_reachable" => "already_reachable",
         _ => "unexpected",
     }
 }
@@ -212,6 +285,12 @@ fn exit_code_from_i32(code: i32) -> ExitCode {
         6 => ExitCode::DeviceUnreachable,
         7 => ExitCode::RuleNotFound,
         8 => ExitCode::NoNetwork,
+        9 => ExitCode::NothingToOffer,
+        10 => ExitCode::NotForwardable,
+        11 => ExitCode::ExternalPortInUse,
+        12 => ExitCode::ForwardUnsupported,
+        13 => ExitCode::ForwardCheckUnavailable,
+        14 => ExitCode::AlreadyReachable,
         _ => ExitCode::Failure,
     }
 }
@@ -482,6 +561,134 @@ mod tests {
     }
 
     #[test]
+    fn every_refusal_a_forward_has_survives_the_bus_with_its_own_code_and_kind() {
+        // All six used to arrive as `com.jacopobriccola.Porthole.Failed`,
+        // because `HelperError::from` had a `_ => Failed` arm and no arm of
+        // their own: a user on a firewall that cannot redirect got exit 1 and
+        // the kind `unexpected` instead of 12 and `forward_unsupported`, and
+        // a script watching for 14 to say "publish it on loopback instead"
+        // could never see one. The wildcard is gone, and this is the other
+        // half: the names the helper now sends, mapped back here.
+        use porthole_core::error::ExitCode;
+
+        let cases: &[(&str, Error)] = &[
+            (
+                "com.jacopobriccola.Porthole.ForwardUnsupported",
+                Error::ForwardUnsupported(String::new()),
+            ),
+            (
+                "com.jacopobriccola.Porthole.NotPublishedByContainer",
+                Error::NotPublishedByContainer(String::new()),
+            ),
+            (
+                "com.jacopobriccola.Porthole.DockerUnreadable",
+                Error::DockerUnreadable(String::new()),
+            ),
+            (
+                "com.jacopobriccola.Porthole.ExternalPortInUse",
+                Error::ExternalPortInUse {
+                    port: 0,
+                    detail: String::new(),
+                },
+            ),
+            (
+                "com.jacopobriccola.Porthole.ForwardCheckUnavailable",
+                Error::ForwardCheckUnavailable(String::new()),
+            ),
+            (
+                "com.jacopobriccola.Porthole.AlreadyReachable",
+                Error::AlreadyReachable(String::new()),
+            ),
+        ];
+        for (name, local) in cases {
+            let reported = from_dbus(method_error(name, "x"));
+            assert_eq!(reported.kind(), local.kind(), "kind drifted for {name}");
+            assert_eq!(
+                reported.exit_code(),
+                local.exit_code(),
+                "exit code drifted for {name}"
+            );
+            assert_ne!(
+                reported.exit_code(),
+                ExitCode::Failure,
+                "{name} fell back to the catch-all"
+            );
+        }
+
+        // The pair that shares a code: one exit status, two kinds, exactly as
+        // `porthole_core::error`'s own test requires of the local variants.
+        let unpublished = from_dbus(method_error(
+            "com.jacopobriccola.Porthole.NotPublishedByContainer",
+            "x",
+        ));
+        let unreadable = from_dbus(method_error(
+            "com.jacopobriccola.Porthole.DockerUnreadable",
+            "x",
+        ));
+        assert_eq!(unpublished.exit_code(), unreadable.exit_code());
+        assert_ne!(unpublished.kind(), unreadable.kind());
+    }
+
+    fn wire_rule() -> WireRule {
+        WireRule {
+            id: "1f0c8b6e-0000-4000-8000-000000000001".to_string(),
+            port: 8443,
+            protocol: "tcp".to_string(),
+            target: "10.10.10.0/24".to_string(),
+            scope: "network".to_string(),
+            backend: "firewalld".to_string(),
+            opened_at: 1_757_000_000,
+            expires_at: 1_757_003_600,
+            uid: 1000,
+            container_addr: String::new(),
+            container_port: 0,
+            published_port: 0,
+        }
+    }
+
+    #[test]
+    fn a_wire_rule_with_a_container_address_comes_back_as_a_forward() {
+        let wire = WireRule {
+            container_addr: "172.17.0.9".to_string(),
+            container_port: 80,
+            published_port: 3000,
+            ..wire_rule()
+        };
+        let rule = to_local(&wire).expect("a rule");
+        let forward = rule
+            .forward
+            .expect("a rule the helper sent a container address for is a forward");
+        assert_eq!(forward.container_addr.to_string(), "172.17.0.9");
+        assert_eq!(forward.container_port, 80);
+        assert_eq!(forward.published_port, 3000);
+        // The wire carries no protocol for the mapping; the rule's own is it.
+        assert_eq!(forward.protocol, rule.protocol);
+    }
+
+    #[test]
+    fn a_wire_rule_without_one_stays_an_ordinary_open() {
+        // The sentinel, and the reason it is the address rather than a port:
+        // `0` is what a forward with no mapping would carry for both ports
+        // too, and an address is never the empty string.
+        let rule = to_local(&wire_rule()).expect("a rule");
+        assert!(rule.forward.is_none());
+    }
+
+    #[test]
+    fn a_container_address_the_helper_could_not_have_meant_is_not_silently_dropped() {
+        // Dropping it would render a forward as an open -- the one rendering
+        // this whole field exists to prevent.
+        let wire = WireRule {
+            container_addr: "not-an-address".to_string(),
+            container_port: 80,
+            published_port: 3000,
+            ..wire_rule()
+        };
+        let err = to_local(&wire).expect_err("a malformed address is an error");
+        assert!(err.to_string().contains("not-an-address"), "got: {err}");
+    }
+
+    #[test]
     fn close_all_failures_keep_their_structured_kind_over_the_bus() {
         // I3: close_all's per-rule failures used to be `.to_string()`'d away
         // into `Error::Unexpected`, so `close --all --json` reported
@@ -513,5 +720,93 @@ mod tests {
             code: 1,
         };
         assert_eq!(wire_error_to_local(wire).kind(), "unexpected");
+    }
+
+    /// Every arm of `static_kind` and `exit_code_from_i32`, driven from the
+    /// local `Error` that produced the wire values in the first place.
+    ///
+    /// Both functions had exactly one caller -- `wire_error_to_local`, for
+    /// `close_all`'s per-rule failures -- and `close_all` cannot produce a
+    /// forward failure, so nothing in the workspace ever exercised the six
+    /// forward arms of either. Deleting `14 => ExitCode::AlreadyReachable`
+    /// *and* the `"already_reachable"` slug together left every test green.
+    ///
+    /// Not a hand-written table of numbers: taking each pair from the local
+    /// `Error`'s own `kind()` and `exit_code()` is what makes this a
+    /// round-trip rather than a second copy of the mapping, which would agree
+    /// with a wrong one just as readily.
+    #[test]
+    fn every_kind_and_code_a_helper_can_send_maps_back_to_the_error_it_came_from() {
+        // `porthole-helper`'s `HelperError` sends each of these under a name
+        // of its own; everything else it can send collapses into `Failed`,
+        // whose kind is `unexpected` and whose code is 1.
+        let sent: &[Error] = &[
+            Error::InvalidArgument(String::new()),
+            Error::BackendUnavailable(String::new()),
+            Error::NotAuthorized(String::new()),
+            Error::AlreadyOpen {
+                port: 5173,
+                protocol: porthole_core::model::Protocol::Tcp,
+                detail: String::new(),
+            },
+            Error::DeviceUnreachable(String::new()),
+            Error::RuleNotFound(String::new()),
+            Error::NoNetwork(String::new()),
+            Error::CommandFailed {
+                command: String::new(),
+                status: 1,
+                stderr: String::new(),
+            },
+            Error::State {
+                path: String::new(),
+                detail: String::new(),
+            },
+            Error::ForwardUnsupported(String::new()),
+            Error::NotPublishedByContainer(String::new()),
+            Error::DockerUnreadable(String::new()),
+            Error::ExternalPortInUse {
+                port: 0,
+                detail: String::new(),
+            },
+            Error::ForwardCheckUnavailable(String::new()),
+            Error::AlreadyReachable(String::new()),
+        ];
+
+        for original in sent {
+            let wire = WireError {
+                message: "rendered by the helper".to_string(),
+                kind: original.kind().to_string(),
+                code: original.exit_code() as i32,
+            };
+            let back = wire_error_to_local(wire);
+            assert_eq!(
+                back.kind(),
+                original.kind(),
+                "the kind slug did not survive the bus"
+            );
+            assert_eq!(
+                back.exit_code(),
+                original.exit_code(),
+                "the exit code did not survive the bus for kind {}",
+                original.kind()
+            );
+        }
+
+        // The forward codes specifically: each is a number a script switches
+        // on, so none of them may arrive as the catch-all. Asserted apart
+        // from the loop because `command_failed` and `state_error` above
+        // legitimately carry `ExitCode::Failure` and would mask a fallback.
+        for code in [10, 11, 12, 13, 14] {
+            assert_ne!(
+                exit_code_from_i32(code),
+                ExitCode::Failure,
+                "exit code {code} fell through to the catch-all"
+            );
+        }
+
+        // And the reverse direction: a number this client has never heard of
+        // is a failure, not a panic and not a wrong code.
+        assert_eq!(exit_code_from_i32(99), ExitCode::Failure);
+        assert_eq!(exit_code_from_i32(0), ExitCode::Failure);
     }
 }

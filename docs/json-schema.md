@@ -17,7 +17,7 @@ All timestamps are **seconds since the Unix epoch**, as integers. Convert with
 
 ## Rule object
 
-Used in `list`, `status`, `open` and `close`.
+Used in `list`, `status`, `open`, `forward` and `close`.
 
 ```json
 {
@@ -30,7 +30,8 @@ Used in `list`, `status`, `open` and `close`.
   "opened_at": 1757000000,
   "expires_at": 1757003600,
   "expires_in_seconds": 3421,
-  "uid": 1000
+  "uid": 1000,
+  "forward": null
 }
 ```
 
@@ -41,6 +42,37 @@ Used in `list`, `status`, `open` and `close`.
   created this rule. See [docs/backends.md](backends.md) for what each one
   can and cannot do.
 - `expires_at` and `expires_in_seconds` are `null` for an `--until-reboot` rule.
+- `forward` — `null` when the rule only **permits** traffic, and an object
+  when it **redirects** it. The two are different things and the rest of this
+  object cannot tell them apart, so a script that treats every rule alike will
+  report a redirect as a permission.
+
+`forward: null` is every rule `porthole open` creates, and every rule
+recorded before forwards existed. It says this rule redirects nothing; it says
+nothing about Docker, about the port, or about what else may be reachable.
+
+When it is not `null` — only `porthole forward` creates such a rule — it is:
+
+```json
+{
+  "container_addr": "172.17.0.9",
+  "container_port": 80,
+  "published_port": 3000
+}
+```
+
+- `container_addr` and `container_port` are where the traffic actually
+  arrives: an address on Docker's own network, and the port inside the
+  container. Neither is a port on this machine.
+- `published_port` is the port Docker published on this machine — the number
+  shown by `porthole listen` and the number typed at `porthole forward`.
+- The rule's own `port`, above, is what the **local network** connects to.
+  It is `published_port` unless `--as` set it to something else, and the whole
+  point of a forward is that the two may differ.
+
+There is no protocol in this object. A forward whose two ends disagree about
+protocol is refused before the rule exists, so the rule's own `protocol`
+governs both.
 
 A rule opened with `--to <device name>` is indistinguishable here from one
 opened with `--to <IP>`: both record `scope: "network"` and a `target` of
@@ -193,6 +225,53 @@ whichever ports it could actually read. This is a plain string, not a
 structured object: a script that needs the underlying fact reads it from
 `porthole listen --json`'s own `docker` field instead, which names the exact
 address rather than a rendered sentence.
+
+## `porthole forward --json`
+
+The same object `open --json` prints, from the same rule:
+
+```json
+{
+  "schema": 1,
+  "dry_run": false,
+  "rule": { /* rule object, whose `forward` is not null */ },
+  "commands": [],
+  "docker_note": null
+}
+```
+
+`rule.forward` is what distinguishes this from an open — see [Rule
+object](#rule-object) for its three members and for which of the numbers is
+which.
+
+`docker_note` is always `null` here, and carries no information at all.
+`open`'s note warns that Docker may already have made a port reachable; a
+forward that got as far as printing this object has had that same question
+asked and answered, and would have failed with `already_reachable` (exit
+`14`) if the answer had been yes.
+
+`forward` has refusals `open` does not, each with its own `kind` and exit
+code in the error object below: `forward_unsupported` (`12`) when the
+detected firewall cannot redirect a port at all, `not_published_by_container`
+and `docker_unreadable` (both `10`, and the two are told apart by `kind`
+alone) when no container publishes the port or Docker could not be read,
+`external_port_in_use` (`11`) when the port the local network would connect
+to already carries something a redirect would take traffic from — a porthole
+rule, a container Docker publishes on that port at an address the network
+reaches, or a service listening on `0.0.0.0` or on one address the network
+reaches; restricted to loopback, neither the mapping nor the listener refuses,
+and the message says which of the three sources found it —
+`forward_check_unavailable` (`13`) when a
+check porthole makes before creating a redirect has no answer for what was
+asked, and `already_reachable` (`14`) when Docker publishes the container on
+an address other than loopback. What that last one reads is the `-d` flag on
+Docker's own DNAT rule for the port and nothing else: no `-d` is every
+interface, and a `-d` naming any other address is that one address, whether
+or not this machine holds it — so a container published on an address no
+interface here carries is refused too. Every one of them is decided by
+porthole, not by
+this CLI, and each arrives with the same `code` and `kind` whether the work
+was attempted locally under `--dry-run` or over the bus.
 
 ## `porthole close --json`
 

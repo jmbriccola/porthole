@@ -7,7 +7,9 @@
 //! it stays out of `--json`.
 //!
 //! D-Bus has no optional types, so `expires_at == 0` means "until reboot".
-//! Epoch 0 is 1970 and can never be a real expiry.
+//! Epoch 0 is 1970 and can never be a real expiry. An empty `container_addr`
+//! is the same device for the other absent thing: a rule that redirects
+//! rather than merely permits.
 
 use crate::engine::Status;
 use crate::model::Target;
@@ -39,6 +41,26 @@ pub struct WireRule {
     /// Seconds since the epoch, or **0 for until-reboot**.
     pub expires_at: u64,
     pub uid: u32,
+    /// The address a forward redirects to, or **empty for a rule that only
+    /// permits**. An address can never be the empty string, so this is the
+    /// field that tells the two apart — the ports below cannot, since `0` is
+    /// also what a forward to a container port nobody could have published
+    /// would carry.
+    ///
+    /// Without it a forward reaches a subscriber as an open with the same
+    /// port and the same target, and gets rendered as one: nothing in the
+    /// remaining fields says that what answers on that port is a container
+    /// rather than something on this machine. It discloses no more than the
+    /// bus already carries — `docker_ports` returns the same addresses to
+    /// every caller `list` is open to.
+    pub container_addr: String,
+    /// The port inside the container. `0` when `container_addr` is empty.
+    pub container_port: u16,
+    /// The port Docker published on this machine, which is the port the
+    /// person named. Not `port`: that is what the local network connects to,
+    /// and the whole point of a forward is that the two may differ. `0` when
+    /// `container_addr` is empty.
+    pub published_port: u16,
 }
 
 impl WireRule {
@@ -57,7 +79,34 @@ impl WireRule {
             opened_at: rule.opened_at,
             expires_at: rule.expires_at.unwrap_or(0),
             uid: rule.uid,
+            container_addr: rule
+                .forward
+                .as_ref()
+                .map(|f| f.container_addr.to_string())
+                .unwrap_or_default(),
+            container_port: rule.forward.as_ref().map(|f| f.container_port).unwrap_or(0),
+            published_port: rule.forward.as_ref().map(|f| f.published_port).unwrap_or(0),
         }
+    }
+
+    /// Whether this rule redirects rather than only permits.
+    ///
+    /// The sentinel is [`WireRule::container_addr`]'s, defined and documented
+    /// on the field itself: an address can never be the empty string, and the
+    /// two ports cannot say it, since `0` is also what a forward to a
+    /// container port nobody could have published would carry.
+    ///
+    /// **One method, on the type that owns the sentinel.** There were three
+    /// copies of this line — `porthole-agent`'s `notify::redirects`,
+    /// `porthole-gui`'s `open_now::is_forward`, and an inline
+    /// `container_addr.is_empty()` in `porthole-cli`'s `client.rs` — in three
+    /// crates, each deriving a rule this module defines. Two copies of a
+    /// one-line predicate is how a rule ends up *described* as one act and
+    /// *re-sent* as the other, which is a bug this branch has already fixed
+    /// once, in the agent's `Reopen`. Three copies is the same bug waiting.
+    /// Every crate that needs the answer already depends on this one.
+    pub fn redirects(&self) -> bool {
+        !self.container_addr.is_empty()
     }
 }
 
@@ -65,9 +114,10 @@ impl WireRule {
 ///
 /// A single undifferentiated "closed" would force every subscriber to guess:
 /// a rule that ran out its own clock, one a person asked to close, one the
-/// helper closed because the machine left the network it was scoped to, and
-/// one that was already gone from the firewall by the time porthole looked
-/// are four different things to tell a user about. The slug is spelled twice:
+/// helper closed because the machine left the network it was scoped to, one
+/// that was already gone from the firewall by the time porthole looked, and
+/// one whose container is no longer the one it was created against are five
+/// different things to tell a user about. The slug is spelled twice:
 /// the wire form comes from serde's `rename_all` below, the journal form from
 /// the `match` in [`CloseReason::as_str`]. Nothing in the type system makes
 /// those agree — `every_close_carries_why` checks both halves for every
@@ -96,6 +146,21 @@ pub enum CloseReason {
     /// never save, so the record is still in the state file and the next
     /// operation that does write is where it is dropped for real.
     Reconciled,
+    /// A forward whose container is no longer the one it was created
+    /// against: the mapping the rule stored is absent from Docker's own
+    /// table now -- see `porthole_core::forward::stale_forwards`.
+    ///
+    /// The forward closes rather than being re-aimed. Docker assigns
+    /// container addresses at start, so the address a restarted container
+    /// gives up can be taken by a different one; a rule re-aimed at whatever
+    /// now holds that address would carry traffic from the local network to
+    /// a service nobody authorised. This is the same principle as a rule
+    /// scoped to a subnet the machine has left.
+    ///
+    /// Never sent because Docker could not be read. Not knowing is not
+    /// knowing it changed -- see
+    /// `porthole_core::engine::Engine::close_stale_forwards`.
+    TargetGone,
 }
 
 impl CloseReason {
@@ -103,14 +168,14 @@ impl CloseReason {
     /// the wire -- `rename_all` above derives that from the variant name
     /// independently -- so the two are held equal by `every_close_carries_why`
     /// rather than by construction. Kept next to the enum all the same, so
-    /// that the four spellings are in one place rather than at each call
-    /// site.
+    /// that every spelling is in one place rather than at each call site.
     pub fn as_str(self) -> &'static str {
         match self {
             CloseReason::Expired => "expired",
             CloseReason::Requested => "requested",
             CloseReason::NetworkChanged => "network-changed",
             CloseReason::Reconciled => "reconciled",
+            CloseReason::TargetGone => "target-gone",
         }
     }
 }
@@ -268,6 +333,30 @@ pub trait Porthole {
         seconds: u32,
     ) -> zbus::Result<WireRule>;
 
+    /// Redirect `port` to the container that publishes `published_port` on
+    /// this machine, for `seconds` (0 for until-reboot). `scope` is what the
+    /// user typed and the helper parses, exactly as in `open` — named the
+    /// same thing here because it is the same thing.
+    ///
+    /// Authorized every time. `open` towards the local subnet can reuse an
+    /// authentication given minutes earlier; this never does, and the action
+    /// it asks for does not depend on `scope`.
+    ///
+    /// Refusals all come from the helper, in the fixed order
+    /// [`crate::error::FORWARD_REFUSALS`] lists them in — plus the one a
+    /// forward shares with `open`, a firewall that is installed but not
+    /// enforcing rules. Enumerated there rather than here: this doc comment
+    /// was one of two copies that had gone a refusal out of date while
+    /// promising "a fixed order" for a list with a hole in the middle of it.
+    async fn forward(
+        &self,
+        port: u16,
+        protocol: &str,
+        scope: &str,
+        seconds: u32,
+        published_port: u16,
+    ) -> zbus::Result<WireRule>;
+
     async fn close(&self, port: u16, protocol: &str) -> zbus::Result<WireRule>;
 
     /// `from_timer` is the expiry timer's own claim about itself, forwarded
@@ -315,8 +404,8 @@ pub trait Porthole {
     /// - A rule can leave `list` with no `RuleClosed` behind it.
     ///   `close --id <id> --forget` drops porthole's record of a rule
     ///   recorded under a backend this machine no longer has, without
-    ///   touching any firewall — so none of the four reasons is true of it
-    ///   and none is sent. A client that only listens goes on showing that
+    ///   touching any firewall — so none of the reasons is true of it and
+    ///   none is sent. A client that only listens goes on showing that
     ///   rule as open.
     /// - Signals are emitted after the state lock is released, so two
     ///   clients acting at once can put a `RuleClosed` on the bus ahead of
@@ -371,6 +460,7 @@ mod tests {
                 zone: "FedoraWorkstation".to_string(),
                 rich_rule: "the exact spec needed to remove this".to_string(),
             },
+            forward: None,
         }
     }
 
@@ -386,6 +476,50 @@ mod tests {
         assert_eq!(wire.opened_at, 1_757_000_000);
         assert_eq!(wire.expires_at, 1_757_003_600);
         assert_eq!(wire.uid, 1000);
+    }
+
+    #[test]
+    fn a_forward_reaches_a_subscriber_as_something_it_can_tell_from_an_open() {
+        // Same port, same protocol, same target, same everything an `open`
+        // has: a client with only those fields renders a redirect to a
+        // container as a permission granted to whatever is on this machine.
+        // The three fields below are what it takes to say otherwise, and to
+        // say where the traffic actually goes.
+        let mut r = rule(None);
+        r.forward = Some(crate::forward::ForwardTo {
+            container_addr: "172.18.0.2".parse().unwrap(),
+            container_port: 80,
+            published_port: 3000,
+            protocol: Protocol::Tcp,
+        });
+        let wire = WireRule::from_rule(&r);
+        assert_eq!(wire.container_addr, "172.18.0.2");
+        assert_eq!(wire.container_port, 80);
+        assert_eq!(
+            wire.published_port, 3000,
+            "the published port is the one the person named, and is not `port`"
+        );
+        assert_eq!(wire.port, 5173, "`port` stays what the network connects to");
+        assert!(
+            wire.redirects(),
+            "the one predicate three crates ask, on the type that defines the \
+             sentinel it reads"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_open_carries_the_empty_address_that_means_not_a_forward() {
+        // D-Bus has no optional types. The address is the sentinel rather
+        // than either port, because `0` is a value a port field can hold for
+        // other reasons and the empty string is not an address.
+        let wire = WireRule::from_rule(&rule(None));
+        assert_eq!(wire.container_addr, "");
+        assert_eq!(wire.container_port, 0);
+        assert_eq!(wire.published_port, 0);
+        assert!(
+            !wire.redirects(),
+            "and the other direction: a rule that only permits says so"
+        );
     }
 
     #[test]
@@ -550,9 +684,10 @@ mod tests {
 
     #[test]
     fn every_close_carries_why() {
-        // "expired", "requested", "network-changed", "reconciled". The
-        // notification says something different for each, and a single
-        // undifferentiated ClosedSignal would force the agent to guess.
+        // "expired", "requested", "network-changed", "reconciled",
+        // "target-gone". The notification says something different for each,
+        // and a single undifferentiated ClosedSignal would force the agent to
+        // guess.
         //
         // Both halves are checked for every variant: the slug `as_str`
         // returns (what the journal line is built from) and the string that
@@ -568,6 +703,7 @@ mod tests {
             (CloseReason::Requested, "requested"),
             (CloseReason::NetworkChanged, "network-changed"),
             (CloseReason::Reconciled, "reconciled"),
+            (CloseReason::TargetGone, "target-gone"),
         ] {
             assert_eq!(reason.as_str(), expected);
             assert_eq!(reason.to_string(), expected);
@@ -582,6 +718,45 @@ mod tests {
             let back: CloseReason = encoded.deserialize().unwrap().0;
             assert_eq!(back, reason, "a subscriber must be able to read it back");
         }
+    }
+
+    #[test]
+    fn the_reasons_that_predate_forwarding_keep_their_slugs() {
+        // These four crossed the bus before `target-gone` existed, and
+        // subscribers match on the slug: a rename would be a silent break for
+        // anything already deployed, not a compile error anywhere. The test
+        // above covers every reason including the new one; this one exists to
+        // say that these particular strings are not free to move.
+        //
+        // Spelled as literals rather than derived from the enum, which is
+        // the point -- a test that asked `as_str` what the slug is would
+        // agree with any rename.
+        assert_eq!(CloseReason::Expired.as_str(), "expired");
+        assert_eq!(CloseReason::Requested.as_str(), "requested");
+        assert_eq!(CloseReason::NetworkChanged.as_str(), "network-changed");
+        assert_eq!(CloseReason::Reconciled.as_str(), "reconciled");
+    }
+
+    #[test]
+    fn a_new_reason_has_to_be_written_into_the_slug_test_by_hand() {
+        // Not a behavioural check: an exhaustive match that stops compiling
+        // when a variant is added, so the next reason cannot reach the bus
+        // with nobody having decided what it is called. It is deliberately
+        // not `as_str` -- reading the answer out of the code under test
+        // would agree with whatever that code says.
+        fn slug(reason: CloseReason) -> &'static str {
+            match reason {
+                CloseReason::Expired => "expired",
+                CloseReason::Requested => "requested",
+                CloseReason::NetworkChanged => "network-changed",
+                CloseReason::Reconciled => "reconciled",
+                CloseReason::TargetGone => "target-gone",
+            }
+        }
+        assert_eq!(
+            slug(CloseReason::TargetGone),
+            CloseReason::TargetGone.as_str()
+        );
     }
 
     #[test]

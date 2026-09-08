@@ -832,6 +832,170 @@ fn a_section_waiting_on_the_helper_does_not_report_a_failure() -> Result<(), Str
     Ok(())
 }
 
+/// A loopback row gets a Forward button only when a container publishes it.
+/// A plain local process cannot be forwarded at all, and a disabled button
+/// with no explanation is worse than none.
+fn only_container_published_loopback_rows_offer_forward() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningForward",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_services(&[
+                svc(3000, Some("docker-proxy"), Binding::LoopbackOnly),
+                svc(9843, Some("code"), Binding::LoopbackOnly),
+            ]);
+            section.set_docker_ports(&[published(3000, Some("127.0.0.1"))]);
+            let rows = section.rows();
+            let published_row = rows
+                .iter()
+                .position(|r| r.title().contains("3000"))
+                .expect("the 3000 row must exist");
+            let plain_row = 1 - published_row;
+            *seen.borrow_mut() = Some((
+                section.forward_button_for(published_row).is_some(),
+                section.forward_button_for(plain_row).is_some(),
+                section.open_button_for(published_row).is_some(),
+                section.activate_forward(published_row),
+                rows[published_row].subtitle().map(|s| s.to_string()),
+            ));
+        },
+    );
+    let (offers_forward, plain_offers_forward, offers_open, activated, subtitle) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if !offers_forward {
+        return Err("the container-published row must offer Forward".to_string());
+    }
+    if plain_offers_forward {
+        return Err(
+            "an ordinary loopback row must offer nothing, not a disabled button".to_string(),
+        );
+    }
+    if offers_open {
+        return Err(
+            "a loopback row must still offer no Open button: opening the firewall for it \
+             changes nothing"
+                .to_string(),
+        );
+    }
+    if activated != Some(3000) {
+        return Err(format!(
+            "pressing Forward must carry the port Docker publishes on this machine, \
+             got {activated:?}"
+        ));
+    }
+    // The row now offers an act, so it must say which one -- a row reading
+    // only "the firewall does not affect it" beside a Forward button says
+    // nothing about what that button does.
+    let subtitle = subtitle.ok_or("the row must have a subtitle")?;
+    if !subtitle.contains("redirect") {
+        return Err(format!(
+            "a row that offers Forward must say it can be redirected into: {subtitle}"
+        ));
+    }
+    if !subtitle.contains("only on this machine") {
+        return Err(format!(
+            "the loopback reassurance must survive the addition: {subtitle}"
+        ));
+    }
+    // And it must name the *container* as where the redirected traffic
+    // goes. The sentence used to end "redirect a network port into it",
+    // which said a forward reaches this loopback socket. It does not:
+    // `firewalld::forward_rich_rule` writes the container's own address on
+    // Docker's network as `to-addr`, and its doc says loopback cannot stand
+    // there at all. Saying "into it" also put the sentence at war with the
+    // clause before it, since a forward is itself a firewall rule.
+    if !subtitle.contains("container") {
+        return Err(format!(
+            "a forward reaches the container, not this socket, and the row must say which: \
+             {subtitle}"
+        ));
+    }
+    Ok(())
+}
+
+/// The refusal `porthole_core::docker::already_reachable` produces, before
+/// it can be reached: a container the local network already gets to is one
+/// the helper will not forward, because a forward would add a second way in
+/// and closing it later would remove only that one.
+fn a_container_the_network_already_reaches_offers_no_forward() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningForwardExposed",
+        move |_app| {
+            let section = ListeningSection::new();
+            // The `/proc` scan says loopback and Docker's own rule says
+            // every interface. Docker's rule is the one a forward would
+            // have to compete with, so it is the one that decides.
+            section.set_services(&[svc(3000, Some("docker-proxy"), Binding::LoopbackOnly)]);
+            section.set_docker_ports(&[published(3000, None)]);
+            let exposed = section.forward_button_for(0).is_some();
+
+            // And a network-facing row, which offers Open instead: a
+            // forward is for a service the network cannot reach at all.
+            let facing = ListeningSection::new();
+            facing.set_services(&[svc(9000, Some("docker-proxy"), Binding::AllInterfaces)]);
+            facing.set_docker_ports(&[published(9000, Some("10.0.0.5"))]);
+            *seen.borrow_mut() = Some((exposed, facing.forward_button_for(0).is_some()));
+        },
+    );
+    let (exposed, facing) = result.borrow_mut().take().ok_or("activation never ran")?;
+    if exposed {
+        return Err(
+            "a container Docker publishes on every interface must not be offered a forward \
+             the helper would refuse"
+                .to_string(),
+        );
+    }
+    if facing {
+        return Err("a network-facing row must not be offered a forward".to_string());
+    }
+    Ok(())
+}
+
+/// Neither no-answer state is an answer. A row carries no Forward button
+/// until a checked list actually names it -- the same rule the Docker
+/// marker follows, for the same reason.
+fn a_row_with_no_checked_docker_list_offers_no_forward() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.ListeningForwardUnchecked",
+        move |_app| {
+            let section = ListeningSection::new();
+            section.set_services(&[svc(3000, Some("docker-proxy"), Binding::LoopbackOnly)]);
+            let not_checked = section.forward_button_for(0).is_some();
+
+            section.set_docker_ports(&[published(3000, Some("127.0.0.1"))]);
+            let checked = section.forward_button_for(0).is_some();
+
+            section.set_docker_unavailable();
+            let unavailable = section.forward_button_for(0).is_some();
+            *seen.borrow_mut() = Some((not_checked, checked, unavailable));
+        },
+    );
+    let (not_checked, checked, unavailable) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if not_checked {
+        return Err(
+            "a row nobody has asked Docker about must not be offered a forward".to_string(),
+        );
+    }
+    if !checked {
+        return Err("fixture setup: the checked list must offer the forward".to_string());
+    }
+    if unavailable {
+        return Err(
+            "losing the Docker list must withdraw the forward, not leave it standing on a \
+             claim porthole can no longer make"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// The same measurement `tests/open_now.rs` makes on its own section, on
 /// this one: a quiet state is one section among several, not a view of its
 /// own. Both sections draw their quiet states from the same function
@@ -879,7 +1043,7 @@ fn the_confirmed_empty_state_is_no_taller_than_one_rendered_service() -> Result<
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 21] = [
+    let cases: [Case; 24] = [
         (
             "a_service_shows_its_name_and_port_the_way_the_spec_writes_it",
             a_service_shows_its_name_and_port_the_way_the_spec_writes_it,
@@ -963,6 +1127,18 @@ fn main() {
         (
             "a_section_waiting_on_the_helper_does_not_report_a_failure",
             a_section_waiting_on_the_helper_does_not_report_a_failure,
+        ),
+        (
+            "only_container_published_loopback_rows_offer_forward",
+            only_container_published_loopback_rows_offer_forward,
+        ),
+        (
+            "a_container_the_network_already_reaches_offers_no_forward",
+            a_container_the_network_already_reaches_offers_no_forward,
+        ),
+        (
+            "a_row_with_no_checked_docker_list_offers_no_forward",
+            a_row_with_no_checked_docker_list_offers_no_forward,
         ),
     ];
 

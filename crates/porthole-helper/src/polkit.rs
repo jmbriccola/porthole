@@ -8,7 +8,8 @@
 //! The severity difference between the actions is the whole point, and it
 //! lives in the installed policy file rather than here: `open-subnet` is
 //! `auth_admin_keep` so a user authenticates once per session, `open-any` is
-//! `auth_admin` so a bigger choice costs more every time, and `close` is `yes`
+//! `auth_admin` so a bigger choice costs more every time, `forward` is
+//! `auth_admin` in every context for the same reason, and `close` is `yes`
 //! because closing reduces exposure and must never be the thing a user cannot
 //! be bothered to do.
 //!
@@ -47,12 +48,36 @@ pub fn open_details(port: u16, protocol: Protocol, target: &Target) -> Details {
     details
 }
 
+/// The same three, plus the port the request says a container published on
+/// this machine.
+///
+/// A forward has two ports and they are not interchangeable: `port` is what
+/// the local network would connect to and `published_port` is the one the
+/// person named. A prompt showing only one of them could not be read against
+/// what was typed.
+///
+/// Both are what the *request* asked for. This map is built before anything
+/// has been read — the prompt comes first, so nothing here has been checked
+/// against Docker, and the message it fills in says what porthole was asked
+/// to do rather than what it found.
+pub fn forward_details(
+    port: u16,
+    protocol: Protocol,
+    target: &Target,
+    published_port: u16,
+) -> Details {
+    let mut details = open_details(port, protocol, target);
+    details.insert("published_port", published_port.to_string());
+    details
+}
+
 /// The refusal a caller sees. Separate function so the message is identical
 /// whether polkit said no or the subject could not be built.
 fn denied(action: Action) -> Error {
     Error::NotAuthorized(format!(
         "polkit refused {}. Opening towards the current subnet asks once per \
-         session; opening towards everyone asks every time.",
+         session; opening towards everyone, and forwarding to a container, \
+         ask every time.",
         action.id()
     ))
 }
@@ -137,6 +162,7 @@ mod tests {
         for action in [
             Action::OpenSubnet,
             Action::OpenAny,
+            Action::Forward,
             Action::Close,
             Action::List,
         ] {
