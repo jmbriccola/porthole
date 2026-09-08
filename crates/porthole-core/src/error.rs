@@ -40,6 +40,9 @@ pub enum ExitCode {
     ExternalPortInUse = 11,
     /// The detected backend has no way to redirect a port.
     ForwardUnsupported = 12,
+    /// A check porthole makes before creating a forward does not cover what
+    /// was asked for.
+    ForwardCheckUnavailable = 13,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -119,6 +122,15 @@ pub enum Error {
     #[error("port {port} is already in use ({detail})")]
     ExternalPortInUse { port: u16, detail: String },
 
+    /// A forward was refused because one of the checks porthole makes before
+    /// creating one has no coverage for what was asked.
+    ///
+    /// Not [`Error::ForwardUnsupported`], which is about what the firewall
+    /// can express. This one is about what porthole can verify, and the
+    /// message says which check and what it does not reach.
+    #[error("{0}")]
+    ForwardCheckUnavailable(String),
+
     #[error("command `{command}` exited with status {status}: {stderr}")]
     CommandFailed {
         command: String,
@@ -181,6 +193,7 @@ impl Error {
                 ExitCode::NotForwardable
             }
             Error::ExternalPortInUse { .. } => ExitCode::ExternalPortInUse,
+            Error::ForwardCheckUnavailable(_) => ExitCode::ForwardCheckUnavailable,
             Error::Remote { code, .. } => *code,
             Error::CommandFailed { .. }
             | Error::CommandSpawn { .. }
@@ -205,6 +218,7 @@ impl Error {
             Error::NotPublishedByContainer(_) => "not_published_by_container",
             Error::DockerUnreadable(_) => "docker_unreadable",
             Error::ExternalPortInUse { .. } => "external_port_in_use",
+            Error::ForwardCheckUnavailable(_) => "forward_check_unavailable",
             Error::Remote { kind, .. } => kind,
             Error::CommandFailed { .. } => "command_failed",
             Error::CommandSpawn { .. } => "command_spawn_failed",
@@ -235,6 +249,7 @@ mod tests {
         assert_eq!(ExitCode::NotForwardable as i32, 10);
         assert_eq!(ExitCode::ExternalPortInUse as i32, 11);
         assert_eq!(ExitCode::ForwardUnsupported as i32, 12);
+        assert_eq!(ExitCode::ForwardCheckUnavailable as i32, 13);
     }
 
     #[test]
@@ -275,6 +290,10 @@ mod tests {
             .exit_code(),
             ExitCode::ExternalPortInUse
         );
+        assert_eq!(
+            Error::ForwardCheckUnavailable("no udp check".into()).exit_code(),
+            ExitCode::ForwardCheckUnavailable
+        );
     }
 
     #[test]
@@ -312,6 +331,10 @@ mod tests {
             }
             .kind(),
             "external_port_in_use"
+        );
+        assert_eq!(
+            Error::ForwardCheckUnavailable("x".into()).kind(),
+            "forward_check_unavailable"
         );
     }
 

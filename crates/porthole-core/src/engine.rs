@@ -264,6 +264,38 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Refuse unless the firewall is confirmed to be enforcing rules.
+    ///
+    /// One copy, called by every operation that would write a rule: a rule
+    /// written where nothing enforces it is a promise porthole cannot keep,
+    /// and two copies of the sentence saying so would drift apart.
+    fn require_enforcing_firewall(&self) -> Result<()> {
+        let health = self.backend.health()?;
+        if health.active {
+            return Ok(());
+        }
+        // `active: false` is two different facts (see
+        // `BackendHealth::active_unknown`'s own doc comment), and only one of
+        // them supports "the firewall is not enforcing rules" as a stated
+        // premise. Saying that outright when porthole could not read the
+        // ruleset at all would assert something it does not know, right where
+        // a hedge already exists for the other half of the same claim
+        // (reachable vs. blocked) -- so the unknown case gets its own honest
+        // lead-in instead of reusing this one.
+        let why = if health.active_unknown {
+            "porthole cannot open anything here until it can confirm the firewall is \
+             actually enforcing rules -- it could not read enough of the ruleset to tell"
+        } else {
+            "porthole will not open anything while the firewall is not enforcing \
+             rules: the port is either already reachable or blocked by something \
+             porthole does not manage"
+        };
+        Err(Error::BackendUnavailable(format!(
+            "{}. {why}",
+            health.detail
+        )))
+    }
+
     pub fn open(
         &mut self,
         port: u16,
@@ -273,30 +305,7 @@ impl<'a> Engine<'a> {
         uid: u32,
     ) -> Result<ManagedRule> {
         self.reconcile();
-
-        let health = self.backend.health()?;
-        if !health.active {
-            // `active: false` is two different facts (see
-            // `BackendHealth::active_unknown`'s own doc comment), and only
-            // one of them supports "the firewall is not enforcing rules" as
-            // a stated premise. Saying that outright when porthole could not
-            // read the ruleset at all would assert something it does not
-            // know, right where a hedge already exists for the other half
-            // of the same claim (reachable vs. blocked) -- so the unknown
-            // case gets its own honest lead-in instead of reusing this one.
-            let why = if health.active_unknown {
-                "porthole cannot open anything here until it can confirm the firewall is \
-                 actually enforcing rules -- it could not read enough of the ruleset to tell"
-            } else {
-                "porthole will not open anything while the firewall is not enforcing \
-                 rules: the port is either already reachable or blocked by something \
-                 porthole does not manage"
-            };
-            return Err(Error::BackendUnavailable(format!(
-                "{}. {why}",
-                health.detail
-            )));
-        }
+        self.require_enforcing_firewall()?;
 
         if let Some(existing) = self.state.find_by_port(port, protocol) {
             // A foreign-backend entry (see `close_rule`'s own doc comment)
@@ -410,6 +419,11 @@ impl<'a> Engine<'a> {
     /// to -- any listener on that port and protocol refuses, loopback ones
     /// included.
     ///
+    /// Two refusals sit outside that pair. A UDP request is refused before
+    /// any read, because the listening check has no UDP counterpart yet. And
+    /// a firewall that is not confirmed to be enforcing rules is refused
+    /// where `open` refuses it, in the same words.
+    ///
     /// `procfs` is a parameter rather than an `Engine` field because this is
     /// the only operation on this type that reads `/proc` at all.
     pub fn forward(
@@ -419,6 +433,22 @@ impl<'a> Engine<'a> {
         uid: u32,
         procfs: &dyn ProcFs,
     ) -> Result<ManagedRule> {
+        let external = req.port;
+
+        // Ahead of every read, because it is a property of the request rather
+        // than of this machine. The check further down that looks for a local
+        // listener on the external port reads TCP only; for UDP it would find
+        // nothing however much was there, and a check that cannot fail is not
+        // one.
+        if req.protocol == Protocol::Udp {
+            return Err(Error::ForwardCheckUnavailable(format!(
+                "porthole will not create a UDP forward yet: before redirecting a port it \
+                 checks whether something on this machine is already listening on it, and \
+                 that check reads TCP only -- for {external}/udp it would compare against \
+                 nothing"
+            )));
+        }
+
         let published = crate::docker::published(self.runner).map_err(|e| {
             Error::DockerUnreadable(format!(
                 "porthole could not read Docker's published ports, so it cannot say \
@@ -427,11 +457,9 @@ impl<'a> Engine<'a> {
             ))
         })?;
 
-        // The first match on the pair, not the most exposing one
-        // (`docker::advise` picks by exposure, because it is deciding what to
-        // warn about). A host port can carry more than one DNAT rule --
-        // `-p 127.0.0.1:5432:80 -p 0.0.0.0:5432:80` is two -- and this takes
-        // whichever came first in the chain.
+        // A host port can carry more than one DNAT rule --
+        // `-p 127.0.0.1:5432:80 -p 0.0.0.0:5432:80` is two. The first match
+        // wins; the chain is not searched for a best one.
         let mapping = published
             .iter()
             .copied()
@@ -449,8 +477,8 @@ impl<'a> Engine<'a> {
         // record the firewall no longer has is not read as a conflict -- the
         // same reason `open` reconciles ahead of its own already-open check.
         self.reconcile();
+        self.require_enforcing_firewall()?;
 
-        let external = req.port;
         if let Some(existing) = self.state.find_by_port(external, req.protocol) {
             return Err(Error::ExternalPortInUse {
                 port: external,
@@ -2568,6 +2596,110 @@ mod tests {
         assert!(
             backend.forwarded().is_empty(),
             "a refusal must not have reached the firewall"
+        );
+    }
+
+    #[test]
+    fn forward_refuses_udp_and_says_it_is_the_check_that_does_not_reach_yet() {
+        // The listening scan reads /proc/net/tcp and /proc/net/tcp6, so on a
+        // UDP port it finds nothing however much is there. Creating the
+        // forward anyway would run a check that cannot fail and present it as
+        // protection. The message has to say that is what is missing -- a
+        // sentence reading "porthole does not do UDP" would close a door that
+        // is not closed.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DockerChain::Reads(DOCKER_CHAIN_LOOPBACK), Vec::new());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let mut req = forward_req(EXTERNAL_PORT);
+        req.protocol = Protocol::Udp;
+        let err = engine
+            .forward(&req, PUBLISHED_PORT, 1000, &nothing_listening())
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::ForwardCheckUnavailable(_)),
+            "got {err}"
+        );
+        assert_eq!(err.exit_code(), ExitCode::ForwardCheckUnavailable);
+        assert_eq!(err.kind(), "forward_check_unavailable");
+        let text = err.to_string();
+        assert!(
+            text.contains("yet") && text.contains("TCP"),
+            "the message must name the gap and leave it open: {text}"
+        );
+        assert!(
+            text.contains("8443/udp"),
+            "and name the port it was asked about: {text}"
+        );
+
+        assert!(
+            backend.forwarded().is_empty(),
+            "a refusal must not have reached the firewall"
+        );
+        assert!(
+            runner.recorded().is_empty(),
+            "the refusal is a property of the request, so nothing needs reading first"
+        );
+    }
+
+    #[test]
+    fn forward_refuses_while_the_firewall_is_not_running() {
+        // Same refusal `open` makes, in the same words: a rule written where
+        // nothing enforces it is a promise porthole cannot keep, and a user
+        // whose firewall is stopped has to be told that and not something
+        // downstream of it.
+        let harness = Harness::new();
+        let backend = FakeBackend::inactive();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DockerChain::Reads(DOCKER_CHAIN_LOOPBACK), Vec::new());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let err = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &nothing_listening(),
+            )
+            .unwrap_err();
+
+        assert_eq!(err.exit_code(), ExitCode::BackendUnavailable);
+        assert!(
+            backend.forwarded().is_empty(),
+            "a refusal must not have reached the firewall"
+        );
+    }
+
+    #[test]
+    fn forward_refuses_without_claiming_reachability_when_activity_is_unknown() {
+        // The same hedge `open` carries: "the firewall is not enforcing
+        // rules" is a fact only a confirmed-stopped firewall supports, and a
+        // ruleset porthole could not read supports only "porthole could not
+        // tell".
+        let harness = Harness::new();
+        let backend = FakeBackend::active_unknown();
+        let clock = FixedClock(NOW);
+        let runner = DockerRunner::new(DockerChain::Reads(DOCKER_CHAIN_LOOPBACK), Vec::new());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let err = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &nothing_listening(),
+            )
+            .unwrap_err();
+
+        assert_eq!(err.exit_code(), ExitCode::BackendUnavailable);
+        let text = err.to_string();
+        assert!(
+            text.contains("could not read enough of the ruleset"),
+            "must say porthole could not tell, not that the firewall is confirmed \
+             inactive: {text}"
         );
     }
 
