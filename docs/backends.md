@@ -78,6 +78,27 @@ closer tracking of the rule in the firewall: it is tracking of the
 the record of it is corrected on the next porthole command by the same
 reconciliation, in the same direction, with the same silence in the other.
 
+**One consequence of that is worth naming on its own, because it is the one
+place the limit stops being only a limit.** When porthole adds a rich rule it
+lists the zone's rules before and after, and takes the single new one matching
+the port and protocol as the rule it just made — the only identity available
+on this backend. If something else adds a rich rule on the same port and
+protocol in that same instant, the read-back finds two new rules, porthole
+cannot tell which is its own, and it refuses rather than adopt one. The rule
+it added is then in the firewall with no record of it: `porthole list` does
+not show it, `porthole close --all` cannot reach it, and the orphan sweep that
+would clean it up on ufw or nftables does not run here, for the reason above.
+
+For an `open` the leftover is an accept the person asked for. For a `forward`
+it is an unmanaged, untimed **redirect**. The window is narrow — the helper
+holds the exclusive state lock across the whole operation, so only something
+outside porthole writing a rich rule on that exact port and protocol in that
+instant can produce it — but "narrow" is not "impossible", and there is no
+mechanism here that would recover it. What removes it is what removes any
+runtime rich rule: `firewall-cmd --reload`, or a reboot. `firewall-cmd
+--list-rich-rules` is what shows it in the meantime; a `forward-port` rule
+naming a container address is the shape to look for.
+
 That same asymmetry reaches `porthole close --id <id> --forget` (the escape
 hatch for a rule recorded under a backend this machine no longer has — see
 `porthole close --help`). Forgetting a **ufw or nftables** rule is not
