@@ -21,21 +21,52 @@
 //! Everything awkward about this file follows from that: finding the user's
 //! chain, refusing when there is more than one, inserting rather than adding,
 //! and re-reading kernel handles instead of storing them.
-
+//!
+//! # Why there is no `forward` here
+//!
+//! A forward would be a `dnat` in a nat prerouting chain plus, where
+//! something drops forwarded traffic, an accept that lets the redirected
+//! packet through. The accept is the problem.
+//!
+//! It cannot go in a table of porthole's own, for the reason above. That was
+//! measured at the forward hook in the mirror direction: an unrelated `inet`
+//! table with `hook forward ... policy drop`, added beside a working
+//! forward, made it unreachable, and removing the table restored it. A drop
+//! in any forward base chain decides the packet; by the same rule an accept
+//! in one cannot rescue a packet another drops.
+//!
+//! So it would have to go in a forward base chain the host already has. The
+//! arrangement measured to work was a hand-built ruleset with exactly one
+//! such chain and no container runtime anywhere: an accept on the post-DNAT
+//! tuple (`ip saddr <scope> ip daddr <container> tcp dport <container port>`)
+//! in that chain made a redirect reachable that was otherwise dropped.
+//!
+//! That is not the ruleset a forward meets. Docker registers a forward base
+//! chain of its own — `ip filter FORWARD`, at nft priority 0 — which starts
+//! by jumping to `DOCKER-USER`, and which was measured to accept the
+//! redirected traffic already: in a chain it reaches, a rule keyed on the
+//! container's address and port counted the packet, and deleting that one
+//! rule left the connection dying at Docker's own `DROP`. porthole only ever
+//! redirects to a mapping Docker has published, which is exactly what that
+//! rule covers. An accept porthole inserted would land ahead of the jump to
+//! `DOCKER-USER`, where a user's own container policy goes, and no
+//! measurement here shows it carrying anything.
+//!
+//! This backend on a host also running Docker was never measured working
+//! either way; which combinations of the forward base chains such a host
+//! carries would pass was not established. So `forward` refuses. A redirect on its own is
+//! not the smaller alternative: on a ruleset whose forward chain has `policy
+//! drop`, it was measured unreachable.
+//!
 use super::{BackendHealth, BackendId, FirewallBackend, Ownership, RuleHandle};
 use crate::command::{Command, CommandRunner};
 use crate::error::{Error, Result};
 use crate::forward::ForwardTo;
-use crate::model::{OpenRequest, Protocol, Target};
+use crate::model::{OpenRequest, Target};
 use serde::Deserialize;
 
-/// A base chain porthole may write into, named for the hook it was first
-/// used at: the input hook, the only place an inserted accept can be reached.
-///
-/// A forward's redirect reuses this type for a `type nat hook prerouting`
-/// chain. Every field means the same thing there, and nothing that consumes
-/// one — `close_impl` and the argv builders — reads the hook. The name is
-/// what is now narrower than the type, not the type's contents.
+/// A base chain porthole may write into, named for the hook it is used at:
+/// the input hook, the only place an inserted accept can be reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputChain {
     pub family: String,
@@ -153,31 +184,6 @@ fn parse_input_chains(json: &str) -> Result<Vec<InputChain>> {
         .filter(|(chain, hook, kind)| {
             hook.as_deref() == Some("input")
                 && kind.as_deref() == Some("filter")
-                && matches!(chain.family.as_str(), "inet" | "ip")
-        })
-        .map(|(chain, _, _)| chain)
-        .collect())
-}
-
-/// Parse `nft -j list chains`, returning only base chains that can carry a
-/// redirect: `type nat hook prerouting`.
-///
-/// Prerouting, not output: the traffic a forward redirects arrives from the
-/// local network, so it is never generated on this machine.
-///
-/// Reuses [`InputChain`] rather than introducing a second near-identical
-/// struct. Every field means the same thing here, and `close_impl` finds a
-/// rule by marker in a `family table chain` triple without caring which hook
-/// the chain is registered at.
-fn parse_nat_prerouting_chains(json: &str) -> Result<Vec<InputChain>> {
-    Ok(parse_base_chains(json)?
-        .into_iter()
-        .filter(|(chain, hook, kind)| {
-            hook.as_deref() == Some("prerouting")
-                && kind.as_deref() == Some("nat")
-                // Same two families, for the same reason as the
-                // input-hook filter above: a `dnat ip to` statement is an
-                // IPv4 one.
                 && matches!(chain.family.as_str(), "inet" | "ip")
         })
         .map(|(chain, _, _)| chain)
@@ -369,37 +375,6 @@ impl<'a> Nftables<'a> {
         Ok(chains.remove(0))
     }
 
-    /// The one chain porthole may put a redirect in, or a refusal that names
-    /// why not.
-    ///
-    /// The same shape as [`Nftables::discover_single_input_chain`], and the
-    /// same two refusals, at the hook a redirect has to sit at. Zero
-    /// candidates means there is no nat prerouting chain to redirect in;
-    /// more than one means porthole cannot prove which one would decide the
-    /// packet's destination. Neither case mutates anything.
-    fn discover_single_nat_prerouting_chain(&self) -> Result<InputChain> {
-        let cmd = Command::read("nft", ["-j", "list", "chains"]);
-        let out = self.runner.run(&cmd)?.into_ok(&cmd)?;
-        let mut chains = parse_nat_prerouting_chains(&out.stdout)?;
-        if chains.is_empty() {
-            return Err(Error::BackendUnavailable(
-                "no nftables chain is registered at the nat prerouting hook, so there is \
-                 nowhere to write a redirect; porthole has not changed anything"
-                    .to_string(),
-            ));
-        }
-        if chains.len() > 1 {
-            let names: Vec<String> = chains.iter().map(ToString::to_string).collect();
-            return Err(Error::BackendUnavailable(format!(
-                "more than one nftables chain is registered at the nat prerouting hook ({}); \
-                 porthole cannot prove which one decides where a packet goes, so it will not \
-                 claim to have redirected the port",
-                names.join(", ")
-            )));
-        }
-        Ok(chains.remove(0))
-    }
-
     /// Every rule in every chain registered at the input hook, paired with
     /// the chain it came from.
     ///
@@ -465,9 +440,7 @@ impl<'a> Nftables<'a> {
 
         // `insert`, not `add`: `add` appends after the user's drop, where the
         // rule is never reached. This is the entire point of this backend.
-        // `permit_args` builds both, for the accept here and for the accept
-        // half of a forward.
-        let cmd = Command::mutate("nft", Self::permit_args(&chain, req, marker));
+        let cmd = Command::mutate("nft", Self::open_args(&chain, req, marker));
         self.runner.run(&cmd)?.into_ok(&cmd)?;
 
         Ok(RuleHandle::Nftables {
@@ -480,7 +453,7 @@ impl<'a> Nftables<'a> {
 
     /// The argv for the accept `open_impl` writes, into an already-chosen
     /// chain.
-    fn permit_args(chain: &InputChain, req: &OpenRequest, marker: &str) -> Vec<String> {
+    fn open_args(chain: &InputChain, req: &OpenRequest, marker: &str) -> Vec<String> {
         let mut args: Vec<String> = vec![
             "insert".to_string(),
             "rule".to_string(),
@@ -509,96 +482,6 @@ impl<'a> Nftables<'a> {
         // parsed. Do not "clean up" these quotes -- they are load-bearing.
         args.push(format!("\"{marker}\""));
         args
-    }
-
-    /// The argv for a forward's redirect: a `dnat` in the nat prerouting
-    /// chain, matching the external port and scoped to `req.target`.
-    fn redirect_args(
-        chain: &InputChain,
-        req: &OpenRequest,
-        to: &ForwardTo,
-        protocol: Protocol,
-        marker: &str,
-    ) -> Vec<String> {
-        let mut args: Vec<String> = vec![
-            "insert".to_string(),
-            "rule".to_string(),
-            chain.family.clone(),
-            chain.table.clone(),
-            chain.name.clone(),
-            protocol.to_string(),
-            "dport".to_string(),
-            // The external port: what the local network connects to.
-            req.port.to_string(),
-        ];
-        if let Target::Network { cidr } = req.target {
-            args.push("ip".to_string());
-            args.push("saddr".to_string());
-            args.push(cidr.to_string());
-        }
-        args.push("dnat".to_string());
-        // Measured against nft 1.1.6: in an `inet` table a bare `dnat to` is
-        // rejected -- "specify `dnat ip' or `dnat ip6' in inet table to
-        // disambiguate" -- while an `ip` table takes `dnat to`. An `ip`
-        // table also accepts the qualified form, but emitting the qualifier
-        // only where it is required keeps this off a spelling whose
-        // acceptance elsewhere was never the point.
-        if chain.family == "inet" {
-            args.push("ip".to_string());
-        }
-        args.push("to".to_string());
-        // The container's own address on Docker's network, never loopback: a
-        // redirect to `127.0.0.0/8` is only delivered when `route_localnet`
-        // is set, and porthole changes no sysctl.
-        args.push(format!("{}:{}", to.container_addr, to.container_port));
-        args.push("comment".to_string());
-        // Literal quotes, for the reason `permit_args` gives.
-        args.push(format!("\"{marker}\""));
-        args
-    }
-
-    fn forward_impl(&self, req: &OpenRequest, to: &ForwardTo, marker: &str) -> Result<RuleHandle> {
-        let protocol = super::forward_protocol(req, to)?;
-        // Both discoveries first. Each one refuses without mutating
-        // anything, so a refusal from the second cannot leave the first
-        // half's rule behind.
-        let filter = self.discover_single_input_chain()?;
-        let nat = self.discover_single_nat_prerouting_chain()?;
-
-        // The redirect goes in first. Between the two writes the ruleset
-        // holds a redirect and no accept, the less exposed of the two
-        // half-built states; `close`'s removal order mirrors it.
-        let add_redirect =
-            Command::mutate("nft", Self::redirect_args(&nat, req, to, protocol, marker));
-        self.runner.run(&add_redirect)?.into_ok(&add_redirect)?;
-
-        let add_permit = Command::mutate("nft", Self::permit_args(&filter, req, marker));
-        if let Err(e) = self
-            .runner
-            .run(&add_permit)
-            .and_then(|out| out.into_ok(&add_permit))
-        {
-            // Take the redirect back out rather than leave a rule behind
-            // that nothing recorded. The attempt's own outcome is discarded:
-            // the error worth reporting is the one that stopped the forward.
-            let _ = self.close_impl(&nat.family, &nat.table, &nat.name, marker);
-            return Err(e);
-        }
-
-        Ok(RuleHandle::Forward {
-            permit: Box::new(RuleHandle::Nftables {
-                family: filter.family,
-                table: filter.table,
-                chain: filter.name,
-                marker: marker.to_string(),
-            }),
-            redirect: Box::new(RuleHandle::Nftables {
-                family: nat.family,
-                table: nat.table,
-                chain: nat.name,
-                marker: marker.to_string(),
-            }),
-        })
     }
 
     fn close_impl(&self, family: &str, table: &str, chain: &str, marker: &str) -> Result<()> {
@@ -641,8 +524,17 @@ impl FirewallBackend for Nftables<'_> {
         self.open_impl(req, marker)
     }
 
-    fn forward(&self, req: &OpenRequest, to: &ForwardTo, marker: &str) -> Result<RuleHandle> {
-        self.forward_impl(req, to, marker)
+    /// Refused, and nothing is run at all -- not even a read.
+    ///
+    /// The module docs carry what was measured and what follows from it.
+    fn forward(&self, _req: &OpenRequest, _to: &ForwardTo, _marker: &str) -> Result<RuleHandle> {
+        Err(Error::ForwardUnsupported(
+            "nftables cannot redirect a port: a redirect on its own does not reach a \
+             container through a forward chain that drops, and the accept that would carry \
+             it belongs in the chain deciding forwarded traffic, where porthole does not \
+             write"
+                .to_string(),
+        ))
     }
 
     fn close(&self, handle: &RuleHandle) -> Result<()> {
@@ -653,16 +545,6 @@ impl FirewallBackend for Nftables<'_> {
                 chain,
                 marker,
             } => self.close_impl(family, table, chain, marker),
-            // Permit first, then redirect: an interruption between the two
-            // leaves a redirect nothing is permitted to reach, rather than a
-            // permitted port that still reaches a container. `?` is what
-            // makes the order mean something — a permit that would not go
-            // stops the removal here, and the caller is told, instead of the
-            // redirect going next and `Ok(())` claiming both halves are gone.
-            RuleHandle::Forward { permit, redirect } => {
-                self.close(permit)?;
-                self.close(redirect)
-            }
             other @ (RuleHandle::Firewalld { .. } | RuleHandle::Ufw { .. }) => Err(
                 Error::Unexpected(format!("the nftables backend was handed a {other:?}")),
             ),
@@ -708,14 +590,6 @@ impl FirewallBackend for Nftables<'_> {
     /// diagnostic `list_rules`, would hand the orphan sweep a rule to delete
     /// on exactly the same guess `open` already declined to make.
     ///
-    /// This reads one filter chain, so a forward's two rules are treated
-    /// unequally here. The permit is in that chain and is returned, in the
-    /// same shape `open`'s rule has -- reconciliation must therefore
-    /// recognise it as belonging to a stored `RuleHandle::Forward`, which it
-    /// does through `RuleHandle::leaves`. The redirect is in a nat
-    /// prerouting chain, which nothing in this function reads, so an
-    /// orphaned redirect is never offered for removal and stays until a
-    /// reboot or a ruleset reload clears it.
     fn owned_rules(&self) -> Result<Option<Vec<RuleHandle>>> {
         let chain = self.discover_single_input_chain()?;
         let cmd = Command::read(
@@ -1413,220 +1287,59 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_forward_dnats_to_the_container_address_and_never_to_loopback() {
-        // The whole point: traffic goes to the container's own address on
-        // Docker's network. 127.0.0.1 would need route_localnet, which
-        // porthole does not touch.
-        let runner = RecordingRunner::with_responses(vec![
-            Output::stdout(CHAINS_ONE_INPUT), // discover the filter chain
-            Output::stdout(CHAINS_ONE_INPUT), // discover the nat chain
-            Output::empty(),                  // insert the redirect
-            Output::empty(),                  // insert the permit
-        ]);
-        let handle = Nftables::new(&runner)
-            .forward(&request(3000, subnet()), &to(), "porthole:abc")
-            .unwrap();
-
-        let mutating = mutations(&runner);
-        assert_eq!(mutating.len(), 2, "a forward is two rules: {mutating:#?}");
-        // CHAINS_ONE_INPUT's nat chain is in the `ip` family, where a bare
-        // `dnat to` is what nft accepts -- see the inet test below.
-        assert_eq!(
-            mutating[0],
-            "nft insert rule ip nat prerouting tcp dport 3000 \
-             ip saddr 10.10.10.0/24 dnat to 172.18.0.2:8080 comment '\"porthole:abc\"'"
-        );
-        assert!(
-            !mutating.iter().any(|c| c.contains("127.0.0.1")),
-            "a command named loopback, which cannot be a redirect destination here: {mutating:#?}"
-        );
-        assert_eq!(
-            handle,
-            RuleHandle::Forward {
-                permit: Box::new(RuleHandle::Nftables {
-                    family: "inet".to_string(),
-                    table: "filter".to_string(),
-                    chain: "input".to_string(),
-                    marker: "porthole:abc".to_string(),
-                }),
-                redirect: Box::new(RuleHandle::Nftables {
-                    family: "ip".to_string(),
-                    table: "nat".to_string(),
-                    chain: "prerouting".to_string(),
-                    marker: "porthole:abc".to_string(),
-                }),
-            }
-        );
-    }
-
-    #[test]
-    fn a_forward_adds_the_redirect_before_the_permit() {
-        // The mirror of the removal order: between the two writes the
-        // ruleset holds a redirect and no accept, not an accept and no
-        // redirect.
-        let runner = RecordingRunner::with_responses(vec![
-            Output::stdout(CHAINS_ONE_INPUT),
-            Output::stdout(CHAINS_ONE_INPUT),
-            Output::empty(),
-            Output::empty(),
-        ]);
-        Nftables::new(&runner)
-            .forward(&request(3000, subnet()), &to(), "porthole:abc")
-            .unwrap();
-
-        let mutating = mutations(&runner);
-        assert!(mutating[0].contains("dnat"), "got: {}", mutating[0]);
-        assert_eq!(
-            mutating[1],
-            "nft insert rule inet filter input tcp dport 3000 \
-             ip saddr 10.10.10.0/24 accept comment '\"porthole:abc\"'",
-            "the permit half must be exactly what `open` writes"
-        );
-    }
-
-    #[test]
-    fn a_forward_in_an_inet_nat_table_qualifies_the_dnat_with_its_family() {
-        // Measured against nft 1.1.6: in an `inet` table a bare `dnat to` is
-        // rejected outright -- "specify `dnat ip' or `dnat ip6' in inet
-        // table to disambiguate" -- so the family qualifier is not
-        // decoration, it is the difference between a rule and a syntax
-        // error.
-        const CHAINS_INET_NAT: &str = r#"{"nftables":[
-          {"metainfo":{"version":"1.1.3","json_schema_version":1}},
-          {"chain":{"family":"inet","table":"filter","name":"input","handle":1,
-                    "type":"filter","hook":"input","prio":0,"policy":"drop"}},
-          {"chain":{"family":"inet","table":"natx","name":"pre","handle":1,
-                    "type":"nat","hook":"prerouting","prio":-100,"policy":"accept"}}
-        ]}"#;
-        let runner = RecordingRunner::with_responses(vec![
-            Output::stdout(CHAINS_INET_NAT),
-            Output::stdout(CHAINS_INET_NAT),
-            Output::empty(),
-            Output::empty(),
-        ]);
-        Nftables::new(&runner)
-            .forward(&request(3000, subnet()), &to(), "porthole:abc")
-            .unwrap();
-
-        assert_eq!(
-            mutations(&runner)[0],
-            "nft insert rule inet natx pre tcp dport 3000 \
-             ip saddr 10.10.10.0/24 dnat ip to 172.18.0.2:8080 comment '\"porthole:abc\"'"
-        );
-    }
-
-    #[test]
-    fn a_forward_refuses_when_no_chain_is_registered_at_the_nat_prerouting_hook() {
-        // Nothing to redirect in. The same refusal shape `open` gives for a
-        // missing input chain, and like it, nothing is mutated.
-        const CHAINS_NO_NAT: &str = r#"{"nftables":[
-          {"metainfo":{"version":"1.1.3","json_schema_version":1}},
-          {"chain":{"family":"inet","table":"filter","name":"input","handle":1,
-                    "type":"filter","hook":"input","prio":0,"policy":"drop"}}
-        ]}"#;
-        let runner = RecordingRunner::with_responses(vec![
-            Output::stdout(CHAINS_NO_NAT),
-            Output::stdout(CHAINS_NO_NAT),
-        ]);
+    fn nftables_refuses_to_forward_and_runs_nothing_at_all() {
+        // "Runs nothing at all" is the load-bearing half. A refusal that
+        // first discovered a chain, or wrote a redirect and then gave up,
+        // would leave the ruleset changed by a call that reports having
+        // done nothing.
+        //
+        // The message is pinned because it is what a user is left with. It
+        // says where the missing rule would have to go, not that porthole
+        // cannot find a chain -- it can; the module docs carry why writing
+        // there was not something this backend could stand behind.
+        let runner = RecordingRunner::new();
         let err = Nftables::new(&runner)
             .forward(&request(3000, subnet()), &to(), "porthole:abc")
             .unwrap_err();
-        assert_eq!(err.exit_code(), ExitCode::BackendUnavailable);
+
+        assert_eq!(err.exit_code(), ExitCode::ForwardUnsupported);
         assert!(
-            mutations(&runner).is_empty(),
-            "refusing must not change the ruleset"
+            err.to_string().contains("nftables cannot redirect a port"),
+            "got: {err}"
         );
-    }
-
-    #[test]
-    fn a_forward_that_cannot_permit_takes_its_redirect_back_out() {
-        // Otherwise the ruleset keeps a redirect nothing recorded, and
-        // nothing would ever come back for it.
-        let runner = RecordingRunner::with_responses(vec![
-            Output::stdout(CHAINS_ONE_INPUT),
-            Output::stdout(CHAINS_ONE_INPUT),
-            Output::empty(),                 // the redirect goes in
-            Output::failure("nft: boom"),    // the permit does not
-            Output::stdout(MARKED_NAT_RULE), // the undo re-reads the nat chain
-            Output::empty(),                 // and deletes what it found
-        ]);
-        let err = Nftables::new(&runner)
-            .forward(&request(3000, subnet()), &to(), "porthole:abc")
-            .unwrap_err();
         assert!(
-            err.to_string().contains("boom"),
-            "the error must be the one that stopped the forward, not the undo's: {err}"
-        );
-        assert_eq!(
-            mutations(&runner).last().unwrap(),
-            "nft delete rule ip nat prerouting handle 7",
-            "the redirect must be taken back out"
-        );
-    }
-
-    #[test]
-    fn closing_a_forward_removes_the_permit_first_then_the_redirect() {
-        // An interruption between the two then leaves a redirect nothing is
-        // permitted to reach, rather than a permitted port that still
-        // reaches a container.
-        let runner = RecordingRunner::with_responses(vec![
-            Output::stdout(MARKED_FILTER_RULE),
-            Output::empty(),
-            Output::stdout(MARKED_NAT_RULE),
-            Output::empty(),
-        ]);
-        Nftables::new(&runner).close(&forward_handle()).unwrap();
-
-        assert_eq!(
-            mutations(&runner),
-            vec![
-                "nft delete rule inet filter input handle 4",
-                "nft delete rule ip nat prerouting handle 7",
-            ]
-        );
-    }
-
-    #[test]
-    fn a_forward_whose_permit_will_not_go_is_an_error_and_leaves_the_redirect() {
-        // The negative control for the test above: without this, the order
-        // is only decoration, because a failed permit removal would be
-        // followed by the redirect's and the whole close would still report
-        // success. A close returns Ok only when both halves were removed.
-        const NO_MARKED_RULE: &str = r#"{"nftables":[
-          {"metainfo":{"version":"1.1.3","json_schema_version":1}}
-        ]}"#;
-        let runner = RecordingRunner::with_responses(vec![Output::stdout(NO_MARKED_RULE)]);
-        let err = Nftables::new(&runner).close(&forward_handle()).unwrap_err();
-        assert_eq!(err.exit_code(), ExitCode::RuleNotFound);
-        assert_eq!(
-            runner.recorded().len(),
-            1,
-            "the redirect's removal must not have been attempted: {:#?}",
+            runner.recorded().is_empty(),
+            "refusing must run no command at all, not even a read: {:#?}",
             runner.recorded()
         );
     }
 
-    /// A `dnat` rule as `nft -j list chain` really reports one -- captured
-    /// from nft 1.1.6 in a container, comment and all.
-    const MARKED_NAT_RULE: &str = r#"{"nftables":[
-      {"metainfo":{"version":"1.1.6","json_schema_version":1}},
-      {"rule":{"family":"ip","table":"nat","chain":"prerouting","handle":7,
-               "comment":"porthole:abc",
-               "expr":[
-                 {"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":3000}},
-                 {"dnat":{"addr":"172.18.0.2","port":8080}}
-               ]}}
-    ]}"#;
+    #[test]
+    fn no_nat_chain_is_ever_written_to() {
+        // The refusal above only pins that `forward` runs nothing. This
+        // drives the two calls that do write -- `open`, then `forward` --
+        // and asserts no command from either names a nat chain or a dnat.
+        // `close` is not driven here; it deletes by the handle it is given
+        // and builds no rule of its own.
+        let runner = RecordingRunner::with_responses(vec![
+            Output::stdout(CHAINS_ONE_INPUT),
+            Output::empty(),
+        ]);
+        let backend = Nftables::new(&runner);
+        backend
+            .open(&request(5173, subnet()), "porthole:abc")
+            .unwrap();
+        let _ = backend.forward(&request(3000, subnet()), &to(), "porthole:abc");
 
-    const MARKED_FILTER_RULE: &str = r#"{"nftables":[
-      {"metainfo":{"version":"1.1.6","json_schema_version":1}},
-      {"rule":{"family":"inet","table":"filter","chain":"input","handle":4,
-               "comment":"porthole:abc",
-               "expr":[
-                 {"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":3000}},
-                 {"accept":null}
-               ]}}
-    ]}"#;
+        for cmd in runner.recorded() {
+            let shown = cmd.display();
+            assert!(!shown.contains("dnat"), "a dnat was issued: {shown}");
+            assert!(
+                !shown.contains("nat prerouting"),
+                "a nat chain was named: {shown}"
+            );
+        }
+    }
 
     fn to() -> ForwardTo {
         ForwardTo {
@@ -1635,33 +1348,6 @@ pub(crate) mod tests {
             published_port: 3000,
             protocol: Protocol::Tcp,
         }
-    }
-
-    fn forward_handle() -> RuleHandle {
-        RuleHandle::Forward {
-            permit: Box::new(RuleHandle::Nftables {
-                family: "inet".to_string(),
-                table: "filter".to_string(),
-                chain: "input".to_string(),
-                marker: "porthole:abc".to_string(),
-            }),
-            redirect: Box::new(RuleHandle::Nftables {
-                family: "ip".to_string(),
-                table: "nat".to_string(),
-                chain: "prerouting".to_string(),
-                marker: "porthole:abc".to_string(),
-            }),
-        }
-    }
-
-    /// Every command that changes the ruleset, in order, as it would be run.
-    fn mutations(runner: &RecordingRunner) -> Vec<String> {
-        runner
-            .recorded()
-            .iter()
-            .filter(|c| c.effect == Effect::Mutate)
-            .map(|c| c.display())
-            .collect()
     }
 
     #[test]

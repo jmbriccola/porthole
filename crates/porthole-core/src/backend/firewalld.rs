@@ -110,7 +110,8 @@ impl<'a> Firewalld<'a> {
     /// `port` and `protocol` are the clauses the read-back matches on, not
     /// necessarily anything about the rule's effect: both an accept rule and
     /// a `forward-port` rule name the external port and the protocol that
-    /// way, which is what lets one read-back serve both halves of a forward.
+    /// way, which is what lets one read-back serve `open` and `forward`
+    /// alike.
     fn add_rich_rule(
         &self,
         zone: String,
@@ -220,63 +221,47 @@ impl FirewallBackend for Firewalld<'_> {
         self.add_rich_rule(zone, &rule, req.port, req.protocol)
     }
 
-    /// Two rich rules: a `forward-port` redirect, then an accept for
-    /// `req.port`.
+    /// One rich rule: the `forward-port` redirect.
     ///
-    /// Measured on firewalld 2.4.4 in a container: a `forward-port` rich rule
-    /// renders to exactly one nftables rule, a `dnat` in
-    /// `nat_PRE_<zone>_allow`, and adds nothing to any filter chain — so the
-    /// permit is a second rule, not something the redirect brings with it.
+    /// Measured on firewalld 2.4.4 in a container, against a real Docker
+    /// 29.8.0 container published on loopback and a client in its own
+    /// network namespace, with counter-only rules at the input and forward
+    /// hooks:
     ///
-    /// The redirect is written first. Between the two writes the zone holds a
-    /// redirect and no accept, which is the less exposed of the two
-    /// half-built states; the removal order in `close` mirrors it.
+    /// - With the redirect in the zone, the client's connection completed
+    ///   and **zero** packets were counted at the input hook. The SYN
+    ///   arrived at the forward hook already carrying `ct status dnat`, and
+    ///   `filter_FORWARD`'s second rule is `ct status dnat accept`, ahead of
+    ///   the jump to any zone chain. Setting the zone's target to `DROP` did
+    ///   not stop it.
+    /// - Adding an accept for the external port beside the redirect changed
+    ///   nothing: the two arrangements were byte-for-byte identical in every
+    ///   counter.
+    /// - That accept on its own, with a service of the host's own bound to
+    ///   `0.0.0.0` on the external port, let a client on the local network
+    ///   reach *that* service. It is a working accept for something else.
+    ///
+    /// So a forward here is one rule, and its handle is the ordinary
+    /// firewalld handle for it. Nothing porthole writes permits the
+    /// forwarded traffic; what does was measured to be already there, and
+    /// is not porthole's to write.
     fn forward(&self, req: &OpenRequest, to: &ForwardTo, _marker: &str) -> Result<RuleHandle> {
         // The marker goes nowhere, for the same reason `open` drops it: the
-        // rich language has no comment element. Both stored rule strings are
-        // the identity, and `ownership()` reports `Unprovable` for both.
+        // rich language has no comment element. The stored rule string is
+        // the identity, and `ownership()` reports `Unprovable`.
         let protocol = super::forward_protocol(req, to)?;
         let zone = self.managed_zone()?;
-
-        let redirect = self.add_rich_rule(
-            zone.clone(),
+        self.add_rich_rule(
+            zone,
             &Self::forward_rich_rule(req, to, protocol),
             req.port,
             protocol,
-        )?;
-
-        let permit = match self.add_rich_rule(zone, &Self::rich_rule(req), req.port, req.protocol) {
-            Ok(handle) => handle,
-            Err(e) => {
-                // Take the redirect back out rather than leave a rule behind
-                // that nothing recorded. The attempt's own outcome is
-                // discarded: the error worth reporting is the one that
-                // stopped the forward, and a caller told about a failed undo
-                // instead would be told about the wrong thing.
-                let _ = self.close(&redirect);
-                return Err(e);
-            }
-        };
-
-        Ok(RuleHandle::Forward {
-            permit: Box::new(permit),
-            redirect: Box::new(redirect),
-        })
+        )
     }
 
     fn close(&self, handle: &RuleHandle) -> Result<()> {
         match handle {
             RuleHandle::Firewalld { zone, rich_rule } => self.remove_rich_rule(zone, rich_rule),
-            // Permit first, then redirect: an interruption between the two
-            // leaves a redirect nothing is permitted to reach, rather than a
-            // permitted port that still reaches a container. `?` is what
-            // makes the order mean something — a permit that would not go
-            // stops the removal here, and the caller is told, instead of the
-            // redirect going next and `Ok(())` claiming both halves are gone.
-            RuleHandle::Forward { permit, redirect } => {
-                self.close(permit)?;
-                self.close(redirect)
-            }
             // A caller bug, not a firewall state: the engine only ever hands a
             // backend the handle it itself produced. Enumerated rather than a
             // wildcard so the next variant this enum gains breaks the build
@@ -591,13 +576,21 @@ pub(crate) mod tests {
 
     // --- forward -------------------------------------------------------
 
-    /// Captured verbatim from firewalld 2.4.4 in a container: these are the
-    /// two strings `--list-rich-rules` prints back after adding the rules
+    /// Captured verbatim from firewalld 2.4.4 in a container: this is the
+    /// string `--list-rich-rules` prints back after adding the rule
     /// `forward` builds, byte for byte. If `forward_rich_rule` ever stops
-    /// producing the first of them, firewalld is being asked for something
-    /// other than what was measured.
-    const FORWARD_REDIRECT: &str = r#"rule family="ipv4" source address="10.10.10.0/24" forward-port port="3000" protocol="tcp" to-port="8080" to-addr="172.18.0.2""#;
-    const FORWARD_PERMIT: &str = r#"rule family="ipv4" source address="10.10.10.0/24" port port="3000" protocol="tcp" accept"#;
+    /// producing it, firewalld is being asked for something other than what
+    /// was measured.
+    pub(crate) const FORWARD_REDIRECT: &str = r#"rule family="ipv4" source address="10.10.10.0/24" forward-port port="3000" protocol="tcp" to-port="8080" to-addr="172.18.0.2""#;
+
+    /// The accept a forward must **not** write, spelled as firewalld would
+    /// print it back. It is exactly what `open` writes for the same request
+    /// -- `a_forward_writes_no_accept_for_the_external_port` asserts that
+    /// equality rather than trusting this literal -- and adding it beside
+    /// the redirect was measured to carry none of the forwarded traffic
+    /// while exposing a host service on the external port to the local
+    /// network.
+    const THE_ACCEPT_A_FORWARD_MUST_NOT_WRITE: &str = r#"rule family="ipv4" source address="10.10.10.0/24" port port="3000" protocol="tcp" accept"#;
 
     fn forward_request() -> OpenRequest {
         OpenRequest {
@@ -616,17 +609,14 @@ pub(crate) mod tests {
     }
 
     /// Scripted responses for a successful `forward`: the zone lookup, then
-    /// one add-and-read-back for each half, redirect first.
+    /// one add-and-read-back.
     fn forward_script() -> Vec<Output> {
         vec![
             Output::stdout(ROUTE_JSON),
             Output::stdout(ZONE),
-            Output::stdout(""),        // --list-rich-rules, before the redirect
-            Output::stdout("success"), // --add-rich-rule, the redirect
-            Output::stdout(FORWARD_REDIRECT), // after the redirect
-            Output::stdout(FORWARD_REDIRECT), // before the permit
-            Output::stdout("success"), // --add-rich-rule, the permit
-            Output::stdout(&format!("{FORWARD_REDIRECT}\n{FORWARD_PERMIT}")),
+            Output::stdout(""),               // --list-rich-rules, before
+            Output::stdout("success"),        // --add-rich-rule
+            Output::stdout(FORWARD_REDIRECT), // after
         ]
     }
 
@@ -654,12 +644,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_forward_is_two_rules_and_the_permit_is_the_one_open_would_write() {
-        // Measured on firewalld 2.4.4: a `forward-port` rich rule renders to
-        // one nftables rule, a dnat in nat_PRE_<zone>_allow, and to nothing
-        // in any filter chain. So the permit is a rule of its own, and this
-        // pins that it is the very rule `open` writes for the same request
-        // rather than a second spelling that could drift from it.
+    fn a_forward_is_one_rule_and_its_handle_is_that_rule() {
         let runner = RecordingRunner::with_responses(forward_script());
         let handle = Firewalld::new(&runner)
             .forward(&forward_request(), &forward_to(), "porthole:test")
@@ -667,42 +652,59 @@ pub(crate) mod tests {
 
         assert_eq!(
             handle,
-            RuleHandle::Forward {
-                permit: Box::new(RuleHandle::Firewalld {
-                    zone: ZONE.to_string(),
-                    rich_rule: FORWARD_PERMIT.to_string(),
-                }),
-                redirect: Box::new(RuleHandle::Firewalld {
-                    zone: ZONE.to_string(),
-                    rich_rule: FORWARD_REDIRECT.to_string(),
-                }),
-            }
+            RuleHandle::Firewalld {
+                zone: ZONE.to_string(),
+                rich_rule: FORWARD_REDIRECT.to_string(),
+            },
+            "a forward's handle is the ordinary handle for the one rule it wrote"
         );
-        assert_eq!(
-            FORWARD_PERMIT,
-            Firewalld::rich_rule(&forward_request()),
-            "the permit half must be exactly what `open` writes"
-        );
-    }
-
-    #[test]
-    fn a_forward_adds_the_redirect_before_the_permit() {
-        // The mirror of the removal order: between the two writes the zone
-        // holds a redirect and no accept, not an accept and no redirect.
-        let runner = RecordingRunner::with_responses(forward_script());
-        Firewalld::new(&runner)
-            .forward(&forward_request(), &forward_to(), "porthole:test")
-            .unwrap();
-
         let adds: Vec<String> = runner
             .recorded()
             .iter()
             .filter(|c| c.args.iter().any(|a| a.starts_with("--add-rich-rule=")))
             .map(|c| c.display())
             .collect();
-        assert_eq!(adds.len(), 2, "a forward is two rules: {adds:#?}");
+        assert_eq!(adds.len(), 1, "a forward is one rule: {adds:#?}");
         assert!(adds[0].contains("forward-port"), "got: {}", adds[0]);
-        assert!(adds[1].contains("accept"), "got: {}", adds[1]);
+    }
+
+    #[test]
+    fn a_forward_writes_no_accept_for_the_external_port() {
+        // The rule this asserts the absence of is a real accept: measured
+        // on firewalld 2.4.4, with a service of the host's own bound to
+        // `0.0.0.0:3000` and only this rule installed, a client on the
+        // local network reached that service. Measured in the same
+        // container, it carries none of the forwarded traffic -- with the
+        // redirect present, zero packets reach the input hook at all.
+        //
+        // So this is the whole difference between a forward and a forward
+        // that also opens the host's own port 3000 to the local network,
+        // and nothing about which commands are issued would show it. Note
+        // what this does *not* assert: that the forward works. No packet
+        // was sent here.
+        assert_eq!(
+            THE_ACCEPT_A_FORWARD_MUST_NOT_WRITE,
+            Firewalld::rich_rule(&forward_request()),
+            "the literal below must stay the rule `open` writes, or this test \
+             asserts the absence of something porthole never wrote anyway"
+        );
+
+        let runner = RecordingRunner::with_responses(forward_script());
+        Firewalld::new(&runner)
+            .forward(&forward_request(), &forward_to(), "porthole:test")
+            .unwrap();
+
+        for cmd in runner.recorded() {
+            let shown = cmd.display();
+            assert!(
+                !shown.contains(THE_ACCEPT_A_FORWARD_MUST_NOT_WRITE),
+                "a forward wrote the accept that opens the host's own port: {shown}"
+            );
+            assert!(
+                !shown.contains("--add-rich-rule=") || shown.contains("forward-port"),
+                "a forward added a rich rule that is not the redirect: {shown}"
+            );
+        }
     }
 
     #[test]
@@ -736,7 +738,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_forward_whose_two_halves_disagree_on_protocol_is_refused() {
+    fn a_forward_whose_outside_and_inside_protocols_disagree_is_refused() {
         // One rich rule carries one `protocol=`, and it governs both the
         // match on the external port and the destination. There is no
         // spelling for a disagreement, so it must not be silently resolved.
@@ -757,105 +759,53 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_forward_that_cannot_permit_takes_its_redirect_back_out() {
-        // Otherwise the zone keeps a redirect nothing recorded, and nothing
-        // would ever come back for it.
-        let runner = RecordingRunner::with_responses(vec![
-            Output::stdout(ROUTE_JSON),
-            Output::stdout(ZONE),
-            Output::stdout(""),
-            Output::stdout("success"),
-            Output::stdout(FORWARD_REDIRECT),
-            Output::stdout(FORWARD_REDIRECT),
-            Output::failure("Error: INVALID_RULE"),
-        ]);
-        let err = Firewalld::new(&runner)
-            .forward(&forward_request(), &forward_to(), "porthole:test")
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("INVALID_RULE"),
-            "the error must be the one that stopped the forward, not the undo's: {err}"
-        );
-
-        let last = runner.recorded().last().unwrap().display();
-        assert_eq!(
-            last,
-            format!("firewall-cmd --zone={ZONE} '--remove-rich-rule={FORWARD_REDIRECT}'"),
-            "the redirect must be taken back out"
-        );
-    }
-
-    #[test]
-    fn closing_a_forward_removes_the_permit_first_then_the_redirect() {
-        // An interruption between the two then leaves a redirect nothing is
-        // permitted to reach, rather than a permitted port that still
-        // reaches a container.
+    fn closing_a_forward_removes_the_one_rule_it_wrote() {
         let runner = RecordingRunner::new();
         Firewalld::new(&runner).close(&forward_handle()).unwrap();
 
         let cmds = runner.recorded();
-        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds.len(), 1, "a forward is one rule: {cmds:#?}");
         assert_eq!(
             cmds[0].display(),
-            format!("firewall-cmd --zone={ZONE} '--remove-rich-rule={FORWARD_PERMIT}'")
-        );
-        assert_eq!(
-            cmds[1].display(),
             format!("firewall-cmd --zone={ZONE} '--remove-rich-rule={FORWARD_REDIRECT}'")
         );
     }
 
-    #[test]
-    fn a_forward_whose_permit_will_not_go_is_an_error_and_leaves_the_redirect() {
-        // The negative control for the test above: without this, the order
-        // is only decoration, because a failed permit removal would be
-        // followed by the redirect's and the whole close would still report
-        // success. A close returns Ok only when both commands did.
-        let runner = RecordingRunner::with_responses(vec![Output {
-            status: 1,
-            stdout: String::new(),
-            stderr: "Error: INVALID_ZONE: NoSuchZone".into(),
-        }]);
-        let err = Firewalld::new(&runner)
-            .close(&forward_handle())
-            .unwrap_err();
-        assert!(err.to_string().contains("INVALID_ZONE"), "got: {err}");
-        assert_eq!(
-            runner.recorded().len(),
-            1,
-            "the redirect's removal must not have been attempted"
-        );
-    }
-
     fn forward_handle() -> RuleHandle {
-        RuleHandle::Forward {
-            permit: Box::new(RuleHandle::Firewalld {
-                zone: ZONE.to_string(),
-                rich_rule: FORWARD_PERMIT.to_string(),
-            }),
-            redirect: Box::new(RuleHandle::Firewalld {
-                zone: ZONE.to_string(),
-                rich_rule: FORWARD_REDIRECT.to_string(),
-            }),
+        RuleHandle::Firewalld {
+            zone: ZONE.to_string(),
+            rich_rule: FORWARD_REDIRECT.to_string(),
         }
     }
 
     #[test]
-    fn a_forward_under_dry_run_withholds_both_adds() {
+    fn a_forward_under_dry_run_withholds_its_add() {
         use crate::command::DryRunRunner;
         let inner = RecordingRunner::with_responses(vec![
             Output::stdout(ROUTE_JSON),
             Output::stdout(ZONE),
-            Output::stdout(""), // before the redirect
-            Output::stdout(""), // before the permit
+            Output::stdout(""), // --list-rich-rules, before
         ]);
         let runner = DryRunRunner::new(Box::new(inner));
         let handle = Firewalld::new(&runner)
             .forward(&forward_request(), &forward_to(), "porthole:test")
             .unwrap();
 
-        assert_eq!(handle, forward_handle());
-        assert_eq!(runner.recorded().len(), 2, "two withheld mutations");
+        // Under dry-run nothing is added, so the read-back is skipped and
+        // the handle carries the rule as constructed rather than as
+        // firewalld would normalise it.
+        assert_eq!(
+            handle,
+            RuleHandle::Firewalld {
+                zone: ZONE.to_string(),
+                rich_rule: Firewalld::forward_rich_rule(
+                    &forward_request(),
+                    &forward_to(),
+                    Protocol::Tcp
+                ),
+            }
+        );
+        assert_eq!(runner.recorded().len(), 1, "one withheld mutation");
     }
 
     #[test]
