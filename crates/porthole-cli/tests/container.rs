@@ -1932,3 +1932,168 @@ nft add rule inet filter input iif lo accept";
          match a hand-written expected string above: {nft_check}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// What a firewalld forward renders to.
+// ---------------------------------------------------------------------------
+
+/// Every `chain <name> { ... }` block in one `nft list table` dump, as
+/// `(name, body)`.
+///
+/// A chain's body ends at the first line that is a lone tab-indented `}` --
+/// the shape `nft` prints for a table's direct children, and firewalld's
+/// chains are all direct children of `table inet firewalld`.
+fn nft_chains(ruleset: &str) -> Vec<(String, String)> {
+    let mut chains = Vec::new();
+    let mut rest = ruleset;
+    while let Some(at) = rest.find("chain ") {
+        let after = &rest[at + "chain ".len()..];
+        let Some(brace) = after.find(" {") else { break };
+        let name = after[..brace].trim().to_string();
+        let body = &after[brace + 2..];
+        let Some(end) = body.find("\n\t}") else { break };
+        chains.push((name, body[..end].to_string()));
+        rest = &body[end..];
+    }
+    chains
+}
+
+/// The rules a firewalld forward really writes, read out of the kernel's own
+/// rendering rather than out of the commands porthole issued.
+///
+/// This is the assertion the milestone was missing. Until it, a forward was
+/// two rich rules -- the redirect plus an accept for the external port --
+/// and every test of it asserted which `firewall-cmd` invocations were made,
+/// which all passed. What none of them could see is that the accept opens
+/// the *host's own* port on that number to the local network while carrying
+/// none of the forwarded traffic; a spike measured both halves of that with
+/// packet counters, and this is what keeps the accept from coming back.
+///
+/// Two things are asserted about the same real ruleset, and the second is
+/// what makes the first mean anything:
+///
+/// 1. With the redirect in the zone, no `filter_IN_*` chain has a rule for
+///    the external port. Nothing porthole wrote permits anything.
+/// 2. Adding the accept `open` writes puts a rule for that port in exactly
+///    such a chain. Without this control, assertion 1 would pass just as
+///    well if `nft_chains` found no chains at all, or if firewalld had
+///    renamed its filter chains, or if the rule had simply failed to be
+///    added.
+///
+/// What this does **not** assert: that a forward works. No packet is sent
+/// here, and reachability is a separate test with a separate topology.
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn a_firewalld_forward_renders_a_redirect_and_permits_nothing() {
+    use porthole_core::backend::firewalld::Firewalld;
+    use porthole_core::forward::ForwardTo;
+    use porthole_core::model::{Lifetime, OpenRequest, Protocol, Target};
+
+    require_environment!();
+    ensure_image(FEDORA_IMAGE, "Containerfile.fedora");
+
+    let req = OpenRequest {
+        port: 3000,
+        protocol: Protocol::Tcp,
+        target: Target::Network {
+            cidr: "10.10.10.0/24".parse().unwrap(),
+        },
+        lifetime: Lifetime::UntilReboot,
+    };
+    let to = ForwardTo {
+        container_addr: std::net::Ipv4Addr::new(172, 18, 0, 2),
+        container_port: 8080,
+        published_port: 3000,
+        protocol: Protocol::Tcp,
+    };
+    // Both strings come from the backend itself. A retyped copy would go on
+    // passing after the code that builds them changed.
+    let redirect = Firewalld::forward_rich_rule(&req, &to, Protocol::Tcp);
+    let accept = Firewalld::rich_rule(&req);
+
+    let args = vec!["--cap-add=NET_ADMIN".to_string()];
+    let script = format!(
+        "set -e\n{FAKE_LAN_INTERFACE}\n{FIREWALLD_DAEMON_SETUP}\n\
+         ZONE=$(firewall-cmd --get-default-zone)\n\
+         firewall-cmd --zone=\"$ZONE\" '--add-rich-rule={redirect}'\n\
+         {}\n\
+         firewall-cmd --zone=\"$ZONE\" '--add-rich-rule={accept}'\n\
+         {}\n",
+        marker_block("REDIRECT_ONLY", "nft list table inet firewalld"),
+        marker_block("WITH_ACCEPT", "nft list table inet firewalld"),
+    );
+
+    eprintln!("== firewalld test: what a forward renders to ==");
+    let out = podman_run(FEDORA_IMAGE, &args, &script);
+    eprintln!("{}", String::from_utf8_lossy(&out.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&out.stderr));
+    assert_container_ok(&out, "the firewalld forward-rendering container");
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let redirect_only = nft_chains(extract_marker(&stdout, "REDIRECT_ONLY"));
+    let with_accept = nft_chains(extract_marker(&stdout, "WITH_ACCEPT"));
+
+    let filtering_the_port = |chains: &[(String, String)]| -> Vec<String> {
+        chains
+            .iter()
+            .filter(|(name, body)| name.starts_with("filter_IN") && body.contains("dport 3000"))
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+
+    // The redirect itself: one dnat, in a nat chain, naming the container.
+    let dnat: Vec<&String> = redirect_only
+        .iter()
+        .filter(|(_, body)| body.contains("172.18.0.2:8080"))
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        dnat.len(),
+        1,
+        "a forward is one rule; chains naming the container: {dnat:?}"
+    );
+    assert!(
+        dnat[0].starts_with("nat_PRE"),
+        "the redirect must be in a nat prerouting chain, not {}",
+        dnat[0]
+    );
+
+    assert!(
+        filtering_the_port(&redirect_only).is_empty(),
+        "a forward wrote a rule for the external port into a filter chain: {:?}\n{}",
+        filtering_the_port(&redirect_only),
+        extract_marker(&stdout, "REDIRECT_ONLY"),
+    );
+
+    // The rule this design now rests on, in firewalld's own rendering:
+    // `filter_FORWARD` accepts DNAT'd traffic ahead of the jump to any zone
+    // chain. That it is what the redirected connection travels through was
+    // measured elsewhere with packet counters -- zero at the input hook, and
+    // the connection still completing with the zone's target set to DROP.
+    // All that is asserted here is that the rule exists, so that a firewalld
+    // release dropping it fails loudly rather than turning every forward
+    // into a redirect nothing lets through.
+    let forward_chain = redirect_only
+        .iter()
+        .find(|(name, _)| name == "filter_FORWARD")
+        .map(|(_, body)| body.clone())
+        .unwrap_or_else(|| {
+            panic!(
+                "firewalld has no filter_FORWARD chain; chains: {:?}",
+                redirect_only.iter().map(|(n, _)| n).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        forward_chain.contains("ct status dnat accept"),
+        "filter_FORWARD no longer accepts DNAT'd traffic, which is what a forward \
+         relies on here: {forward_chain}"
+    );
+
+    // The control: such a rule is visible here when it exists.
+    assert!(
+        !filtering_the_port(&with_accept).is_empty(),
+        "the accept `open` writes did not show up in any filter_IN chain, so the \
+         assertion above proves nothing about where rules land:\n{}",
+        extract_marker(&stdout, "WITH_ACCEPT"),
+    );
+}
