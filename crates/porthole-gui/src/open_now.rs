@@ -450,9 +450,14 @@ fn subtitle_for(rule: &WireRule) -> String {
 // own `anyone_note()` for its tooltip, called directly rather than kept as
 // a second, separate copy of the sentence -- an earlier version of this
 // module did exactly that, as a private constant worded slightly
-// differently ("Open to anyone…" vs. `anyone_note()`'s own "Opens the port
-// to anyone…"), which is precisely the drift `open_dialog.rs`'s own module
+// differently, which is precisely the drift `open_dialog.rs`'s own module
 // doc says keeping this sentence to one function is meant to rule out.
+//
+// Sharing it is also what makes it correct here now. This section renders
+// forwards as well as opens, so an anywhere-scoped *forward*'s icon gets
+// this tooltip too -- which is why `anyone_note()` names neither act. A
+// copy kept locally and worded for opens would have been wrong on half the
+// rows this section can now draw.
 
 /// The helper's own rendered text from a D-Bus method error, verbatim.
 ///

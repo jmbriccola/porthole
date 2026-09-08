@@ -390,17 +390,35 @@ silently. `porthole-agent` is what says so: one per logged-in session, no
 window and no interface of its own, listening on the system bus and showing a
 desktop notification through `org.freedesktop.Notifications`.
 
-It announces the closes **nobody asked for** — an expiry, a network change,
-and a rule the firewall no longer had when porthole next looked — and only for
-rules opened by your own uid. A close you asked for is not announced: you were
+It announces the closes **nobody asked for** — an expiry, a network change, a
+rule the firewall no longer had when porthole next looked, and a forward whose
+container is no longer the one it was created against — and only for rules
+opened by your own uid. A close you asked for is not announced: you were
 there, and the client you ran told you.
 
-An **expiry** notification carries a `Reopen` button that re-sends the same
-port, protocol, scope and duration. That is a fresh request to open a port, so
-polkit asks again wherever the scope warrants it. The other two offer no
-button: after a network change the machine is somewhere else and the rule
-would reach nobody, and after a reconciliation something outside porthole
-removed the rule and porthole cannot tell what.
+Two of those four carry a `Reopen` button, and the test for which is whether
+re-sending the original request can still mean what it meant.
+
+An **expiry** can: nothing changed under the rule, your own clock ran out. A
+**gone container** can too, and this is the less obvious one — a forward's
+request names a *published port*, and the helper resolves the container
+address from Docker's own table each time it acts, so re-sending it finds the
+container wherever it now is. That is also why porthole closes such a forward
+rather than quietly re-aiming it: it re-resolves, it does not assume.
+
+What `Reopen` sends follows the rule it was about. A rule that only permitted
+re-sends `open`, with the same port, protocol, scope and duration. A forward
+re-sends `forward`, with the same external port, scope and duration, and the
+same published port — never the container address the closed rule held. Either
+way it is a fresh request, so polkit asks again wherever the scope warrants
+it, and for a forward it asks every time.
+
+The other two offer no button. After a **network change** the machine is
+somewhere else, and the request names the subnet itself — nothing re-resolves
+that, so the rule would appear to work and reach nobody. After a
+**reconciliation** something outside porthole removed the rule and porthole
+cannot tell what; putting it back at one click, before you have seen what took
+it away, would be porthole arguing with whatever that was.
 
 The agent ships two start files, a systemd user unit and an XDG autostart
 entry, because desktops differ in which they honour — see

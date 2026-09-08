@@ -78,6 +78,21 @@ pub fn is_worth_announcing(reason: CloseReason) -> bool {
     !matches!(reason, CloseReason::Requested)
 }
 
+/// Whether this rule redirected rather than only permitted.
+///
+/// A non-empty `container_addr` is the wire's own sentinel for it: an
+/// address can never be the empty string, and the two ports cannot say it,
+/// since `0` is also what a forward to a container port nobody could have
+/// published would carry -- see `WireRule::container_addr`.
+///
+/// One function for the whole binary. Both places that need the distinction
+/// call this: the wording here, and `crate::reopen_request`, which decides
+/// which method a `Reopen` sends. Two copies of a one-line predicate is how
+/// a rule ends up *described* as one act and *re-sent* as the other.
+pub fn redirects(rule: &WireRule) -> bool {
+    !rule.container_addr.is_empty()
+}
+
 /// What to say about a rule that has stopped being open.
 ///
 /// Total over every reason, including the one [`is_worth_announcing`] filters
@@ -114,6 +129,23 @@ pub fn notification_for(rule: &WireRule, reason: CloseReason) -> Notification {
     let port = format!("{}/{}", rule.port, rule.protocol);
     let target = &rule.target;
     match reason {
+        // The one reason both kinds of rule reach in numbers, so it is the
+        // one whose wording has to tell them apart. A forward expires like
+        // anything else, and "8443/tcp towards 10.10.10.0/24 has expired"
+        // says nothing about the container -- the identical collapse
+        // `porthole-gui`'s own `open_now.rs` was changed to stop making on
+        // the row, beside this very button. Whoever is deciding whether to
+        // press `Reopen` is deciding about a redirect, and has to be told
+        // that is what it was.
+        CloseReason::Expired if redirects(rule) => Notification {
+            summary: format!("Port {port} closed"),
+            body: format!(
+                "{port} towards {target} — a redirect into the container publishing {} on \
+                 this machine — has expired and is closed again.",
+                rule.published_port
+            ),
+            actions: vec![(REOPEN.to_string(), "Reopen".to_string())],
+        },
         CloseReason::Expired => Notification {
             summary: format!("Port {port} closed"),
             body: format!("{port} towards {target} has expired and is closed again."),
@@ -276,6 +308,44 @@ mod tests {
     }
 
     #[test]
+    fn an_expired_forward_says_a_container_was_behind_it() {
+        // A forward expires like any other rule, and this is the reason
+        // both kinds of rule reach in numbers. Told only "8443/tcp towards
+        // 10.10.10.0/24 has expired", a person deciding whether to press
+        // `Reopen` believes they are deciding about traffic to something on
+        // this machine. `porthole-gui`'s `open_now.rs` was changed to stop
+        // making exactly this collapse on the row; the notification beside
+        // the button made it too.
+        let permit = closed_rule(5173, "tcp");
+        let forward = forward_rule(8443, 3000);
+
+        let plain = notification_for(&permit, CloseReason::Expired);
+        let redirected = notification_for(&forward, CloseReason::Expired);
+
+        assert!(
+            redirected.body.contains("redirect"),
+            "an expired forward must say it redirected: {}",
+            redirected.body
+        );
+        assert!(
+            redirected.body.contains("3000"),
+            "and name the published port it redirected to: {}",
+            redirected.body
+        );
+        assert!(
+            !plain.body.contains("redirect"),
+            "a rule that only permitted must claim no redirect: {}",
+            plain.body
+        );
+        // Both still say the thing an expiry notification is for, and both
+        // still carry the button -- this changed the words, not the offer.
+        for n in [&plain, &redirected] {
+            assert!(n.body.contains("expired"), "{}", n.body);
+            assert!(n.actions.iter().any(|a| a.0 == REOPEN), "{:?}", n.actions);
+        }
+    }
+
+    #[test]
     fn a_gone_container_offers_reopen_and_a_network_change_still_does_not() {
         // Both halves, deliberately, in one check: the two reasons are
         // adjacent in the enum and share the shape of their notification,
@@ -347,6 +417,137 @@ mod tests {
             n.body
         );
         assert!(n.actions.is_empty());
+    }
+
+    /// One document this binary is described to a person in, read from
+    /// disk. Neither is compiled, so nothing else in this workspace notices
+    /// when the code they describe changes underneath them -- which is
+    /// exactly what happened: `TargetGone` gaining a `Reopen` made both of
+    /// them false, and both were caught by a reviewer rather than by any
+    /// check. The same coupling `tests/units.rs` keeps between this
+    /// binary's `ExecStart=` and its install instructions.
+    fn document(name: &str) -> String {
+        let path = format!("{}/../../{name}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    /// The one `##` section of `text` that describes this binary, from its
+    /// heading to the next one, whitespace collapsed.
+    ///
+    /// **The section, not the file, and that is not tidiness.** Both checks
+    /// below were first written against whole documents, and their own
+    /// negative controls exposed it: deleting the sentence that names
+    /// `forward` among what a `Reopen` can send left the check green,
+    /// because `docs/installing.md` says "`forward`" elsewhere; deleting
+    /// "every time" left it green too, because the polkit table above says
+    /// "asks every time" about a different action entirely. A guard that a
+    /// nearby paragraph can satisfy is not guarding the paragraph it was
+    /// written for.
+    ///
+    /// Whitespace is collapsed *after* slicing, and that is also load-
+    /// bearing: both files are hard-wrapped prose, so a phrase looked for
+    /// here is routinely split across a line break. The first run of the
+    /// reason check failed on `"no longer had"` for exactly that -- the
+    /// words present, a newline between them -- which is a guard a reader
+    /// would otherwise have weakened rather than a defect in the document.
+    fn section(text: &str, heading: &str) -> String {
+        let start = text
+            .find(heading)
+            .unwrap_or_else(|| panic!("no section starting {heading:?}"));
+        let body = &text[start + heading.len()..];
+        let end = body.find("\n## ").unwrap_or(body.len());
+        body[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// `docs/installing.md`'s account of this binary.
+    fn installing_sections_on_the_agent() -> String {
+        section(&document("docs/installing.md"), "## The agent")
+    }
+
+    /// `README.md`'s.
+    fn readme_section_on_the_agent() -> String {
+        section(&document("README.md"), "## Desktop notifications")
+    }
+
+    /// How each reason is named to a person, as opposed to how it is named
+    /// on the wire.
+    ///
+    /// Exhaustive over the enum on purpose, exactly as `notification_for`
+    /// is and for the same reason: a reason added to the wire has to come
+    /// here and say what a reader is told about it, rather than being
+    /// announced on screen and mentioned in no document at all.
+    fn documented_as(reason: CloseReason) -> &'static str {
+        match reason {
+            CloseReason::Expired => "expiry",
+            CloseReason::NetworkChanged => "network change",
+            CloseReason::Reconciled => "no longer had",
+            CloseReason::TargetGone => "no longer the one it was created against",
+            // Not announced at all, so no document owes it an entry -- the
+            // check below skips it through `is_worth_announcing`.
+            CloseReason::Requested => "",
+        }
+    }
+
+    #[test]
+    fn both_documents_name_every_close_this_binary_announces() {
+        // `README.md`'s "Desktop notifications" section and
+        // `docs/installing.md`'s "The agent" section each enumerate what
+        // this binary announces. Both enumerations were written when there
+        // were three reasons and silently became wrong when there were
+        // four.
+        let readme = readme_section_on_the_agent();
+        let installing = installing_sections_on_the_agent();
+        for reason in [
+            CloseReason::Expired,
+            CloseReason::Requested,
+            CloseReason::NetworkChanged,
+            CloseReason::Reconciled,
+            CloseReason::TargetGone,
+        ] {
+            if !is_worth_announcing(reason) {
+                continue;
+            }
+            let phrase = documented_as(reason);
+            assert!(
+                readme.contains(phrase),
+                "README.md never names the {reason} close (looked for {phrase:?})"
+            );
+            assert!(
+                installing.contains(phrase),
+                "docs/installing.md never names the {reason} close (looked for {phrase:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn the_install_document_still_states_the_whole_of_what_a_reopen_can_provoke() {
+        // This one is a *security* statement, not a description: it is what
+        // an administrator reads to learn the full extent of what this
+        // unprivileged session agent can cause on the system bus. It said
+        // the button "re-sends an ordinary `open` request" at a commit
+        // where the button could already send a `forward` -- an
+        // `auth_admin`-every-time operation -- so it understated the agent
+        // to the one reader who most needed it not to be understated.
+        //
+        // What this pins is that both methods stay named, in that section,
+        // and that the stronger authorization stays stated. It cannot
+        // notice a *third* method appearing; `reopen`'s own `match` in
+        // `main.rs` is where that would be added, and its two arms are what
+        // these two names correspond to.
+        let installing = installing_sections_on_the_agent();
+        for method in ["`open`", "`forward`"] {
+            assert!(
+                installing.contains(method),
+                "docs/installing.md's agent section must name {method} among what a Reopen \
+                 can send"
+            );
+        }
+        assert!(
+            installing.contains("every time"),
+            "docs/installing.md's agent section must say a forward is authorized every \
+             time, whatever its scope: that is what makes the agent's reach worth stating \
+             at all"
+        );
     }
 
     #[test]

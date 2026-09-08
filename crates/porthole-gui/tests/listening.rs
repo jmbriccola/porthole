@@ -899,6 +899,19 @@ fn only_container_published_loopback_rows_offer_forward() -> Result<(), String> 
             "the loopback reassurance must survive the addition: {subtitle}"
         ));
     }
+    // And it must name the *container* as where the redirected traffic
+    // goes. The sentence used to end "redirect a network port into it",
+    // which said a forward reaches this loopback socket. It does not:
+    // `firewalld::forward_rich_rule` writes the container's own address on
+    // Docker's network as `to-addr`, and its doc says loopback cannot stand
+    // there at all. Saying "into it" also put the sentence at war with the
+    // clause before it, since a forward is itself a firewall rule.
+    if !subtitle.contains("container") {
+        return Err(format!(
+            "a forward reaches the container, not this socket, and the row must say which: \
+             {subtitle}"
+        ));
+    }
     Ok(())
 }
 

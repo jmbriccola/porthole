@@ -119,12 +119,29 @@ file that now exists.
 `porthole-agent` is the session half: unprivileged, one per logged-in
 session, no window and no interface of its own. It listens on the system bus
 for the helper's `RuleClosed` signal and shows a desktop notification for the
-closes nobody asked for — an expiry, a network change, and a rule the
-firewall no longer had when porthole next looked — filtered to rules opened by
-that session's own uid. It has nothing to listen to until the helper above is
-installed. It closes nothing and keeps no view of what is open; the one thing
-it can cause is the `Reopen` button on an expiry notification, which re-sends
-an ordinary `open` request to the helper, polkit prompt and all.
+closes nobody asked for — an expiry, a network change, a rule the firewall no
+longer had when porthole next looked, and a forward whose container is no
+longer the one it was created against — filtered to rules opened by that
+session's own uid. It has nothing to listen to until the helper above is
+installed. It closes nothing and keeps no view of what is open.
+
+**What it can cause on the system bus**, which is the whole of it: a `Reopen`
+click on a notification it is currently showing. Two of the four reasons above
+carry that button — an expiry, and a container that moved — and what it
+re-sends depends on the rule the notification was about:
+
+- a rule that only permitted re-sends `open`, with the same port, protocol,
+  scope and duration;
+- a rule that redirected re-sends `forward`, with the same external port,
+  scope and duration, and the **published port** the original request named.
+  The container's address is never sent: the helper resolves it again from
+  Docker's own table at the moment it acts, which is why a container that
+  moved is something a click can recover from.
+
+Both go through polkit like any other request, and a `forward` is
+`auth_admin` **every time**, whatever its scope — so a click on that button
+always produces an administrator prompt. The agent cannot skip it and does
+not decide it. Nothing else it does reaches the helper at all.
 
 Three files, and one of the three commands below is **not** run as root:
 

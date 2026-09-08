@@ -501,6 +501,18 @@ fn the_note_on_anyone_is_one_dry_sentence_with_no_scolding() -> Result<(), Strin
     if !note.contains("anyone your machine can reach") {
         return Err(format!("note must say what it means: {note}"));
     }
+    // The same act-neutrality the unit guard holds, on the string the real
+    // widget actually carries. This row appears on a forwarding dialog too,
+    // where a sentence saying "opens the port" describes the accept
+    // `firewalld.rs`'s own `forward` was measured into never writing.
+    let lowered = note.to_lowercase();
+    for act in ["open", "forward", "redirect"] {
+        if lowered.contains(act) {
+            return Err(format!(
+                "the note is shared by both acts and must name neither (\"{act}\"): {note}"
+            ));
+        }
+    }
     Ok(())
 }
 

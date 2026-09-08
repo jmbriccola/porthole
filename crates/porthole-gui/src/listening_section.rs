@@ -90,10 +90,14 @@
 //! A loopback-only row published by a container on loopback carries a
 //! **Forward** button. That is a different act from Open and the row says
 //! so: `open` permits traffic to a service the network was already reaching,
-//! and a forward redirects a port on the network into one it was not. The
-//! reassurance stays as it was -- nothing outside this machine reaches that
-//! socket, and the firewall is not what is stopping it -- and
-//! [`FORWARDABLE_SUFFIX`] is the sentence that says what the button does.
+//! and a forward redirects a port on the network to the container behind
+//! this one. The reassurance stays as it was and stays true -- nothing
+//! outside this machine reaches that socket, and a forward does not change
+//! that either, because it never reaches this socket at all: it aims at the
+//! container's own address on Docker's network, past this row's loopback
+//! listener rather than through it. [`FORWARDABLE_SUFFIX`] is the sentence
+//! that says so, and its own doc comment is where that mechanism is spelled
+//! out.
 //!
 //! [`can_forward`] is the whole condition, and each of its four parts
 //! mirrors a refusal the helper makes on its own side -- so no button is
@@ -295,7 +299,31 @@ const LOOPBACK_SUBTITLE: &str = "listening only on this machine — the firewall
 /// performs, which is not opening. A row offering a button whose subtitle
 /// only says the firewall cannot help says nothing about what the button
 /// does.
-const FORWARDABLE_SUFFIX: &str = ", but a forward can redirect a network port into it";
+///
+/// ## Why it ends "the container behind it" and not "into it"
+///
+/// It read ", but a forward can redirect a network port **into it**", which
+/// was wrong twice over.
+///
+/// It fought the clause in front of it: a forward *is* a firewall rule, so
+/// "the firewall does not affect it, but a forward can…" reads as a
+/// sentence contradicting itself, and the distinction actually meant --
+/// opening does not help, redirecting does -- was nowhere in the words.
+///
+/// And "into **it**" named the wrong destination. A forward never reaches
+/// this socket. `porthole_core::backend::firewalld::forward_rich_rule`
+/// writes `to-addr` as the *container's* own address on Docker's network,
+/// and its doc comment says why loopback cannot stand there at all: a
+/// redirect to `127.0.0.0/8` is only delivered with `route_localnet` set,
+/// and porthole changes no sysctl. The traffic goes to the container, past
+/// this socket, not through it.
+///
+/// Naming the container is what dissolves both problems at once: the
+/// subject changes, so the two clauses stop being about the same thing, and
+/// the sentence becomes a more precise account of the mechanism rather than
+/// a hedged one.
+const FORWARDABLE_SUFFIX: &str = ", but a forward can redirect a network port to the container \
+     behind it";
 
 /// The opposite-direction case: porthole cannot open or close this either,
 /// but because it is blind to it, not because it is safe. Deliberately
@@ -481,21 +509,32 @@ fn is_actionable(service: &Service, open_ports: &HashSet<u16>) -> bool {
 
 /// Whether a forward of this service could be created at all.
 ///
-/// Four conditions, each one a refusal `porthole_core::engine::Engine::
-/// forward` makes on its own side. All four are properties of the row
-/// itself, which is what makes them answerable here; the helper's other
-/// refusals are not, and this is deliberately **not** the set of everything
-/// that can go wrong -- see this module's own doc comment on what still
-/// arrives as a message:
+/// Four conditions. Three of them are properties of the row that
+/// `porthole_core::engine::Engine::forward` refuses on separately, so the
+/// button is withheld where the helper would say no; the first is this
+/// section's own, and the list says which is which rather than crediting
+/// them all to the engine.
 ///
-/// - the service is [`Binding::LoopbackOnly`]. A forward redirects traffic
-///   to something the network was not reaching; a network-facing service
-///   is what `open` is for.
+/// This is deliberately **not** the set of everything that can go wrong --
+/// see this module's own doc comment on what still arrives as a message:
+///
+/// - the service is [`Binding::LoopbackOnly`]. **No engine refusal
+///   corresponds to this one.** `Engine::forward` never reads the `/proc`
+///   binding of the published port, so it would accept a forward of a
+///   network-facing row whose container publishes on loopback only. This
+///   section withholds the button anyway, because a service the network
+///   already reaches is what `open` is for, and offering both acts on one
+///   row would be offering a choice with no difference a user could see.
+///   In practice the state hardly arises -- docker-proxy binds where the
+///   publish says, so this is close to a duplicate of the last condition --
+///   which is why it can be this section's own judgement rather than a
+///   mirror of anything.
 /// - the protocol is TCP. The helper declines a UDP forward, because the
 ///   check it makes for a local listener on the external port reads TCP.
 /// - a **checked** Docker list names this port. `None` is both ways there
 ///   can fail to be one, and neither is an answer -- the same rule the
-///   Docker marker follows.
+///   Docker marker follows. The helper refuses both separately: a Docker
+///   table it could not read, and a published port no container publishes.
 /// - Docker publishes it on loopback only, per
 ///   `porthole_core::docker::already_reachable`. A container the local
 ///   network already reaches is refused a forward: it would add a second

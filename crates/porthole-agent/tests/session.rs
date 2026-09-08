@@ -518,6 +518,124 @@ async fn a_gone_container_offers_reopen_and_the_click_sends_a_forward_not_an_ope
 }
 
 #[tokio::test]
+async fn a_reopen_of_an_expired_forward_sends_a_forward_not_an_open() {
+    // The bug this whole branch's agent change was written for, named at
+    // last. A forward is an ordinary rule with an expiry, and `Expired` has
+    // offered `Reopen` since this binary existed -- so long before
+    // `TargetGone` was reachable, a click here already sent `open` for the
+    // forward's external port: permitting the local network to a port on
+    // this machine that nothing answers on, because the redirect was the
+    // whole of what that port meant.
+    //
+    // `TargetGone`'s own session test above cannot stand in for this one.
+    // That reason is only ever emitted for forwards, so a `reopen_request`
+    // that keyed off the *reason* rather than the rule would pass it and
+    // still be wrong here. This case is what tells the two apart.
+    let bus = Bus::start();
+    let uid = our_uid();
+
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let opens = Arc::new(Mutex::new(Vec::new()));
+    let forwards = Arc::new(Mutex::new(Vec::new()));
+    let notification_id = 17;
+
+    let notifications = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(NOTIFICATIONS_SERVICE)
+        .unwrap()
+        .serve_at(
+            NOTIFICATIONS_PATH,
+            FakeNotifications {
+                shown: shown.clone(),
+                id: notification_id,
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let helper = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(SERVICE)
+        .unwrap()
+        .serve_at(
+            PATH,
+            FakeHelper {
+                opens: opens.clone(),
+                forwards: forwards.clone(),
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let mut agent = Agent::start(&bus);
+    until("the agent to start listening", || {
+        agent.journal().contains("listening for uid").then_some(())
+    })
+    .await;
+
+    helper
+        .emit_signal(
+            None::<()>,
+            PATH,
+            INTERFACE,
+            "RuleClosed",
+            &(wire_forward(8443, 3000, uid), CloseReason::Expired),
+        )
+        .await
+        .unwrap();
+
+    let notice = until("a notification", || shown.lock().unwrap().first().cloned()).await;
+    assert!(notice.body.contains("8443/tcp"), "{notice:?}");
+    // The words beside the button, not only the button: a person pressing
+    // it has to know they are restoring a redirect.
+    assert!(
+        notice.body.contains("redirect") && notice.body.contains("3000"),
+        "an expired forward's notification must say what it was: {notice:?}"
+    );
+    assert_eq!(
+        notice.actions,
+        vec!["reopen".to_string(), "Reopen".to_string()],
+        "an expiry has always offered the button, and still does"
+    );
+
+    notifications
+        .emit_signal(
+            None::<()>,
+            NOTIFICATIONS_PATH,
+            NOTIFICATIONS_INTERFACE,
+            "ActionInvoked",
+            &(notification_id, "reopen"),
+        )
+        .await
+        .unwrap();
+
+    let sent = until("the reopen to reach the helper", || {
+        forwards.lock().unwrap().first().cloned()
+    })
+    .await;
+    assert_eq!(
+        sent,
+        Forwarded {
+            port: 8443,
+            protocol: "tcp".to_string(),
+            scope: "10.10.10.0/24".to_string(),
+            seconds: (EXPIRES_AT - OPENED_AT) as u32,
+            published_port: 3000,
+        }
+    );
+    assert!(
+        opens.lock().unwrap().is_empty(),
+        "the click opened the external port instead of re-creating the redirect: {:?}",
+        opens.lock().unwrap()
+    );
+    assert!(agent.is_running());
+}
+
+#[tokio::test]
 async fn a_network_change_is_announced_without_a_button_that_could_not_work() {
     // The other half of the pair above, kept as its own check so that making
     // the two reasons "consistent" cannot pass silently. A rule scoped to a

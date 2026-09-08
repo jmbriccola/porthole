@@ -179,13 +179,33 @@ fn duration_options() -> Vec<(&'static str, Lifetime)> {
 /// and [`OpenDialog::note_for_anyone`]) so those three cannot drift into
 /// different claims about the same choice. `pub(crate)`, not private: a
 /// fourth site outside this module makes the identical claim about the
-/// identical choice -- `open_now.rs`'s "open to anyone" marking on an
-/// already-open rule -- and calls this directly rather than keeping its
-/// own, separate copy of the sentence (an earlier version did exactly
-/// that, worded slightly differently, outside every guard that keeps
-/// these three in sync).
+/// identical choice -- `open_now.rs`'s marking on an already-anywhere-scoped
+/// rule -- and calls this directly rather than keeping its own, separate
+/// copy of the sentence (an earlier version did exactly that, worded
+/// slightly differently, outside every guard that keeps these three in
+/// sync).
+///
+/// ## It names no act, and that is the whole constraint on its wording
+///
+/// The four sites are not four views of one act. Two of them belong to an
+/// `open` (this dialog built by [`OpenDialog::for_port`], and an open rule's
+/// row) and two to a `forward` ([`OpenDialog::for_forward`], and a forward's
+/// row): "Anyone" means the same thing in both -- the rich rule drops its
+/// `source address` clause, so it matches traffic from anywhere -- and it is
+/// the *only* thing about the two acts that is the same.
+///
+/// So this sentence must describe the scope and nothing else. It used to
+/// open with "Opens the port to…", which was not merely the wrong verb on a
+/// forwarding dialog: an accept for the external port is the one rule
+/// `porthole_core::backend::firewalld`'s own `forward` was measured into
+/// *not* writing, because on a host with a service of its own bound to that
+/// number it would expose that service too. The sentence described to a user
+/// the exact effect the design refuses to produce.
+///
+/// `the_note_on_anyone_is_one_dry_sentence_with_no_scolding` is what holds
+/// this: it fails on any wording that names either act.
 pub(crate) fn anyone_note() -> String {
-    "Opens the port to anyone your machine can reach, not just devices on this network.".to_string()
+    "Lets in anyone your machine can reach, not just devices on this network.".to_string()
 }
 
 /// One saved device as this dialog needs it: its name, and either the
@@ -1615,14 +1635,27 @@ mod tests {
     fn the_note_on_anyone_is_one_dry_sentence_with_no_scolding() {
         // Guards `anyone_note()` itself, which now covers four call sites,
         // not three: this dialog's own target row/icon/`note_for_anyone`,
-        // plus `open_now.rs`'s "open to anyone" marking on an already-open
-        // rule.
+        // plus `open_now.rs`'s marking on an already-anywhere-scoped rule.
         let note = anyone_note();
         assert_eq!(note.matches('.').count(), 1, "one sentence: {note}");
         for scolding in ["careful", "dangerous", "warning", "risk", "are you sure"] {
             assert!(!note.to_lowercase().contains(scolding), "{note}");
         }
         assert!(note.contains("anyone your machine can reach"));
+
+        // And it names neither act. Two of the four sites belong to an
+        // `open` and two to a `forward`, so a sentence naming either is
+        // false at half of them -- and the one it used to name, "opens the
+        // port", is the accept `firewalld.rs`'s `forward` was measured into
+        // never writing. Without this the previous wording passes every
+        // assertion above, which is exactly how it survived.
+        let lowered = note.to_lowercase();
+        for act in ["open", "forward", "redirect"] {
+            assert!(
+                !lowered.contains(act),
+                "the note is shared by both acts and must name neither ({act}): {note}"
+            );
+        }
     }
 
     fn resolved_device(name: &str, addr: &str) -> DeviceEntry {
