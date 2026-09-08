@@ -186,7 +186,13 @@ impl Porthole {
                 state,
                 self.executable.clone(),
             );
-            let opened = engine.open(port, protocol, &spec, lifetime, uid);
+            // `open_resolved`, not `open`: the target was resolved above,
+            // before the authorization, because the polkit message names it.
+            // Resolving it a second time here would make the address a
+            // person read and the address written into the firewall two
+            // separate lookups with a password prompt in between them --
+            // which is exactly the property `forward` was built not to have.
+            let opened = engine.open_resolved(port, protocol, target, lifetime, uid);
             (opened, engine.take_reconciled())
         };
 

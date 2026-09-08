@@ -296,6 +296,14 @@ impl<'a> Engine<'a> {
         )))
     }
 
+    /// Open `port` towards whatever `spec` resolves to.
+    ///
+    /// The resolution happens here, after the checks below, because this is
+    /// the entry point for a caller that has not resolved anything yet --
+    /// `porthole open --dry-run`, and every test. A caller that has already
+    /// resolved a target, and must not resolve it a second time, calls
+    /// [`Engine::open_resolved`]; see its doc comment for why that
+    /// distinction matters.
     pub fn open(
         &mut self,
         port: u16,
@@ -304,6 +312,43 @@ impl<'a> Engine<'a> {
         lifetime: Lifetime,
         uid: u32,
     ) -> Result<ManagedRule> {
+        self.before_opening(port, protocol)?;
+        let target = self.resolve(spec)?;
+        self.write_open(port, protocol, target, lifetime, uid)
+    }
+
+    /// Open `port` towards a target somebody else has already resolved.
+    ///
+    /// **The prompt names the thing the rule carries.** `porthole-helper`
+    /// resolves the scope before it authorizes, because the polkit message
+    /// interpolates the resolved target -- a person is asked about
+    /// `10.10.10.0/24`, not about the word `subnet`. If this method then
+    /// resolved the scope again, the address in the message a person read
+    /// and the address written into the firewall would be two separate
+    /// lookups with a polkit authentication -- which can sit for as long as
+    /// somebody takes to find their password -- in between them. The window
+    /// is small and the harm bounded, but the property is the one this
+    /// feature was audited for, and `Engine::forward` already has it: the
+    /// helper resolves once and passes the `Target` through.
+    ///
+    /// Same checks, same order, same rule as [`Engine::open`]. The only
+    /// difference is where the `Target` came from.
+    pub fn open_resolved(
+        &mut self,
+        port: u16,
+        protocol: Protocol,
+        target: Target,
+        lifetime: Lifetime,
+        uid: u32,
+    ) -> Result<ManagedRule> {
+        self.before_opening(port, protocol)?;
+        self.write_open(port, protocol, target, lifetime, uid)
+    }
+
+    /// Everything both entry points ask before either of them resolves or
+    /// writes anything. One copy: two would be two places for the
+    /// already-open refusal's wording to live.
+    fn before_opening(&mut self, port: u16, protocol: Protocol) -> Result<()> {
         self.reconcile();
         self.require_enforcing_firewall()?;
 
@@ -335,8 +380,21 @@ impl<'a> Engine<'a> {
                 detail,
             });
         }
+        Ok(())
+    }
 
-        let target = self.resolve(spec)?;
+    /// The half after the checks: build the request, write the rule, record
+    /// it. Reached only through [`Engine::open`] or
+    /// [`Engine::open_resolved`], both of which have run
+    /// [`Engine::before_opening`] first.
+    fn write_open(
+        &mut self,
+        port: u16,
+        protocol: Protocol,
+        target: Target,
+        lifetime: Lifetime,
+        uid: u32,
+    ) -> Result<ManagedRule> {
         let request = OpenRequest {
             port,
             protocol,
@@ -1199,6 +1257,68 @@ mod tests {
             },
             forward: None,
         }
+    }
+
+    #[test]
+    fn open_resolved_writes_the_target_it_was_handed_and_looks_up_nothing() {
+        // The property the whole-branch review was about: the address named
+        // in the polkit prompt is the address written into the rule. The
+        // helper resolves the scope before it authorizes, because the
+        // message interpolates the resolved target; if the engine resolved
+        // it again, the two would be separate lookups with a password prompt
+        // in between. `Engine::forward` was built to take a resolved
+        // `Target`; `open` predated it and did not.
+        //
+        // The scripted `ip` answers name 10.10.10.0/24 and the target handed
+        // in is 192.168.5.0/24, so a second lookup could not produce the
+        // same answer by coincidence: it would show up in the rule as well
+        // as in the recorded commands.
+        let harness = Harness::new();
+        let backend = FakeBackend::new();
+        let runner = RecordingRunner::with_responses(subnet_open_script());
+        let clock = FixedClock(NOW);
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+
+        let handed = Target::Network {
+            cidr: "192.168.5.0/24".parse().unwrap(),
+        };
+        let rule = engine
+            .open_resolved(5173, Protocol::Tcp, handed, Lifetime::UntilReboot, 1000)
+            .unwrap();
+
+        assert_eq!(rule.target, handed, "the rule carries what it was handed");
+        assert!(
+            !runner.recorded().iter().any(|c| c.program == "ip"),
+            "and nothing was looked up to decide it: {:?}",
+            runner.recorded()
+        );
+
+        // The control, on the entry point that does resolve: same engine
+        // shape, `ScopeSpec::CurrentSubnet`, and both halves of the
+        // assertion above come out the other way.
+        let harness = Harness::new();
+        let runner = RecordingRunner::with_responses(subnet_open_script());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+        let rule = engine
+            .open(
+                5173,
+                Protocol::Tcp,
+                &ScopeSpec::CurrentSubnet,
+                Lifetime::UntilReboot,
+                1000,
+            )
+            .unwrap();
+        assert_eq!(
+            rule.target,
+            Target::Network {
+                cidr: "10.10.10.0/24".parse().unwrap()
+            },
+            "`open` resolves, and this is what the scripted `ip` answers say"
+        );
+        assert!(
+            runner.recorded().iter().any(|c| c.program == "ip"),
+            "so the assertion above is one a lookup would have failed"
+        );
     }
 
     #[test]
