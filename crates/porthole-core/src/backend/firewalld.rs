@@ -262,9 +262,13 @@ impl FirewallBackend for Firewalld<'_> {
     /// input chain could be carrying anything.
     ///
     /// The second and third bullets are the spike's alone. Nothing committed
-    /// compares the counters with and without the accept, and nothing
+    /// compares packet counters with and without the accept, and nothing
     /// committed binds a host service to `0.0.0.0` to show the accept
-    /// exposing it — no test here writes an accept beside a redirect at all.
+    /// exposing it. One committed test does write an accept beside a
+    /// redirect — `a_redirect_rich_rule_renders_to_a_dnat_and_no_filter_rule`
+    /// adds it as the control that makes its first assertion mean something —
+    /// but it sends no packet and nothing listens behind that port, so it
+    /// shows where the accept lands in the ruleset, not what it exposes.
     /// What keeps that accept from coming back is the unit test
     /// `a_forward_writes_no_accept_for_the_external_port` below, which
     /// asserts it is absent from every command a forward issues.
