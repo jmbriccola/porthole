@@ -1,8 +1,20 @@
 //! End-to-end tests against the built binary.
 //!
-//! Everything here runs unprivileged. Tests that would need root, or a
-//! firewall that is not installed, skip themselves rather than fail: this file
-//! has to be runnable on a developer laptop and in a bare CI container alike.
+//! Everything here runs unprivileged, and nothing here skips itself.
+//!
+//! This file has to be runnable on a developer laptop and in a bare CI
+//! container alike, and for a while the way it did that was
+//! `if !have("firewall-cmd") { eprintln!("skipped: ..."); return; }` -- which
+//! libtest counts as `ok`. Measured: on a `PATH` with no `firewall-cmd` and
+//! no `ip`, twelve tests printed `skipped:` and the run reported
+//! `49 passed; 0 failed`. Among them was the whole of the host-level `--as`
+//! coverage and the coverage of a Critical fixed on this same branch.
+//!
+//! The cure is [`stub_firewalld_and_ip`], not a louder failure: a suite that
+//! goes red on a ufw laptop is a different way of not being run. Every
+//! command porthole issues to those two programs is a read of a handful of
+//! fixed shapes, so a test can carry its own. Same `PATH`, after: 49 passed,
+//! nothing skipped.
 //!
 //! # Why every process started here is given a bus of its own
 //!
@@ -269,10 +281,6 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).to_string()
 }
 
-fn have(program: &str) -> bool {
-    which(program).is_some()
-}
-
 fn is_root() -> bool {
     // SAFETY: geteuid takes no arguments and cannot fail.
     unsafe { libc::geteuid() == 0 }
@@ -423,14 +431,14 @@ fn opening_without_a_helper_says_the_helper_is_missing() {
 
 #[test]
 fn dry_run_needs_no_privileges_and_changes_nothing() {
-    if !have("firewall-cmd") || !have("ip") {
-        eprintln!("skipped: needs firewall-cmd and ip");
-        return;
-    }
     let dir = TempDir::new().unwrap();
     let path = state_path(&dir);
 
-    let out = porthole(&["open", "5173", "--for", "30m", "--dry-run"], &path);
+    let out = porthole_with_a_firewall(
+        &["open", "5173", "--for", "30m", "--dry-run"],
+        &path,
+        &bin_dir(&dir),
+    );
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
 
     let text = stdout(&out);
@@ -453,12 +461,12 @@ fn dry_run_needs_no_privileges_and_changes_nothing() {
 
 #[test]
 fn dry_run_json_lists_the_commands_it_would_run() {
-    if !have("firewall-cmd") || !have("ip") {
-        eprintln!("skipped: needs firewall-cmd and ip");
-        return;
-    }
     let dir = TempDir::new().unwrap();
-    let out = porthole(&["open", "5173", "--dry-run", "--json"], &state_path(&dir));
+    let out = porthole_with_a_firewall(
+        &["open", "5173", "--dry-run", "--json"],
+        &state_path(&dir),
+        &bin_dir(&dir),
+    );
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
 
     let json: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid JSON");
@@ -475,12 +483,12 @@ fn dry_run_json_lists_the_commands_it_would_run() {
 
 #[test]
 fn the_default_scope_is_the_current_subnet_never_anywhere() {
-    if !have("firewall-cmd") || !have("ip") {
-        eprintln!("skipped: needs firewall-cmd and ip");
-        return;
-    }
     let dir = TempDir::new().unwrap();
-    let out = porthole(&["open", "5173", "--dry-run", "--json"], &state_path(&dir));
+    let out = porthole_with_a_firewall(
+        &["open", "5173", "--dry-run", "--json"],
+        &state_path(&dir),
+        &bin_dir(&dir),
+    );
     let json: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
     assert_eq!(
         json["rule"]["scope"], "network",
@@ -548,24 +556,24 @@ fn closing_without_a_helper_says_the_helper_is_missing() {
 
 #[test]
 fn closing_a_port_that_is_not_open_exits_rule_not_found() {
-    if !have("firewall-cmd") || !have("ip") {
-        eprintln!("skipped: needs firewall-cmd and ip");
-        return;
-    }
     let dir = TempDir::new().unwrap();
-    let out = porthole(&["close", "5173", "--dry-run"], &state_path(&dir));
+    let out = porthole_with_a_firewall(
+        &["close", "5173", "--dry-run"],
+        &state_path(&dir),
+        &bin_dir(&dir),
+    );
     assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
     assert!(stderr(&out).contains("5173/tcp"), "got: {}", stderr(&out));
 }
 
 #[test]
 fn close_all_on_an_empty_state_succeeds_quietly() {
-    if !have("firewall-cmd") || !have("ip") {
-        eprintln!("skipped: needs firewall-cmd and ip");
-        return;
-    }
     let dir = TempDir::new().unwrap();
-    let out = porthole(&["close", "--all", "--dry-run"], &state_path(&dir));
+    let out = porthole_with_a_firewall(
+        &["close", "--all", "--dry-run"],
+        &state_path(&dir),
+        &bin_dir(&dir),
+    );
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
     assert!(
         stdout(&out).contains("Nothing to close"),
@@ -576,14 +584,11 @@ fn close_all_on_an_empty_state_succeeds_quietly() {
 
 #[test]
 fn close_all_json_on_an_empty_state_is_an_empty_array() {
-    if !have("firewall-cmd") || !have("ip") {
-        eprintln!("skipped: needs firewall-cmd and ip");
-        return;
-    }
     let dir = TempDir::new().unwrap();
-    let out = porthole(
+    let out = porthole_with_a_firewall(
         &["close", "--all", "--dry-run", "--json"],
         &state_path(&dir),
+        &bin_dir(&dir),
     );
     let json: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
     assert_eq!(json["closed"].as_array().unwrap().len(), 0);
@@ -598,16 +603,19 @@ fn a_dry_run_works_without_a_writable_state_directory() {
     // the one that does -- it reads Docker's chain itself -- which is why
     // this test names `open`.) Taking the state lock would try
     // to create that directory and fail.
-    if is_root() {
-        eprintln!("skipped: running as root");
-        return;
-    }
-    if !have("firewall-cmd") || !have("ip") {
-        eprintln!("skipped: needs firewall-cmd and ip");
-        return;
-    }
+    assert!(
+        !is_root(),
+        "this test is about a directory an unprivileged process cannot create, \
+         so as root it would assert nothing. The suite is never run as root -- \
+         porthole's own rule is that nothing here needs `sudo`."
+    );
+    let dir = TempDir::new().unwrap();
+    let bin = bin_dir(&dir);
+    stub_firewalld_and_ip(&bin);
     let mut command = porthole_command(&["open", "5173", "--dry-run", "--json"]);
-    command.env_remove("PORTHOLE_STATE_FILE");
+    command
+        .env_remove("PORTHOLE_STATE_FILE")
+        .env("PATH", path_ahead_of(&bin));
     let out = run(command, None);
     assert_eq!(
         out.status.code(),
@@ -626,16 +634,18 @@ fn status_works_without_a_writable_state_directory() {
     // second, independent regression that a single `for_write` gate on
     // `--dry-run` alone would not have caught, since `status` never writes
     // regardless of that flag.
-    if is_root() {
-        eprintln!("skipped: running as root");
-        return;
-    }
-    if !have("firewall-cmd") || !have("ip") {
-        eprintln!("skipped: needs firewall-cmd and ip");
-        return;
-    }
+    assert!(
+        !is_root(),
+        "as above: as root there is no unwritable directory to test against, \
+         and the suite is never run as root."
+    );
+    let dir = TempDir::new().unwrap();
+    let bin = bin_dir(&dir);
+    stub_firewalld_and_ip(&bin);
     let mut command = porthole_command(&["status", "--json"]);
-    command.env_remove("PORTHOLE_STATE_FILE");
+    command
+        .env_remove("PORTHOLE_STATE_FILE")
+        .env("PATH", path_ahead_of(&bin));
     let out = run(command, None);
     assert_eq!(
         out.status.code(),
@@ -740,13 +750,16 @@ fn every_failing_check_says_what_to_do_about_it() {
 }
 
 #[test]
-fn doctor_notices_docker_on_a_machine_that_has_it() {
-    // This machine runs Docker, and Docker publishes container ports below
-    // the firewall — porthole cannot close what it never opened.
-    if !std::path::Path::new("/sys/class/net/docker0").exists() {
-        eprintln!("skipped: no docker0 on this machine");
-        return;
-    }
+fn doctor_always_reports_a_docker_check_and_explains_it_where_docker_is() {
+    // `check_docker` reads `/sys/class/net/docker0`, which no `PATH` stub can
+    // answer for, so this is the one test in this file whose subject really
+    // is the machine it runs on. It used to skip itself when that directory
+    // was absent -- and libtest counts a skip as `ok`.
+    //
+    // Split instead. The half that holds everywhere is asserted everywhere:
+    // the check is always present and is always `ok`, because Docker is a
+    // warning and never a failure. The half that needs Docker is an extra
+    // assertion on a machine that has it, not the whole test.
     let dir = TempDir::new().unwrap();
     let out = porthole(&["doctor", "--json"], &state_path(&dir));
     let json: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
@@ -755,12 +768,27 @@ fn doctor_notices_docker_on_a_machine_that_has_it() {
         .unwrap()
         .iter()
         .find(|c| c["name"] == "Docker")
-        .expect("a Docker check");
-    assert!(
-        docker["detail"].as_str().unwrap().contains("0.0.0.0")
-            || docker["detail"].as_str().unwrap().contains("publish"),
-        "the Docker check must explain the consequence, got: {docker}"
+        .expect("a Docker check, on every machine");
+    assert_eq!(
+        docker["ok"], true,
+        "Docker is a warning, never a failed check: {docker}"
     );
+
+    if std::path::Path::new("/sys/class/net/docker0").exists() {
+        // Docker publishes container ports below the firewall, so porthole
+        // cannot close what it never opened, and the check has to say so.
+        assert!(
+            docker["detail"].as_str().unwrap().contains("0.0.0.0")
+                || docker["detail"].as_str().unwrap().contains("publish"),
+            "the Docker check must explain the consequence, got: {docker}"
+        );
+    } else {
+        assert_eq!(
+            docker["detail"], "not present",
+            "and must say plainly that it found nothing, rather than warning \
+             about a Docker this machine does not run: {docker}"
+        );
+    }
 }
 
 #[test]
@@ -855,19 +883,28 @@ fn open_towards_an_unknown_device_says_so_and_lists_what_exists() {
 
 #[test]
 fn open_towards_a_saved_device_that_is_absent_exits_device_unreachable() {
-    if !have("ip") {
-        return; // resolution shells out to `ip -4 neigh show`.
-    }
+    // Resolution shells out to `ip -4 neigh show`. This used to `return` on
+    // a machine without `ip` -- without even printing why, and libtest
+    // counted it `ok`. The stub answers that read with an empty table, which
+    // is the situation under test: a saved device nothing on this network
+    // answers for.
     let dir = TempDir::new().unwrap();
+    let bin = bin_dir(&dir);
+    stub_firewalld_and_ip(&bin);
     let book = dir.path().join("devices.toml");
     // A MAC from the reserved documentation range, which will not be in any
-    // real neighbour table.
+    // real neighbour table either.
     write_book(
         &book,
         "[[device]]\nname = \"ghost\"\nmac = \"00:00:5e:00:53:01\"\n",
     );
 
-    let out = porthole_with_devices(&["open", "5173", "--to", "ghost"], &state_path(&dir), &book);
+    let mut command = porthole_command(&["open", "5173", "--to", "ghost"]);
+    command
+        .env("PORTHOLE_STATE_FILE", state_path(&dir))
+        .env("PORTHOLE_DEVICES_FILE", &book)
+        .env("PATH", path_ahead_of(&bin));
+    let out = run(command, None);
 
     assert_eq!(code(&out), 6, "{}", stderr(&out));
     assert!(stderr(&out).contains("ghost"), "{}", stderr(&out));
@@ -1060,6 +1097,99 @@ fn stub(bin: &Path, name: &str, body: &str) {
     std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A directory of this test's own, for stubs, inside its `TempDir`.
+fn bin_dir(dir: &TempDir) -> PathBuf {
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("the temp dir is writable");
+    bin
+}
+
+/// A `firewall-cmd` and an `ip` that answer the reads porthole makes of
+/// them, so a test that needs a firewall does not need *this machine* to
+/// have one.
+///
+/// # Why every test that needs a firewall stubs one
+///
+/// These tests used to open with
+///
+/// ```ignore
+/// if !have("firewall-cmd") || !have("ip") {
+///     eprintln!("skipped: needs firewall-cmd and ip");
+///     return;
+/// }
+/// ```
+///
+/// which libtest counts as `ok`. `tests/container.rs`'s own
+/// `require_environment!` documents that exact construct as the defect it
+/// exists to remove -- and this file kept producing new instances of it, in
+/// the same branch, including the whole of the host-level `--as` coverage
+/// and the coverage of a Critical fixed on the way. On any machine without
+/// firewalld -- which is every ufw and nftables machine `docs/backends.md`
+/// is written for, and every CI runner without it -- twelve tests here
+/// reported success having executed nothing.
+///
+/// The cure is not to fail loudly instead: a suite that goes red on a ufw
+/// laptop is a different way of not being run. It is to stop needing the
+/// machine to have a firewall. Every command porthole issues to these two
+/// programs is a *read* of a handful of fixed shapes, and the answers below
+/// are the ones `porthole-core`'s own unit fixtures use, so what these tests
+/// assert -- the rule porthole composes, the exit code it leaves, the JSON
+/// it prints -- is decided by porthole either way.
+///
+/// What this does not test is `backend::detect` against a real firewalld.
+/// That was never what these tests were for, and it has a home of its own:
+/// `tests/container.rs` runs the real binary against a real firewalld, a
+/// real ufw and a real nftables, and fails rather than skips when it cannot.
+fn stub_firewalld_and_ip(bin: &Path) {
+    // `--version` and `--state` are `Firewalld::health`; `--get-default-zone`
+    // is `managed_zone`; `--list-rich-rules` is the read-back
+    // `add_rich_rule` makes around its own write. Nothing else is read, and
+    // an unrecognised argument exits non-zero rather than answering, so a
+    // read this stub has not been taught about surfaces as a failure instead
+    // of as an empty string.
+    stub(
+        bin,
+        "firewall-cmd",
+        "for arg in \"$@\"; do\n\
+         case \"$arg\" in\n\
+         --version) echo '2.4.4'; exit 0 ;;\n\
+         --state) echo 'running'; exit 0 ;;\n\
+         --get-default-zone) echo 'FedoraWorkstation'; exit 0 ;;\n\
+         --list-rich-rules) exit 0 ;;\n\
+         esac\n\
+         done\n\
+         echo \"cli-test stub firewall-cmd: unhandled $*\" >&2\n\
+         exit 2",
+    );
+    // The two reads `net::current_network` makes, and the one
+    // `net::present_networks` makes, answering with the same 10.10.10.119/24
+    // `porthole-core`'s own `ROUTE_JSON`/`ADDR_JSON` fixtures use.
+    stub(
+        bin,
+        "ip",
+        "case \"$*\" in\n\
+         *'route show default'*)\n\
+         echo '[{\"dst\":\"default\",\"dev\":\"wlo1\",\"metric\":600}]' ;;\n\
+         *'addr show'*)\n\
+         echo '[{\"ifindex\":2,\"ifname\":\"wlo1\",\"addr_info\":[{\"family\":\"inet\",\
+         \"local\":\"10.10.10.119\",\"prefixlen\":24,\"scope\":\"global\"}]}]' ;;\n\
+         *'neigh show'*) : ;;\n\
+         *) echo \"cli-test stub ip: unhandled $*\" >&2; exit 2 ;;\n\
+         esac",
+    );
+}
+
+/// `porthole` with a stub firewall and network ahead of everything on
+/// `PATH`, and its state file in this test's own directory.
+fn porthole_with_a_firewall(args: &[&str], state: &Path, bin: &Path) -> Output {
+    stub_firewalld_and_ip(bin);
+    let mut command = porthole_command(args);
+    command
+        .env("PORTHOLE_STATE_FILE", state)
+        .env("PATH", path_ahead_of(bin));
+    run(command, None)
 }
 
 /// The whole picker, end to end, on the table that produced both defects:
@@ -1265,13 +1395,9 @@ fn list_json_carries_a_forward_and_says_nothing_for_an_open() {
 
 #[test]
 fn forward_defaults_the_external_port_to_the_published_one() {
-    if !have("firewall-cmd") || !have("ip") {
-        eprintln!("skipped: needs firewall-cmd and ip");
-        return;
-    }
     let dir = TempDir::new().unwrap();
-    let bin = dir.path().join("bin");
-    std::fs::create_dir(&bin).unwrap();
+    let bin = bin_dir(&dir);
+    stub_firewalld_and_ip(&bin);
     // Docker's own DNAT rules, as `porthole_core::docker::published` reads
     // them. A stub because this machine's real chain needs root to read and
     // is nobody's to depend on; published on loopback because that is the
@@ -1303,13 +1429,9 @@ fn forward_defaults_the_external_port_to_the_published_one() {
 
 #[test]
 fn forward_takes_a_different_external_port() {
-    if !have("firewall-cmd") || !have("ip") {
-        eprintln!("skipped: needs firewall-cmd and ip");
-        return;
-    }
     let dir = TempDir::new().unwrap();
-    let bin = dir.path().join("bin");
-    std::fs::create_dir(&bin).unwrap();
+    let bin = bin_dir(&dir);
+    stub_firewalld_and_ip(&bin);
     stub(
         &bin,
         "iptables",
@@ -1396,10 +1518,6 @@ fn forwarding_without_a_helper_says_the_helper_is_missing() {
 /// case says and this machine's own containers are neither read nor touched.
 #[test]
 fn each_refusal_a_forward_can_reach_has_its_own_exit_code() {
-    if !have("firewall-cmd") || !have("ip") {
-        eprintln!("skipped: needs firewall-cmd and ip");
-        return;
-    }
     let published_on_loopback = "echo '-N DOCKER'\n\
          echo '-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 34567 \
          -j DNAT --to-destination 172.17.0.9:80'";
@@ -1434,8 +1552,8 @@ fn each_refusal_a_forward_can_reach_has_its_own_exit_code() {
 
     for (name, chain, expected_code, expected_kind) in cases {
         let dir = TempDir::new().unwrap();
-        let bin = dir.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
+        let bin = bin_dir(&dir);
+        stub_firewalld_and_ip(&bin);
         stub(&bin, "iptables", chain);
 
         let mut command = porthole_command(&["forward", "34567", "--dry-run", "--json"]);
@@ -1466,8 +1584,8 @@ fn each_refusal_a_forward_can_reach_has_its_own_exit_code() {
     let taken = listener.local_addr().unwrap().port().to_string();
 
     let dir = TempDir::new().unwrap();
-    let bin = dir.path().join("bin");
-    std::fs::create_dir(&bin).unwrap();
+    let bin = bin_dir(&dir);
+    stub_firewalld_and_ip(&bin);
     stub(&bin, "iptables", published_on_loopback);
     let mut command =
         porthole_command(&["forward", "34567", "--as", &taken, "--dry-run", "--json"]);
@@ -1506,19 +1624,14 @@ fn each_refusal_a_forward_can_reach_has_its_own_exit_code() {
 /// passes `--as`.
 #[test]
 fn a_loopback_listener_on_the_published_port_does_not_refuse_the_ordinary_forward() {
-    if !have("firewall-cmd") || !have("ip") {
-        eprintln!("skipped: needs firewall-cmd and ip");
-        return;
-    }
-
     // Bound first, so the number is one nothing else on this machine can
     // take, and held for the whole run: this stands in for `docker-proxy`.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     let port = listener.local_addr().unwrap().port();
 
     let dir = TempDir::new().unwrap();
-    let bin = dir.path().join("bin");
-    std::fs::create_dir(&bin).unwrap();
+    let bin = bin_dir(&dir);
+    stub_firewalld_and_ip(&bin);
     stub(
         &bin,
         "iptables",
