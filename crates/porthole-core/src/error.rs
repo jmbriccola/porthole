@@ -32,6 +32,12 @@ pub enum ExitCode {
     NoNetwork = 8,
     /// A command that offers a choice had nothing to offer.
     NothingToOffer = 9,
+    /// The detected backend has no way to redirect a port.
+    ///
+    /// 10 and 11 are unassigned. They are held for the two codes the
+    /// forwarding work adds next; this one takes 12 so that whichever of the
+    /// two lands first, no number here has to move.
+    ForwardUnsupported = 12,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -77,6 +83,13 @@ pub enum Error {
     /// of its own and never crosses the bus.
     #[error("{0}")]
     NothingToOffer(String),
+
+    /// The detected backend has no way to redirect a port to a container.
+    ///
+    /// Constructed in one place, `FirewallBackend::forward`'s trait default,
+    /// which every backend that does not implement a forward inherits.
+    #[error("{0}")]
+    ForwardUnsupported(String),
 
     #[error("command `{command}` exited with status {status}: {stderr}")]
     CommandFailed {
@@ -135,6 +148,7 @@ impl Error {
             Error::RuleNotFound(_) => ExitCode::RuleNotFound,
             Error::NoNetwork(_) => ExitCode::NoNetwork,
             Error::NothingToOffer(_) => ExitCode::NothingToOffer,
+            Error::ForwardUnsupported(_) => ExitCode::ForwardUnsupported,
             Error::Remote { code, .. } => *code,
             Error::CommandFailed { .. }
             | Error::CommandSpawn { .. }
@@ -155,6 +169,7 @@ impl Error {
             Error::RuleNotFound(_) => "rule_not_found",
             Error::NoNetwork(_) => "no_network",
             Error::NothingToOffer(_) => "nothing_to_offer",
+            Error::ForwardUnsupported(_) => "forward_unsupported",
             Error::Remote { kind, .. } => kind,
             Error::CommandFailed { .. } => "command_failed",
             Error::CommandSpawn { .. } => "command_spawn_failed",
@@ -182,6 +197,11 @@ mod tests {
         assert_eq!(ExitCode::RuleNotFound as i32, 7);
         assert_eq!(ExitCode::NoNetwork as i32, 8);
         assert_eq!(ExitCode::NothingToOffer as i32, 9);
+        // 10 and 11 are unassigned, and this test is where that stays
+        // visible. `ForwardUnsupported` skipped them so that the two codes
+        // the forwarding work adds next can take them in either order
+        // without moving this one.
+        assert_eq!(ExitCode::ForwardUnsupported as i32, 12);
     }
 
     #[test]
@@ -210,6 +230,10 @@ mod tests {
             Error::NothingToOffer("nothing seen".into()).exit_code(),
             ExitCode::NothingToOffer
         );
+        assert_eq!(
+            Error::ForwardUnsupported("ufw cannot".into()).exit_code(),
+            ExitCode::ForwardUnsupported
+        );
     }
 
     #[test]
@@ -220,6 +244,10 @@ mod tests {
         );
         assert_eq!(Error::NoNetwork("x".into()).kind(), "no_network");
         assert_eq!(Error::NothingToOffer("x".into()).kind(), "nothing_to_offer");
+        assert_eq!(
+            Error::ForwardUnsupported("x".into()).kind(),
+            "forward_unsupported"
+        );
     }
 
     #[test]

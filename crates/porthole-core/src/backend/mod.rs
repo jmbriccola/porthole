@@ -17,7 +17,8 @@ pub mod ufw;
 
 use crate::command::CommandRunner;
 use crate::error::{Error, Result};
-use crate::model::OpenRequest;
+use crate::forward::ForwardTo;
+use crate::model::{OpenRequest, Protocol};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +48,11 @@ impl std::fmt::Display for BackendId {
 /// (the `marker` field below). firewalld rich rules cannot — the rich
 /// language has no comment element — so for firewalld the stored `rich_rule`
 /// string, exactly as firewalld normalised it, *is* the identity.
+///
+/// Note on the `backend` tag: it names the *variant*, and three of the four
+/// variants are named after a backend. [`RuleHandle::Forward`] is not — it is
+/// a pair of one backend's own handles, and which backend that is, is read
+/// from the tag each of the two carries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "backend", rename_all = "snake_case")]
 pub enum RuleHandle {
@@ -72,6 +78,28 @@ pub enum RuleHandle {
         table: String,
         chain: String,
         marker: String,
+    },
+    /// Both halves of a forward, in the order they must be removed: `permit`
+    /// first, then `redirect`.
+    ///
+    /// Removing the permit first means an interrupted removal leaves a
+    /// redirect nothing is permitted to reach, rather than a permitted port
+    /// that still reaches a container.
+    ///
+    /// Both halves are always present. Measured on firewalld 2.4.4 in a
+    /// container: `--add-forward-port`, and a `forward-port` rich rule, each
+    /// write exactly one nftables rule, a `dnat` in the zone's
+    /// `nat_PRE_<zone>_allow` chain, and neither writes anything into any
+    /// filter chain. The redirect grants nothing on its own, on either
+    /// backend, so there is no case where one half stands alone and no
+    /// `Option` here to represent one.
+    ///
+    /// Both are handles of the same backend — the one that built them. A
+    /// backend's `close` refuses a handle it did not produce, and that
+    /// refusal reaches the halves too, because closing this walks into them.
+    Forward {
+        permit: Box<RuleHandle>,
+        redirect: Box<RuleHandle>,
     },
 }
 
@@ -155,6 +183,33 @@ pub trait FirewallBackend {
     fn open(&self, req: &OpenRequest, marker: &str) -> Result<RuleHandle>;
     fn close(&self, handle: &RuleHandle) -> Result<()>;
 
+    /// Redirect `req.port` to `to`, and permit `req.port` for the target
+    /// `req` names.
+    ///
+    /// `req.port` is the external port — what the local network connects to.
+    /// `to` says where that traffic goes: a container's own address and port
+    /// on Docker's network, never loopback.
+    ///
+    /// The returned handle is a [`RuleHandle::Forward`] carrying both rules.
+    ///
+    /// The default refuses, and says a forward here would have to be a
+    /// permanent rule. ufw is the backend that takes it: its forwarding
+    /// lives in `/etc/ufw/before.rules`, a file that survives a reboot, and
+    /// porthole never writes a permanent firewall rule.
+    ///
+    /// That sentence is about ufw, not about anything the default can check,
+    /// so this module's tests pin which backends reach it — see
+    /// `ufw_is_the_only_backend_without_a_forward`, whose match on
+    /// [`BackendId`] does not compile until a new backend picks a side.
+    fn forward(&self, _req: &OpenRequest, _to: &ForwardTo, _marker: &str) -> Result<RuleHandle> {
+        Err(Error::ForwardUnsupported(format!(
+            "{} cannot redirect a port: porthole has no forward for this backend, because \
+             writing one there means writing a permanent firewall rule, and porthole never \
+             writes one",
+            self.id()
+        )))
+    }
+
     /// Every rule visible in the place porthole writes to.
     ///
     /// **This is diagnostic information, not evidence of ownership.** On
@@ -184,6 +239,25 @@ pub trait FirewallBackend {
     fn location(&self) -> Result<Option<String>> {
         Ok(None)
     }
+}
+
+/// The one protocol a forward's two rules are written for.
+///
+/// `OpenRequest` and `ForwardTo` each carry a protocol, and they are built
+/// from different sources — the request from what the user asked for, the
+/// mapping from what Docker published. Each backend renders the redirect as a
+/// single rule whose one protocol governs both the match on `req.port` and
+/// the destination `to` names, so a disagreement between the two has no
+/// spelling: it can only be resolved by picking one and discarding the other.
+/// Refuse instead.
+pub(crate) fn forward_protocol(req: &OpenRequest, to: &ForwardTo) -> Result<Protocol> {
+    if req.protocol != to.protocol {
+        return Err(Error::InvalidArgument(format!(
+            "a forward cannot be {} on the outside and {} on the inside",
+            req.protocol, to.protocol
+        )));
+    }
+    Ok(req.protocol)
 }
 
 /// The exact message [`detect`] fails with when no firewall is installed at
@@ -243,9 +317,11 @@ mod tests {
     use super::firewalld::tests::{ROUTE_JSON, SUBNET_RULE, ZONE};
     use super::nftables;
     use super::ufw;
-    use super::{detect, BackendId, FirewallBackend, Ownership};
+    use super::{detect, BackendId, FirewallBackend, Ownership, RuleHandle};
     use crate::command::{Command, CommandRunner, Output, RecordingRunner};
     use crate::error::{Error, ExitCode};
+    use crate::forward::ForwardTo;
+    use crate::model::{Lifetime, OpenRequest, Target};
 
     #[test]
     fn firewalld_cannot_prove_ownership_and_says_so() {
@@ -375,6 +451,113 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ufw_is_the_only_backend_without_a_forward() {
+        // `FirewallBackend::forward`'s refusing default tells a user that
+        // writing a forward on this backend would mean writing a permanent
+        // firewall rule. That sentence is true of ufw, whose forwarding
+        // lives in /etc/ufw/before.rules; it is not something the default
+        // itself can check. This test is what keeps it true, by pinning
+        // exactly which backends fall through to it.
+        //
+        // The match on BackendId is exhaustive on purpose: a new backend
+        // does not compile until someone decides which side of this it is
+        // on, and if it is on the refusing side, whether the default's
+        // sentence is still honest about it.
+        fn refuses(backend: &dyn FirewallBackend, runner: &RecordingRunner) {
+            let err = backend
+                .forward(&forward_req(), &forward_to(), "porthole:abc")
+                .expect_err("this backend is expected to have no forward");
+            assert_eq!(err.exit_code(), ExitCode::ForwardUnsupported);
+            assert!(
+                err.to_string().contains(&backend.id().to_string()),
+                "the refusal must name the backend: {err}"
+            );
+            assert!(
+                runner.recorded().is_empty(),
+                "refusing must not run any command"
+            );
+        }
+
+        for id in [BackendId::Firewalld, BackendId::Ufw, BackendId::Nftables] {
+            match id {
+                // Both of these implement `forward`, so neither reaches the
+                // default. Called with an empty script, they fail somewhere
+                // in their own implementation -- what matters here is only
+                // that the failure is not the default's refusal.
+                BackendId::Firewalld => {
+                    let runner = RecordingRunner::new();
+                    let err = firewalld::Firewalld::new(&runner)
+                        .forward(&forward_req(), &forward_to(), "porthole:abc")
+                        .expect_err("an empty script cannot complete a forward");
+                    assert_ne!(err.exit_code(), ExitCode::ForwardUnsupported);
+                }
+                BackendId::Nftables => {
+                    let runner = RecordingRunner::new();
+                    let err = nftables::Nftables::new(&runner)
+                        .forward(&forward_req(), &forward_to(), "porthole:abc")
+                        .expect_err("an empty script cannot complete a forward");
+                    assert_ne!(err.exit_code(), ExitCode::ForwardUnsupported);
+                }
+                BackendId::Ufw => {
+                    let runner = RecordingRunner::new();
+                    refuses(&ufw::Ufw::new(&runner), &runner);
+                }
+            }
+        }
+    }
+
+    fn forward_req() -> OpenRequest {
+        OpenRequest {
+            port: 3000,
+            protocol: crate::model::Protocol::Tcp,
+            target: Target::Network {
+                cidr: "10.10.10.0/24".parse().unwrap(),
+            },
+            lifetime: Lifetime::For(std::time::Duration::from_secs(300)),
+        }
+    }
+
+    fn forward_to() -> ForwardTo {
+        ForwardTo {
+            container_addr: std::net::Ipv4Addr::new(172, 18, 0, 2),
+            container_port: 8080,
+            published_port: 3000,
+            protocol: crate::model::Protocol::Tcp,
+        }
+    }
+
+    #[test]
+    fn a_forward_handle_survives_the_state_file_round_trip() {
+        // `RuleHandle` is serialised into /run/porthole/state.json, and a
+        // handle that cannot be read back is a rule nothing can ever remove.
+        // The nesting is what makes this worth asserting: `Forward` holds
+        // two `RuleHandle`s inside an enum that is itself internally tagged.
+        let handle = RuleHandle::Forward {
+            permit: Box::new(RuleHandle::Firewalld {
+                zone: ZONE.to_string(),
+                rich_rule: SUBNET_RULE.to_string(),
+            }),
+            redirect: Box::new(RuleHandle::Nftables {
+                family: "ip".to_string(),
+                table: "nat".to_string(),
+                chain: "prerouting".to_string(),
+                marker: "porthole:abc".to_string(),
+            }),
+        };
+        let json = serde_json::to_string(&handle).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RuleHandle>(&json).unwrap(),
+            handle,
+            "serialised as: {json}"
+        );
+        // The tag names the variant; the two halves keep their own.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["backend"], "forward");
+        assert_eq!(v["permit"]["backend"], "firewalld");
+        assert_eq!(v["redirect"]["backend"], "nftables");
     }
 
     /// Delegates every call to an inner [`RecordingRunner`], except for named
