@@ -2,6 +2,14 @@
 //!
 //! Every method follows the same shape, and the order is deliberate:
 //!
+//! 0. **Be admitted** ([`crate::retire::Retirement::admit`]). One line at the
+//!    top of every method, before anything else, and it does two things: it
+//!    counts the request for exactly as long as it runs -- a request parked on
+//!    the polkit prompt in step 3 is in flight for as long as a person takes
+//!    to type, and a helper that measured idleness by wall-clock quiet would
+//!    retire out from under the dialog -- and it refuses the request outright
+//!    once this process has decided to retire. [`Porthole::protocol_version`]
+//!    is the one exception, and says at its own declaration why.
 //! 1. **Validate**, treating everything the client sent as untrusted. The
 //!    helper never accepts a rule string and never acts on a value it would
 //!    not have accepted from a person.
@@ -70,6 +78,7 @@
 
 use crate::authz::{caller_uid, Action, Authorizer, Details};
 use crate::error::HelperError;
+use crate::retire::Retirement;
 use porthole_core::backend::{self, BackendHealth, BackendId};
 use porthole_core::clock::SystemClock;
 use porthole_core::command::RealRunner;
@@ -82,6 +91,7 @@ use porthole_core::net;
 use porthole_core::state::StateStore;
 use porthole_core::validate;
 use std::path::PathBuf;
+use std::sync::Arc;
 use zbus::object_server::SignalEmitter;
 
 static SYSTEM_CLOCK: SystemClock = SystemClock;
@@ -94,6 +104,11 @@ pub struct Porthole {
     bus: zbus::Connection,
     state_path: PathBuf,
     executable: PathBuf,
+    /// What decides whether this process has anything left to do -- see
+    /// [`crate::retire`]. Every method below opens with
+    /// [`Retirement::admit`], which counts it for as long as it runs and
+    /// refuses it outright once the process has decided to go.
+    retirement: Arc<Retirement>,
 }
 
 impl Porthole {
@@ -102,12 +117,14 @@ impl Porthole {
         bus: zbus::Connection,
         state_path: PathBuf,
         executable: PathBuf,
+        retirement: Arc<Retirement>,
     ) -> Self {
         Porthole {
             authorizer,
             bus,
             state_path,
             executable,
+            retirement,
         }
     }
 }
@@ -125,6 +142,15 @@ impl Porthole {
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> Result<WireRule, HelperError> {
+        // 0. Count this request for as long as it runs -- including for as
+        // long as a person takes to answer the polkit prompt in step 3 --
+        // and refuse it outright if this process has already decided to
+        // retire. First, before validation and before anything is read: a
+        // request served after that decision would emit a `RuleOpened` that
+        // no subscriber can receive, and would open a rule the process is
+        // about to exit with. See `crate::retire`.
+        let _busy = self.retirement.admit().await?;
+
         // 1. Validate. Nothing the client sent is trusted.
         if port == 0 {
             return Err(HelperError::InvalidArgument(
@@ -253,6 +279,10 @@ impl Porthole {
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> Result<WireRule, HelperError> {
+        // 0. Counted and, if this process is retiring, refused -- `open`'s
+        // own step 0, for `open`'s own reasons.
+        let _busy = self.retirement.admit().await?;
+
         // 1. Validate, in `open`'s own order and for its own reason: nothing
         // the client sent is trusted, and nothing is authorized until the
         // request is one the helper would have accepted from a person.
@@ -364,6 +394,7 @@ impl Porthole {
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> Result<WireRule, HelperError> {
+        let _busy = self.retirement.admit().await?;
         let protocol = validate::parse_protocol(protocol).map_err(HelperError::from)?;
         self.authorizer
             .check(Action::Close, &Details::new(), &header)
@@ -428,6 +459,7 @@ impl Porthole {
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> Result<WireRule, HelperError> {
+        let _busy = self.retirement.admit().await?;
         self.authorizer
             .check(Action::Close, &Details::new(), &header)
             .await
@@ -501,6 +533,7 @@ impl Porthole {
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> Result<(Vec<WireRule>, Vec<WireError>), HelperError> {
+        let _busy = self.retirement.admit().await?;
         self.authorizer
             .check(Action::Close, &Details::new(), &header)
             .await
@@ -563,6 +596,7 @@ impl Porthole {
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<Vec<WireRule>, HelperError> {
+        let _busy = self.retirement.admit().await?;
         self.authorizer
             .check(Action::List, &Details::new(), &header)
             .await
@@ -577,6 +611,7 @@ impl Porthole {
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<WireStatus, HelperError> {
+        let _busy = self.retirement.admit().await?;
         self.authorizer
             .check(Action::List, &Details::new(), &header)
             .await
@@ -638,6 +673,7 @@ impl Porthole {
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> Result<Vec<WireDockerPort>, HelperError> {
+        let _busy = self.retirement.admit().await?;
         self.authorizer
             .check(Action::List, &Details::new(), &header)
             .await
@@ -666,6 +702,17 @@ impl Porthole {
     ///
     /// The helper checks no versions of its own. It is the authority; it
     /// answers, and the clients decide.
+    ///
+    /// **The one method with no [`Retirement::admit`] in front of it**, and
+    /// it could not have one: its reply is `u` and nothing else, so there is
+    /// no error for a retiring helper to send back, which is the same
+    /// property that makes it readable by a client that disagrees about every
+    /// other type here. Nothing is lost by serving it during a retirement:
+    /// it returns a compile-time constant, takes no lock, reads no state,
+    /// touches no firewall and emits no signal, so neither hazard the
+    /// admission check exists for -- an announcement no subscriber can
+    /// receive, a rule opened by a process about to exit -- is reachable
+    /// through it.
     async fn protocol_version(&self) -> u32 {
         porthole_core::ipc::PROTOCOL_VERSION
     }

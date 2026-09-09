@@ -50,6 +50,7 @@ mod common;
 use porthole_core::cli_path::CLI_CANDIDATES;
 use porthole_core::ipc::{signature_digest, INTERFACE, PATH, PROTOCOL_VERSION, SIGNATURE};
 use porthole_helper::authz::AlwaysAllow;
+use porthole_helper::retire::Retirement;
 use porthole_helper::service::Porthole;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -69,6 +70,7 @@ async fn serve(suffix: &str, state: &TempDir) -> (zbus::Connection, String) {
         bus,
         state.path().join("state.json"),
         std::path::PathBuf::from(CLI_CANDIDATES[0]),
+        Retirement::never(),
     );
     let name = probe_name(suffix);
     let conn = common::builder()
@@ -271,6 +273,7 @@ async fn the_three_answers_a_version_read_can_get_are_told_apart() {
         bus,
         state.path().join("state.json"),
         std::path::PathBuf::from(CLI_CANDIDATES[0]),
+        Retirement::never(),
     );
     let _current = common::builder()
         .name(porthole_core::ipc::SERVICE)

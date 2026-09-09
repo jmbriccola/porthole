@@ -15,6 +15,7 @@ mod common;
 use porthole_core::cli_path::CLI_CANDIDATES;
 use porthole_core::ipc::{PortholeProxy, PATH};
 use porthole_helper::authz::{Action, AlwaysAllow};
+use porthole_helper::retire::Retirement;
 use porthole_helper::service::Porthole;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -42,6 +43,7 @@ async fn serve(
         // silently drift apart the way the CLI's install path and the timer's
         // once did.
         std::path::PathBuf::from(CLI_CANDIDATES[0]),
+        Retirement::never(),
     );
     let name = probe_name(suffix);
     let conn = common::builder()

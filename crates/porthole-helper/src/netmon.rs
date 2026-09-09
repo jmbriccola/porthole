@@ -65,20 +65,34 @@
 //! # This module's own lifetime
 //!
 //! `main` spawns [`run`] onto the same runtime that serves the D-Bus
-//! interface and never awaits it there. Nothing in the helper exits the
-//! process early on its own -- there is no idle timeout and no
-//! "last-rule-closed" shutdown -- so [`run`] lives exactly as long as the
-//! process does, no more and no less. That is not the same as covering
-//! every open rule continuously: a crash, an OOM kill, a plain `systemctl
-//! stop`, or a package `try-restart` ends the process (and this module with
-//! it) while `RuntimeDirectoryPreserve=yes` keeps the state file and the
-//! firewall keeps every rule, and nothing restarts the helper until a
-//! client next addresses the bus name -- see `data/porthole-helper.service`'s
-//! own comment on why `Restart=` is not set there. Automatic close
-//! (`porthole_core::expiry`) does not share this gap: it is a systemd
-//! transient timer that lives outside this process, so a helper restart
-//! cannot lose it. A network change this module would have caught can be
-//! lost that way.
+//! interface and never awaits it there, so [`run`] lives exactly as long as
+//! the process does, no more and no less.
+//!
+//! The process does end on its own now: with **no rule recorded** and nothing
+//! in flight, [`crate::retire`] gives up the bus name and exits after a grace
+//! period, and the bus starts a new helper the moment a client wants one. That
+//! never costs this module anything it was doing, and the reason is the
+//! empty-state shortcut in [`wake_up_tracking`] rather than a promise made
+//! elsewhere: with nothing recorded, a wake-up returns before detecting a
+//! backend and before a single `ip` runs, and clears the subnet it tracked on
+//! the way out. So the one piece of in-process memory this module keeps is, by
+//! construction, already empty exactly when the helper becomes eligible to
+//! exit -- there is nothing for an exit to lose, and nothing for the next
+//! process to rebuild that it would not have had to rebuild anyway.
+//! `a_wake_up_with_nothing_recorded_clears_the_tracked_subnet` is what pins
+//! that. **With a rule recorded the helper never retires**, for exactly this
+//! module's sake.
+//!
+//! What that is still not is covering every open rule continuously: a crash,
+//! an OOM kill, a plain `systemctl stop`, or a package `try-restart` ends the
+//! process (and this module with it) while `RuntimeDirectoryPreserve=yes`
+//! keeps the state file and the firewall keeps every rule, and nothing
+//! restarts the helper until a client next addresses the bus name -- see
+//! `data/porthole-helper.service`'s own comment on why `Restart=` is not set
+//! there. Automatic close (`porthole_core::expiry`) does not share this gap:
+//! it is a systemd transient timer that lives outside this process, so
+//! neither a helper restart nor a retirement can lose it. A network change
+//! this module would have caught can be lost that way.
 
 use crate::service::Porthole;
 use ipnet::Ipv4Net;
@@ -1413,6 +1427,7 @@ mod tests {
             bus,
             PathBuf::from("/nonexistent/state.json"),
             PathBuf::from("/usr/bin/porthole"),
+            crate::retire::Retirement::never(),
         );
         let server = zbus::connection::Builder::address(address)
             .unwrap()

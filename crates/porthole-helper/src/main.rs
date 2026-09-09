@@ -17,6 +17,7 @@ use porthole_core::state::{ManagedRule, StateStore};
 use porthole_helper::authz::{AlwaysAllow, Authorizer};
 use porthole_helper::netmon;
 use porthole_helper::polkit::PolkitAuthorizer;
+use porthole_helper::retire::Retirement;
 use porthole_helper::service::Porthole;
 
 #[tokio::main]
@@ -82,7 +83,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let state_path = StateStore::default_path();
-    let service = Porthole::new(authorizer, bus, state_path.clone(), cli.clone());
+    // Built before the object is served, because every interface method asks
+    // it for admission -- see `porthole_helper::retire` for the whole of what
+    // it decides and why the obvious sequence is wrong.
+    let retirement = Retirement::from_env(session);
+    let service = Porthole::new(
+        authorizer,
+        bus,
+        state_path.clone(),
+        cli.clone(),
+        retirement.clone(),
+    );
 
     let conn = serving
         .name(SERVICE)?
@@ -110,11 +121,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // already spoken for (`Porthole` uses it to ask the bus daemon who a
     // caller is).
     if netmon::should_run(session) {
-        tokio::spawn(netmon::run(conn.clone(), state_path, cli));
+        tokio::spawn(netmon::run(conn.clone(), state_path.clone(), cli));
     }
 
-    tokio::signal::ctrl_c().await?;
+    // Three ways this process ends, and they race on purpose.
+    //
+    // `retirement.run` never returns: with no rule open and nothing in
+    // flight, it gives up the bus name and ends the process itself, and the
+    // bus starts a new helper the moment one is wanted again. On a helper
+    // that is not eligible to retire it simply never completes.
+    //
+    // The two signals are the ways somebody else ends it. `SIGTERM` is new
+    // here and is not a nicety: systemd sends one to a `Type=dbus` unit
+    // **40 microseconds** after it releases its `BusName`, measured, so a
+    // helper that handled only `SIGINT` would be killed by the default
+    // disposition in the middle of its own retirement -- the drain would
+    // never run. `terminated` therefore asks whether this particular
+    // `SIGTERM` is systemd acknowledging a retirement already under way, and
+    // lets that retirement finish; any other one ends the process here, which
+    // is what `systemctl stop` and a package `try-restart` expect and get
+    // today.
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminated(&retirement) => {}
+        _ = retirement.clone().run(conn, state_path) => {}
+    }
     Ok(())
+}
+
+/// Wait for a `SIGTERM` that is somebody asking this process to stop, rather
+/// than systemd acknowledging the retirement it is already carrying out.
+///
+/// Returns on the first of the former. A `SIGTERM` that arrives while
+/// [`Retirement::is_retiring`] holds is dropped and the wait resumes: the
+/// retirement is a few tens of milliseconds from calling `exit(0)` itself,
+/// and systemd's own `TimeoutStopSec=90s` is ample room for it. The exit is
+/// still recorded as `Deactivated successfully` either way -- measured.
+async fn terminated(retirement: &Retirement) {
+    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(term) => term,
+        Err(e) => {
+            // Without a handler the default disposition kills the process,
+            // which is the behaviour this helper had until now: say so, and
+            // let the other two arms of the race carry on.
+            eprintln!(
+                "porthole-helper: could not install a SIGTERM handler ({e}); a stop arriving \
+                 during a retirement will end this process before it has finished draining"
+            );
+            std::future::pending().await
+        }
+    };
+    while term.recv().await.is_some() {
+        if !retirement.is_retiring() {
+            return;
+        }
+    }
 }
 
 /// Reconcile once, under the exclusive lock, before the helper is reachable

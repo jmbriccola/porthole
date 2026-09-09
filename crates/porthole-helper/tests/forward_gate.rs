@@ -38,6 +38,7 @@ mod common;
 use porthole_core::cli_path::CLI_CANDIDATES;
 use porthole_core::ipc::{PortholeProxy, PATH};
 use porthole_helper::authz::{Action, AlwaysAllow};
+use porthole_helper::retire::Retirement;
 use porthole_helper::service::Porthole;
 use std::path::Path;
 use std::sync::Arc;
@@ -97,6 +98,7 @@ async fn serve(
         bus,
         state.to_path_buf(),
         std::path::PathBuf::from(CLI_CANDIDATES[0]),
+        Retirement::never(),
     );
     let name = format!("com.jacopobriccola.PortholeTest{suffix}");
     let conn = common::builder()

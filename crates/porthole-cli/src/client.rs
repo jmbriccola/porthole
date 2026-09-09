@@ -251,7 +251,30 @@ fn nobody_answered(e: &zbus::Error) -> bool {
     )
 }
 
-/// [`answered`], plus **one** retry when nobody answered the first call.
+/// Whether the helper answered that it was **retiring**, which is the one
+/// refusal on this interface that is not about the request at all.
+///
+/// A helper with no rule open and nothing in flight gives up the bus name and
+/// exits (`porthole_helper::retire`). From the instant it decides to, it
+/// refuses every request rather than serving it — because a request served
+/// after that point would emit an announcement no subscriber can receive, and
+/// could open a rule the process is about to exit with. The refusal is only
+/// ever sent once the name is already gone, so asking again reaches the fresh
+/// instance the bus activates rather than the one that is leaving.
+fn helper_was_retiring(e: &zbus::Error) -> bool {
+    matches!(
+        e,
+        zbus::Error::MethodError(name, ..)
+            if name.as_str() == "com.jacopobriccola.Porthole.Retiring"
+    )
+}
+
+/// The two failures a second call can turn into service, and nothing else.
+fn worth_asking_again(e: &zbus::Error) -> bool {
+    nobody_answered(e) || helper_was_retiring(e)
+}
+
+/// [`answered`], plus **one** retry when the first call is [`worth_asking_again`].
 ///
 /// This is a defect fixed in its own right, not a piece of any shutdown
 /// sequence: a helper that is restarted by a package upgrade, killed by an
@@ -280,23 +303,23 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = zbus::Result<T>>,
 {
-    answered(proxy, once_more_if_nobody_answered(call).await).await
+    answered(proxy, once_more_if_worth_asking_again(call).await).await
 }
 
 /// The retry itself, with no proxy and no classification in it, so what it
 /// decides is testable without a bus: `call` once, and exactly once more if
-/// the first attempt found [`nobody_answered`].
+/// the first attempt was [`worth_asking_again`].
 ///
 /// Whatever the second attempt says is the answer, including a second
 /// `NoReply` — a helper that dies on every request must report, not be asked
 /// forever.
-async fn once_more_if_nobody_answered<T, F, Fut>(mut call: F) -> zbus::Result<T>
+async fn once_more_if_worth_asking_again<T, F, Fut>(mut call: F) -> zbus::Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = zbus::Result<T>>,
 {
     match call().await {
-        Err(e) if nobody_answered(&e) => call().await,
+        Err(e) if worth_asking_again(&e) => call().await,
         first => first,
     }
 }
@@ -732,6 +755,42 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn a_helper_that_was_retiring_is_the_other_failure_worth_asking_again_about() {
+        // The one refusal on this interface that is not about the request:
+        // the helper had already given up the bus name when this arrived and
+        // deliberately did not act on it, so the second call reaches the
+        // fresh instance the bus activates. Spelled as the literal wire name,
+        // because that name is the contract with
+        // `porthole_helper::error::HelperError::Retiring` and nothing in
+        // either file makes a rename fail to compile.
+        let retiring = method_error(
+            "com.jacopobriccola.Porthole.Retiring",
+            "the porthole helper was retiring when this request arrived",
+        );
+        assert!(helper_was_retiring(&retiring));
+        assert!(worth_asking_again(&retiring));
+        assert!(
+            !nobody_answered(&retiring),
+            "it is an answer, and a deliberate one -- just not one about the request"
+        );
+
+        // The negative control that matters most here: no other refusal the
+        // helper can send is retried. A retried `open` whose refusal was real
+        // would charge a second polkit prompt.
+        for name in [
+            "com.jacopobriccola.Porthole.NotAuthorized",
+            "com.jacopobriccola.Porthole.AlreadyOpen",
+            "com.jacopobriccola.Porthole.Failed",
+            "com.jacopobriccola.Porthole.RetiringSoon",
+        ] {
+            assert!(
+                !helper_was_retiring(&method_error(name, "x")),
+                "{name} must not be read as a retirement"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_call_nobody_answered_is_made_exactly_once_more() {
         use std::cell::Cell;
@@ -739,7 +798,7 @@ mod tests {
         // Served on the second attempt: the whole point. A helper that has
         // just retired is activated afresh by this very call.
         let attempts = Cell::new(0u32);
-        let served = once_more_if_nobody_answered(|| {
+        let served = once_more_if_worth_asking_again(|| {
             attempts.set(attempts.get() + 1);
             let n = attempts.get();
             async move {
@@ -757,7 +816,7 @@ mod tests {
         // Once more and never again: a helper that dies on every request has
         // to report, not turn the client into something that keeps asking.
         let attempts = Cell::new(0u32);
-        let gave_up = once_more_if_nobody_answered(|| {
+        let gave_up = once_more_if_worth_asking_again(|| {
             attempts.set(attempts.get() + 1);
             async { Err::<u32, _>(nobody_answered_error()) }
         })
@@ -773,7 +832,7 @@ mod tests {
         // prompt, and a retried `close --all` would report an empty second
         // answer over a first one that had closed something.
         let attempts = Cell::new(0u32);
-        let refused = once_more_if_nobody_answered(|| {
+        let refused = once_more_if_worth_asking_again(|| {
             attempts.set(attempts.get() + 1);
             async {
                 Err::<u32, _>(method_error(
@@ -788,7 +847,7 @@ mod tests {
 
         // And a first call that simply worked is one call.
         let attempts = Cell::new(0u32);
-        let plain = once_more_if_nobody_answered(|| {
+        let plain = once_more_if_worth_asking_again(|| {
             attempts.set(attempts.get() + 1);
             async { Ok::<u32, zbus::Error>(1) }
         })
