@@ -751,9 +751,12 @@ pub const NO_REPLY_ERROR: &str = "org.freedesktop.DBus.Error.NoReply";
 ///   `try-restart`, an administrator's `systemctl stop`, a crash, or the last
 ///   instant of a helper retiring with a call already routed to it.
 /// - [`RETIRING_ERROR`] -- the helper had decided to go and deliberately did
-///   not act on the request. It only ever sends this once the name is already
-///   gone (`porthole_helper::retire`), so the second call reaches the fresh
-///   instance the bus activates rather than the one that is leaving.
+///   not act on the request. It sends this only once the name is provably no
+///   longer its own (`porthole_helper::retire`), so the second call reaches
+///   the fresh instance the bus activates rather than the one that is
+///   leaving. A helper whose `ReleaseName` *failed* sends nothing instead and
+///   lets the request lose its reply, which is the other name here and whose
+///   retry cannot come back to a process that has gone.
 ///
 /// Everything else is either a decision the helper made and delivered intact,
 /// or this process's own socket having gone -- and a second call over the

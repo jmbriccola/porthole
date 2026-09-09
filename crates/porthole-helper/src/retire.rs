@@ -20,8 +20,14 @@
 //!
 //! **Never with a rule open.** The network monitor is needed then, and there
 //! is no arrangement of the code below that can retire while the state file
-//! holds anything: [`Retirement::claim`] refuses, and it refuses under the
-//! same lock that admits requests, so nothing can slip between the two.
+//! holds anything -- but the lock is only half of why. The lock covers the
+//! `in_flight`/`retiring` pair: [`Retirement::claim`] and
+//! [`Retirement::admit`] read and write it under one `std::sync::Mutex`, so a
+//! request cannot be admitted after the decision and the decision cannot be
+//! taken while a request is executing. Whether the state file is *empty* is
+//! read outside that lock, on a blocking thread, and what closes that gap is
+//! an argument about who can write to the file rather than a lock over it:
+//! see [`Retirement::claim`]'s own doc comment, which carries it.
 //!
 //! # The sequence, and why the obvious one is wrong
 //!
@@ -50,9 +56,12 @@
 //! no signal is emitted after the release because nothing acts after the
 //! decision, and no rule can be opened by a process that is about to exit.
 //!
-//! The refusal waits for the release to complete before it answers, so the
-//! client's retry cannot land back on this instance: by the time it is told
-//! to ask again, this instance no longer owns the name it would ask.
+//! The refusal is answered only once the name is really gone, so the client's
+//! retry cannot land back on this instance: by the time anything is told to
+//! ask again, this instance no longer owns the name it would ask. That is why
+//! a `ReleaseName` that *fails* answers nothing at all -- the requests it was
+//! holding lose their replies instead, which their callers retry just the
+//! same, against a name this process is no longer there to own.
 //!
 //! `porthole-cli` retries once on that refusal (`client.rs`), which is what
 //! makes the whole arrangement robust rather than delicate -- and which is a
@@ -118,10 +127,37 @@ pub const GRACE_ENV: &str = "PORTHOLE_IDLE_GRACE_MS";
 /// same reason as [`GRACE_ENV`].
 ///
 /// It exists so that a test can put a request *inside* a window that is
-/// otherwise 50 ms wide -- the window where a request meets a retiring
-/// helper, which is the one thing about this feature that cannot be measured
-/// by waiting for it to happen by chance.
+/// otherwise 50 ms wide: the one between the release and the exit, where the
+/// old instance is still running and draining while the bus routes new calls
+/// to a fresh one. [`PRERELEASE_ENV`] widens the other window, the one before
+/// the release, which is a different fact and a different test.
 pub const SETTLE_ENV: &str = "PORTHOLE_IDLE_SETTLE_MS";
+
+/// How long to wait between deciding to retire and giving up the name, in
+/// milliseconds. **Zero in production, and debug builds only** -- the same
+/// rule as [`GRACE_ENV`], and the same purpose as [`SETTLE_ENV`], for the
+/// other of this feature's two unaddressable windows.
+///
+/// [`SETTLE_ENV`] widens the window *after* the release, where a request is
+/// no longer routed here at all -- the bus activates a fresh instance and
+/// that one serves it. This widens the window *before* it, which is the only
+/// moment at which a request can still reach an instance that has already
+/// decided to go, and therefore the only moment at which
+/// [`Retirement::admit`] can refuse anything. Without a knob it is the time a
+/// `ReleaseName` takes to reach the bus daemon and come back: a fraction of a
+/// millisecond, hit two or three times in a thousand calls under a load that
+/// suppresses the very idleness it needs, and missed entirely about one run
+/// in nine.
+///
+/// That matters more than a flaky test. The refusal path is the one place in
+/// this crate where an interface method awaits anything, and an interface
+/// method's future is polled on zbus's own executor thread, where a
+/// runtime-dependent primitive panics (see [`Retirement::released`]). The
+/// deterministic unit test for the same behaviour is a `#[tokio::test]`, so
+/// it polls `admit` inside a tokio runtime where such a primitive works
+/// perfectly. Entering this window on purpose is what turns the only guard
+/// against that defect from a lottery into a check.
+pub const PRERELEASE_ENV: &str = "PORTHOLE_IDLE_PRERELEASE_MS";
 
 /// Test-only opt-in that makes a `--session` helper retire too. Honoured in
 /// debug builds only. See [`should_run`] for what the pair of conditions is
@@ -142,8 +178,11 @@ const REFUSAL: &str = "the porthole helper was retiring when this request arrive
 /// started **by hand** by a test harness with no activation file anywhere --
 /// nothing would bring it back, and every later call in that suite would fail.
 /// So it retires there only when something says the bus can activate it, by
-/// setting [`SESSION_ENV`]; `crates/porthole-cli/tests/container.rs` is the
-/// only thing in this workspace that does.
+/// setting [`SESSION_ENV`]; `crates/porthole-helper/tests/idle_exit.rs` is
+/// the only thing in this workspace that does -- it starts a `dbus-daemon`
+/// with a `<servicedir>` of its own, which is what makes the claim true
+/// there. `crates/porthole-cli/tests/container.rs` does not: its helper is
+/// started by systemd on the system bus and never sees `--session` at all.
 ///
 /// The same shape, and the same reasoning, as [`crate::netmon::should_run`].
 pub fn should_run(session: bool) -> bool {
@@ -223,6 +262,9 @@ pub struct Retirement {
     released: watch::Sender<bool>,
     grace: Duration,
     settle: Duration,
+    /// Zero in production. See [`PRERELEASE_ENV`], which is the only thing
+    /// that ever makes it anything else.
+    prerelease: Duration,
     enabled: bool,
 }
 
@@ -240,7 +282,7 @@ impl Drop for Busy {
 }
 
 impl Retirement {
-    fn with(grace: Duration, settle: Duration, enabled: bool) -> Arc<Self> {
+    fn with(grace: Duration, settle: Duration, prerelease: Duration, enabled: bool) -> Arc<Self> {
         Arc::new(Retirement {
             book: Mutex::new(Bookkeeping {
                 in_flight: 0,
@@ -250,6 +292,7 @@ impl Retirement {
             released: watch::channel(false).0,
             grace,
             settle,
+            prerelease,
             enabled,
         })
     }
@@ -268,6 +311,11 @@ impl Retirement {
                 SETTLE,
                 cfg!(debug_assertions),
             ),
+            millis_from(
+                std::env::var(PRERELEASE_ENV).ok().as_deref(),
+                Duration::ZERO,
+                cfg!(debug_assertions),
+            ),
             should_run(session),
         )
     }
@@ -281,7 +329,7 @@ impl Retirement {
     /// refuses too, so a `Porthole` built with this cannot be talked into
     /// refusing a request no matter what else in the process goes wrong.
     pub fn never() -> Arc<Self> {
-        Self::with(GRACE, SETTLE, false)
+        Self::with(GRACE, SETTLE, Duration::ZERO, false)
     }
 
     /// Poisoning is taken rather than panicked on: what is behind the lock is
@@ -302,9 +350,17 @@ impl Retirement {
     /// Admit one interface method, or refuse it because this instance is on
     /// its way out.
     ///
-    /// The guard is taken **before** the decision is read and held across the
-    /// refusal's own wait, so a request being refused still counts as in
-    /// flight: the drain must not exit before the refusal has been written.
+    /// The guard is taken **before** the decision is read, and is held across
+    /// the refusal's own wait: a request waiting to be refused counts as in
+    /// flight, so [`Retirement::drain`] cannot decide the process is finished
+    /// while one is still parked on the release.
+    ///
+    /// It is *not* what keeps the process alive until the refusal reaches the
+    /// wire, and the distinction is worth having straight: the guard is
+    /// dropped before this returns `Err`, and zbus writes the reply only after
+    /// the method returns. The trailing settle in [`Retirement::retire`] is
+    /// what covers that last hop, and says so at its own call site. Nothing
+    /// inside a method can hold a process open past its own return.
     pub async fn admit(self: &Arc<Self>) -> Result<Busy, HelperError> {
         let retiring = {
             let mut book = self.lock();
@@ -324,10 +380,17 @@ impl Retirement {
         Err(HelperError::Retiring(REFUSAL.to_string()))
     }
 
-    /// Wait until the well-known name has been given up. Bounded by the
-    /// `ReleaseName` round trip -- a message to the bus daemon and back -- and
-    /// by nothing else: [`Retirement::retire`] records it whatever the bus
-    /// answered.
+    /// Wait until the well-known name has been given up.
+    ///
+    /// Ordinarily bounded by the `ReleaseName` round trip -- a message to the
+    /// bus daemon and back. **Not bounded at all when the release fails**, and
+    /// deliberately: [`Retirement::retire`] then records nothing, this never
+    /// completes, and the caller is answered by the process exiting rather
+    /// than by a refusal that would send its retry back to an instance still
+    /// owning the name. [`Retirement::drain`]'s own bound is what ends the
+    /// wait, at which point the caller gets `NoReply` -- which
+    /// `porthole_core::ipc::worth_asking_again` covers too, and whose retry
+    /// finds no owner and activates a fresh helper.
     async fn await_release(&self) {
         let mut released = self.released.subscribe();
         // `borrow` first, through `wait_for`'s own initial check: the release
@@ -417,21 +480,50 @@ impl Retirement {
             self.grace
         );
 
+        // Zero in production, and the only thing that ever makes it anything
+        // else is a test placing a request inside the window this opens --
+        // see `PRERELEASE_ENV`, which is where the whole of the reasoning is.
+        if !self.prerelease.is_zero() {
+            tokio::time::sleep(self.prerelease).await;
+        }
+
         // The FIFO barrier. Once this reply is in, every message that will
         // ever be routed to this connection is already in its socket.
-        match conn.release_name(SERVICE).await {
-            Ok(true) => {}
-            Ok(false) => eprintln!(
-                "porthole-helper: the bus says this connection did not own {SERVICE}; exiting \
-                 anyway, since it is not serving it either"
-            ),
-            Err(e) => eprintln!(
-                "porthole-helper: could not give up {SERVICE} ({e}); exiting anyway -- a request \
-                 that loses its reply to that is one the client asks again"
-            ),
+        //
+        // Whether the name is really gone is what decides whether anything
+        // may be *told* to ask again: a refusal reaching a client whose retry
+        // would land back here would spend that client's one retry against
+        // the same answer.
+        let name_is_gone = match conn.release_name(SERVICE).await {
+            Ok(true) => true,
+            Ok(false) => {
+                eprintln!(
+                    "porthole-helper: the bus says this connection did not own {SERVICE}; exiting \
+                     anyway, since it is not serving it either"
+                );
+                // Not ours to give up means nothing can be routed here *as
+                // the owner*, which is the same thing a release buys.
+                true
+            }
+            Err(e) => {
+                eprintln!(
+                    "porthole-helper: could not give up {SERVICE} ({e}); exiting without telling \
+                     anything to ask again, because a retry could land back on this same \
+                     instance. What was already routed here loses its reply instead, and the \
+                     client's retry then finds the name unowned and activates a fresh helper."
+                );
+                false
+            }
+        };
+        // Only now, and only if the name really is gone. A request still
+        // waiting when this is not sent stays waiting until the drain below
+        // gives up on it and the process exits, which hands its caller a
+        // `NoReply` -- the other failure `worth_asking_again` covers, and the
+        // one whose retry cannot come back here because there is nothing here
+        // to come back to.
+        if name_is_gone {
+            let _ = self.released.send(true);
         }
-        // Whatever the bus said, nothing may go on waiting for it.
-        let _ = self.released.send(true);
 
         // Settle, drain, and do it once more.
         //
@@ -462,11 +554,16 @@ impl Retirement {
 
     /// Wait for every request that was already routed here to be answered.
     ///
-    /// Bounded, and the bound is a bug net rather than a schedule: each of
-    /// those requests is a refusal that returns as soon as the release above
-    /// has been recorded, so this is measured in milliseconds. Reaching the
-    /// bound would mean exiting with a reply unsent, which costs the client
-    /// one retry.
+    /// Bounded, and the bound does two jobs. On the ordinary path it is a bug
+    /// net: each of those requests is a refusal that returns as soon as the
+    /// release has been recorded, so the wait is milliseconds and the bound is
+    /// never reached. On the path where `ReleaseName` *failed* it is the
+    /// mechanism -- nothing records a release, every waiting refusal stays
+    /// waiting, and this is what ends them, by exiting. Their callers get
+    /// `NoReply` and retry, which is the outcome that path is choosing on
+    /// purpose (see [`Retirement::await_release`]).
+    ///
+    /// Five seconds against systemd's own `TimeoutStopSec` default of 90.
     async fn drain(&self) {
         const LIMIT: Duration = Duration::from_secs(5);
         let deadline = Instant::now() + LIMIT;
@@ -551,7 +648,7 @@ mod tests {
     /// An eligible retirement whose grace has already elapsed, so `claim`
     /// turns on the three facts under test rather than on a wait.
     fn ready() -> Arc<Retirement> {
-        let r = Retirement::with(GRACE, SETTLE, true);
+        let r = Retirement::with(GRACE, SETTLE, Duration::ZERO, true);
         {
             let mut book = r.lock();
             book.last_active = Instant::now() - GRACE - Duration::from_secs(1);
@@ -647,7 +744,7 @@ mod tests {
 
     #[test]
     fn a_helper_that_has_just_been_asked_something_waits_out_the_whole_grace() {
-        let r = Retirement::with(GRACE, SETTLE, true);
+        let r = Retirement::with(GRACE, SETTLE, Duration::ZERO, true);
         assert!(
             !r.claim(true),
             "the process has only just started; nothing is idle yet"

@@ -142,21 +142,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is what `systemctl stop` and a package `try-restart` expect and get
     // today.
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
+        _ = interrupted() => {}
         _ = terminated(&retirement) => {}
         _ = retirement.clone().run(conn, state_path) => {}
     }
     Ok(())
 }
 
+/// Wait for `SIGINT`, which is what this helper has always ended on.
+///
+/// A function rather than `tokio::signal::ctrl_c()` inline, because a
+/// `select!` arm matches `Err` as readily as `Ok`: a failure to install the
+/// handler would complete that arm at once, `main` would return `Ok(())`, and
+/// the helper would exit at start-up with status 0 and nothing said. It used
+/// to be `ctrl_c().await?`, which reported and exited 1. This keeps the
+/// reporting and, like [`terminated`], stops waiting for a signal it will
+/// never be told about rather than pretending it arrived.
+async fn interrupted() {
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        eprintln!(
+            "porthole-helper: could not wait for SIGINT ({e}); this helper will not stop on              one. SIGTERM, which is what systemd and every package scriptlet send, is              unaffected."
+        );
+        std::future::pending().await
+    }
+}
+
 /// Wait for a `SIGTERM` that is somebody asking this process to stop, rather
 /// than systemd acknowledging the retirement it is already carrying out.
 ///
 /// Returns on the first of the former. A `SIGTERM` that arrives while
-/// [`Retirement::is_retiring`] holds is dropped and the wait resumes: the
-/// retirement is a few tens of milliseconds from calling `exit(0)` itself,
-/// and systemd's own `TimeoutStopSec=90s` is ample room for it. The exit is
-/// still recorded as `Deactivated successfully` either way -- measured.
+/// [`Retirement::is_retiring`] holds is dropped and the wait resumes, because
+/// the retirement is about to call `exit(0)` itself: three settles at the
+/// floor -- **150 ms** with the shipped 50 ms settle, measured at 154 ms --
+/// and at most that plus the drain's own five-second bound if a request is
+/// still being answered. systemd's `TimeoutStopSec` default of 90 s is ample
+/// room for either, and the exit is recorded as `Deactivated successfully`
+/// whichever way it goes -- measured, which is also why that record alone is
+/// not evidence the drain ran: it reads the same when a `SIGTERM` ends the
+/// process mid-drain.
 async fn terminated(retirement: &Retirement) {
     let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
         Ok(term) => term,

@@ -87,8 +87,18 @@ fn write_executable(path: &Path, body: &str) {
 
 impl Bus {
     /// Start a bus that will activate a helper with `grace_ms` before it
-    /// retires and `settle_ms` on each side of its drain.
+    /// retires and `settle_ms` on each side of its drain, and no pause at all
+    /// between the decision and the release.
     fn start(grace_ms: u64, settle_ms: u64) -> Self {
+        Self::start_with(grace_ms, settle_ms, 0)
+    }
+
+    /// The same, plus `prerelease_ms` between deciding to retire and giving
+    /// up the name -- the window in which a request can still reach an
+    /// instance that is leaving, and therefore the only one in which it can
+    /// be refused. Zero in production, and a fraction of a millisecond wide
+    /// there; see `porthole_helper::retire::PRERELEASE_ENV`.
+    fn start_with(grace_ms: u64, settle_ms: u64, prerelease_ms: u64) -> Self {
         // Shallow, because a unix socket path is capped at 108 bytes and
         // `dbus-daemon` refuses to start with "Socket name too long".
         let dir = TempDir::new().expect("a temporary directory");
@@ -148,6 +158,7 @@ impl Bus {
                  export PORTHOLE_STATE_FILE='{state}'\n\
                  export PORTHOLE_IDLE_GRACE_MS={grace_ms}\n\
                  export PORTHOLE_IDLE_SETTLE_MS={settle_ms}\n\
+                 export PORTHOLE_IDLE_PRERELEASE_MS={prerelease_ms}\n\
                  export PORTHOLE_IDLE_EXIT=1\n\
                  exec '{helper}' --session >>'{log}' 2>&1\n",
                 bin = bin.display(),
@@ -683,105 +694,114 @@ fn the_activation_file_names_the_service_this_workspace_actually_serves() {
 )]
 async fn a_request_that_races_the_decision_to_retire_is_refused_rather_than_served() {
     // The window this refusal exists for is the one between the helper
-    // deciding to go and the bus acknowledging that it has given up the name:
-    // sub-millisecond, and the only moment at which a request can still reach
-    // an instance that is leaving. Everything arriving after it is routed to a
-    // fresh instance instead (the test above), and everything arriving before
-    // it is served normally.
+    // deciding to go and the bus acknowledging that it has given up the name.
+    // Everything arriving after it is routed to a fresh instance (the test
+    // above); everything arriving before it is served normally. This is the
+    // only moment at which a request can still reach an instance that is
+    // leaving, and therefore the only one in which anything is ever refused.
     //
-    // Rare is not never -- the spike measured four such requests in 6,600
-    // calls across thirty crossings, and each one, served, would have been a
-    // port opened with nothing announcing it. So this aims at the window
-    // rather than waiting for it: the grace is as short as the loop can look,
-    // and callers pause for about that long between calls, which puts each
-    // call in the neighbourhood of a decision instead of at a fixed offset
-    // from one.
-    const CALLERS: usize = 3;
-    const BUDGET: Duration = Duration::from_secs(25);
+    // In production that window is the time a `ReleaseName` takes to reach the
+    // bus daemon and come back: a fraction of a millisecond. This test used to
+    // hunt it with load -- three callers pausing about one grace between calls
+    // -- and that was self-defeating twice over. Every completed call stamps
+    // the activity clock, so the load postponed the idleness the retirement
+    // needs; the run that failed had the most calls and among the fewest
+    // retirements. And it failed about one run in nine, on a test that is not
+    // `#[ignore]`d and so runs in the ordinary suite.
+    //
+    // That would matter even for a nuisance, and this is not one. The refusal
+    // path is the only place in the helper where an interface method awaits
+    // anything, and an interface method's future is polled on **zbus's own
+    // executor thread**, which is not a tokio runtime: a runtime-dependent
+    // primitive there panics, takes the executor thread with it and hands
+    // `NoReply` to every outstanding caller. That defect was real and was
+    // caught here and nowhere else -- the deterministic unit test for the same
+    // behaviour is a `#[tokio::test]`, so it polls `admit` inside a runtime
+    // where such a primitive works perfectly. A guard people re-run until
+    // green is not a guard.
+    //
+    // So the window is entered on purpose, through the same kind of debug-only
+    // knob `PORTHOLE_IDLE_SETTLE_MS` already provides for the other one, and
+    // the assertion is a count rather than a lottery.
+    const CALLS: usize = 3;
+    let bus = Bus::start_with(500, 50, 2500);
+    let client = bus.connect().await;
 
-    let bus = Bus::start(30, 50);
-    let deadline = Instant::now() + BUDGET;
-    let mut tasks = Vec::new();
-    for caller in 0..CALLERS {
-        let proxy = bus.proxy().await;
-        tasks.push(tokio::spawn(async move {
-            let (mut calls, mut refusals, mut unanswered) = (0u64, 0u64, 0u64);
-            let mut nap = 28 + caller as u64;
-            while Instant::now() < deadline && refusals == 0 {
-                calls += 1;
-                match proxy.list().await {
-                    Ok(rules) => assert!(rules.is_empty(), "nothing was ever opened"),
-                    Err(zbus::Error::MethodError(name, detail, _))
-                        if name.as_str() == RETIRING_ERROR =>
-                    {
-                        refusals += 1;
-                        assert!(
-                            detail.as_deref().is_some_and(|d| d.contains("ask again")),
-                            "the refusal must name the remedy: {detail:?}"
-                        );
-                        // Exactly what `porthole-cli` does, and it must work.
-                        assert!(proxy
-                            .list()
-                            .await
-                            .expect("the retry after a refusal is served")
-                            .is_empty());
-                    }
-                    // The residue the drain is meant to shrink and the client
-                    // retry is meant to cover: a call the bus had already
-                    // routed to an instance that then went before answering
-                    // it. Counted rather than passed over, and reported below.
-                    Err(zbus::Error::MethodError(name, _, _))
-                        if name.as_str() == porthole_core::ipc::NO_REPLY_ERROR =>
-                    {
-                        unanswered += 1;
-                        assert!(proxy
-                            .list()
-                            .await
-                            .expect("the retry after an unanswered call is served")
-                            .is_empty());
-                    }
-                    Err(other) => {
-                        panic!("neither served nor a failure a client can act on: {other}")
-                    }
-                }
-                // Sweeps across the decision rather than sitting at one offset
-                // from it: 28-30 ms of nap against a 30 ms grace, walked by a
-                // millisecond each time round.
-                tokio::time::sleep(Duration::from_millis(nap)).await;
-                nap = 26 + (nap + 1) % 8;
-            }
-            (calls, refusals, unanswered)
-        }));
-    }
+    // Activate, and note which instance is about to retire.
+    bus.proxy().await.list().await.expect("the helper answers");
+    let retiring_instance = owner_of(&client).await.expect("a helper");
 
-    let mut calls = 0;
-    let mut refusals = 0;
-    let mut unanswered = 0;
-    for task in tasks {
-        let (c, r, u) = task.await.expect("a caller ran to completion");
-        calls += c;
-        refusals += r;
-        unanswered += u;
-    }
-
-    eprintln!(
-        "{calls} calls across {} helper instances: {refusals} met one that had already \
-         decided to go, {unanswered} were left unanswered by one that went",
-        bus.activations()
-    );
-    eprintln!("--- helper log ---\n{}", bus.log());
-    // The control, and it is the only one needed: a refusal can only be sent
-    // by an instance that had *decided* to retire, so one of them is proof
-    // that a request really did meet that window rather than that the loop
-    // ran and nothing happened. `unanswered` is reported and not asserted on
-    // -- there is always a last instant, and the client retry above is what
-    // covers it.
+    // Grace 500 ms, looked at every 50 ms, so the decision falls in
+    // [500, 550] ms and the name is not given up for 2.5 s after that.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let log = bus.log();
     assert!(
-        refusals > 0,
-        "{calls} calls across {} retirements and not one of them met the window \
-         between the decision and the release. Either the window has closed for \
-         a reason worth knowing, or this machine is fast enough that the aim \
-         above no longer reaches it -- both are findings, and neither is a pass.",
-        bus.activations()
+        log.contains("giving up"),
+        "the helper had not decided to retire yet, so nothing below is racing \
+         anything:\n{log}"
+    );
+
+    // Concurrently, because each refusal blocks until the release: sent one
+    // after another, only the first would be inside the window and the rest
+    // would meet a fresh instance instead.
+    let mut calls = Vec::new();
+    for _ in 0..CALLS {
+        let proxy = bus.proxy().await;
+        calls.push(tokio::spawn(async move { proxy.list().await }));
+    }
+
+    let mut refusals = 0;
+    for call in calls {
+        match call.await.expect("the caller ran") {
+            Err(zbus::Error::MethodError(name, detail, _)) if name.as_str() == RETIRING_ERROR => {
+                refusals += 1;
+                assert!(
+                    detail.as_deref().is_some_and(|d| d.contains("ask again")),
+                    "the refusal must name the remedy, since a client without \
+                     the retry shows it verbatim: {detail:?}"
+                );
+            }
+            Ok(served) => panic!(
+                "an instance that had already decided to retire served a request \
+                 ({served:?}); anything it announced would reach nobody, and an \
+                 `open` would leave a rule behind a process about to exit.\n{}",
+                bus.log()
+            ),
+            Err(other) => panic!(
+                "neither served nor refused -- if this is `NoReply`, the refusal \
+                 path panicked on zbus's executor thread, which is what a \
+                 runtime-dependent primitive does there: {other}\n{}",
+                bus.log()
+            ),
+        }
+    }
+    assert_eq!(
+        refusals, CALLS,
+        "every request inside the window must be refused, not some of them"
+    );
+
+    // And the retry, which is what `porthole-cli` does automatically: served,
+    // by a different instance. Without this the refusal above would be an
+    // answer with nowhere to go.
+    assert!(bus
+        .proxy()
+        .await
+        .list()
+        .await
+        .expect("the retry is served")
+        .is_empty());
+    let serving_instance = owner_of(&client).await.expect("a helper");
+    assert_ne!(
+        retiring_instance,
+        serving_instance,
+        "the retry was served by the instance that had already decided to go, \
+         so being told to ask again bought nothing:\n{}",
+        bus.log()
+    );
+    assert_eq!(
+        bus.activations(),
+        2,
+        "one instance refused and a second served:\n{}",
+        bus.log()
     );
 }
