@@ -366,24 +366,7 @@ async fn main() -> std::process::ExitCode {
                 );
                 pending.clear();
             }
-            // The helper's bus name changed owner, which is the helper
-            // having just started -- after an upgrade, that is the new
-            // one. Re-read the version, from a proxy built for that one
-            // call: the measured trap is a *cached property*, which at
-            // exactly this moment answers with the version of the helper
-            // that has just died.
-            //
-            // This is where the common case resolves itself: an agent that
-            // outlived a package upgrade learns it is the older half the
-            // moment the upgraded helper comes back, and starts the agent
-            // that upgrade installed. `Some(None)` is the helper *losing*
-            // the name, and there is nothing to ask then.
-            Some(owner) = next_owner(&mut helper_owners) => {
-                if owner.is_some() {
-                    helper = realign(&system).await;
-                }
-            }
-            // Ahead of the three below on purpose. A newer agent has the
+            // Ahead of the four below on purpose. A newer agent has the
             // name and is about to be subscribed to the same signals; from
             // this point on, anything this process announces is announced
             // twice. Stopping first can leave a close announced by neither
@@ -398,6 +381,35 @@ async fn main() -> std::process::ExitCode {
                     // The stream is on the session connection, so its end is
                     // that connection's end.
                     None => break Ended::SessionBus,
+                }
+            }
+            // The helper's bus name changed owner, which is the helper having
+            // just started -- after an upgrade, that is the new one. Re-read
+            // the version, through a proxy built for that one call: the
+            // measured trap is a *cached property*, which at exactly this
+            // moment answers with the version of the helper that has just
+            // died.
+            //
+            // This is where the common case resolves itself: an agent that
+            // outlived a package upgrade learns it is the older half the
+            // moment the upgraded helper comes back, and starts the agent
+            // that upgrade installed. `Some(None)` is the helper *losing*
+            // the name, and there is nothing to ask then.
+            //
+            // **After the replacement branch above**, and that ordering is a
+            // decision: an agent that has already lost the session name is
+            // not this session's agent any more, and re-executing from here
+            // would put a third agent in front of the one that just replaced
+            // this one. Being replaced wins; the agent that took the name
+            // makes this same check for itself at its own start-up.
+            //
+            // A refutable pattern for the same reason the first branch has
+            // one: this stream is `None` when no match rule could be
+            // installed, and `next_owner` keeps that branch inert rather
+            // than instantly ready forever.
+            Some(owner) = next_owner(&mut helper_owners) => {
+                if owner.is_some() {
+                    helper = realign(&system).await;
                 }
             }
             close = closes.next() => {
