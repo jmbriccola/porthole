@@ -779,11 +779,7 @@ impl Porthole {
     /// for a rule recorded under a backend this machine no longer has, and
     /// removes porthole's own record of it without touching any firewall.
     fn log_forget(rule: &porthole_core::state::ManagedRule, forgotten_by: u32) {
-        eprintln!(
-            "porthole: forgot {}/{} towards {} (recorded under backend {}, opened by uid={}, \
-             forgotten by uid={}) -- no firewall was touched",
-            rule.port, rule.protocol, rule.target, rule.backend, rule.uid, forgotten_by
-        );
+        eprintln!("{}", format_forget_log(rule, forgotten_by));
     }
 }
 
@@ -825,6 +821,67 @@ fn status_for_undetected_backend(
     }
 }
 
+/// The clause every journal line about a rule ends with when that rule was a
+/// forward, and the empty string when it was an ordinary open.
+///
+/// A forward and an open are one line otherwise, and the audit trail is the
+/// place that can least afford to describe one as the other: what answers on
+/// the port is a container, and the mapping names which one. Only the
+/// redirect's own detail is appended, so the line an `open` writes is the
+/// line it always wrote.
+///
+/// **One clause, four lines.** It was written inline in [`format_open_log`]
+/// while [`format_close_log`], [`format_autoclose_log`] and
+/// [`format_forget_log`] said nothing, which is how an administrator came to
+/// read a redirect open and a plain port close for the same rule. It is one
+/// function rather than four matches for the reason `porthole-agent`'s
+/// `subject` and `porthole-gui`'s `anyone_note` are each one function: more
+/// than one wording of a single distinction is more than one thing that can
+/// go stale separately.
+///
+/// It claims only what the rule was and where the traffic went. On firewalld
+/// a forward is that one `forward-port` rich rule and nothing else -- there
+/// is deliberately no accompanying accept, since writing one would expose the
+/// *host's* own port on that number too (`docs/backends.md`) -- so this says
+/// nothing about what else was written, because nothing else was.
+///
+/// Not [`porthole_core::ipc::WireRule::redirects`]: that predicate reads the
+/// empty-`container_addr` sentinel the *wire* type carries, and nothing here
+/// holds a `WireRule`. On a [`ManagedRule`](porthole_core::state::ManagedRule)
+/// the same question is the typed `Option` this destructures, whose payload
+/// the clause needs anyway.
+fn forward_note(rule: &porthole_core::state::ManagedRule) -> String {
+    match &rule.forward {
+        Some(to) => format!(
+            " -- redirected to {}:{}, published on this machine as {}",
+            to.container_addr, to.container_port, to.published_port
+        ),
+        None => String::new(),
+    }
+}
+
+/// Split out from [`Porthole::log_forget`] for the reason the other three
+/// are, and carrying [`forward_note`] for the reason they do.
+///
+/// This is the one line here that describes a rule which is still in the
+/// firewall: `--forget` drops porthole's record and touches nothing, which
+/// the line already says. What that leaves is therefore not a permitted port
+/// but a live redirect into a container that porthole has stopped tracking,
+/// and the clause is what says which.
+fn format_forget_log(rule: &porthole_core::state::ManagedRule, forgotten_by: u32) -> String {
+    format!(
+        "porthole: forgot {}/{} towards {} (recorded under backend {}, opened by uid={}, \
+         forgotten by uid={}) -- no firewall was touched{}",
+        rule.port,
+        rule.protocol,
+        rule.target,
+        rule.backend,
+        rule.uid,
+        forgotten_by,
+        forward_note(rule)
+    )
+}
+
 /// Split out from [`Porthole::announce_open`] so the line itself is testable
 /// without capturing stderr from a live process.
 fn format_open_log(rule: &porthole_core::state::ManagedRule) -> String {
@@ -837,18 +894,7 @@ fn format_open_log(rule: &porthole_core::state::ManagedRule) -> String {
         rule.expires_at
             .map(|t| t.to_string())
             .unwrap_or_else(|| "reboot".to_string()),
-        // A forward and an open are one line otherwise, and the audit trail
-        // is the place that can least afford to describe one as the other:
-        // what answers on the port is a container, and the mapping names
-        // which one. Only the redirect's own detail is appended, so the line
-        // an `open` writes is the line it always wrote.
-        match &rule.forward {
-            Some(to) => format!(
-                " -- redirected to {}:{}, published on this machine as {}",
-                to.container_addr, to.container_port, to.published_port
-            ),
-            None => String::new(),
-        }
+        forward_note(rule)
     )
 }
 
@@ -862,17 +908,32 @@ fn format_open_log(rule: &porthole_core::state::ManagedRule) -> String {
 /// notice and drop its own record -- saying "closed" would claim porthole
 /// did something it did not do, and would date the close to the moment of
 /// the sweep rather than to whenever the rule actually vanished.
+///
+/// [`forward_note`] is appended to *both* sentences, and so to every reason
+/// this handles. These are the closes porthole performs on its own -- an
+/// expiry, a network change, a container that is no longer the one the rule
+/// was created against, a record reconciliation dropped -- so they are
+/// precisely the ones for which the journal is the only account anybody will
+/// ever read: nobody was at a terminal to be told.
 fn format_autoclose_log(rule: &porthole_core::state::ManagedRule, reason: CloseReason) -> String {
     match reason {
         CloseReason::Reconciled => format!(
             "porthole: dropped {}/{} towards {} from state (opened by uid={}) -- the firewall \
-             no longer had it, {reason}",
-            rule.port, rule.protocol, rule.target, rule.uid
+             no longer had it, {reason}{}",
+            rule.port,
+            rule.protocol,
+            rule.target,
+            rule.uid,
+            forward_note(rule)
         ),
         _ => format!(
             "porthole: closed {}/{} towards {} (opened by uid={}) -- porthole closed this \
-             itself, nobody asked, {reason}",
-            rule.port, rule.protocol, rule.target, rule.uid
+             itself, nobody asked, {reason}{}",
+            rule.port,
+            rule.protocol,
+            rule.target,
+            rule.uid,
+            forward_note(rule)
         ),
     }
 }
@@ -880,19 +941,25 @@ fn format_autoclose_log(rule: &porthole_core::state::ManagedRule, reason: CloseR
 /// Split out from [`Porthole::announce_close`] so the line itself is testable
 /// without capturing stderr from a live process.
 ///
-/// The trailing marker is [`CloseReason::as_str`] for every reason except
+/// The reason marker is [`CloseReason::as_str`] for every reason except
 /// `Requested`, which is the unremarkable case and stays bare exactly as it
 /// read before reason codes existed. It is the *same value* the `RuleClosed`
 /// signal carries, so the journal and the bus cannot disagree about what a
 /// close was -- which they could while `from_timer: bool` was the only thing
 /// either had to go on.
+///
+/// The marker ends the line for an ordinary open and is followed by
+/// [`forward_note`] for a forward, the same place and the same words
+/// [`format_open_log`] puts it. A close that named neither read byte for byte
+/// like an ordinary open ending, so the journal showed a redirect being
+/// opened and a plain port being closed for one and the same rule.
 fn format_close_log(
     rule: &porthole_core::state::ManagedRule,
     closed_by: u32,
     reason: CloseReason,
 ) -> String {
     format!(
-        "porthole: closed {}/{} towards {} (opened by uid={}, closed by uid={}){}",
+        "porthole: closed {}/{} towards {} (opened by uid={}, closed by uid={}){}{}",
         rule.port,
         rule.protocol,
         rule.target,
@@ -901,7 +968,8 @@ fn format_close_log(
         match reason {
             CloseReason::Requested => String::new(),
             other => format!(", {other}"),
-        }
+        },
+        forward_note(rule)
     )
 }
 
@@ -945,6 +1013,38 @@ mod tests {
             forward: None,
         }
     }
+
+    /// The same rule, opened as a forward instead of an open. The mapping is
+    /// [`the_open_line_says_when_what_it_opened_was_a_redirect`]'s, so every
+    /// line built from it below is describing one and the same rule.
+    fn forwarding_rule(opener_uid: u32) -> ManagedRule {
+        let mut r = rule(opener_uid);
+        r.forward = Some(porthole_core::forward::ForwardTo {
+            container_addr: "172.18.0.2".parse().unwrap(),
+            container_port: 80,
+            published_port: 3000,
+            protocol: Protocol::Tcp,
+        });
+        r
+    }
+
+    /// Every variant, listed here rather than iterated from the enum so that
+    /// a reason added to the wire has to be added here by hand and cannot
+    /// join the journal untested.
+    ///
+    /// `Requested` never reaches `format_autoclose_log` in practice --
+    /// `close` sends it to [`format_close_log`], and `announce_autoclose`'s
+    /// three callers send `NetworkChanged`, `TargetGone` and `Reconciled`.
+    /// It is exercised there anyway because that function's `_` arm is total
+    /// over the enum, and an arm no test enters is an arm that can lose the
+    /// clause without anything noticing.
+    const EVERY_REASON: [CloseReason; 5] = [
+        CloseReason::Expired,
+        CloseReason::Requested,
+        CloseReason::NetworkChanged,
+        CloseReason::Reconciled,
+        CloseReason::TargetGone,
+    ];
 
     #[test]
     fn the_close_line_names_both_uids_when_they_differ() {
@@ -1067,6 +1167,139 @@ mod tests {
         assert!(
             !format_open_log(&rule(1000)).contains("redirected"),
             "an open keeps the line it always had"
+        );
+    }
+
+    #[test]
+    fn a_close_of_a_redirect_says_so_whoever_asked_and_whatever_the_reason() {
+        // The defect the owner found on first real use: the open line named
+        // the redirect and the close line was byte for byte how an ordinary
+        // `open` being closed reads. An administrator reading the journal saw
+        // a redirect open and a plain port close, for one and the same rule.
+        for reason in EVERY_REASON {
+            let line = format_close_log(&forwarding_rule(1000), 1001, reason);
+            assert!(
+                line.contains("redirected to 172.18.0.2:80"),
+                "{reason:?} closed as: {line}"
+            );
+            assert!(
+                line.contains("published on this machine as 3000"),
+                "{reason:?} must name which redirect ended: {line}"
+            );
+            // The control that makes the assertions above mean something:
+            // an ordinary open must still write the line it always wrote.
+            let plain = format_close_log(&rule(1000), 1001, reason);
+            assert!(
+                !plain.contains("redirect"),
+                "{reason:?}: a rule that only permitted must claim no redirect: {plain}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_close_nobody_asked_for_says_when_the_rule_was_a_redirect() {
+        // The worse half of the same defect. These are the closes porthole
+        // performs on its own -- an expiry, a network change, a container
+        // that moved, a record reconciliation dropped -- so nobody was at a
+        // terminal to be told, and this line is the whole account.
+        for reason in EVERY_REASON {
+            let line = format_autoclose_log(&forwarding_rule(1000), reason);
+            assert!(
+                line.contains("redirected to 172.18.0.2:80"),
+                "{reason:?} logged as: {line}"
+            );
+            assert!(
+                line.contains("published on this machine as 3000"),
+                "{reason:?} must name which redirect ended: {line}"
+            );
+            let plain = format_autoclose_log(&rule(1000), reason);
+            assert!(
+                !plain.contains("redirect"),
+                "{reason:?}: a rule that only permitted must claim no redirect: {plain}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_close_says_the_redirect_in_the_open_lines_own_words() {
+        // Four wordings of one distinction are four things that can go stale
+        // separately -- the reason `porthole-agent`'s `subject` is one
+        // function. This pins the journal's own four: whatever clause the
+        // open line ends with, the close, autoclose and forget lines end with
+        // that same one, so a further phrasing cannot be introduced in any of
+        // them without failing here.
+        let forward = forwarding_rule(1000);
+        let opened = format_open_log(&forward);
+        let clause = opened
+            .find(" -- redirected to")
+            .map(|i| &opened[i..])
+            .unwrap_or_else(|| panic!("the open line stopped naming the redirect: {opened}"));
+
+        for reason in EVERY_REASON {
+            let closed = format_close_log(&forward, 1000, reason);
+            assert!(
+                closed.ends_with(clause),
+                "{reason:?}: close says {closed:?}, open says {clause:?}"
+            );
+            let auto = format_autoclose_log(&forward, reason);
+            assert!(
+                auto.ends_with(clause),
+                "{reason:?}: autoclose says {auto:?}, open says {clause:?}"
+            );
+        }
+        let forgotten = format_forget_log(&forward, 1000);
+        assert!(
+            forgotten.ends_with(clause),
+            "forget says {forgotten:?}, open says {clause:?}"
+        );
+    }
+
+    #[test]
+    fn a_forgotten_forward_says_what_the_firewall_was_left_holding() {
+        // `--forget` drops porthole's record and touches no firewall, so
+        // unlike every other line here the rule this one describes is still
+        // in the ruleset. "forgot 5173/tcp towards 10.10.10.0/24" alone tells
+        // an administrator a port was left permitted; what was really left is
+        // a live redirect into a container that porthole has stopped tracking.
+        let line = format_forget_log(&forwarding_rule(1000), 1001);
+        assert!(line.contains("forgotten by uid=1001"), "got: {line}");
+        assert!(line.contains("no firewall was touched"), "got: {line}");
+        assert!(line.contains("redirected to 172.18.0.2:80"), "got: {line}");
+        assert!(
+            line.contains("published on this machine as 3000"),
+            "got: {line}"
+        );
+        let plain = format_forget_log(&rule(1000), 1001);
+        assert!(
+            !plain.contains("redirect"),
+            "a rule that only permitted keeps the line it always had: {plain}"
+        );
+        assert!(plain.ends_with("no firewall was touched"), "got: {plain}");
+    }
+
+    #[test]
+    fn the_reason_a_forward_closed_for_is_still_in_its_line() {
+        // The redirect clause goes after the reason marker, so the marker is
+        // no longer the last thing on the line for a forward. It must still
+        // be *on* it: `TargetGone` is the reason that only a forward can ever
+        // carry, and a line that dropped it would say a redirect ended
+        // without saying it was the container that went.
+        for reason in EVERY_REASON {
+            let auto = format_autoclose_log(&forwarding_rule(1000), reason);
+            assert!(
+                auto.contains(&format!(", {}", reason.as_str())),
+                "{reason:?} lost its marker: {auto}"
+            );
+        }
+        assert!(
+            format_close_log(&forwarding_rule(1000), 1000, CloseReason::TargetGone)
+                .contains(", target-gone"),
+            "`format_close_log` must carry the marker too, before the clause"
+        );
+        assert!(
+            !format_close_log(&forwarding_rule(1000), 1000, CloseReason::Requested)
+                .contains("requested"),
+            "and `Requested` stays bare on a forward exactly as on an open"
         );
     }
 
