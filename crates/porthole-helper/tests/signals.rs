@@ -291,72 +291,13 @@ async fn a_close_that_finds_nothing_announces_nothing() {
     );
 }
 
-#[tokio::test]
-async fn a_record_the_firewall_no_longer_has_is_announced_by_the_operation_that_finds_it() {
-    // The reload case, with no restart anywhere: the firewall has forgotten
-    // a rule, porthole's state file has not, and the next operation's own
-    // reconciliation sweep drops the record. Before this was plumbed the
-    // drop was silent on the journal and on the bus, so a client that keeps
-    // its view from signals showed the port as open forever.
-    //
-    // The close below *fails* -- the sweep dropped the rule a moment before
-    // it looked -- which is the case that matters most and the one a naive
-    // wiring would miss, because the method returns early.
-    //
-    // Firewalld only: the record's handle has to be one the detected backend
-    // would recognise as its own, and this is the backend whose read-only
-    // listing (`firewall-cmd --list-rich-rules`) an unprivileged caller can
-    // actually run. Nothing here mutates the firewall -- firewalld cannot
-    // prove which rules are porthole's, so its orphan sweep never runs (see
-    // `reconcile.rs`).
-    let runner = RealRunner;
-    match porthole_core::backend::detect(&runner) {
-        Ok(backend) if backend.id() == BackendId::Firewalld => {}
-        Ok(backend) => {
-            eprintln!(
-                "skipped: this host detects {}, and this test needs a firewalld handle",
-                backend.id()
-            );
-            return;
-        }
-        Err(e) => {
-            eprintln!("skipped: no firewall backend on this host: {e}");
-            return;
-        }
-    }
-
-    let dir = TempDir::new().unwrap();
-    let state_path = dir.path().join("state.json");
-    let mut orphan = created_rule();
-    orphan.expires_at = None;
-    let mut store = StateStore::open(&state_path).unwrap();
-    store.insert(orphan.clone());
-    store.save().unwrap();
-
-    let (_server, name) = serve("SigReconciled", &state_path).await;
-    let proxy = proxy_to(&name).await;
-    let mut signals = proxy.receive_rule_closed().await.unwrap();
-
-    let failed = proxy.close(orphan.port, "tcp").await;
-    assert!(
-        failed.is_err(),
-        "the sweep dropped the record first, so the close has nothing to find"
-    );
-
-    let signal = next_signal(&mut signals).await;
-    let args = signal.args().unwrap();
-    assert_eq!(
-        args.reason,
-        CloseReason::Reconciled,
-        "porthole did not close this one -- it found the record of a rule the \
-         firewall no longer had"
-    );
-    assert_eq!(args.rule.id, orphan.id);
-    assert_eq!(args.rule.port, orphan.port);
-
-    // And the record really is gone, so a `list` and the signal agree.
-    assert!(proxy.list().await.unwrap().is_empty());
-}
+// `a_record_the_firewall_no_longer_has_is_announced_by_the_operation_that_finds_it`
+// used to be here. It is in `tests/reconciled_signal.rs` now, one test in a
+// file of its own so it can put a stub firewalld on `PATH` without racing
+// the threads this file's tests run on: it needs a firewalld that *answers*,
+// which is not the question `backend::detect` asks, and the guard it had
+// here reported success having run nothing on every machine whose firewalld
+// was absent or stopped. That file's module doc has the whole of it.
 
 #[tokio::test]
 async fn a_forget_announces_no_close_because_nothing_was_closed() {
@@ -371,11 +312,25 @@ async fn a_forget_announces_no_close_because_nothing_was_closed() {
     // This is a real `close_by_id` call, all the way through the engine, on
     // the one close path that can succeed on a host whose firewall must not
     // be touched.
+    //
+    // Asserted, not skipped. `close_by_id` detects a backend before it can
+    // reach `forget_rule` at all, so a machine with none of the three
+    // installed cannot run this -- and `return`ing there would count as a
+    // pass, which is how twelve tests in `porthole-cli/tests/cli.rs` came to
+    // report success having executed nothing. The condition is porthole's
+    // own `Requires:` line, not a preference: `nft` ships on nearly every
+    // modern Linux, and the RPM's `%check` declares `nftables` among its
+    // `BuildRequires` for exactly this.
     let runner = RealRunner;
-    let Ok(detected) = porthole_core::backend::detect(&runner) else {
-        eprintln!("skipped: no firewall backend on this host, so nothing is 'foreign' to it");
-        return;
-    };
+    let detected = porthole_core::backend::detect(&runner).unwrap_or_else(|e| {
+        panic!(
+            "this test needs a firewall backend to exist, because `close_by_id` \
+             detects one before it can reach `forget_rule` -- and nothing here \
+             touches it: the record it forgets is recorded under a *different* \
+             backend. Install one of firewalld, ufw or nftables (`porthole \
+             doctor` says the same thing). Detection failed with: {e}"
+        )
+    });
     let foreign = [BackendId::Ufw, BackendId::Nftables, BackendId::Firewalld]
         .into_iter()
         .find(|id| *id != detected.id())
@@ -482,10 +437,18 @@ fn bus_config(socket_dir: &Path, include_shipped_policy: bool) -> String {
     )
 }
 
-/// Start a private session `dbus-daemon` on `config`. `None` when
-/// `dbus-daemon` is not installed, which is a reason to skip loudly rather
-/// than to fail.
-fn start_bus(include_shipped_policy: bool) -> Option<PrivateBus> {
+/// Start a private session `dbus-daemon` on `config`.
+///
+/// Asserted, not skipped, when `dbus-daemon` will not run. It used to
+/// `return None` and both callers `return`ed on it -- which libtest counts
+/// as `ok`, so on a machine carrying only `dbus-broker` the only two tests
+/// that measure the shipped bus policy at all reported success having
+/// started no daemon and parsed no file. `dbus-broker` cannot stand in: it
+/// does not read a `busconfig` file the way this test needs, and the point
+/// here is what a real daemon makes of the real shipped XML. The RPM's
+/// `%check` declares `/usr/bin/dbus-daemon` among its `BuildRequires` for
+/// this reason and no other.
+fn start_bus(include_shipped_policy: bool) -> PrivateBus {
     use std::io::BufRead;
 
     // `TempDir::new` lands under TMPDIR; a deep path would blow the 108-byte
@@ -495,19 +458,23 @@ fn start_bus(include_shipped_policy: bool) -> Option<PrivateBus> {
     let config_path = dir.path().join("bus.conf");
     std::fs::write(&config_path, bus_config(dir.path(), include_shipped_policy)).unwrap();
 
-    let mut child = match std::process::Command::new("dbus-daemon")
+    let mut child = std::process::Command::new("dbus-daemon")
         .arg(format!("--config-file={}", config_path.display()))
         .arg("--print-address")
         .arg("--nofork")
         .stdout(std::process::Stdio::piped())
         .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            eprintln!("skipped: dbus-daemon is not runnable here: {e}");
-            return None;
-        }
-    };
+        .unwrap_or_else(|e| {
+            panic!(
+                "`dbus-daemon` would not run ({e}). It is required, not optional: \
+                 the two tests below are the only place the shipped \
+                 data/com.jacopobriccola.Porthole.conf is read by a real bus \
+                 daemon, and skipping them would report success on a policy \
+                 nothing had parsed. Install it (Fedora: `dbus-daemon`, Debian: \
+                 `dbus`, Arch: `dbus`) -- `dbus-broker` does not answer this \
+                 question."
+            )
+        });
 
     let stdout = child.stdout.take().expect("piped");
     let mut address = String::new();
@@ -521,11 +488,11 @@ fn start_bus(include_shipped_policy: bool) -> Option<PrivateBus> {
         );
     }
 
-    Some(PrivateBus {
+    PrivateBus {
         child,
         address: address.trim().to_string(),
         _dir: dir,
-    })
+    }
 }
 
 /// Own the shipped service name on `bus` and emit one `RuleClosed`; return
@@ -575,7 +542,7 @@ async fn the_shipped_bus_policy_is_what_a_real_dbus_daemon_parses() {
     // gets its name. Nothing short of a real daemon reading the real file
     // checks this -- a string search over the XML would pass on a file with
     // a misspelled attribute or an unclosed element.
-    let Some(bus) = start_bus(true) else { return };
+    let bus = start_bus(true);
     assert!(
         bus.address.starts_with("unix:"),
         "got: {}",
@@ -595,17 +562,13 @@ async fn the_shipped_policy_is_what_lets_a_signal_reach_a_subscriber() {
     // system bus. It is not: Fedora's `/usr/share/dbus-1/system.conf`
     // already allows `receive_type="signal"` for everyone, so a subscriber
     // there would get these signals with or without it. See `bus_config`.
-    let Some(with_policy) = start_bus(true) else {
-        return;
-    };
+    let with_policy = start_bus(true);
     assert!(
         signal_survives(&with_policy).await,
         "the shipped policy was included and the signal still did not arrive"
     );
 
-    let Some(without_policy) = start_bus(false) else {
-        return;
-    };
+    let without_policy = start_bus(false);
     assert!(
         !signal_survives(&without_policy).await,
         "the signal arrived with the shipped policy left out, so this test \

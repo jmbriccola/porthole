@@ -1163,10 +1163,11 @@ kill "$MONPID" 2>/dev/null || true
 /// to the operation succeeding.
 ///
 /// The host-side counterpart
-/// (`porthole-helper/tests/signals.rs`'s
+/// (`porthole-helper/tests/reconciled_signal.rs`'s
 /// `a_record_the_firewall_no_longer_has_is_announced_by_the_operation_that_finds_it`)
-/// synthesises the orphaned record; this one gets it from a real reload of a
-/// real firewalld.
+/// synthesises the orphaned record and answers the firewall's reads from a
+/// stub, so it runs anywhere; this one gets the record from a real reload of
+/// a real firewalld.
 #[test]
 #[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
 fn a_reload_under_a_running_helper_announces_the_records_it_orphaned() {

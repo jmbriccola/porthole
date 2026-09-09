@@ -85,24 +85,21 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             dbus firewalld nftables iptables iproute2
           sudo systemctl enable --now firewalld
-      # Three conditions the suite reads out of the machine, asserted before
-      # the suite runs so a changed runner image fails here rather than as a
-      # test result:
+      # This is no longer what makes the suite run, and saying so is the
+      # point. Every test that needs a firewall to *answer* now writes a
+      # `firewall-cmd` and an `ip` of its own into a temp directory and puts
+      # it in front of PATH -- crates/porthole-cli/tests/{cli,helper_e2e}.rs
+      # and crates/porthole-helper/tests/{forward_gate,reconciled_signal}.rs
+      # -- which is what lets the same suite run inside the RPM's %check with
+      # no firewalld daemon anywhere. Before that, eight tests in cli.rs
+      # returned early printing `skipped` on a runner without firewalld, and
+      # a skip of that shape counts as a pass.
       #
-      #   firewall-cmd present   eight tests in crates/porthole-cli/tests/cli.rs
-      #                          return early printing `skipped` without it, and
-      #                          a skip of that shape counts as a pass
-      #   firewalld running      those eight assert firewalld's own
-      #                          --add-rich-rule wording; with firewalld
-      #                          installed but not reachable, four of them
-      #                          were measured failing on `porthole open
-      #                          --dry-run` exiting 3
-      #   a system bus           firewall-cmd is how those eight reach
-      #                          firewalld, and it reaches it over the system
-      #                          bus. No test needs the runner's system bus
-      #                          for anything else: the porthole processes in
-      #                          crates/porthole-cli/tests/cli.rs are each
-      #                          given a private one of that file's own.
+      # What is left genuinely reading this machine is `porthole doctor`,
+      # whose whole subject is the machine it runs on, and the two tests in
+      # crates/porthole-helper/tests/service.rs that need *a* backend to
+      # exist. Asserted here so a changed runner image fails at this step
+      # rather than as a test result:
       - name: The conditions the suite reads out of this machine
         run: |
           set -euo pipefail
@@ -110,6 +107,10 @@ jobs:
           firewall-cmd --state
           ip -j route show default
           busctl --system --no-pager list > /dev/null
+          # signals.rs starts one on the shipped bus policy; dbus-broker
+          # cannot stand in, and those two tests are the only place that file
+          # is read by a real daemon.
+          dbus-daemon --version > /dev/null
       # --locked fails on a Cargo.lock that does not already satisfy
       # Cargo.toml. No other command in this workflow reads the lockfile that
       # strictly. First in the job, so it fails before the test build spends
@@ -170,8 +171,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             dbus firewalld nftables iptables iproute2
           sudo systemctl enable --now firewalld
-      # The same three conditions the stable test job asserts, and for the
-      # same reasons; that job's comment says what each one carries.
+      # The same conditions the stable test job asserts, and for the same
+      # reasons; that job's comment says what each one carries and what no
+      # longer depends on it.
       - name: The conditions the suite reads out of this machine
         run: |
           set -euo pipefail
@@ -179,6 +181,7 @@ jobs:
           firewall-cmd --state
           ip -j route show default
           busctl --system --no-pager list > /dev/null
+          dbus-daemon --version > /dev/null
       - name: cargo +MSRV check
         run: cargo "+${MSRV}" check --workspace --exclude porthole-gui --all-targets
       - name: cargo +MSRV clippy
@@ -260,11 +263,22 @@ jobs:
           dnf install -y --setopt=install_weak_deps=False \
             rpm-build rpmdevtools dnf5-plugins jq \
             rust-srpm-macros systemd-rpm-macros
-          rpmdev-setuptree
       # BuildRequires is read from the spec rather than repeated here, so a
       # dependency added there reaches this job without an edit.
       - name: dnf builddep
         run: dnf builddep -y packaging/rpm/porthole.spec
+      # This container runs as root and mock and COPR do not: they build as an
+      # unprivileged user, and %check refuses to run as root because six of
+      # the suite's tests cannot run there at all -- `porthole-helper
+      # --session` will not accept a CLI that is not installed at
+      # /usr/bin/porthole when it is root, and two more are about a directory
+      # an unprivileged process cannot create. So this job builds the way the
+      # real builders do rather than the way the container happens to start.
+      - name: An unprivileged build user
+        run: |
+          set -euo pipefail
+          useradd --create-home builder
+          install -d -o builder -g builder /home/builder/rpmbuild/SOURCES
       - name: Source tarball
         run: |
           set -euo pipefail
@@ -272,20 +286,26 @@ jobs:
           echo "spec Version: ${version}"
           test -n "${version}"
           git archive --prefix="porthole-${version}/" \
-            -o "${HOME}/rpmbuild/SOURCES/porthole-${version}.tar.gz" HEAD
+            -o "/home/builder/rpmbuild/SOURCES/porthole-${version}.tar.gz" HEAD
+          chown builder:builder "/home/builder/rpmbuild/SOURCES/porthole-${version}.tar.gz"
       # %check inside this build runs desktop-file-validate,
       # appstream-util validate-relax, the three-way agreement between the
       # helper's path and the two files that name it, and
       # `cargo test --locked --workspace --exclude porthole-gui` under
       # dbus-run-session. That is the only cargo test in this job, and this
-      # job has a runner of its own.
-      - name: rpmbuild -ba
-        run: rpmbuild -ba packaging/rpm/porthole.spec
+      # job has a runner of its own. No firewalld daemon runs in this
+      # container and none is needed: the tests that need a firewall to answer
+      # put one of their own on PATH.
+      - name: rpmbuild -ba (unprivileged, as mock and COPR build)
+        run: |
+          set -euo pipefail
+          su builder -c "rpmbuild -ba '${GITHUB_WORKSPACE}/packaging/rpm/porthole.spec' \
+            --define '_topdir /home/builder/rpmbuild'"
       - name: What was built
         run: |
           set -euo pipefail
           shopt -s nullglob
-          rpms=("${HOME}"/rpmbuild/RPMS/*/*.rpm)
+          rpms=(/home/builder/rpmbuild/RPMS/*/*.rpm)
           printf '%s\n' "${rpms[@]}"
           test "${#rpms[@]}" -gt 0
       # A spec that installs to the wrong paths builds cleanly and fails the
@@ -300,7 +320,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          rpms=("${HOME}"/rpmbuild/RPMS/*/*.rpm)
+          rpms=(/home/builder/rpmbuild/RPMS/*/*.rpm)
           dnf install -y "${rpms[@]}"
           porthole --version
           status=0

@@ -45,15 +45,45 @@ BuildRequires:  rust-srpm-macros
 BuildRequires:  systemd-rpm-macros
 BuildRequires:  desktop-file-utils
 BuildRequires:  libappstream-glib
-# %%check runs the workspace's own suite, which drives the helper and the CLI
-# against the real tools rather than stubs. crates/porthole-agent/tests/session.rs
-# spawns each agent under a private session bus; two of
-# crates/porthole-helper/tests/service.rs need a backend to be *present* (so
-# `close` reaches RuleNotFound rather than "no firewall found") and `iptables`
-# to be *present* (so reading Docker's chain fails as a typed CommandFailed
-# rather than as a missing file). Neither is run privileged, and neither
-# writes a rule.
+# What %%check's `cargo test` runs, declared rather than left to whatever the
+# build root happens to drag in. Every one of these is executed by the suite
+# and named by the test that executes it; a build root without them does not
+# fail with a clear message, it reports a pass on a test that ran nothing,
+# which is the failure mode this list exists to prevent.
+#
+# The firewall itself is deliberately *not* on this list. The tests that need
+# one carry their own: crates/porthole-cli/tests/cli.rs, its helper_e2e.rs and
+# crates/porthole-helper/tests/{forward_gate,reconciled_signal}.rs each write
+# a `firewall-cmd` and an `ip` of their own into a temporary directory and put
+# it in front of `PATH`, because every command porthole issues to those two on
+# the paths under test is a read of a handful of fixed shapes. Requiring
+# firewalld here would be worse than useless: no build root runs a firewalld
+# *daemon*, and an installed-but-stopped firewalld is what made
+# crates/porthole-helper/tests/signals.rs stop skipping and start failing.
+#
+#   dbus-run-session  one private bus for the whole run; see %%check below
+#   dbus-daemon       crates/porthole-helper/tests/signals.rs starts one on the
+#                     shipped data/com.jacopobriccola.Porthole.conf and checks
+#                     what a real bus daemon makes of it. dbus-broker cannot
+#                     stand in, and those two tests are the only place that
+#                     file is ever parsed.
+#   busctl            crates/porthole-cli/tests/helper_e2e.rs waits for the
+#                     helper's bus name to appear before driving it
+#   nftables          two of crates/porthole-helper/tests/service.rs need a
+#                     backend to be *present* (so `close` reaches RuleNotFound
+#                     rather than "no firewall found"), and
+#                     a_forget_announces_no_close_because_nothing_was_closed in
+#                     its signals.rs needs `backend::detect` to succeed before
+#                     `close_by_id` can reach `forget_rule` at all. nft is the
+#                     cheapest of the three to satisfy that with, and this is
+#                     the same alternation the Requires: below offers.
+#   iptables          reading Docker's chain must fail as a typed CommandFailed
+#                     rather than as a missing file
+#
+# Nothing here is run privileged and nothing here writes a rule.
 BuildRequires:  /usr/bin/dbus-run-session
+BuildRequires:  /usr/bin/dbus-daemon
+BuildRequires:  /usr/bin/busctl
 BuildRequires:  nftables
 BuildRequires:  /usr/sbin/iptables
 %if %{with gui}
@@ -228,6 +258,46 @@ grep -qx 'Restart=on-failure' \
     %{buildroot}%{_userunitdir}/porthole-agent.service
 
 %if %{with check}
+# %%check runs as whoever invoked rpmbuild, and as root this suite cannot run.
+# Not "runs and is a bit weaker" -- cannot run, and used to report a pass
+# saying so:
+#
+#   - porthole_core::cli_path::resolve_cli offers a *root* helper only
+#     /usr/bin/porthole and /usr/local/bin/porthole, never the CLI built
+#     beside it, because that path is a root-execution target for the expiry
+#     timer. In a build root porthole is not installed yet, so every helper
+#     crates/porthole-cli/tests/helper_e2e.rs starts exits before serving:
+#     four of its five tests. They used to print `skipped:` and be counted
+#     `ok`; they assert now, which is why this refusal has to come first.
+#   - a_dry_run_works_without_a_writable_state_directory and
+#     status_works_without_a_writable_state_directory in its cli.rs are about
+#     a directory an unprivileged process cannot create. As root there is no
+#     such directory, so they assert nothing -- and they say so themselves,
+#     loudly, which is how a root build first surfaced as two failures.
+#
+# mock and COPR both build as an unprivileged user, so this refusal never
+# fires there; it fires on a bare `rpmbuild -ba` run as root, which is the one
+# case where six of this suite's tests cannot run. Refusing beats letting them
+# through: a build that quietly ran a fraction of its own tests is exactly the
+# green check that executed nothing this project keeps finding, and six
+# failures that all mean "you are root" is a worse way to learn it than one
+# sentence that says so.
+if [ "$(id -u)" -eq 0 ] ; then
+    cat >&2 <<-'REFUSAL'
+	porthole: %%check must not run as root.
+	porthole: `porthole-helper --session` refuses a CLI that is not installed
+	porthole: at /usr/bin/porthole when it is root, and two more tests are
+	porthole: about a directory an unprivileged process cannot create. Six
+	porthole: tests therefore cannot run at all as root; they say so rather
+	porthole: than pass, and this says it once instead of six times.
+	porthole: Build as an unprivileged user, which is what mock and COPR do:
+	porthole:     rpmbuild --rebuild <the .src.rpm>   # as an ordinary user
+	porthole: or, to build a package without running its tests at all:
+	porthole:     rpmbuild -ba --without check packaging/rpm/porthole.spec
+	REFUSAL
+    exit 1
+fi
+
 # `cargo test`, and with %%build's RUSTFLAGS dropped rather than reused. Those
 # carry -Copt-level=3, and rustc leaves cfg!(debug_assertions) off above
 # opt-level 0 whichever cargo profile asked -- measured on this spec: with
@@ -243,10 +313,15 @@ unset RUSTFLAGS
 # crates/porthole-agent/tests/session.rs spawns its own session bus per test
 # and crates/porthole-cli/tests/cli.rs gives every porthole process it starts
 # a private one of its own, so neither depends on this; what is left needing
-# a session bus is the helper's own service tests and the CLI-to-helper
-# round trip, which run `porthole-helper --session` on it. The system-bus
-# address is exported alongside so nothing that asks for a system bus in this
-# chroot finds none.
+# a session bus is the helper's own service and signal tests and the
+# CLI-to-helper round trip, which run `porthole-helper --session` on it. The
+# system-bus address is exported alongside so nothing that asks for a system
+# bus in this chroot finds none.
+#
+# No firewall daemon is needed and none is started: every test that needs a
+# firewall to answer writes one of its own onto `PATH` -- see the
+# BuildRequires block above for which files do it and why requiring firewalld
+# here would make things worse rather than better.
 #
 # porthole-gui is excluded: its test targets open a GTK display.
 dbus-run-session -- sh -c '
