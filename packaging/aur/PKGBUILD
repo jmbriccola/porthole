@@ -111,10 +111,12 @@ sha256sums=('SKIP')
 # do what a scriptlet does with none, and would put the remove/upgrade split
 # in a Trigger clause instead of in the name of the function that runs. The
 # post_upgrade is the same hazard on the other side of that split:
-# porthole-helper has no idle timeout, so an upgrade that ends no process
-# leaves the previous version's root daemon serving the new version's
-# clients. No hook in the list above covers that -- reloading the manager
-# restarts nothing -- and systemd's fourth one,
+# porthole-helper retires itself once nothing is open, so on an idle machine
+# an upgrade resolves itself; on one where a port is open right then, the
+# helper is pinned and an upgrade that ends no process leaves the previous
+# version's root daemon serving the new version's clients. No hook in the
+# list above covers that -- reloading the manager restarts nothing -- and
+# systemd's fourth one,
 # 35-systemd-enqueue-marked.hook, restarts only units something has marked
 # `needs-restart`, which on Arch nothing does. Both of them also run
 # PostTransaction, after the scriptlet, which is why post_upgrade does its

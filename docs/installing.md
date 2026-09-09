@@ -72,7 +72,7 @@ yourself.
 | `target/release/porthole-helper` (built, not in `data/`) | `/usr/libexec/porthole-helper` | The privileged binary itself. It is never setuid and never run directly — only D-Bus activation or systemd starts it, always as root. |
 | `target/release/porthole-gui` (built with `cargo build --release -p porthole-gui`, not in `data/`) | `/usr/local/bin/porthole-gui` (a packaged install may instead use `/usr/bin/porthole-gui`) | The GTK4/libadwaita application. Unlike `porthole`'s own install path, nothing else on the system reads this one back — it only has to be on `$PATH` for the desktop file below to find it. |
 | `data/com.jacopobriccola.Porthole.service` | `/usr/share/dbus-1/system-services/` | Tells the system bus daemon how to start the helper the first time something addresses `com.jacopobriccola.Porthole`: which binary to run, and — via `SystemdService=` — which systemd unit actually owns the process. |
-| `data/porthole-helper.service` | `/usr/lib/systemd/system/` | The systemd unit the activation file names. `Type=dbus` plus `BusName=` makes systemd wait until the name is actually claimed before treating the service as started; `RuntimeDirectory=porthole` creates `/run/porthole` mode `0755` so an unprivileged `porthole list` can read the state file that only the helper writes, and `RuntimeDirectoryPreserve=yes` keeps `state.json` there across a restart or a crash instead of systemd deleting it with the directory; the unit has no `WantedBy=`, so nothing starts it at boot — D-Bus activation starts it the first time something addresses the bus name. It does not exit on its own once running: it stops only when something stops it. |
+| `data/porthole-helper.service` | `/usr/lib/systemd/system/` | The systemd unit the activation file names. `Type=dbus` plus `BusName=` makes systemd wait until the name is actually claimed before treating the service as started; `RuntimeDirectory=porthole` creates `/run/porthole` mode `0755` so an unprivileged `porthole list` can read the state file that only the helper writes, and `RuntimeDirectoryPreserve=yes` keeps `state.json` there across a restart or a crash instead of systemd deleting it with the directory; the unit has no `WantedBy=`, so nothing starts it at boot — D-Bus activation starts it the first time something addresses the bus name, and it ends itself again once there is nothing to cover: five minutes after the last request, with no port open, it gives up the bus name and exits, and the next call activates it afresh. With a port open it stays, because the network-change monitor lives in that process. There is deliberately no `Restart=`: a service that retires on purpose and is restarted automatically would be a perpetual root daemon again by another route. |
 | `data/com.jacopobriccola.Porthole.conf` | `/usr/share/dbus-1/system.d/` | The bus's own policy: only `root` may own the name — a bus-level guard against anything else posing as the helper — and any user may address it, because deciding *who may do what* is the next file's job, not the bus's. It also lets any user *receive* what the helper sends, which is the direction the `RuleOpened`, `RuleClosed` and `NetworkChanged` signals travel in. On a stock system bus that clause changes nothing — `/usr/share/dbus-1/system.conf`'s own default policy already allows every user to receive signals — but it is what carries them on a bus configured more strictly, and it says in porthole's own file that these signals are meant to be listened to. |
 | `data/com.jacopobriccola.Porthole.policy` | `/usr/share/polkit-1/actions/` | The polkit actions and their severities — five of them. Opening towards your own subnet (`open-subnet`) asks once per session (`auth_admin_keep`); opening towards everyone (`open-any`, `--to any`) asks every time (`auth_admin`); **redirecting a port to a container (`forward`) asks every time too (`auth_admin`), whatever its scope** — there is no `_keep` variant of it to choose, because an answer given minutes ago for an ordinary open must not carry over to making a port answer to something that was not on the network at all; and closing (`close`) or listing (`list`) never ask (`yes` for `allow_any`, `allow_active` and `allow_inactive` alike), which is also what lets a non-interactive package removal run `porthole close --all` without a prompt. Without this file, polkit falls back to its own default for an unrecognised action and every one of those severity choices disappears — `porthole doctor` is what notices and says so. |
 | `data/com.jacopobriccola.Porthole.desktop` | `/usr/share/applications/` | The desktop entry: what `Name=`, icon and `Exec=` line a launcher (GNOME's Activities overview, an app grid, `gtk-launch`) uses to show and start the GUI. Unrelated to the D-Bus files above — this is what makes the app *appear*, not what lets it *talk to the helper*, which it still does exactly as the CLI does, over the system bus. |
@@ -404,13 +404,21 @@ the app there, not just a bare name.
 
 ## Upgrading: the helper restarts, the ports stay
 
-`porthole-helper` has no idle timeout and no last-rule-closed shutdown. Once
-the bus has activated it, it runs until something stops it — so unless the
-upgrade ends that process, the machine goes on serving the new version's
-clients from the **previous version's** root daemon, out of a binary that is
-no longer on disk. On a Debian machine, `readlink /proc/$(systemctl show -p
-MainPID --value porthole-helper.service)/exe` said
-`/usr/libexec/porthole-helper (deleted)` after exactly that.
+`porthole-helper` retires itself: with no rule open and nothing in flight it
+gives up the bus name and exits after five minutes, and the bus starts a new
+one — the new version's binary — the next time a client asks for anything. So
+on the ordinary machine, where nothing is open, an upgrade resolves itself and
+these scriptlets have nothing to end.
+
+What they still exist for is the machine where somebody is **using** porthole
+at the moment of the upgrade: a port open pins the helper for as long as it
+stays open (the network monitor is needed then), and so does anything done
+within the last five minutes. Unless the upgrade ends that process, the
+machine goes on serving the new version's clients from the **previous
+version's** root daemon, out of a binary that is no longer on disk. On a
+Debian machine, `readlink /proc/$(systemctl show -p MainPID --value
+porthole-helper.service)/exe` said `/usr/libexec/porthole-helper (deleted)`
+after exactly that.
 
 The reason it is worth a maintainer script is that a stale component cannot do
 its job. porthole's D-Bus wire format has already changed incompatibly once —

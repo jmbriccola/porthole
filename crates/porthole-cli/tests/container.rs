@@ -434,12 +434,22 @@ impl SystemdContainer {
     }
 
     /// Wait until PID 1 has finished starting, rather than sleeping a guessed
-    /// fixed time. `degraded` is the expected steady state, not a problem:
-    /// `dbus.socket` and `systemd-logind.service` fail in this image (no
-    /// `dbus-broker` package, and no seat to manage), and neither is anything
-    /// these tests use -- the system bus firewalld needs is started by hand
-    /// by [`FIREWALLD_DAEMON_SETUP`], exactly as in the three non-systemd
-    /// images.
+    /// fixed time. `degraded` is accepted as a steady state as well as
+    /// `running`, and which of the two appears depends on the image:
+    ///
+    /// - [`DOCKER_IMAGE`] carries no `dbus-broker` package and no seat to
+    ///   manage, so `dbus.socket` and `systemd-logind.service` fail there and
+    ///   the system is `degraded`. Neither is anything those tests use: the
+    ///   system bus firewalld needs is started by hand by
+    ///   [`FIREWALLD_DAEMON_SETUP`], exactly as in the three non-systemd
+    ///   images.
+    /// - [`SYSTEMD_IMAGE`] installs *and enables* `dbus-broker`, and its own
+    ///   setup starts firewalld and polkit as real units, so it generally
+    ///   reaches `running`.
+    ///
+    /// Both are accepted because what this waits for is PID 1 having finished,
+    /// not a particular verdict on the units — every test that needs a unit
+    /// asserts on that unit itself.
     fn wait_for_systemd(&self) {
         for _ in 0..120 {
             let out = self.exec("systemctl is-system-running 2>&1 || true");
@@ -3433,5 +3443,445 @@ fn a_forward_is_refused_when_the_external_port_already_answers_and_the_refusal_n
         extract_marker(&stdout, "LOOPBACK_STILL_PUBLISHED"),
         "PORTHOLE-TARGET-OK",
         "a refused forward must not have disturbed Docker's own publication"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The helper's idle exit, against a machine where porthole is *installed*.
+// ---------------------------------------------------------------------------
+
+/// The image whose helper is started by **systemd**, from the shipped unit,
+/// through **D-Bus activation on the system bus**, with a real polkit
+/// deciding. See `tests/container/Containerfile.systemd` for why none of the
+/// other four images can answer these questions.
+const SYSTEMD_IMAGE: &str = "localhost/porthole-container-test-systemd";
+
+/// Install this repository's own `data/` files into the paths the packages
+/// use, and start the two system services the helper needs.
+///
+/// The shipped files are installed **verbatim**; nothing here is a second
+/// copy of a unit or a policy that could drift from the one users get. Two
+/// things are added that a real machine does not have, and both are stated
+/// where they are written:
+///
+/// - a polkit rule granting root the porthole actions, because
+///   `open`/`forward` are `auth_admin` and there is no authentication agent
+///   in a container to answer the prompt. The shipped policy is unchanged and
+///   is still what decides on a real machine; this only removes the prompt
+///   from in front of the paths these tests are about, which are not about
+///   authorization at all;
+/// - a `porthole-helper.service.d` drop-in shortening the idle grace, because
+///   five real minutes per test is not a test suite. The drop-in mechanism is
+///   the same one an administrator would use, and the unit itself is
+///   untouched.
+const PORTHOLE_INSTALLED: &str = r#"
+set -e
+install -m0644 /porthole-data/porthole-helper.service \
+  /usr/lib/systemd/system/porthole-helper.service
+mkdir -p /usr/share/dbus-1/system-services /usr/share/dbus-1/system.d \
+  /usr/share/polkit-1/actions /etc/polkit-1/rules.d \
+  /etc/systemd/system/porthole-helper.service.d
+install -m0644 /porthole-data/com.jacopobriccola.Porthole.service \
+  /usr/share/dbus-1/system-services/
+install -m0644 /porthole-data/com.jacopobriccola.Porthole.conf /usr/share/dbus-1/system.d/
+install -m0644 /porthole-data/com.jacopobriccola.Porthole.policy /usr/share/polkit-1/actions/
+cat > /etc/polkit-1/rules.d/49-porthole-container-test.rules <<'POLKIT_EOF'
+polkit.addRule(function(action, subject) {
+  if (action.id.indexOf("com.jacopobriccola.Porthole.") === 0 && subject.user === "root") {
+    return polkit.Result.YES;
+  }
+});
+POLKIT_EOF
+systemctl daemon-reload
+systemctl reload-or-restart dbus-broker
+systemctl restart polkit
+systemctl start firewalld
+for i in $(seq 1 150); do firewall-cmd --state >/dev/null 2>&1 && break; sleep 0.2; done
+firewall-cmd --state
+systemctl is-active polkit
+"#;
+
+/// A container of [`SYSTEMD_IMAGE`] with porthole installed, firewalld up, a
+/// fabricated LAN, and the idle grace shortened to `grace_ms`.
+///
+/// The `data/` directory is mounted rather than copied so what is installed
+/// is this working tree's own files -- a unit edited here and not re-built
+/// still reaches the test.
+fn installed_container(name: &str, cli: &Path, helper: &Path, grace_ms: u32) -> SystemdContainer {
+    ensure_image(SYSTEMD_IMAGE, "Containerfile.systemd");
+    let mut args = Vec::new();
+    args.extend(bind_ro(cli, "/usr/bin/porthole"));
+    args.extend(bind_ro(helper, "/usr/libexec/porthole-helper"));
+    args.extend(bind_ro(&workspace_root().join("data"), "/porthole-data"));
+    let container = SystemdContainer::start(name, SYSTEMD_IMAGE, &args);
+
+    let out = container.exec(&format!(
+        "{PORTHOLE_INSTALLED}\n{FAKE_LAN_INTERFACE}\n\
+         printf '[Service]\\nEnvironment=PORTHOLE_IDLE_GRACE_MS={grace_ms}\\n' \
+           > /etc/systemd/system/porthole-helper.service.d/grace.conf\n\
+         systemctl daemon-reload\n"
+    ));
+    assert_container_ok(&out, "installing porthole in the systemd container");
+    container
+}
+
+/// The unit's `ActiveState`, as systemd itself reports it.
+fn unit_state(container: &SystemdContainer) -> String {
+    let out = container.exec("systemctl show porthole-helper.service -p ActiveState --value");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Everything systemd and the helper have logged for the unit.
+fn unit_journal(container: &SystemdContainer) -> String {
+    let out = container.exec("journalctl -u porthole-helper.service --no-pager -o short-precise");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Wait for the helper to give up the bus name and go, or fail with the
+/// journal that says why it did not.
+fn wait_until_retired(container: &SystemdContainer) {
+    let out = container.exec(
+        "for i in $(seq 1 120); do \
+           [ \"$(systemctl show porthole-helper.service -p ActiveState --value)\" = inactive ] \
+             && exit 0; \
+           sleep 0.5; \
+         done; exit 1",
+    );
+    assert!(
+        out.status.success(),
+        "the helper never retired with nothing open.\n--- journal ---\n{}",
+        unit_journal(container),
+    );
+}
+
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn an_idle_helper_retires_and_systemd_records_a_clean_stop() {
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    let container = installed_container("porthole-idle-clean", &cli, &helper, 1500);
+
+    // Activated by the bus, not started by hand: `ProtocolVersion` is the one
+    // method with no authorizer in front of it, so this is the helper coming
+    // up because a client addressed the name and nothing else.
+    assert_container_ok(
+        &container.exec(
+            "busctl --system call com.jacopobriccola.Porthole /com/jacopobriccola/Porthole \
+             com.jacopobriccola.Porthole1 ProtocolVersion",
+        ),
+        "the first call must activate the helper",
+    );
+    assert_eq!(unit_state(&container), "active");
+
+    wait_until_retired(&container);
+
+    // What systemd made of it. `Result=success` and `ExecMainStatus=0` are
+    // the difference between a service that finished and one an administrator
+    // has to look at.
+    let shown = container.exec(
+        "systemctl show porthole-helper.service \
+         -p Result -p NRestarts -p ExecMainStatus -p ExecMainCode; \
+         systemctl is-failed porthole-helper.service || true",
+    );
+    let shown = String::from_utf8_lossy(&shown.stdout).to_string();
+    for expected in ["Result=success", "NRestarts=0", "ExecMainStatus=0"] {
+        assert!(shown.contains(expected), "expected {expected} in:\n{shown}");
+    }
+    assert!(
+        shown.contains("inactive"),
+        "`systemctl is-failed` must say `inactive`, not `failed`:\n{shown}"
+    );
+
+    let journal = unit_journal(&container);
+    assert!(
+        journal.contains("Deactivated successfully"),
+        "systemd must record an ordinary stop:\n{journal}"
+    );
+    assert!(
+        journal.contains("giving up com.jacopobriccola.Porthole"),
+        "and the helper must say why it went, where a person would read it:\n{journal}"
+    );
+    // The line the helper writes *after* its drain, and the whole reason
+    // `main` handles SIGTERM at all: systemd sends one within microseconds of
+    // the release above, and without a handler the default disposition ends
+    // the process there -- measured, by removing the handler and watching
+    // this line never appear while `Deactivated successfully` still did. So
+    // an exit that systemd is happy with is not on its own evidence that the
+    // drain ran; this is.
+    assert!(
+        journal.contains("nothing is left to answer"),
+        "the helper never finished draining: systemd's SIGTERM at the release \
+         ended it mid-drain, and every request already routed to it lost its \
+         reply\n{journal}"
+    );
+
+    // Nothing an administrator would look at twice. The check that matters
+    // most for a daemon that now comes and goes on its own.
+    let warnings =
+        container.exec("journalctl -u porthole-helper.service --no-pager -p warning -q | head -20");
+    assert!(
+        String::from_utf8_lossy(&warnings.stdout).trim().is_empty(),
+        "the retirement logged at warning level or above: {}",
+        String::from_utf8_lossy(&warnings.stdout)
+    );
+
+    // And back again, which is the half that makes going safe at all.
+    assert_container_ok(
+        &container.exec(
+            "busctl --system call com.jacopobriccola.Porthole /com/jacopobriccola/Porthole \
+             com.jacopobriccola.Porthole1 ProtocolVersion",
+        ),
+        "the bus must activate a fresh helper after the first one has gone",
+    );
+    assert_eq!(unit_state(&container), "active");
+    assert_eq!(
+        unit_journal(&container)
+            .matches("Started porthole-helper.service")
+            .count(),
+        2,
+        "two instances, not one that never went"
+    );
+}
+
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn a_helper_holding_a_port_open_stays_up_and_goes_once_it_is_closed() {
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    let container = installed_container("porthole-idle-openport", &cli, &helper, 1000);
+
+    // A real `porthole open`, through the system bus, through polkit, into a
+    // real firewalld -- not a seeded state file.
+    let opened =
+        container.exec("porthole open 5173 --until-reboot && firewall-cmd --list-rich-rules");
+    assert_container_ok(&opened, "the open");
+    assert!(
+        String::from_utf8_lossy(&opened.stdout).contains(r#"port="5173""#),
+        "firewalld must actually be holding the rule: {}",
+        String::from_utf8_lossy(&opened.stdout)
+    );
+
+    // Ten graces of complete idleness. The network monitor is needed while a
+    // rule is open, and there is no length of quiet that may take it away.
+    let out =
+        container.exec("sleep 10; systemctl show porthole-helper.service -p ActiveState --value");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "active",
+        "the helper retired with a port open, leaving the network monitor gone \
+         while the rule stayed in the firewall:\n{}",
+        unit_journal(&container)
+    );
+    assert!(
+        !unit_journal(&container).contains("giving up com.jacopobriccola.Porthole"),
+        "and it must not even have decided to:\n{}",
+        unit_journal(&container)
+    );
+
+    // The other half, so the wait above is not passing because this helper
+    // never retires at all.
+    assert_container_ok(&container.exec("porthole close 5173"), "the close");
+    wait_until_retired(&container);
+    assert!(
+        String::from_utf8_lossy(&container.exec("firewall-cmd --list-rich-rules").stdout)
+            .trim()
+            .is_empty(),
+        "and it left the firewall as it found it"
+    );
+}
+
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn an_opening_still_expires_with_the_helper_stopped() {
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    // The grace is left long here on purpose: what stops this helper is a
+    // `systemctl stop`, and the point is what happens *after* it, not how it
+    // came to be down.
+    let container = installed_container("porthole-idle-expiry", &cli, &helper, 600_000);
+
+    let out = container.exec(
+        "set -e\n\
+         porthole open 6000 --for 8s\n\
+         systemctl list-timers --all --no-pager | grep -c porthole-close\n\
+         systemctl stop porthole-helper.service\n\
+         systemctl show porthole-helper.service -p ActiveState --value\n\
+         firewall-cmd --list-rich-rules\n",
+    );
+    assert_container_ok(&out, "opening with a timer and stopping the helper");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        text.contains("inactive"),
+        "the helper was supposed to be stopped: {text}"
+    );
+    assert!(
+        text.contains(r#"port="6000""#),
+        "the rule must survive the helper going down -- that is the whole \
+         premise: {text}"
+    );
+
+    // The timer lives in systemd, outside this process, which is why a helper
+    // that comes and goes cannot lose an expiry. It re-activates the helper
+    // itself when it fires.
+    let closed = container.exec(
+        "for i in $(seq 1 60); do \
+           firewall-cmd --list-rich-rules | grep -q 'port=\"6000\"' || exit 0; \
+           sleep 0.5; \
+         done; exit 1",
+    );
+    assert!(
+        closed.status.success(),
+        "the opening never expired with the helper stopped, so the timer does \
+         not in fact live outside the process.\n--- journal ---\n{}",
+        unit_journal(&container)
+    );
+
+    let journal = unit_journal(&container);
+    assert!(
+        journal.contains("closed 6000/tcp") && journal.contains("expired"),
+        "and it must be the expiry that closed it, by a helper the timer \
+         activated:\n{journal}"
+    );
+    assert!(
+        String::from_utf8_lossy(&container.exec("porthole list").stdout).contains("No ports open"),
+        "the record must be gone too"
+    );
+}
+
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn repeated_activation_and_exit_cycles_do_not_trip_the_start_limiter() {
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    let container = installed_container("porthole-idle-cycles", &cli, &helper, 300);
+
+    // A hostile limiter, so this is not a limit that simply never fires: two
+    // starts in sixty seconds, against eight cycles. `systemd.unit(5)` says
+    // the counter is over *failed* starts; a clean start-then-stop must not
+    // touch it, and if it did, porthole would now be a service that renders
+    // itself unstartable by working correctly.
+    let out = container.exec(
+        "set -e\n\
+         printf '[Unit]\\nStartLimitIntervalSec=60\\nStartLimitBurst=2\\n' \
+           > /etc/systemd/system/porthole-helper.service.d/limit.conf\n\
+         systemctl daemon-reload\n\
+         for i in $(seq 1 8); do\n\
+           busctl --system call com.jacopobriccola.Porthole /com/jacopobriccola/Porthole \
+             com.jacopobriccola.Porthole1 ProtocolVersion >/dev/null || \
+             { echo \"CYCLE_$i_FAILED\"; exit 1; }\n\
+           for j in $(seq 1 60); do\n\
+             [ \"$(systemctl show porthole-helper.service -p ActiveState --value)\" = inactive ] \
+               && break\n\
+             sleep 0.2\n\
+           done\n\
+         done\n\
+         echo CYCLES_OK\n",
+    );
+    assert_container_ok(&out, "eight activate-and-exit cycles");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("CYCLES_OK"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let journal = unit_journal(&container);
+    assert_eq!(
+        journal.matches("Started porthole-helper.service").count(),
+        8,
+        "eight starts, eight stops:\n{journal}"
+    );
+    assert_eq!(
+        journal.matches("Deactivated successfully").count(),
+        8,
+        "and every one of them an ordinary stop:\n{journal}"
+    );
+    assert!(
+        !journal.contains("Start request repeated too quickly"),
+        "the start limiter counted clean cycles, so a helper that works \
+         correctly renders itself unstartable:\n{journal}"
+    );
+    let shown = String::from_utf8_lossy(
+        &container
+            .exec("systemctl show porthole-helper.service -p Result -p NRestarts")
+            .stdout,
+    )
+    .to_string();
+    assert!(shown.contains("Result=success"), "{shown}");
+    assert!(shown.contains("NRestarts=0"), "{shown}");
+}
+
+#[test]
+#[ignore = "container integration test: run tests/container/run.sh (needs rootless podman and the musl binaries)"]
+fn every_open_across_a_run_of_retirements_reaches_a_subscriber() {
+    require_environment!();
+    let (cli, helper) = require_musl_binaries!();
+    let container = installed_container("porthole-idle-announce", &cli, &helper, 400);
+
+    // The hazard the whole retirement sequence exists to remove, against the
+    // real helper and a real firewalld: an `open` served by an instance that
+    // has given up the bus name returns its rule to the caller and emits a
+    // `RuleOpened` the bus routes to nobody -- a port opening with nothing
+    // announcing it. It is silent by construction, so only a subscriber
+    // watching across the crossings can see it.
+    //
+    // The grace is shorter than the pause between rounds, so a helper retires
+    // between one open and the next and every round crosses one.
+    const ROUNDS: usize = 8;
+    let out = container.exec(&format!(
+        "set -e\n\
+         stdbuf -oL dbus-monitor --system \
+           \"type='signal',interface='com.jacopobriccola.Porthole1'\" \
+           > /tmp/signals.txt 2>&1 &\n\
+         MON=$!\n\
+         for i in $(seq 1 100); do [ -s /tmp/signals.txt ] && break; sleep 0.1; done\n\
+         for i in $(seq 1 {ROUNDS}); do\n\
+           porthole open $((7000 + i)) --until-reboot >/dev/null\n\
+           porthole close $((7000 + i)) >/dev/null\n\
+           sleep 0.7\n\
+         done\n\
+         sleep 1\n\
+         kill $MON 2>/dev/null || true\n\
+         {}\n",
+        marker_block("SIGNALS", "cat /tmp/signals.txt"),
+    ));
+    assert_container_ok(&out, "opens and closes across retirements");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let signals = extract_marker(&stdout, "SIGNALS");
+
+    // The control first, and it is what the spike's own first attempt at this
+    // measurement was missing: a run in which nothing ever retired would pass
+    // every assertion below while measuring nothing at all.
+    let journal = unit_journal(&container);
+    let retirements = journal
+        .matches("giving up com.jacopobriccola.Porthole")
+        .count();
+    assert!(
+        retirements >= ROUNDS - 2,
+        "only {retirements} retirements across {ROUNDS} rounds, so the opens \
+         below did not in fact cross any:\n{journal}"
+    );
+
+    assert_eq!(
+        signals.matches("member=RuleOpened").count(),
+        ROUNDS,
+        "one announcement per open, across {retirements} retirements -- a \
+         missing one is a port that opened with nothing saying so:\n{signals}"
+    );
+    assert_eq!(
+        signals.matches("member=RuleClosed").count(),
+        ROUNDS,
+        "and one per close:\n{signals}"
+    );
+    for round in 1..=ROUNDS {
+        assert!(
+            signals.contains(&format!("uint16 {}", 7000 + round)),
+            "round {round}'s own port is missing from the announcements:\n{signals}"
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&container.exec("firewall-cmd --list-rich-rules").stdout)
+            .trim()
+            .is_empty(),
+        "every round closed what it opened"
     );
 }

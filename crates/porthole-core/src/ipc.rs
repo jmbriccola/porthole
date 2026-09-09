@@ -724,6 +724,65 @@ pub fn is_undecodable(e: &zbus::Error) -> bool {
     matches!(e, zbus::Error::Variant(_))
 }
 
+/// The D-Bus error name a helper on its way out answers with.
+///
+/// It has no counterpart in [`crate::error::Error`] and nothing in this crate
+/// constructs one: `porthole_helper::error::HelperError::Retiring` does, and
+/// derives this exact string from its own variant name through zbus's
+/// `prefix` attribute. The string is spelled here because it is a fact about
+/// the **wire**, which is this module's subject, and because it is what
+/// [`worth_asking_again`] matches on -- `porthole-helper`'s own
+/// `a_retiring_helper_refuses_under_a_name_of_its_own` holds the two spellings
+/// equal, since nothing in either file makes a rename fail to compile.
+pub const RETIRING_ERROR: &str = "com.jacopobriccola.Porthole.Retiring";
+
+/// The D-Bus error name the bus itself sends when the process that was going
+/// to answer a pending call went away before it did -- with the detail
+/// `Remote peer disconnected`. Not porthole's, and not a decision anything
+/// made: it is the absence of an answer.
+pub const NO_REPLY_ERROR: &str = "org.freedesktop.DBus.Error.NoReply";
+
+/// Whether a failed call is one to **ask again** rather than one to report.
+///
+/// Exactly two failures qualify, and both are facts about the other end that
+/// a second call can change, because the well-known name is D-Bus activated:
+///
+/// - [`NO_REPLY_ERROR`] -- nobody answered. A package upgrade's
+///   `try-restart`, an administrator's `systemctl stop`, a crash, or the last
+///   instant of a helper retiring with a call already routed to it.
+/// - [`RETIRING_ERROR`] -- the helper had decided to go and deliberately did
+///   not act on the request. It sends this only once the name is provably no
+///   longer its own (`porthole_helper::retire`), so the second call reaches
+///   the fresh instance the bus activates rather than the one that is
+///   leaving. A helper whose `ReleaseName` *failed* sends nothing instead and
+///   lets the request lose its reply, which is the other name here and whose
+///   retry cannot come back to a process that has gone.
+///
+/// Everything else is either a decision the helper made and delivered intact,
+/// or this process's own socket having gone -- and a second call over the
+/// same proxy would fail exactly as the first did.
+///
+/// **What a retry cannot promise**, and it belongs here rather than at any
+/// one caller: `NoReply` means the reply was lost, not the request. A first
+/// `open` that took effect is answered by the retry with `AlreadyOpen`, and a
+/// first `close` with `RuleNotFound`. That is what a person re-running the
+/// command by hand gets, and in both cases the message describes the state
+/// the machine is actually in. `RETIRING_ERROR` carries no such caveat: a
+/// helper that sent it did not act.
+///
+/// Here rather than in `porthole-cli`, where it started, because every
+/// component that talks this interface meets the same two names: the CLI
+/// retries on it today, and `porthole-agent` and `porthole-gui` each hold a
+/// proxy of their own. Two spellings of one wire fact is how a repair
+/// survives in one component and rots in the others.
+pub fn worth_asking_again(e: &zbus::Error) -> bool {
+    matches!(
+        e,
+        zbus::Error::MethodError(name, ..)
+            if name.as_str() == NO_REPLY_ERROR || name.as_str() == RETIRING_ERROR
+    )
+}
+
 /// The client side of the helper's interface.
 ///
 /// `scope` is passed as the user typed it — `subnet`, `any`, a CIDR, an IP —
@@ -1182,6 +1241,47 @@ mod tests {
             slug(CloseReason::TargetGone),
             CloseReason::TargetGone.as_str()
         );
+    }
+
+    #[test]
+    fn only_two_failures_are_worth_asking_a_helper_again_about() {
+        // Real `MethodError`s rather than string comparisons: what a client
+        // actually meets is a `zbus::Error`, and the match is on its shape as
+        // well as on its name.
+        let method_error = |name: &str| method_error(name, "detail");
+        assert!(worth_asking_again(&method_error(NO_REPLY_ERROR)));
+        assert!(worth_asking_again(&method_error(RETIRING_ERROR)));
+
+        // The negative controls, and they are the point of asking at all.
+        // Every other `MethodError` is a decision the helper made and
+        // delivered intact -- a second call would charge a second polkit
+        // prompt for a refusal that was real -- and a transport failure is
+        // this process's own socket having gone, which a second call over the
+        // same proxy meets again.
+        for name in [
+            "com.jacopobriccola.Porthole.NotAuthorized",
+            "com.jacopobriccola.Porthole.AlreadyOpen",
+            "com.jacopobriccola.Porthole.RuleNotFound",
+            "com.jacopobriccola.Porthole.Failed",
+            // Near misses, because the match is on the whole name: a helper
+            // that is *not* registered is a different fact from one that is
+            // leaving, and must not be asked again forever.
+            "com.jacopobriccola.Porthole.RetiringSoon",
+            "org.freedesktop.DBus.Error.ServiceUnknown",
+            "org.freedesktop.DBus.Error.NoReplyExpected",
+            "org.freedesktop.DBus.Error.AccessDenied",
+        ] {
+            assert!(
+                !worth_asking_again(&method_error(name)),
+                "{name} is an answer, not a reason to ask again"
+            );
+        }
+        assert!(!worth_asking_again(&zbus::Error::Failure(
+            "the connection was lost".to_string()
+        )));
+        assert!(!worth_asking_again(&zbus::Error::Variant(
+            zbus::zvariant::Error::Message("signature mismatch".to_string())
+        )));
     }
 
     #[test]

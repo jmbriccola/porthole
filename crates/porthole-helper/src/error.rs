@@ -59,6 +59,17 @@ pub enum HelperError {
     /// published it there. Not `AlreadyOpen`: there is no porthole rule to
     /// close.
     AlreadyReachable(String),
+    /// This helper had already decided to retire when the request arrived, so
+    /// it did not act on it -- see [`crate::retire`]. **The one refusal here
+    /// that is not about the request at all**, and the one a client should
+    /// answer by asking again rather than by telling anybody anything:
+    /// `porthole-cli` retries once on this name, and the retry is served by
+    /// the fresh instance the bus activates.
+    ///
+    /// It has no counterpart in [`Error`], because nothing in
+    /// `porthole-core` can be retiring; it is constructed by the admission
+    /// check and nowhere else.
+    Retiring(String),
     /// Everything else: a command that could not even be spawned, a raw I/O
     /// error, or a truly unexpected condition. These have no request-specific
     /// meaning worth distinguishing on the wire, so the client reports them
@@ -200,6 +211,24 @@ mod tests {
                 "a forward refusal must not travel as anything else"
             );
         }
+    }
+
+    #[test]
+    fn a_retiring_helper_refuses_under_a_name_of_its_own() {
+        use zbus::DBusError as _;
+
+        // The name, not the variant: `porthole-cli` reads the last dotted
+        // segment and retries on it, so a rename here silently turns the one
+        // refusal a client is supposed to answer by asking again into one it
+        // reports to a person.
+        assert_eq!(
+            HelperError::Retiring("x".into()).name().as_str(),
+            porthole_core::ipc::RETIRING_ERROR,
+            "the name zbus derives from this variant and the one \
+             `porthole_core::ipc::worth_asking_again` matches on are two \
+             spellings of one wire fact, and nothing makes a rename of \
+             either fail to compile"
+        );
     }
 
     #[test]

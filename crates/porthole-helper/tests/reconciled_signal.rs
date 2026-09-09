@@ -66,6 +66,7 @@ use porthole_core::ipc::{CloseReason, PortholeProxy, PATH};
 use porthole_core::model::{Protocol, Target};
 use porthole_core::state::{ManagedRule, StateStore};
 use porthole_helper::authz::AlwaysAllow;
+use porthole_helper::retire::Retirement;
 use porthole_helper::service::Porthole;
 use std::path::Path;
 use std::sync::Arc;
@@ -171,6 +172,7 @@ async fn serve(state: &Path) -> (zbus::Connection, String) {
         bus,
         state.to_path_buf(),
         std::path::PathBuf::from(CLI_CANDIDATES[0]),
+        Retirement::never(),
     );
     let name = "com.jacopobriccola.PortholeTestSigReconciled".to_string();
     let conn = common::builder()
