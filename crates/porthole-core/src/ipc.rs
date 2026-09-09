@@ -27,6 +27,389 @@ pub const PATH: &str = "/com/jacopobriccola/Porthole";
 /// The interface clients talk to.
 pub const INTERFACE: &str = "com.jacopobriccola.Porthole1";
 
+/// What this build speaks, and the one thing on the wire that says which of
+/// two porthole binaries is the older half.
+///
+/// **Raise it whenever [`SIGNATURE`] changes, and append a row to
+/// [`CONTRACTS`] naming the pair.** Nothing in the type system can make a
+/// hand-written number follow a hand-written string; what holds them
+/// together is that the *pair* is what is committed. Changing the interface
+/// and updating [`SIGNATURE`] without touching this number leaves a pair no
+/// row names, and `the_version_and_the_signature_are_a_pair_that_was_shipped`
+/// fails until somebody chooses a version for the contract they just wrote.
+///
+/// Every component ships in one package, so two porthole binaries speaking
+/// different versions is always an upgrade that left one of them behind --
+/// there is no supported configuration in which they differ. What the
+/// number buys is not compatibility, which nothing here attempts, but the
+/// answer to *which one to restart*: a `zbus::Error::Variant` names two
+/// signatures and does not order them (see [`is_undecodable`]), so before
+/// this existed a component that met one could only name both remedies and
+/// stop.
+///
+/// **0 is not a value any helper reports.** It is what [`read_protocol_version`]
+/// reads an absent member as -- every helper built before this constant
+/// existed, which is every helper deployed today. See that function.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// What an absent version member is read as: a helper from before
+/// [`PROTOCOL_VERSION`] existed.
+///
+/// Lower than any version a helper can report, so [`alignment`] answers
+/// [`Alignment::HelperIsOlder`] for it without a case of its own.
+pub const PROTOCOL_VERSION_ABSENT: u32 = 0;
+
+/// Every method and every signal of [`INTERFACE`], normalised: one line
+/// each, sorted, with argument names and documentation stripped.
+///
+/// **What the interface this build serves must be.** Two tests hold *that*.
+/// `the_wire_types_are_the_ones_this_digest_names` needs no bus: it rebuilds
+/// the lines that carry a wire type from that type's own `Type::SIGNATURE`,
+/// so adding a field to [`WireRule`] -- the exact change that produced the
+/// defect this whole contract exists for -- fails in `cargo test` with
+/// nothing running. `the_served_interface_is_the_one_this_digest_names`, in
+/// `porthole-helper/tests/interface_contract.rs`, introspects the real
+/// object on a private bus and compares [`signature_digest`] of what it
+/// serves against this constant, which catches what the types cannot: an
+/// argument list, a member added or removed, a member renamed, and the
+/// interface itself being renamed -- every line names it.
+///
+/// **Neither of those says anything about [`PROTOCOL_VERSION`]**, and an
+/// earlier version of this comment claimed they did. Measured, by a
+/// reviewer, on exactly the path that matters: change the wire for real,
+/// update this constant as the two failures above instruct, leave the
+/// number at 1 -- 618 passed, 0 failed. A contract that moved while the
+/// number stayed put, under a green tick, which is the failure this whole
+/// pair of constants exists to prevent. [`CONTRACTS`] is what closes it:
+/// the *pair* is committed, so a changed digest belongs to no shipped
+/// version until somebody says which version it is.
+///
+/// **Not the introspection XML itself**, which was the obvious thing to
+/// pin and is the wrong one. Measured
+/// (`.superpowers/sdd/2026-09-07-docker-forward/spike-protocol-version.md`):
+/// it is deterministic to the byte across processes, rebuilds, profiles and
+/// libcs -- and it embeds every rustdoc comment and every Rust parameter
+/// name, so four words added to a doc comment change it and renaming
+/// `_seconds` to `_secs` changes it. A contract that breaks when prose
+/// improves, in a project that spends half its time improving prose, is a
+/// test that gets re-blessed unread. (It is also not well-formed XML today:
+/// five of those doc comments contain `--`.)
+pub const SIGNATURE: &str = "\
+method com.jacopobriccola.Porthole1.Close(qs) -> ((sqssssttusqq))
+method com.jacopobriccola.Porthole1.CloseAll() -> (a(sqssssttusqq)a(ssi))
+method com.jacopobriccola.Porthole1.CloseById(sbb) -> ((sqssssttusqq))
+method com.jacopobriccola.Porthole1.DockerPorts() -> (a(sqssq))
+method com.jacopobriccola.Porthole1.Forward(qssuq) -> ((sqssssttusqq))
+method com.jacopobriccola.Porthole1.List() -> (a(sqssssttusqq))
+method com.jacopobriccola.Porthole1.Open(qssu) -> ((sqssssttusqq))
+method com.jacopobriccola.Porthole1.ProtocolVersion() -> (u)
+method com.jacopobriccola.Porthole1.Status() -> ((sbbbssssssa(sqssssttusqq)))
+signal com.jacopobriccola.Porthole1.NetworkChanged(ss)
+signal com.jacopobriccola.Porthole1.RuleClosed((sqssssttusqq)s)
+signal com.jacopobriccola.Porthole1.RuleOpened((sqssssttusqq))
+";
+
+/// One contract porthole has spoken: a protocol version, and the interface
+/// that version promised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Contract {
+    pub version: u32,
+    /// The same normal form [`SIGNATURE`] is written in -- see
+    /// [`signature_digest`].
+    pub signature: &'static str,
+}
+
+/// Every contract porthole has spoken, oldest first. **Append a row; never
+/// edit one.**
+///
+/// This is what makes [`PROTOCOL_VERSION`] something a test can hold rather
+/// than something somebody has to remember. Neither guard on [`SIGNATURE`]
+/// can see the number: both compare the interface against that string, and
+/// both are satisfied the moment the string is updated. So the string alone
+/// is not what is committed -- the *pair* is, and
+/// `the_version_and_the_signature_are_a_pair_that_was_shipped` fails when
+/// the two constants above name a pair no row here does.
+///
+/// The repair that clears it is an **append**: a row for the contract just
+/// written, with a version one higher than the last, and
+/// [`PROTOCOL_VERSION`] raised to match. That is the moment the number gets
+/// chosen, and it is a line added to a table rather than a string edited in
+/// place -- which is the whole difference between a decision and an
+/// oversight, both in the writing and in the reading of the diff.
+///
+/// **What this does not do**, stated plainly because the alternative is the
+/// defect this feature exists to remove: it cannot stop somebody editing the
+/// digest of a version that has already shipped. No in-repository check can,
+/// since every value a test compares against lives in the same repository. A
+/// row is a promise about a released version; rewriting one is rewriting
+/// history, and what this arrangement buys is that doing so is a distinct,
+/// legible act rather than the same edit as any other.
+///
+/// Public because a client that meets an unfamiliar helper can ask which of
+/// these it is speaking -- a use the container suite could take up against
+/// an installed binary, and the reason the older rows are worth keeping at
+/// all once a newer one exists.
+pub const CONTRACTS: [Contract; 1] = [Contract {
+    version: 1,
+    signature: CONTRACT_1,
+}];
+
+/// The interface protocol **1** promised: the first version porthole ever
+/// put a number on, and the one every component in this package speaks.
+///
+/// Deliberately a second spelling of what [`SIGNATURE`] holds today, in the
+/// same way `CloseReason`'s slug is spelled twice (once in `as_str`, once by
+/// serde's `rename_all`) with a test holding the two equal. There the two
+/// spellings are produced by different machinery; here they are the same
+/// text with different jobs -- this row is what version 1 *promised*, and
+/// [`SIGNATURE`] is what this build *serves*. They are equal until somebody
+/// changes the interface, and the test that notices they have stopped being
+/// equal is the one that asks for a version number.
+const CONTRACT_1: &str = "\
+method com.jacopobriccola.Porthole1.Close(qs) -> ((sqssssttusqq))
+method com.jacopobriccola.Porthole1.CloseAll() -> (a(sqssssttusqq)a(ssi))
+method com.jacopobriccola.Porthole1.CloseById(sbb) -> ((sqssssttusqq))
+method com.jacopobriccola.Porthole1.DockerPorts() -> (a(sqssq))
+method com.jacopobriccola.Porthole1.Forward(qssuq) -> ((sqssssttusqq))
+method com.jacopobriccola.Porthole1.List() -> (a(sqssssttusqq))
+method com.jacopobriccola.Porthole1.Open(qssu) -> ((sqssssttusqq))
+method com.jacopobriccola.Porthole1.ProtocolVersion() -> (u)
+method com.jacopobriccola.Porthole1.Status() -> ((sbbbssssssa(sqssssttusqq)))
+signal com.jacopobriccola.Porthole1.NetworkChanged(ss)
+signal com.jacopobriccola.Porthole1.RuleClosed((sqssssttusqq)s)
+signal com.jacopobriccola.Porthole1.RuleOpened((sqssssttusqq))
+";
+
+/// Which of the two binaries is the older half, as a client that has just
+/// read the helper's [`PROTOCOL_VERSION`] sees it.
+///
+/// The distinction is the whole point of the number: the remedy for one is
+/// something a session process can do by itself, and the remedy for the
+/// other needs a person with privilege.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Alignment {
+    /// The two speak the same contract.
+    Same,
+    /// The helper is the older half. The remedy is `systemctl restart
+    /// porthole-helper.service`, which needs privilege and therefore a
+    /// person. Includes the helper that reports no version at all -- see
+    /// [`PROTOCOL_VERSION_ABSENT`].
+    HelperIsOlder,
+    /// **This** binary is the older half: the helper speaks a later
+    /// contract than this build was compiled against. The remedy is to
+    /// replace this process, which `porthole-agent` can do by itself
+    /// because its binary on disk is already the new one.
+    ThisOneIsOlder,
+}
+
+/// Which half is behind, given what the helper just answered.
+pub fn alignment(helper_version: u32) -> Alignment {
+    match helper_version.cmp(&PROTOCOL_VERSION) {
+        std::cmp::Ordering::Equal => Alignment::Same,
+        std::cmp::Ordering::Less => Alignment::HelperIsOlder,
+        std::cmp::Ordering::Greater => Alignment::ThisOneIsOlder,
+    }
+}
+
+/// Read the helper's [`PROTOCOL_VERSION`] over `conn`, freshly.
+///
+/// **A method call, and a proxy built for this one read.** Measured: a
+/// long-lived proxy's *cached property* answers with the version of the
+/// helper that has just died, at exactly the moment a re-check is called
+/// for -- `cached=2` while `uncached=3` across a helper restart, because
+/// zbus fills the cache with `GetAll` when the proxy is built and
+/// invalidates it on `PropertiesChanged`, which a brand-new helper process
+/// never sends. A version check that reads the old value precisely when the
+/// new one matters is worse than no check. A method cannot be cached, and a
+/// proxy that lives for one call cannot hold a stale anything.
+///
+/// **An absent member is an answer, not a failure.** A helper built before
+/// this contract has no such member and says so:
+/// `org.freedesktop.DBus.Error.UnknownMethod`, or `...UnknownProperty` for
+/// a caller that asks for it as a property -- verified read-only against
+/// the live helper on the author's own machine. That is read as
+/// [`PROTOCOL_VERSION_ABSENT`], because a helper without the member is by
+/// construction older than a build that expects one: the member is only
+/// ever added, and [`SIGNATURE`]'s guards are what make removing it break
+/// the suite.
+///
+/// Everything else stays an error. A helper that is simply **absent**
+/// answers `ServiceUnknown`, and reading that as a version would turn
+/// "porthole is not installed" into "porthole is out of date".
+pub async fn read_protocol_version(conn: &zbus::Connection) -> zbus::Result<u32> {
+    let proxy = PortholeProxy::new(conn).await?;
+    match proxy.protocol_version().await {
+        Ok(version) => Ok(version),
+        Err(e) if names_an_absent_member(&e) => Ok(PROTOCOL_VERSION_ABSENT),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether this error is the bus's own way of saying the member does not
+/// exist -- see [`read_protocol_version`], which is the only caller and
+/// where the reasoning lives.
+fn names_an_absent_member(e: &zbus::Error) -> bool {
+    matches!(
+        e,
+        zbus::Error::MethodError(name, ..)
+            if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod"
+                || name.as_str() == "org.freedesktop.DBus.Error.UnknownProperty"
+    )
+}
+
+/// [`SIGNATURE`]'s own normal form, computed from an interface's
+/// introspection XML.
+///
+/// One line per method and per signal, sorted, naming the interface, the
+/// member, the argument signature and -- for a method -- the reply body's.
+/// Argument *names* and documentation are deliberately absent: they are
+/// what makes the raw XML churn on prose edits (see [`SIGNATURE`]), and
+/// nothing on the wire depends on them.
+///
+/// Comments are removed before anything is parsed, which is also what makes
+/// this work at all on porthole's own XML: rustdoc prose containing `--`
+/// lands inside an XML comment, `xmllint` refuses the document with five
+/// "double hyphen within comment" errors, and a guard that parsed it
+/// properly would have failed before this feature started.
+///
+/// `Err` when the document has no such interface, rather than an empty
+/// digest: a guard that compares nothing against nothing passes.
+pub fn signature_digest(xml: &str, interface: &str) -> Result<String, String> {
+    let without_comments = strip_comments(xml);
+    let block = interface_block(&without_comments, interface).ok_or_else(|| {
+        format!("the introspection XML declares no interface named `{interface}`")
+    })?;
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut member: Option<(&str, String)> = None;
+    let mut ins = String::new();
+    let mut outs = String::new();
+    for tag in tags(block) {
+        match tag.name {
+            "method" | "signal" => {
+                let name = attribute(tag.attributes, "name")
+                    .ok_or_else(|| format!("a <{}> with no name attribute", tag.name))?;
+                member = Some((tag.name, name.to_string()));
+                ins.clear();
+                outs.clear();
+                // zbus never emits one, but a member with no arguments at
+                // all is `<method name="Ping"/>` in the specification's own
+                // grammar, and it must not swallow the next member's args.
+                if tag.self_closing {
+                    lines.push(rendered(tag.name, interface, name, "", ""));
+                    member = None;
+                }
+            }
+            "arg" => {
+                let (kind, _) = member
+                    .as_ref()
+                    .ok_or_else(|| "an <arg> outside any member".to_string())?;
+                let signature = attribute(tag.attributes, "type")
+                    .ok_or_else(|| "an <arg> with no type attribute".to_string())?;
+                // The specification's own default is `in`; zbus spells it
+                // out for methods and omits it for signals, whose arguments
+                // are the whole body.
+                let direction = attribute(tag.attributes, "direction").unwrap_or("in");
+                if *kind == "signal" || direction == "in" {
+                    ins.push_str(signature);
+                } else {
+                    outs.push_str(signature);
+                }
+            }
+            "/method" | "/signal" => {
+                let (kind, name) = member
+                    .take()
+                    .ok_or_else(|| format!("a <{}> closing nothing", tag.name))?;
+                lines.push(rendered(kind, interface, &name, &ins, &outs));
+            }
+            _ => {}
+        }
+    }
+    if lines.is_empty() {
+        return Err(format!(
+            "interface `{interface}` declares no members at all"
+        ));
+    }
+    lines.sort();
+    Ok(lines.join("\n") + "\n")
+}
+
+/// One line of [`SIGNATURE`]. A method's reply body is a struct of its out
+/// arguments, which is why it is wrapped even when there is one of them.
+fn rendered(kind: &str, interface: &str, name: &str, ins: &str, outs: &str) -> String {
+    match kind {
+        "signal" => format!("signal {interface}.{name}({ins})"),
+        _ => format!("method {interface}.{name}({ins}) -> ({outs})"),
+    }
+}
+
+/// Everything outside `<!-- ... -->`.
+fn strip_comments(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("-->") {
+            Some(end) => rest = &rest[start + end + 3..],
+            // An unterminated comment: everything after it is comment.
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The text between `<interface name="...">` and its `</interface>`.
+fn interface_block<'a>(xml: &'a str, interface: &str) -> Option<&'a str> {
+    let opening = format!("<interface name=\"{interface}\">");
+    let start = xml.find(&opening)? + opening.len();
+    let end = xml[start..].find("</interface>")? + start;
+    Some(&xml[start..end])
+}
+
+/// One `<tag attr="value" ...>` as this parser needs it.
+struct Tag<'a> {
+    /// The element name, with a leading `/` for a closing tag.
+    name: &'a str,
+    attributes: &'a str,
+    self_closing: bool,
+}
+
+/// Every tag in `s`, in order. Not an XML parser: it reads `<`...`>` runs
+/// and nothing else, which is all a digest of members and types needs and
+/// which is why the document not being well-formed does not matter here.
+fn tags(s: &str) -> impl Iterator<Item = Tag<'_>> {
+    let mut rest = s;
+    std::iter::from_fn(move || loop {
+        let start = rest.find('<')?;
+        let end = rest[start..].find('>')? + start;
+        let inner = &rest[start + 1..end];
+        rest = &rest[end + 1..];
+        if inner.starts_with('?') || inner.starts_with('!') {
+            continue;
+        }
+        let self_closing = inner.ends_with('/');
+        let inner = inner.trim_end_matches('/');
+        let (name, attributes) = match inner.find(char::is_whitespace) {
+            Some(i) => (&inner[..i], &inner[i..]),
+            None => (inner, ""),
+        };
+        return Some(Tag {
+            name,
+            attributes,
+            self_closing,
+        });
+    })
+}
+
+/// The value of `key="..."` in an attribute run.
+fn attribute<'a>(attributes: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("{key}=\"");
+    let start = attributes.find(&needle)? + needle.len();
+    let end = attributes[start..].find('"')? + start;
+    Some(&attributes[start..end])
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct WireRule {
     pub id: String,
@@ -407,6 +790,19 @@ pub trait Porthole {
     async fn close_all(&self) -> zbus::Result<(Vec<WireRule>, Vec<WireError>)>;
 
     async fn list(&self) -> zbus::Result<Vec<WireRule>>;
+
+    /// The contract the helper speaks: [`PROTOCOL_VERSION`], as the helper
+    /// was compiled with it.
+    ///
+    /// A method rather than a property, and the difference is measured
+    /// rather than stylistic -- see [`read_protocol_version`], which is what
+    /// every component here calls instead of this, and which is where the
+    /// cached-property trap and the absent-member answer are both handled.
+    ///
+    /// `(u)` and nothing else: it must stay readable by a client that
+    /// disagrees with the helper about every other type on this interface,
+    /// which is the one situation it exists for.
+    async fn protocol_version(&self) -> zbus::Result<u32>;
 
     async fn status(&self) -> zbus::Result<WireStatus>;
 
@@ -899,6 +1295,310 @@ mod tests {
             "the connection was lost".to_string()
         )));
         assert!(!is_undecodable(&zbus::Error::InvalidReply));
+    }
+
+    /// One D-Bus **message body**, from the Rust tuple zvariant encodes it
+    /// from: the arguments concatenated, with no outer parentheses.
+    ///
+    /// zvariant renders a Rust tuple as a struct, so
+    /// `(WireRule, CloseReason)` signs as `((sqssssttusqq)s)` while the
+    /// signal's body on the wire -- what `dbus-monitor` prints and what an
+    /// introspection `<arg>` list adds up to -- is `(sqssssttusqq)s`.
+    fn body(tuple: impl std::fmt::Display) -> String {
+        let rendered = tuple.to_string();
+        rendered
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+            .expect("a tuple's signature is parenthesised")
+            .to_string()
+    }
+
+    fn method_error(name: &str, detail: &str) -> zbus::Error {
+        zbus::Error::MethodError(
+            zbus::names::OwnedErrorName::try_from(name.to_string()).unwrap(),
+            Some(detail.to_string()),
+            zbus::message::Message::method_call("/", "Noop")
+                .unwrap()
+                .build(&())
+                .unwrap(),
+        )
+    }
+
+    /// The guard on the hand-kept number, in the half that needs no bus.
+    ///
+    /// Every line of [`SIGNATURE`] that carries a wire type is rebuilt here
+    /// from that type's own `Type::SIGNATURE` -- the very strings zvariant
+    /// puts on the wire -- so the change that produced this whole contract
+    /// (three members added to [`WireRule`], `a(sqssssttu)` becoming
+    /// `a(sqssssttusqq)`) fails here, in `cargo test`, with nothing running.
+    ///
+    /// What it cannot see is an argument list, a renamed member or a member
+    /// added or removed: nothing in Rust's type system carries "Open takes
+    /// `qssu`". That is the live guard's half --
+    /// `porthole-helper/tests/interface_contract.rs`.
+    #[test]
+    fn the_wire_types_are_the_ones_this_digest_names() {
+        let rule = WireRule::SIGNATURE;
+        let expected = [
+            // `rule` already renders parenthesised -- zvariant signs a
+            // struct that way -- and the reply body is a struct of the one
+            // out argument, which is what the second pair would have been.
+            format!("method {INTERFACE}.Open(qssu) -> ({rule})"),
+            format!("method {INTERFACE}.Forward(qssuq) -> ({rule})"),
+            format!("method {INTERFACE}.Close(qs) -> ({rule})"),
+            format!("method {INTERFACE}.CloseById(sbb) -> ({rule})"),
+            format!(
+                "method {INTERFACE}.CloseAll() -> ({}{})",
+                <Vec<WireRule>>::SIGNATURE,
+                <Vec<WireError>>::SIGNATURE
+            ),
+            format!(
+                "method {INTERFACE}.List() -> ({})",
+                <Vec<WireRule>>::SIGNATURE
+            ),
+            format!("method {INTERFACE}.Status() -> ({})", WireStatus::SIGNATURE),
+            format!(
+                "method {INTERFACE}.DockerPorts() -> ({})",
+                <Vec<WireDockerPort>>::SIGNATURE
+            ),
+            format!(
+                "method {INTERFACE}.ProtocolVersion() -> ({})",
+                u32::SIGNATURE
+            ),
+            format!("signal {INTERFACE}.RuleOpened({rule})"),
+            format!(
+                "signal {INTERFACE}.RuleClosed({})",
+                body(<(WireRule, CloseReason)>::SIGNATURE)
+            ),
+            format!(
+                "signal {INTERFACE}.NetworkChanged({})",
+                body(<(&str, &str)>::SIGNATURE)
+            ),
+        ];
+        for line in &expected {
+            assert!(
+                SIGNATURE.lines().any(|declared| declared == line),
+                "`SIGNATURE` has no line\n  {line}\nwhich is what the types this build \
+                 encodes actually produce. If you changed a wire type on purpose, write \
+                 the new line into `SIGNATURE` **and raise `PROTOCOL_VERSION`** -- a \
+                 changed contract with the same version number is the one failure this \
+                 pair of constants exists to prevent.\n`SIGNATURE` is:\n{SIGNATURE}"
+            );
+        }
+        // The other direction: a line here that no type produces is a line
+        // left behind, and a digest with a stale line in it would go on
+        // matching a live interface that no longer serves it -- so this
+        // count is what says the two lists are the same list.
+        assert_eq!(
+            SIGNATURE.lines().count(),
+            expected.len(),
+            "`SIGNATURE` names {} members and this check accounts for {}. Every member \
+             belongs in both, or the digest and the interface can drift in the direction \
+             neither guard looks.",
+            SIGNATURE.lines().count(),
+            expected.len()
+        );
+    }
+
+    /// The guard on the number itself, which the two guards on
+    /// [`SIGNATURE`] are not.
+    ///
+    /// A reviewer measured the hole this closes: change the wire contract
+    /// for real (`DockerPorts` from `a(sqssq)` to `a(sqssqu)`), update
+    /// `SIGNATURE` as both of those guards' failure text instructs, leave
+    /// `PROTOCOL_VERSION` at 1 -- and the whole suite passed. The contract
+    /// moved, the number did not, and nothing said so. That is exactly what
+    /// this feature exists to make impossible, landed on its own constant.
+    ///
+    /// What is committed now is the **pair**. This build's two constants
+    /// have to name a contract [`CONTRACTS`] records, so an interface change
+    /// carried into `SIGNATURE` and no further leaves a pair no row names,
+    /// and the repair is to append a row -- which is where a version number
+    /// gets chosen on purpose.
+    #[test]
+    fn the_version_and_the_signature_are_a_pair_that_was_shipped() {
+        assert!(
+            CONTRACTS
+                .iter()
+                .any(|c| c.version == PROTOCOL_VERSION && c.signature == SIGNATURE),
+            "`PROTOCOL_VERSION` is {PROTOCOL_VERSION} and `SIGNATURE` is a contract no \
+             row of `CONTRACTS` names.\n\nIf you changed the interface on purpose, this \
+             is the point of this test: the contract you have just written has no \
+             version. Append a row to `CONTRACTS` -- `Contract {{ version: {}, \
+             signature: CONTRACT_{} }}`, with `CONTRACT_{}` holding the new digest -- and \
+             raise `PROTOCOL_VERSION` to {}. Do **not** edit an existing row: it is a \
+             promise about a version that has already shipped, and a client meeting a \
+             helper of that version reads it.\n\n`SIGNATURE` is now:\n{SIGNATURE}",
+            PROTOCOL_VERSION + 1,
+            PROTOCOL_VERSION + 1,
+            PROTOCOL_VERSION + 1,
+            PROTOCOL_VERSION + 1
+        );
+    }
+
+    #[test]
+    fn the_contracts_are_appended_and_never_renumbered() {
+        // The shape that makes the pairing above worth anything. Versions
+        // run 1, 2, 3... with none missing and none repeated -- a version is
+        // an ordering (`alignment` compares them with `<`), so a gap or a
+        // repeat would make "older" mean nothing. And no two rows may
+        // describe the same interface: a version raised over an unchanged
+        // contract would tell two matched binaries they are mismatched.
+        assert!(!CONTRACTS.is_empty(), "there is at least one contract");
+        for (i, contract) in CONTRACTS.iter().enumerate() {
+            assert_eq!(
+                contract.version,
+                i as u32 + 1,
+                "contracts are numbered from 1 with no gaps: row {i} says {}",
+                contract.version
+            );
+            assert!(
+                contract.version > PROTOCOL_VERSION_ABSENT,
+                "no contract may claim the number an absent member is read as"
+            );
+        }
+        for (i, a) in CONTRACTS.iter().enumerate() {
+            for b in CONTRACTS.iter().skip(i + 1) {
+                assert_ne!(
+                    a.signature, b.signature,
+                    "protocol {} and protocol {} describe the same interface, so one of \
+                     the two numbers stands for no change at all",
+                    a.version, b.version
+                );
+            }
+        }
+        assert_eq!(
+            CONTRACTS.last().expect("non-empty").version,
+            PROTOCOL_VERSION,
+            "this build speaks the newest contract there is; a row above the version \
+             this build was compiled with is a contract nothing implements"
+        );
+
+        // Every row is a digest in the form `signature_digest` produces, not
+        // an approximation of one: the comparison it feeds is exact, so a
+        // row with a stray blank line or a missing interface name would be a
+        // row no live interface could ever match.
+        for contract in &CONTRACTS {
+            assert!(
+                contract.signature.ends_with('\n'),
+                "protocol {}'s digest is not newline-terminated",
+                contract.version
+            );
+            for line in contract.signature.lines() {
+                assert!(
+                    line.starts_with("method ") || line.starts_with("signal "),
+                    "protocol {}: `{line}` is neither a method nor a signal",
+                    contract.version
+                );
+                assert!(
+                    line.contains(INTERFACE),
+                    "protocol {}: `{line}` does not name {INTERFACE}. Renaming the \
+                     interface is the one change that would make every subscription \
+                     wait forever instead of failing.",
+                    contract.version
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_digest_is_read_out_of_an_interfaces_own_introspection() {
+        // The parser the live guard runs on, driven by the XML zbus really
+        // emits -- comments with `--` inside them (which is why this is not
+        // an XML parser at all), argument names, and a signal whose args
+        // carry no direction.
+        let xml = "\
+<node>
+  <interface name=\"com.example.Other\">
+    <method name=\"Ignored\"><arg type=\"s\" direction=\"in\"/></method>
+  </interface>
+  <interface name=\"com.jacopobriccola.Porthole1\">
+    <!-- a doc comment with a `--` in it, which is not well-formed XML -->
+    <method name=\"Open\">
+      <arg name=\"port\" type=\"q\" direction=\"in\"/>
+      <arg name=\"scope\" type=\"s\" direction=\"in\"/>
+      <arg type=\"(sq)\" direction=\"out\"/>
+    </method>
+    <method name=\"List\">
+      <arg type=\"a(sq)\" direction=\"out\"/>
+    </method>
+    <signal name=\"RuleClosed\">
+      <arg name=\"rule\" type=\"(sq)\"/>
+      <arg name=\"reason\" type=\"s\"/>
+    </signal>
+  </interface>
+</node>";
+        assert_eq!(
+            signature_digest(xml, INTERFACE).expect("the interface is in there"),
+            "method com.jacopobriccola.Porthole1.List() -> (a(sq))\n\
+             method com.jacopobriccola.Porthole1.Open(qs) -> ((sq))\n\
+             signal com.jacopobriccola.Porthole1.RuleClosed((sq)s)\n"
+        );
+
+        // An interface that is not there is an error and never an empty
+        // digest: a guard comparing nothing to nothing is one of the ways a
+        // check reports success while executing nothing.
+        let missing = signature_digest(xml, "com.jacopobriccola.Porthole2")
+            .expect_err("nothing serves Porthole2");
+        assert!(missing.contains("Porthole2"), "{missing}");
+    }
+
+    #[test]
+    fn an_absent_version_member_is_a_helper_from_before_this_contract() {
+        // Measured, read-only, against the live helper on the author's own
+        // machine: `busctl --system get-property ... ProtocolVersion` ->
+        // `Unknown property 'ProtocolVersion'`. That answer is information,
+        // and reading it as a failure would leave every helper in the field
+        // indistinguishable from a broken one.
+        assert!(names_an_absent_member(&method_error(
+            "org.freedesktop.DBus.Error.UnknownMethod",
+            "Unknown method 'ProtocolVersion'"
+        )));
+        assert!(names_an_absent_member(&method_error(
+            "org.freedesktop.DBus.Error.UnknownProperty",
+            "Unknown property 'ProtocolVersion'"
+        )));
+
+        // And the boundary that matters most: a helper that is not there at
+        // all is not an old helper. Reading `ServiceUnknown` as version 0
+        // would turn "porthole is not installed" into "porthole is out of
+        // date", and every component here acts differently on the two.
+        assert!(!names_an_absent_member(&method_error(
+            "org.freedesktop.DBus.Error.ServiceUnknown",
+            "The name is not activatable"
+        )));
+        assert!(!names_an_absent_member(&method_error(
+            "com.jacopobriccola.Porthole.NotAuthorized",
+            "not authorized"
+        )));
+        assert!(!names_an_absent_member(&zbus::Error::InvalidReply));
+    }
+
+    #[test]
+    fn the_version_says_which_half_is_old_and_never_merely_that_they_differ() {
+        // The whole reason the number exists: one of the two remedies needs
+        // a person with privilege and the other does not, and a component
+        // that only knew "these disagree" had to offer both.
+        assert_eq!(alignment(PROTOCOL_VERSION), Alignment::Same);
+        assert_eq!(
+            alignment(PROTOCOL_VERSION_ABSENT),
+            Alignment::HelperIsOlder,
+            "a helper with no version member is older than one that has it: the member \
+             is only ever added, and `SIGNATURE`'s guards are what keep it from being \
+             removed"
+        );
+        assert_eq!(
+            alignment(PROTOCOL_VERSION + 1),
+            Alignment::ThisOneIsOlder,
+            "a helper ahead of this build makes *this* the half to replace"
+        );
+        // 0 must stay below every version a helper can report, or an absent
+        // member would read as a helper from the future -- and the agent's
+        // answer to that is to replace *itself*, which would be the wrong
+        // half every time. A compile-time assertion rather than a runtime
+        // one, since both sides are constants: this way the impossible
+        // arrangement does not build.
+        const _: () = assert!(PROTOCOL_VERSION > PROTOCOL_VERSION_ABSENT);
     }
 
     #[test]

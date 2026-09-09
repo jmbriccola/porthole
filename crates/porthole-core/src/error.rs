@@ -67,6 +67,29 @@ pub enum ExitCode {
     /// of its own on the port, which a script may close. Nothing porthole can
     /// close is involved here.
     AlreadyReachable = 14,
+    /// The helper answered and this build could not read the answer: the two
+    /// are from different versions of porthole.
+    ///
+    /// Its own code because it is its own situation, and because the one it
+    /// used to leave -- [`ExitCode::Failure`], "something went wrong that has
+    /// no more specific code" -- is the least useful thing a script can be
+    /// told about the one failure that will not go away by itself. Every
+    /// other code here says something about the request; this one says the
+    /// request never got a hearing, and that no retry will change it until a
+    /// person restarts one of the two binaries.
+    ///
+    /// Not [`ExitCode::BackendUnavailable`], which is "porthole could not
+    /// reach the helper": the helper answered. That distinction is the whole
+    /// point of this feature, and collapsing it here would put the false
+    /// claim back at the process boundary after it was removed from the
+    /// message.
+    ///
+    /// **It does not say whether the request took effect.** `open`'s
+    /// arguments did not change across the upgrade that produced the
+    /// measured case, so a helper whose reply was unreadable may well have
+    /// done exactly what was asked. `porthole list` reads the state file the
+    /// helper writes, and is what settles that.
+    VersionMismatch = 15,
 }
 
 /// One of the refusals a forward has of its own: the code it leaves, the
@@ -301,6 +324,18 @@ pub enum Error {
     #[error("state file {path}: {detail}")]
     State { path: String, detail: String },
 
+    /// The helper answered, and this build could not read the answer -- see
+    /// [`crate::ipc::is_undecodable`], which is what recognises it, and
+    /// [`ExitCode::VersionMismatch`], which is what a script sees.
+    ///
+    /// Constructed in one place, `porthole-cli`'s own `client.rs`, from a
+    /// failure that came back from a call. It has no D-Bus error name and
+    /// never crosses the bus in either direction: the helper cannot report
+    /// it, because it is a fact about the pair rather than about anything
+    /// the helper did.
+    #[error("{0}")]
+    VersionMismatch(String),
+
     #[error("{0}")]
     Unexpected(String),
 
@@ -340,6 +375,7 @@ impl Error {
             Error::ExternalPortInUse { .. } => ExitCode::ExternalPortInUse,
             Error::ForwardCheckUnavailable(_) => ExitCode::ForwardCheckUnavailable,
             Error::AlreadyReachable(_) => ExitCode::AlreadyReachable,
+            Error::VersionMismatch(_) => ExitCode::VersionMismatch,
             Error::Remote { code, .. } => *code,
             Error::CommandFailed { .. }
             | Error::CommandSpawn { .. }
@@ -367,6 +403,7 @@ impl Error {
             Error::ExternalPortInUse { .. } => "external_port_in_use",
             Error::ForwardCheckUnavailable(_) => "forward_check_unavailable",
             Error::AlreadyReachable(_) => "already_reachable",
+            Error::VersionMismatch(_) => "version_mismatch",
             Error::Remote { kind, .. } => kind,
             Error::CommandFailed { .. } => "command_failed",
             Error::CommandSpawn { .. } => "command_spawn_failed",
@@ -399,6 +436,7 @@ mod tests {
         assert_eq!(ExitCode::ForwardUnsupported as i32, 12);
         assert_eq!(ExitCode::ForwardCheckUnavailable as i32, 13);
         assert_eq!(ExitCode::AlreadyReachable as i32, 14);
+        assert_eq!(ExitCode::VersionMismatch as i32, 15);
     }
 
     /// Every `Name = N,` inside `pub enum ExitCode { ... }`, read out of this
@@ -445,7 +483,7 @@ mod tests {
         // parsed and both guards below would have gone on passing, checking
         // codes 0-9 and calling it a table. A floor whose slack is precisely
         // the subject of the work is not a floor.
-        const LOWEST_TOLERABLE: usize = 15;
+        const LOWEST_TOLERABLE: usize = 16;
         assert!(
             found.len() >= LOWEST_TOLERABLE,
             "the enum body was parsed as {} variants, fewer than the {LOWEST_TOLERABLE} \
@@ -581,17 +619,32 @@ mod tests {
     #[test]
     fn the_forward_refusals_are_exactly_the_forward_exit_codes() {
         // The guard that makes `FORWARD_REFUSALS` worth having instead of a
-        // fifth hand-kept list. Codes 10 and up are the ones this feature
-        // appended and they belong to `forward` alone -- 10 twice, for the
-        // two facts that share it -- so the enum, read out of this file's
-        // own source by `declared_exit_codes`, is what says how many
-        // refusals there are. Add a code for a new one and this fails until
-        // the list names it; name one here that the enum does not have and
-        // it fails the other way.
+        // fifth hand-kept list. Codes 10 and up were appended by the forward
+        // feature and belong to `forward` alone -- 10 twice, for the two
+        // facts that share it -- so the enum, read out of this file's own
+        // source by `declared_exit_codes`, is what says how many refusals
+        // there are. Add a code for a new one and this fails until the list
+        // names it; name one here that the enum does not have and it fails
+        // the other way.
+        //
+        // The exception list rather than an upper bound on the range, and
+        // the difference matters: a bound would silently stop covering
+        // every code appended after it, which is precisely how a guard
+        // stops guarding. This way a new code has to be *classified* --
+        // named here as not a refusal, or added to `FORWARD_REFUSALS` --
+        // before the suite goes green again.
+        const NOT_A_FORWARD_REFUSAL: [ExitCode; 1] = [
+            // The pair could not read each other. Not a refusal of
+            // anything: `forward` never got as far as deciding.
+            ExitCode::VersionMismatch,
+        ];
         let mut from_the_enum: Vec<i32> = declared_exit_codes()
             .into_iter()
             .map(|(_, v)| v)
-            .filter(|v| *v >= ExitCode::NotForwardable as i32)
+            .filter(|v| {
+                *v >= ExitCode::NotForwardable as i32
+                    && !NOT_A_FORWARD_REFUSAL.iter().any(|e| *e as i32 == *v)
+            })
             .collect();
         from_the_enum.sort_unstable();
 

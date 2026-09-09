@@ -18,10 +18,11 @@
 //! the method and emits the signal, it does not draw a bubble or wait for a
 //! human to click it -- nor anything about the real helper or polkit.
 
-use porthole_core::ipc::{CloseReason, WireRule, INTERFACE, PATH, SERVICE};
+use porthole_core::ipc::{CloseReason, WireRule, INTERFACE, PATH, PROTOCOL_VERSION, SERVICE};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use zbus::zvariant::OwnedValue;
@@ -236,6 +237,14 @@ impl FakeHelper {
     /// than the answer.
     async fn list(&self) -> Vec<WireRule> {
         Vec::new()
+    }
+
+    /// The ordinary configuration: a helper and an agent from the same
+    /// package, speaking the same contract. Every test that uses this
+    /// stand-in is therefore also a check that a matched pair does nothing
+    /// unusual -- no re-execution, no notice, no stopping.
+    async fn protocol_version(&self) -> u32 {
+        PROTOCOL_VERSION
     }
 
     async fn open(&self, port: u16, protocol: String, scope: String, seconds: u32) -> WireRule {
@@ -1316,10 +1325,21 @@ async fn a_close_this_agent_cannot_read_stops_it_and_says_so_on_screen() {
         notice.body.contains("could not read"),
         "the notice has to say what happened, not merely that something did: {notice:?}"
     );
+    // Both remedies here, and that is the version working rather than
+    // failing: this stand-in reports the *current* protocol and then sends
+    // a body from before it, which is a contradiction no deployed pair can
+    // produce -- `porthole_core::ipc::CONTRACTS` commits the version and
+    // the digest as a pair, so a signature that moved while the number
+    // stayed put is a contract no row names. So the number is not
+    // evidence about which half is old, and the notice must not name one on
+    // the strength of it. `a_list_this_agent_cannot_read_stops_it_instead_
+    // of_listening_anyway` is where a helper really is the older half, and
+    // that is where the remedy is named.
     assert!(
         notice.body.contains("porthole-helper.service")
             && notice.body.to_lowercase().contains("log out"),
-        "and both remedies, since nothing here knows which half is old: {notice:?}"
+        "an equal version and an unreadable message together say nothing about which \
+         half is old: {notice:?}"
     );
 
     let status = until("the agent to stop", || {
@@ -1392,6 +1412,22 @@ async fn a_list_this_agent_cannot_read_stops_it_instead_of_listening_anyway() {
 
     let notice = until("the notice", || shown.lock().unwrap().first().cloned()).await;
     assert!(notice.body.contains("could not read"), "{notice:?}");
+    // And this one names the remedy instead of offering both, which is the
+    // whole of what putting the version on the wire bought. This stand-in
+    // has no version member at all -- what every helper deployed today
+    // answers -- and an absent member is a helper from before the contract,
+    // so the older half is the helper and restarting it needs a person.
+    assert!(
+        notice
+            .body
+            .contains("systemctl restart porthole-helper.service"),
+        "the notice must name the half the version identified: {notice:?}"
+    );
+    assert!(
+        !notice.body.contains("if closes are still not announced"),
+        "and stop hedging between the two, which is what it had to do while nothing on \
+         the wire ordered them: {notice:?}"
+    );
 
     let journal = agent.journal();
     assert!(
@@ -1457,4 +1493,461 @@ async fn an_absent_helper_leaves_the_agent_listening_and_shows_nothing() {
         "and nothing is put on the user's screen about it: {:?}",
         shown.lock().unwrap()
     );
+}
+
+/// A helper whose `ProtocolVersion` answers are scripted: the first call
+/// gets `first`, every later one gets `rest`.
+///
+/// Scripting it is how a test stands in for the thing it cannot arrange --
+/// an agent whose *binary* changed under it. `Agent::start` runs one path,
+/// and re-executing it necessarily runs the same file, so what changes
+/// across the re-execution here is the helper's answer rather than the
+/// agent's own build. What that models is exact: the second instance is the
+/// one whose version matches, which after a package upgrade is what
+/// re-running the installed binary produces.
+struct VersionedHelper {
+    first: u32,
+    rest: u32,
+    calls: Arc<AtomicUsize>,
+}
+
+#[zbus::interface(name = "com.jacopobriccola.Porthole1")]
+impl VersionedHelper {
+    async fn list(&self) -> Vec<WireRule> {
+        Vec::new()
+    }
+
+    async fn protocol_version(&self) -> u32 {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.first
+        } else {
+            self.rest
+        }
+    }
+}
+
+/// A helper with everything this agent reads and **no version member at
+/// all** -- every helper deployed today, and the one this contract has to
+/// leave alone.
+struct HelperFromBeforeVersions;
+
+#[zbus::interface(name = "com.jacopobriccola.Porthole1")]
+impl HelperFromBeforeVersions {
+    async fn list(&self) -> Vec<WireRule> {
+        Vec::new()
+    }
+}
+
+/// Stand `helper` up on this bus under the helper's real name.
+async fn serve_helper<T>(bus: &Bus, helper: T) -> zbus::Connection
+where
+    T: zbus::object_server::Interface,
+{
+    zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(SERVICE)
+        .unwrap()
+        .serve_at(PATH, helper)
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+}
+
+async fn serve_notifications(
+    bus: &Bus,
+    shown: Arc<Mutex<Vec<Shown>>>,
+    id: u32,
+) -> zbus::Connection {
+    zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(NOTIFICATIONS_SERVICE)
+        .unwrap()
+        .serve_at(NOTIFICATIONS_PATH, FakeNotifications { shown, id })
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+}
+
+/// How many times this agent has started itself afresh.
+fn replacements(journal: &str) -> usize {
+    journal.matches("re-executing").count()
+}
+
+/// The case the version exists for: an agent that outlived a package
+/// upgrade replaces itself, **once**, and goes back to work.
+///
+/// Before this, the same agent could only stop: a `SignatureMismatch` names
+/// two signatures and does not order them, so a blind restart was as likely
+/// to be the wrong remedy as the right one -- and against a helper left
+/// behind by the same upgrade it would have shown the notice five times
+/// over before systemd's start limit stopped it.
+#[tokio::test]
+async fn an_agent_older_than_the_helper_replaces_itself_once_and_comes_back_working() {
+    let bus = Bus::start();
+    let uid = our_uid();
+
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let _notifications = serve_notifications(&bus, shown.clone(), 11).await;
+    let helper = serve_helper(
+        &bus,
+        VersionedHelper {
+            first: PROTOCOL_VERSION + 1,
+            rest: PROTOCOL_VERSION,
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+    )
+    .await;
+
+    let mut agent = Agent::start(&bus);
+    until("the agent to start listening", || {
+        agent.journal().contains("listening for uid").then_some(())
+    })
+    .await;
+
+    let journal = agent.journal();
+    assert_eq!(
+        replacements(&journal),
+        1,
+        "exactly one re-execution: the first agent found the helper ahead of it, and the \
+         second found itself level: {journal}"
+    );
+    assert!(
+        journal.contains("is the older half"),
+        "and the journal says which half it decided it was: {journal}"
+    );
+    assert!(
+        journal.contains(&format!(
+            "the helper speaks porthole's protocol {PROTOCOL_VERSION}, and so does this agent"
+        )),
+        "the agent that came back is the one that matches: {journal}"
+    );
+
+    // "Comes back working" is not the same as "is running": the whole job
+    // is announcing closes, so the proof is a close that gets announced --
+    // by the second instance, over the subscription it made for itself.
+    helper
+        .emit_signal(
+            None::<()>,
+            PATH,
+            INTERFACE,
+            "RuleClosed",
+            &(wire_rule(5173, uid), CloseReason::Expired),
+        )
+        .await
+        .unwrap();
+    let announced = until(
+        "a notification from the agent that replaced the first one",
+        || shown.lock().unwrap().first().cloned(),
+    )
+    .await;
+    assert!(announced.body.contains("5173/tcp"), "{announced:?}");
+
+    // Nothing was put on the user's screen about the replacement itself.
+    // It is the remedy that needs nobody's attention -- that is the whole
+    // reason it is worth doing automatically.
+    assert_eq!(
+        shown.lock().unwrap().len(),
+        1,
+        "the replacement is not something to interrupt anyone about: {:?}",
+        shown.lock().unwrap()
+    );
+    assert!(agent.is_running(), "{}", agent.journal());
+    assert_eq!(
+        replacements(&agent.journal()),
+        1,
+        "and it did not go round again afterwards: {}",
+        agent.journal()
+    );
+}
+
+/// The pathological case, and the reason the replacement is guarded rather
+/// than merely written: a machine whose **installed** agent really is the
+/// older half answers the same way every time.
+///
+/// Nothing here sleeps, so an unguarded version of this would spin as fast
+/// as the machine allows, showing nothing and fixing nothing. What it must
+/// do instead is try once, say what it found, and carry on -- an agent that
+/// can still read the helper's signals is still worth having, and one that
+/// cannot will stop at the first message it cannot read, as it did before
+/// any of this existed.
+#[tokio::test]
+async fn an_agent_that_is_still_the_older_half_after_replacing_itself_does_not_loop() {
+    let bus = Bus::start();
+
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let _notifications = serve_notifications(&bus, shown.clone(), 12).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _helper = serve_helper(
+        &bus,
+        VersionedHelper {
+            // Never satisfied: whatever starts, the helper is ahead of it.
+            first: PROTOCOL_VERSION + 1,
+            rest: PROTOCOL_VERSION + 1,
+            calls: calls.clone(),
+        },
+    )
+    .await;
+
+    let mut agent = Agent::start(&bus);
+    until("the agent to settle", || {
+        agent.journal().contains("listening for uid").then_some(())
+    })
+    .await;
+
+    // Long enough that a loop would have gone round hundreds of times: the
+    // path has no sleep in it, so a second attempt would be immediate.
+    tokio::time::sleep(Duration::from_millis(750)).await;
+
+    let journal = agent.journal();
+    assert_eq!(
+        replacements(&journal),
+        1,
+        "it must try exactly once. Journal: {journal}"
+    );
+    assert!(
+        journal.contains("Not trying again"),
+        "and say that it will not try again, which is the only record that the second \
+         agent recognised itself: {journal}"
+    );
+    assert!(
+        agent.is_running(),
+        "an agent that can still read what the helper sends is still worth having: {journal}"
+    );
+    assert!(
+        shown.lock().unwrap().is_empty(),
+        "and nothing is on the user's screen yet: this helper's signals are readable, so \
+         there is nothing to report: {:?}",
+        shown.lock().unwrap()
+    );
+    // The negative control for the count above: the helper really was asked
+    // more than once (start-up, plus the replacement's own start-up), so
+    // "one re-execution" is a decision this agent made and not a question
+    // it only ever asked once.
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "the version was read {} time(s); with fewer than two the count above proves \
+         nothing",
+        calls.load(Ordering::SeqCst)
+    );
+}
+
+/// The re-check on `NameOwnerChanged`, and that it reads the **new**
+/// answer.
+///
+/// The helper's name changing owner is the helper having restarted, which
+/// after an upgrade is where the new one appears under a live agent. The
+/// measured trap is a cached property: it answers with the dead helper's
+/// version at exactly this moment (`cached=2` while `uncached=3`), so an
+/// agent that read one would look at the restart and see nothing to do.
+/// Here the first helper is level with the agent and the second is ahead of
+/// it, and the only way to reach the re-execution below is to have read the
+/// second one's answer.
+#[tokio::test]
+async fn a_helper_that_comes_back_newer_is_re_read_and_not_remembered() {
+    let bus = Bus::start();
+
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let _notifications = serve_notifications(&bus, shown.clone(), 13).await;
+
+    let level = serve_helper(
+        &bus,
+        VersionedHelper {
+            first: PROTOCOL_VERSION,
+            rest: PROTOCOL_VERSION,
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+    )
+    .await;
+
+    let mut agent = Agent::start(&bus);
+    until("the agent to start listening", || {
+        agent.journal().contains("listening for uid").then_some(())
+    })
+    .await;
+    assert_eq!(
+        replacements(&agent.journal()),
+        0,
+        "nothing to do against a helper of its own version: {}",
+        agent.journal()
+    );
+
+    // The upgrade: the helper goes away and a newer one takes the name.
+    // Two connections rather than one object changing its mind, so that
+    // the bus really does report a change of owner.
+    level.release_name(SERVICE).await.unwrap();
+    let _newer = serve_helper(
+        &bus,
+        VersionedHelper {
+            first: PROTOCOL_VERSION + 1,
+            rest: PROTOCOL_VERSION + 1,
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+    )
+    .await;
+
+    until("the agent to notice the helper it now has", || {
+        (replacements(&agent.journal()) == 1).then_some(())
+    })
+    .await;
+    assert!(
+        agent.is_running(),
+        "a re-execution keeps the process: same pid, new image. A child that had gone          would mean this agent exited and something else started, which is not what this          path does: {}",
+        agent.journal()
+    );
+    let journal = agent.journal();
+    assert!(
+        journal.contains(&format!(
+            "the helper speaks porthole's protocol {}",
+            PROTOCOL_VERSION + 1
+        )),
+        "the version it acted on is the one the *new* owner answered: {journal}"
+    );
+}
+
+/// And the other side of the same coin: a helper with no version member is
+/// every helper installed today, and it must go on being served.
+///
+/// A version difference is not by itself a reason to stop -- what stops
+/// this agent is still a message it cannot read. An agent that refused to
+/// run against an unversioned helper would take notifications away from
+/// every machine porthole is already installed on, on the strength of a
+/// number, while the messages it is refusing to wait for are ones it can
+/// read perfectly.
+#[tokio::test]
+async fn a_helper_from_before_the_version_existed_is_served_exactly_as_before() {
+    let bus = Bus::start();
+    let uid = our_uid();
+
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let _notifications = serve_notifications(&bus, shown.clone(), 14).await;
+    let helper = serve_helper(&bus, HelperFromBeforeVersions).await;
+
+    let mut agent = Agent::start(&bus);
+    until("the agent to start listening", || {
+        agent.journal().contains("listening for uid").then_some(())
+    })
+    .await;
+
+    helper
+        .emit_signal(
+            None::<()>,
+            PATH,
+            INTERFACE,
+            "RuleClosed",
+            &(wire_rule(5173, uid), CloseReason::Expired),
+        )
+        .await
+        .unwrap();
+    let announced = until("a notification", || shown.lock().unwrap().first().cloned()).await;
+    assert!(announced.body.contains("5173/tcp"), "{announced:?}");
+
+    let journal = agent.journal();
+    assert_eq!(
+        replacements(&journal),
+        0,
+        "the helper is the older half here, and replacing this agent would change \
+         nothing: {journal}"
+    );
+    assert!(
+        journal.contains("the helper is the older half"),
+        "an absent version member is an answer, not a failure, and the journal records \
+         which answer: {journal}"
+    );
+    // And it records the answer the helper actually gave. `0` is what an
+    // absent member is *read* as, so that one comparison orders every case;
+    // no helper reports it, and a journal line saying one did sends its
+    // reader looking for a version that does not exist.
+    assert!(
+        !journal.contains("protocol 0"),
+        "no helper answers `0`; this stand-in answered nothing at all: {journal}"
+    );
+    assert!(
+        journal.contains("answers no protocol version at all"),
+        "which is what the line has to say instead: {journal}"
+    );
+    assert!(agent.is_running());
+}
+
+/// A **second** upgrade in one login session is repaired like the first.
+///
+/// The bound on the self-replacement is one attempt per helper version, not
+/// one per process, and this is the case that distinguishes them. A bare
+/// "already tried once" flag survives a successful recovery: the agent that
+/// came back would carry it for the rest of the login, so the next upgrade
+/// would go unrepaired -- and the line it printed instead would assert that
+/// the installed agent is the old one, which after the first recovery it is
+/// not.
+///
+/// The no-loop property is unchanged and is asserted here too: each version
+/// buys exactly one attempt, so the last helper -- which never moves again --
+/// is not retried.
+#[tokio::test]
+async fn a_second_upgrade_in_one_session_is_repaired_like_the_first() {
+    let bus = Bus::start();
+
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let _notifications = serve_notifications(&bus, shown.clone(), 15).await;
+
+    // The first upgrade: a helper one version ahead, which never moves. The
+    // agent replaces itself once and then stops trying, exactly as
+    // `an_agent_that_is_still_the_older_half_after_replacing_itself_does_not_loop`
+    // requires.
+    let first = serve_helper(
+        &bus,
+        VersionedHelper {
+            first: PROTOCOL_VERSION + 1,
+            rest: PROTOCOL_VERSION + 1,
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+    )
+    .await;
+
+    let mut agent = Agent::start(&bus);
+    until("the agent to settle after the first upgrade", || {
+        agent.journal().contains("listening for uid").then_some(())
+    })
+    .await;
+    assert_eq!(
+        replacements(&agent.journal()),
+        1,
+        "one attempt for the first helper version: {}",
+        agent.journal()
+    );
+
+    // The second upgrade, in the same session: the helper goes away and one
+    // two versions ahead takes the name.
+    first.release_name(SERVICE).await.unwrap();
+    let _second = serve_helper(
+        &bus,
+        VersionedHelper {
+            first: PROTOCOL_VERSION + 2,
+            rest: PROTOCOL_VERSION + 2,
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+    )
+    .await;
+
+    until("the agent to try again for the newer helper", || {
+        (replacements(&agent.journal()) == 2).then_some(())
+    })
+    .await;
+
+    // And still no loop: the second attempt's own agent carries the version
+    // it was started for, so the helper that has stopped moving is not
+    // retried.
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let journal = agent.journal();
+    assert_eq!(
+        replacements(&journal),
+        2,
+        "one attempt per helper version, and this session saw two versions: {journal}"
+    );
+    assert!(
+        journal.contains("has already started itself afresh for that same helper version"),
+        "and the refusal names the version it is refusing for, rather than claiming this \
+         agent has had its one chance for the session: {journal}"
+    );
+    assert!(agent.is_running(), "{journal}");
 }

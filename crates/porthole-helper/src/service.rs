@@ -651,6 +651,25 @@ impl Porthole {
             .collect())
     }
 
+    /// The contract this helper speaks, so a client can tell which of the
+    /// two of them is the older half.
+    ///
+    /// **No authorization, deliberately.** Charging a person an
+    /// administrator password to find out whether their own two binaries
+    /// match would be absurd, and the answer is not a secret: it is a
+    /// compile-time constant of a package anyone can read, and every client
+    /// on the machine already gets `list` for the asking. It is also the one
+    /// call that must work when nothing else on this interface does -- a
+    /// client that cannot read a `WireRule` still has to be able to read
+    /// this -- so it takes no arguments, returns `u`, and touches nothing:
+    /// no state file, no firewall, no lock, no polkit.
+    ///
+    /// The helper checks no versions of its own. It is the authority; it
+    /// answers, and the clients decide.
+    async fn protocol_version(&self) -> u32 {
+        porthole_core::ipc::PROTOCOL_VERSION
+    }
+
     // --- Signals ---------------------------------------------------------
     //
     // Broadcast, so nothing here may carry anything a bystander should not

@@ -6,7 +6,7 @@
 //! wording and the filtering are testable without a notification daemon. Only
 //! [`NotificationsProxy`] and [`show`] touch the session bus.
 
-use porthole_core::ipc::{CloseReason, WireRule};
+use porthole_core::ipc::{Alignment, CloseReason, WireRule};
 use std::collections::HashMap;
 use zbus::zvariant::Value;
 
@@ -267,27 +267,56 @@ pub fn stale_agent_notice() -> Notification {
 /// announce_undecodable` is where the decision to stop is argued.
 ///
 /// **What is actually known**, and the wording claims no more: a message
-/// arrived from the helper that this binary could not read. That means the
-/// two are built against different shapes of the same wire type -- nothing
-/// here can say **which of them is the older**, because a signature mismatch
-/// names two signatures and does not order them. So both remedies are
-/// offered rather than one: the agent is replaced by logging out and back
-/// in, and the helper by restarting its service. One notice, one wording,
-/// for both places that reach it -- an agent that stops at start-up and one
-/// that stops mid-run leave the user in exactly the same position.
+/// arrived from the helper that this binary could not read, plus whatever
+/// `alignment` says. A signature mismatch names two signatures and does not
+/// order them, so on its own it cannot say **which of them is older** --
+/// which is what `porthole_core::ipc::PROTOCOL_VERSION` was put on the wire
+/// for, and what `alignment` carries here.
 ///
-/// No action button: the agent shows this on its way out, so there would be
-/// nobody left to answer a click.
-pub fn undecodable_notice() -> Notification {
+/// - `Some(HelperIsOlder)`: the helper's own version says it is the half
+///   left over from the upgrade, and restarting it needs privilege.
+/// - `Some(ThisOneIsOlder)`: this agent is. It replaces itself when it
+///   finds that out (`crate::replace_this_agent`), so reaching this notice
+///   means that did not resolve it -- the installed agent is the old one,
+///   or could not be started at all, and the journal says which.
+/// - `None`, and `Some(Same)`: nothing said. `None` is a version read that
+///   failed; `Same` is two binaries reporting one version and still not
+///   understanding each other, which means a signature changed without the
+///   version being raised -- `porthole_core::ipc::CONTRACTS` commits the
+///   two as a pair to keep that out of a release, and if it is true here
+///   then the version is not evidence about anything. Both get the wording
+///   from before there was a version: both remedies, blaming neither.
+///
+/// No action button in any of them: the agent shows this on its way out, so
+/// there would be nobody left to answer a click.
+pub fn undecodable_notice(alignment: Option<Alignment>) -> Notification {
+    // One opening for all three: what happened, and that this agent has
+    // stopped rather than gone quiet, is the same fact whichever half is
+    // old.
+    let opening = "porthole-agent could not read a message the porthole helper sent, so it \
+                   would have announced nothing at all from here on. It has stopped instead \
+                   of staying silent.";
+    let remedy = match alignment {
+        Some(Alignment::HelperIsOlder) => {
+            "The porthole helper is the older of the two: it is still the one from before \
+             the upgrade. Restart it — `systemctl restart porthole-helper.service` — and \
+             then log out and back in to start this agent again."
+        }
+        Some(Alignment::ThisOneIsOlder) => {
+            "This agent is the older of the two: the porthole helper speaks a newer version \
+             of porthole than the porthole-agent installed on this machine. Reinstall \
+             porthole, or finish the upgrade that was interrupted, and log out and back in."
+        }
+        Some(Alignment::Same) | None => {
+            "The two are from different versions of porthole: log out and back in to start \
+             the agent that is installed now, and if closes are still not announced, \
+             restart porthole-helper.service — that is the half left over from before the \
+             upgrade."
+        }
+    };
     Notification {
         summary: "Porthole notifications stopped".to_string(),
-        body: "porthole-agent could not read a message the porthole helper sent, so it \
-               would have announced nothing at all from here on. It has stopped instead \
-               of staying silent. The two are from different versions of porthole: log \
-               out and back in to start the agent that is installed now, and if closes \
-               are still not announced, restart porthole-helper.service — that is the \
-               half left over from before the upgrade."
-            .to_string(),
+        body: format!("{opening} {remedy}"),
         actions: Vec::new(),
     }
 }
@@ -487,14 +516,16 @@ mod tests {
     }
 
     #[test]
-    fn the_undecodable_notice_offers_both_remedies_and_blames_neither_half() {
-        // Nothing on the wire says which of the two binaries is the old one
-        // -- a signature mismatch names two signatures and does not order
-        // them -- so a notice that told the user to restart one of them
-        // would be right half the time and would send the other half
-        // looking in the wrong place. Both remedies, and no claim about
-        // which is needed.
-        let n = undecodable_notice();
+    fn the_undecodable_notice_offers_both_remedies_when_nothing_said_which_half_is_old() {
+        // The wording from before there was a version on the wire, and
+        // still the right one whenever there is nothing to go on: a
+        // signature mismatch names two signatures and does not order them,
+        // so a notice that named one remedy would be right half the time
+        // and would send the other half looking in the wrong place.
+        //
+        // `None` is a version read that failed -- which includes a helper
+        // that has gone away between the failure and the question.
+        let n = undecodable_notice(None);
         assert!(
             n.body.contains("Log out and back in") || n.body.contains("log out and back in"),
             "the agent's own remedy must be there: {}",
@@ -513,6 +544,66 @@ mod tests {
         // name a second process holds, which is a different thing to go
         // looking for.
         assert_ne!(n.summary, stale_agent_notice().summary);
+
+        // Two binaries reporting the same version and still unable to read
+        // each other means a signature moved without the version being
+        // raised -- so the version is not evidence about anything, and this
+        // must not name a half on the strength of it.
+        assert_eq!(
+            undecodable_notice(Some(Alignment::Same)).body,
+            n.body,
+            "an equal version that is nonetheless a mismatch says nothing about which \
+             half is old, and the notice must not pretend otherwise"
+        );
+    }
+
+    #[test]
+    fn the_notice_names_the_one_remedy_the_version_identifies() {
+        // The whole point of putting the version on the wire. Before it,
+        // both of these read identically and the user had to try both.
+        let helper_older = undecodable_notice(Some(Alignment::HelperIsOlder));
+        assert!(
+            helper_older
+                .body
+                .contains("systemctl restart porthole-helper.service"),
+            "the helper's own version says it is the older half, so say so: {}",
+            helper_older.body
+        );
+        assert!(
+            !helper_older
+                .body
+                .contains("if closes are still not announced"),
+            "and stop hedging between two remedies once one of them is known: {}",
+            helper_older.body
+        );
+
+        let agent_older = undecodable_notice(Some(Alignment::ThisOneIsOlder));
+        assert!(
+            agent_older.body.contains("Reinstall porthole"),
+            "an agent that could not replace itself has one thing left to say: {}",
+            agent_older.body
+        );
+        assert!(
+            !agent_older.body.contains("restart porthole-helper.service"),
+            "the helper is the newer half here; restarting it would change nothing: {}",
+            agent_older.body
+        );
+
+        // The three are three different sentences, not one sentence three
+        // times: a notice that named the same remedy whatever the version
+        // said would pass every assertion above that it happened to
+        // contain.
+        let unknown = undecodable_notice(None);
+        assert_ne!(helper_older.body, agent_older.body);
+        assert_ne!(helper_older.body, unknown.body);
+        assert_ne!(agent_older.body, unknown.body);
+        // And all three still say what happened, which is the half that
+        // does not depend on any version.
+        for n in [&helper_older, &agent_older, &unknown] {
+            assert!(n.body.contains("could not read a message"), "{}", n.body);
+            assert!(n.actions.is_empty());
+            assert_eq!(n.summary, "Porthole notifications stopped");
+        }
     }
 
     #[test]

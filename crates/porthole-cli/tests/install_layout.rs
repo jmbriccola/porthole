@@ -479,6 +479,7 @@ fn the_long_help_documents_every_exit_code() {
         ExitCode::ForwardUnsupported,
         ExitCode::ForwardCheckUnavailable,
         ExitCode::AlreadyReachable,
+        ExitCode::VersionMismatch,
     ] {
         // No wildcard: this arm is here to fail to compile, not to run.
         match code {
@@ -496,7 +497,8 @@ fn the_long_help_documents_every_exit_code() {
             | ExitCode::ExternalPortInUse
             | ExitCode::ForwardUnsupported
             | ExitCode::ForwardCheckUnavailable
-            | ExitCode::AlreadyReachable => {}
+            | ExitCode::AlreadyReachable
+            | ExitCode::VersionMismatch => {}
         }
         // Found by its number, not by its spacing: a two-digit code takes one
         // space after it rather than two, so that the text stays in one

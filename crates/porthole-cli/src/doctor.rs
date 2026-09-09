@@ -10,7 +10,8 @@
 use porthole_core::backend::{self, nftables, BackendId};
 use porthole_core::cli_path;
 use porthole_core::command::{CommandRunner, RealRunner};
-use porthole_core::ipc::PortholeProxy;
+use porthole_core::error::ExitCode;
+use porthole_core::ipc::{Alignment, PortholeProxy};
 use porthole_core::net;
 use serde_json::{json, Value};
 
@@ -324,6 +325,18 @@ enum HelperState {
     NotOnTheBus(String),
     NoBus(String),
     Errored(String),
+    /// The helper answered and **this build could not read the answer**: the
+    /// two are from different versions of porthole. `Option<Alignment>` is
+    /// what the helper's own `ProtocolVersion` said about which of them is
+    /// the older half, or `None` when that could not be read either.
+    ///
+    /// A fifth state rather than one of the four above, and it is the one
+    /// this command was getting wrong: a decode failure is
+    /// `zbus::Error::Variant`, not a `MethodError`, so it fell through to
+    /// `NotOnTheBus` and `doctor` told the user to **install a package they
+    /// already have** -- the exact false claim the rest of porthole stopped
+    /// making, still being made by the command a confused person runs first.
+    Undecodable(String, Option<Alignment>),
 }
 
 fn ask_helper(session: bool) -> HelperState {
@@ -344,9 +357,25 @@ fn ask_helper(session: bool) -> HelperState {
                 Ok(p) => p,
                 Err(e) => return HelperState::NoBus(e.to_string()),
             };
-            match proxy.list().await {
-                Ok(rules) => HelperState::Answering(rules.len()),
-                Err(zbus::Error::MethodError(name, detail, _)) => {
+            let e = match proxy.list().await {
+                Ok(rules) => return HelperState::Answering(rules.len()),
+                Err(e) => e,
+            };
+            // Asked before the shapes below: the helper answered, and what
+            // failed was reading it. `is_undecodable` is the one place that
+            // recognises it (`porthole_core::ipc`), and the version read
+            // that follows is what names the half to restart -- the same
+            // answer `client.rs` gives for the same failure, so `doctor` and
+            // the command that sent the user here do not disagree.
+            if porthole_core::ipc::is_undecodable(&e) {
+                let alignment = porthole_core::ipc::read_protocol_version(&conn)
+                    .await
+                    .ok()
+                    .map(porthole_core::ipc::alignment);
+                return HelperState::Undecodable(e.to_string(), alignment);
+            }
+            match e {
+                zbus::Error::MethodError(name, detail, _) => {
                     let message = detail.unwrap_or_else(|| name.to_string());
                     match name.as_str().rsplit('.').next().unwrap_or("") {
                         // The bus answered; nothing owns the name and nothing
@@ -358,7 +387,7 @@ fn ask_helper(session: bool) -> HelperState {
                         _ => HelperState::Errored(message),
                     }
                 }
-                Err(e) => HelperState::NotOnTheBus(e.to_string()),
+                e => HelperState::NotOnTheBus(e.to_string()),
             }
         })
 }
@@ -382,6 +411,38 @@ fn helper_check(state: HelperState) -> Check {
             format!("cannot reach a bus ({detail})"),
             "No session/system bus is reachable. This is almost never the case \
              on a desktop; check what changed about how this machine starts D-Bus.",
+        ),
+        // The helper is running -- it answered -- so this must not be worded
+        // as an absent package, which is what it used to say. The remedy is
+        // the one the version identifies, and where it identifies none, the
+        // two it could be.
+        HelperState::Undecodable(detail, alignment) => Check::bad(
+            "Helper",
+            format!("running, but this porthole cannot read what it says: {detail}"),
+            &format!(
+                "porthole and the porthole helper are different versions of porthole, \
+                 so this is not a missing-package problem — the helper answered. {} \
+                 `porthole list` reads the state file the helper writes, so it still \
+                 says what is open; opening and closing report exit {} until the two \
+                 are the same version again.",
+                match alignment {
+                    Some(Alignment::HelperIsOlder) => {
+                        "The helper is the older half: restart it with \
+                         `systemctl restart porthole-helper.service`."
+                    }
+                    Some(Alignment::ThisOneIsOlder) => {
+                        "This `porthole` is the older half: the helper speaks a newer \
+                         version than this command. Reinstall porthole, or finish the \
+                         upgrade that was interrupted."
+                    }
+                    Some(Alignment::Same) | None => {
+                        "Restarting porthole-helper.service after an upgrade is what \
+                         replaces the older half; if that does not help, the older \
+                         half is this command."
+                    }
+                },
+                ExitCode::VersionMismatch as i32
+            ),
         ),
         HelperState::Errored(detail) => Check::bad(
             "Helper",
@@ -1001,6 +1062,82 @@ mod tests {
             .remedy
             .to_lowercase()
             .contains("install the porthole package"));
+    }
+
+    #[test]
+    fn an_answer_this_porthole_cannot_read_is_not_reported_as_a_missing_package() {
+        // The defect this state exists for: a decode failure is
+        // `zbus::Error::Variant`, not a `MethodError`, so it used to fall
+        // through to `NotOnTheBus` and this command -- the one a person runs
+        // straight after being told porthole and its helper are different
+        // versions -- answered "not answering on the bus … Install the
+        // porthole package", about a package they already have and a helper
+        // that had just replied.
+        let signatures = "Signature mismatch: got `(sqssssttu)`, expected `(sqssssttusqq)`";
+        for alignment in [
+            None,
+            Some(Alignment::Same),
+            Some(Alignment::HelperIsOlder),
+            Some(Alignment::ThisOneIsOlder),
+        ] {
+            let check = helper_check(HelperState::Undecodable(signatures.to_string(), alignment));
+            assert!(!check.ok);
+            assert!(
+                check.detail.contains("running"),
+                "the helper answered, so it is running: {}",
+                check.detail
+            );
+            assert!(
+                check.detail.contains(signatures),
+                "and zbus's own text names the two signatures: {}",
+                check.detail
+            );
+            assert!(
+                !check
+                    .remedy
+                    .to_lowercase()
+                    .contains("install the porthole package"),
+                "{alignment:?}: {}",
+                check.remedy
+            );
+            assert!(
+                !check.detail.to_lowercase().contains("not answering"),
+                "{alignment:?}: {}",
+                check.detail
+            );
+            assert!(
+                check.remedy.contains("15"),
+                "{alignment:?}: a script's exit status belongs in the remedy: {}",
+                check.remedy
+            );
+        }
+
+        // And the remedy is the one the version identified, not both.
+        let helper_older = helper_check(HelperState::Undecodable(
+            signatures.to_string(),
+            Some(Alignment::HelperIsOlder),
+        ));
+        assert!(helper_older
+            .remedy
+            .contains("systemctl restart porthole-helper.service"));
+        assert!(
+            !helper_older.remedy.contains("Reinstall porthole"),
+            "{}",
+            helper_older.remedy
+        );
+        let this_one_older = helper_check(HelperState::Undecodable(
+            signatures.to_string(),
+            Some(Alignment::ThisOneIsOlder),
+        ));
+        assert!(this_one_older.remedy.contains("Reinstall porthole"));
+        assert!(
+            !this_one_older
+                .remedy
+                .contains("restart porthole-helper.service"),
+            "restarting the newer half changes nothing: {}",
+            this_one_older.remedy
+        );
+        assert_ne!(helper_older.remedy, this_one_older.remedy);
     }
 
     #[test]

@@ -72,7 +72,8 @@ mod notify;
 
 use futures_util::StreamExt;
 use notify::{NotificationsProxy, REOPEN};
-use porthole_core::ipc::{PortholeProxy, WireRule};
+use porthole_core::ipc::{alignment, Alignment, PortholeProxy, WireRule, PROTOCOL_VERSION};
+use std::path::{Path, PathBuf};
 
 /// The session-bus name one agent per session holds. Not an interface: this
 /// process serves nothing, and the name exists only so that a session's
@@ -80,6 +81,33 @@ use porthole_core::ipc::{PortholeProxy, WireRule};
 /// Deliberately not the helper's own `com.jacopobriccola.Porthole`, which is
 /// a system-bus name owned by something else entirely.
 const AGENT_SERVICE: &str = "com.jacopobriccola.PortholeAgent";
+
+/// Set in the environment of the agent [`replace_this_agent`] starts, to
+/// **the helper version that prompted the replacement**, and read by that
+/// agent to bound how often it may try.
+///
+/// Without a bound the pathological case loops for as long as anything keeps
+/// starting agents: a machine whose *installed* `porthole-agent` really is
+/// older than its helper would re-execute the same old binary, find the same
+/// answer, and go round again -- a busy loop, not a slow one, since nothing
+/// in the path sleeps. `tests/session.rs`'s
+/// `an_agent_that_is_still_the_older_half_after_replacing_itself_does_not_loop`
+/// is what proves the bound holds, against a helper that never stops
+/// reporting a newer version.
+///
+/// **A version rather than a flag**, and the difference is a real case: a
+/// bare "already tried" survives a *successful* recovery, so a second
+/// upgrade in the same login session would not be repaired -- and the
+/// journal line refusing it would assert that the installed agent is the old
+/// one, which after the first recovery it is not. Carrying the version
+/// bounds the attempts at one per helper version, which keeps the no-loop
+/// property (a helper that never moves is never retried) and repairs every
+/// upgrade that does move it.
+///
+/// A value in the environment of a session that never came from an agent
+/// disables the replacement for helpers at or below it -- an environment
+/// variable is a small surface, and this is what it does.
+const REEXECED: &str = "PORTHOLE_AGENT_REEXECED";
 
 /// How many notifications can be waiting for a click at once.
 ///
@@ -229,6 +257,29 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
+    // Before the first version read, not after: the helper taking the name
+    // is what says it has just started -- and possibly just been upgraded --
+    // and a restart that happened between the read and this subscription
+    // would be one nothing here ever hears about. Measured unprivileged on
+    // a system bus with porthole's real policy, including the case where
+    // the subscription precedes the name ever being owned.
+    let mut helper_owners = porthole
+        .inner()
+        .receive_owner_changed()
+        .await
+        .inspect_err(|e| {
+            // Not fatal, unlike the notification service's own owner
+            // stream above it: an agent that cannot notice a restart still
+            // announces every close it can read, which is its whole job.
+            // What it loses is the re-check, so it says so and goes on with
+            // the one at start-up.
+            eprintln!(
+                "porthole-agent: could not watch for the helper being restarted ({e}); the \
+                 version check runs once, at start-up, and not again"
+            )
+        })
+        .ok();
+
     let notifications = match NotificationsProxy::new(&session).await {
         Ok(p) => p,
         Err(e) => {
@@ -258,6 +309,13 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
+    // Before the `list` below, so that if that call comes back unreadable
+    // the notice it puts on screen already knows which half is old. It is
+    // also a call, so it wakes a D-Bus activated helper -- after the
+    // subscription above, which is the ordering this module's own doc
+    // comment is about.
+    let mut helper = realign(&system).await;
+
     // Not for its answer. Calling the helper is what starts it, and the
     // subscription above already exists, so whatever its start-up sweep
     // announces arrives here instead of being sent to nobody.
@@ -275,7 +333,7 @@ async fn main() -> std::process::ExitCode {
         if porthole_core::ipc::is_undecodable(&e) {
             eprintln!("porthole-agent: could not read the helper's answer to list ({e})");
             eprintln!("porthole-agent: {}", Ended::Undecodable.reason());
-            announce_undecodable(&notifications).await;
+            announce_undecodable(&notifications, helper).await;
             return std::process::ExitCode::from(Ended::Undecodable.exit_code());
         }
         eprintln!("porthole-agent: could not reach the helper ({e}); listening anyway");
@@ -320,7 +378,7 @@ async fn main() -> std::process::ExitCode {
                 );
                 pending.clear();
             }
-            // Ahead of the three below on purpose. A newer agent has the
+            // Ahead of the four below on purpose. A newer agent has the
             // name and is about to be subscribed to the same signals; from
             // this point on, anything this process announces is announced
             // twice. Stopping first can leave a close announced by neither
@@ -335,6 +393,43 @@ async fn main() -> std::process::ExitCode {
                     // The stream is on the session connection, so its end is
                     // that connection's end.
                     None => break Ended::SessionBus,
+                }
+            }
+            // The helper's bus name changed owner, which is the helper having
+            // just started -- after an upgrade, that is the new one. Re-read
+            // the version, through a proxy built for that one call: the
+            // measured trap is a *cached property*, which at exactly this
+            // moment answers with the version of the helper that has just
+            // died.
+            //
+            // This is where the common case resolves itself: an agent that
+            // outlived a package upgrade learns it is the older half the
+            // moment the upgraded helper comes back, and starts the agent
+            // that upgrade installed. `Some(None)` is the helper *losing*
+            // the name, and there is nothing to ask then.
+            //
+            // **After the replacement branch above**, and that ordering is a
+            // decision: an agent that has already lost the session name is
+            // not this session's agent any more, and re-executing from here
+            // would put a third agent in front of the one that just replaced
+            // this one. Being replaced wins; the agent that took the name
+            // makes this same check for itself at its own start-up.
+            //
+            // A replacement started from here loses `pending`: the new image
+            // begins with an empty list, so a click on a notification that
+            // was already on screen is answered by the journal line in
+            // `on_action` rather than by an `open`. That is the same refusal
+            // an id pushed off `MAX_PENDING` gets, and it is the direction
+            // that cannot open a port nobody asked for -- against which the
+            // alternative is an agent that cannot read the helper at all.
+            //
+            // A refutable pattern for the same reason the first branch has
+            // one: this stream is `None` when no match rule could be
+            // installed, and `next_owner` keeps that branch inert rather
+            // than instantly ready forever.
+            Some(owner) = next_owner(&mut helper_owners) => {
+                if owner.is_some() {
+                    helper = realign(&system).await;
                 }
             }
             close = closes.next() => {
@@ -406,9 +501,195 @@ async fn main() -> std::process::ExitCode {
 
     eprintln!("porthole-agent: {}", ended.reason());
     if ended == Ended::Undecodable {
-        announce_undecodable(&notifications).await;
+        announce_undecodable(&notifications, helper).await;
     }
     std::process::ExitCode::from(ended.exit_code())
+}
+
+/// Ask the helper which contract it speaks, and act on the answer.
+///
+/// Run at start-up and again on every change of the helper's bus-name owner
+/// -- which is exactly when the helper has been restarted, and therefore
+/// possibly upgraded, under a live agent. Each run reads afresh: a
+/// **method**, through a proxy built for the one call, never a cached
+/// property (see `porthole_core::ipc::read_protocol_version`, where the
+/// measurement behind that is recorded).
+///
+/// What it returns is what the agent then knows, and it is used for exactly
+/// one thing: naming the right remedy when a message arrives that this
+/// binary cannot read. `None` is an honest answer here -- the helper may not
+/// be there at all, and "not installed" must not be reported as "out of
+/// date".
+///
+/// **A version difference is not by itself a reason to stop.** This agent
+/// carries on with whatever it learns; the thing that stops it is still a
+/// message it cannot decode, exactly as before this contract existed. The
+/// one exception is the case it can fix by itself, below.
+async fn realign(system: &zbus::Connection) -> Option<Alignment> {
+    let version = match porthole_core::ipc::read_protocol_version(system).await {
+        Ok(version) => version,
+        Err(e) => {
+            eprintln!(
+                "porthole-agent: could not read the helper's protocol version ({e}); \
+                 carrying on without knowing which of the two is older"
+            );
+            return None;
+        }
+    };
+    let alignment = alignment(version);
+    match alignment {
+        Alignment::Same => eprintln!(
+            "porthole-agent: the helper speaks porthole's protocol {version}, and so does \
+             this agent"
+        ),
+        Alignment::HelperIsOlder => eprintln!(
+            "porthole-agent: {} and this agent speaks {PROTOCOL_VERSION}, so the helper is \
+             the older half; restarting it needs privilege, so this agent carries on and \
+             says which half to restart if a message it cannot read arrives",
+            what_the_helper_said(version)
+        ),
+        Alignment::ThisOneIsOlder => replace_this_agent(version),
+    }
+    Some(alignment)
+}
+
+/// What the helper actually answered, for a journal line to report.
+///
+/// **0 is not a number any helper reports** -- `porthole_core::ipc`'s own
+/// constant says so in terms. It is what an absent member is *read* as, so
+/// that one comparison orders every case; writing it into a sentence as the
+/// helper's own answer states something no helper ever said, and sends the
+/// reader of that journal looking for a version 0 that does not exist.
+fn what_the_helper_said(version: u32) -> String {
+    if version == porthole_core::ipc::PROTOCOL_VERSION_ABSENT {
+        "the helper answers no protocol version at all, which is what a porthole helper \
+         from before this contract does"
+            .to_string()
+    } else {
+        format!("the helper speaks porthole's protocol {version}")
+    }
+}
+
+/// Start again from the binary on disk, which after a package upgrade is
+/// the new one -- and return only if that could not be done.
+///
+/// This is the whole reason the version is on the wire. The common case by
+/// far is a session agent that outlived a package upgrade: its own remedy
+/// is to be replaced by the agent that is now installed, and it is the one
+/// remedy of the two that needs nobody's privilege and nobody's attention.
+/// A blind restart could not be offered before, because nothing said which
+/// half was old and guessing wrong shows a notice five times over against a
+/// helper left behind by the same upgrade.
+///
+/// **At most once per helper version**, through [`REEXECED`], and that
+/// bound is not theoretical: a machine whose installed agent really is the
+/// older half answers the same way every time. Per *version* rather than per
+/// process, so that a second upgrade in one session is repaired like the
+/// first -- see [`REEXECED`].
+///
+/// **The path, not `/proc/self/exe`.** That symlink names the *inode*, and
+/// after an upgrade the inode is still this old binary -- re-running it
+/// would be the loop above with extra steps. `current_exe` reads the
+/// symlink's text, which for a replaced file is `<path> (deleted)`
+/// (measured on this machine: a `mv` over a running binary, which is what
+/// rpm and dpkg do, and the stripped path is the new file). See
+/// [`binary_on_disk`].
+fn replace_this_agent(helper_version: u32) {
+    use std::os::unix::process::CommandExt as _;
+
+    if already_tried_for(helper_version) {
+        eprintln!(
+            "porthole-agent: the helper speaks porthole's protocol {helper_version} and this \
+             agent speaks {PROTOCOL_VERSION}; an agent in this session has already started \
+             itself afresh for that same helper version and is still the older half, so the \
+             porthole-agent installed here is the one from before the upgrade. Not trying \
+             again -- carrying on, and a message this agent cannot read will say so on \
+             screen"
+        );
+        return;
+    }
+    let Some(path) = std::env::current_exe()
+        .inspect_err(|e| {
+            eprintln!("porthole-agent: could not find its own binary on disk ({e})");
+        })
+        .ok()
+        .and_then(|current| binary_on_disk(&current))
+    else {
+        eprintln!(
+            "porthole-agent: the helper speaks porthole's protocol {helper_version} and this \
+             agent speaks {PROTOCOL_VERSION}, but this agent's own binary is not where it \
+             was started from any more, so there is nothing to start instead of it"
+        );
+        return;
+    };
+    eprintln!(
+        "porthole-agent: the helper speaks porthole's protocol {helper_version} and this \
+         agent speaks {PROTOCOL_VERSION}, so this agent is the older half; re-executing \
+         {} , which is the binary an upgrade has already replaced",
+        path.display()
+    );
+    // Returns only on failure: on success this process is gone. The bus
+    // connections go with it -- their sockets are close-on-exec -- so the
+    // session name is released and the agent started here takes it back
+    // through `claim_session`'s own `ReplaceExisting`.
+    let e = std::process::Command::new(&path)
+        .args(std::env::args_os().skip(1))
+        .env(REEXECED, helper_version.to_string())
+        .exec();
+    eprintln!(
+        "porthole-agent: could not re-execute {}: {e}; carrying on as the older half",
+        path.display()
+    );
+}
+
+/// Whether an agent in this session has already replaced itself for a helper
+/// at least this new.
+///
+/// `>=` rather than `==`, so the bound cannot be walked around by a helper
+/// that goes *backwards*: a downgrade to a version still ahead of this build
+/// is the same unrepairable situation as the one already tried, and trying
+/// again would be the loop the marker exists to stop. A helper that moves
+/// *forward* is a new upgrade, and gets its own attempt.
+///
+/// A value that is not a number at all counts as "already tried": it did not
+/// come from [`replace_this_agent`], and guessing about it in the direction
+/// that re-executes is the direction that can loop.
+fn already_tried_for(helper_version: u32) -> bool {
+    let Ok(value) = std::env::var(REEXECED) else {
+        return false;
+    };
+    match value.trim().parse::<u32>() {
+        Ok(tried) => tried >= helper_version,
+        Err(_) => true,
+    }
+}
+
+/// Where this process's own binary is **now**, given what `current_exe`
+/// reported.
+///
+/// Measured on this machine rather than assumed, because the whole
+/// re-execution depends on it. `current_exe` reads
+/// `readlink("/proc/self/exe")`, a link to the running *inode*; replace the
+/// file under a running process the way a package upgrade does (`mv` over
+/// it) and the link's text becomes `<path> (deleted)` while `<path>` itself
+/// is the new file. So:
+///
+/// - an ordinary path that still exists is itself;
+/// - `<path> (deleted)` where `<path>` exists is `<path>` -- the upgraded
+///   binary, which is the one worth starting;
+/// - anything else is `None`, including `<path> (deleted)` where the path
+///   has simply been removed (measured too: a plain `rm` gives the same
+///   suffix and leaves nothing behind). Starting the deleted inode would
+///   start this same old binary again.
+///
+/// A file genuinely named `... (deleted)` is not confused with either: the
+/// first branch finds it, because it exists.
+fn binary_on_disk(current: &Path) -> Option<PathBuf> {
+    if current.exists() {
+        return Some(current.to_path_buf());
+    }
+    let replaced = PathBuf::from(current.to_str()?.strip_suffix(" (deleted)")?);
+    replaced.exists().then_some(replaced)
 }
 
 /// The rule behind the notification with this id, newest first.
@@ -768,9 +1049,26 @@ async fn claim_session(session: &zbus::Connection) -> bool {
 /// five times over, showing this notice at each attempt until systemd's
 /// start limit stops it. So the unit stays stopped, as it does for every
 /// other start-up refusal here, and the notice says what to do instead.
-async fn announce_undecodable(notifications: &NotificationsProxy<'_>) {
-    if let Err(e) = notify::show(notifications, &notify::undecodable_notice()).await {
+async fn announce_undecodable(notifications: &NotificationsProxy<'_>, helper: Option<Alignment>) {
+    if let Err(e) = notify::show(notifications, &notify::undecodable_notice(helper)).await {
         eprintln!("porthole-agent: and could not say so on screen either: {e}");
+    }
+}
+
+/// The next owner of the helper's name, or a future that never finishes
+/// when nothing is watching for one.
+///
+/// `std::future::pending` rather than an empty stream: a `select!` branch
+/// over a stream that has ended is ready immediately and forever, which
+/// would spin the loop at whatever speed the machine allows. Failing to
+/// install that match rule is not fatal here -- the agent keeps announcing
+/// closes -- so the branch has to be inert rather than absent.
+async fn next_owner(
+    owners: &mut Option<zbus::proxy::OwnerChangedStream<'_>>,
+) -> Option<Option<zbus::names::UniqueName<'static>>> {
+    match owners {
+        Some(stream) => stream.next().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -837,6 +1135,46 @@ mod tests {
             !undecodable.contains("bus connection ended"),
             "the bus is fine; the message on it is not: {undecodable}"
         );
+    }
+
+    #[test]
+    fn the_binary_to_restart_is_the_one_on_disk_and_never_the_running_inode() {
+        // Measured on this machine, because the whole re-execution rests on
+        // it: `mv` a new file over a running binary -- which is what rpm
+        // and dpkg do -- and `readlink /proc/<pid>/exe`, which is what
+        // `current_exe` reads, comes back as `<path> (deleted)` while
+        // `<path>` is the *new* file. A re-execution that took the link at
+        // face value would either fail to find anything or, going through
+        // `/proc/self/exe` itself, run the same old inode again -- which is
+        // the loop this whole path exists to avoid.
+        let dir = tempfile::TempDir::new().expect("a temp dir");
+        let live = dir.path().join("porthole-agent");
+        std::fs::write(&live, b"#!/bin/sh\n").expect("writable");
+
+        assert_eq!(
+            binary_on_disk(&live),
+            Some(live.clone()),
+            "an ordinary path that is still there is itself"
+        );
+
+        let replaced = dir.path().join("porthole-agent (deleted)");
+        assert_eq!(
+            binary_on_disk(&replaced),
+            Some(live.clone()),
+            "and the upgraded file is what the deleted inode's own path names"
+        );
+
+        // The other half of the measurement: a plain `rm` produces the same
+        // suffix and leaves nothing behind. Starting the deleted inode
+        // would start this same old binary, so there is nothing to start.
+        std::fs::remove_file(&live).expect("removable");
+        assert_eq!(binary_on_disk(&replaced), None);
+        assert_eq!(binary_on_disk(&live), None);
+
+        // And a file that really is called `... (deleted)` is itself, not
+        // the path with the suffix cut off: it exists, so nothing is cut.
+        std::fs::write(&replaced, b"#!/bin/sh\n").expect("writable");
+        assert_eq!(binary_on_disk(&replaced), Some(replaced));
     }
 
     /// An arbitrary but fixed opening time, so a duration in a check below

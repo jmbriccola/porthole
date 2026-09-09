@@ -600,6 +600,17 @@ different versions and switches off everything that would reach the helper,
 including the buttons whose *request* a mismatched helper still accepts.
 [docs/installing.md](docs/installing.md) has the whole of it.
 
+**And the agent now fixes the commonest case by itself.** The helper says which
+version of porthole's own interface it speaks, so a component can tell which of
+the two of them is the older half instead of only that they differ. An agent
+that finds the helper ahead of it starts again from the binary on disk — which
+after an upgrade is the new one — exactly once per start, and goes back to
+announcing closes with nobody having to log out. It is the one remedy that
+needs no privilege and no attention. The other one still does: a *helper* left
+over from an upgrade has to be restarted as a service, and every component now
+names that remedy on its own rather than offering both and asking the person to
+try them in turn.
+
 **Neither start file runs in a session that is already open, so notifications
 begin at the next login.** Installing porthole — from a package or by hand —
 puts both files in place and starts nothing. The user unit is reached through
@@ -635,6 +646,7 @@ starts user units at all: it starts the one unit, now.
 | 12 | This machine's firewall has no way to redirect a port. Only firewalld has one; ufw and nftables refuse here, each for its own reason. |
 | 13 | Something porthole must settle before creating a redirect has no answer for what was asked: the listener check reads TCP only, so a UDP forward would compare against nothing, or the published port has more than one destination and the request does not say which is meant. The message says which of the two, and what to do about it. |
 | 14 | Docker publishes that container on an address other than loopback, so the local network may already reach it. That is Docker's own rule, which porthole can neither have made nor close. What porthole read to decide it is the `-d` flag on Docker's own DNAT rule and nothing else: no `-d` is every interface, and a `-d` naming any other address is that address, whether or not this machine holds it. |
+| 15 | porthole and the porthole helper are different versions of porthole: the helper answered and this command could not read the answer. Retrying changes nothing -- one of the two has to be replaced, and the message names which one whenever the helper is new enough to say. It does not say whether the request took effect: `open`'s arguments have not changed across an upgrade that produced this, so the port may well be open. `porthole list` reads the state file the helper writes, and is what settles that. |
 
 These are a public interface. New codes are added at the end; existing ones are
 never renumbered. `porthole --help` and `porthole.1` list the same **codes** in

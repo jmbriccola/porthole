@@ -689,3 +689,243 @@ fn the_helper_reconciles_at_startup_with_no_client_request_at_all() {
          client request ever made: {state_text}"
     );
 }
+
+/// [`porthole_core::ipc::WireRule`] as it was before the forward feature --
+/// nine members, not twelve.
+///
+/// Written out rather than derived from the real type, which would follow it
+/// forward and stop being the shape a helper from before the upgrade
+/// answers with.
+#[derive(Debug, serde::Serialize, serde::Deserialize, zbus::zvariant::Type)]
+struct RuleBeforeForward {
+    id: String,
+    port: u16,
+    protocol: String,
+    target: String,
+    scope: String,
+    backend: String,
+    opened_at: u64,
+    expires_at: u64,
+    uid: u32,
+}
+
+/// A helper from before the forward feature **and** from before the protocol
+/// version: `close` answers in a shape this `porthole` cannot read, and
+/// there is no `ProtocolVersion` member to ask.
+///
+/// That combination is not a contrivance -- it is what every helper deployed
+/// today is. Measured read-only against the live helper on the author's own
+/// machine: `busctl --system get-property ... ProtocolVersion` answers
+/// `Unknown property 'ProtocolVersion'`.
+struct HelperFromBeforeEverything;
+
+#[zbus::interface(name = "com.jacopobriccola.Porthole1")]
+impl HelperFromBeforeEverything {
+    /// The shape `porthole doctor` asks for, and the one whose *return*
+    /// signature the forward feature changed: `a(sqssssttu)` where this
+    /// build expects `a(sqssssttusqq)`.
+    async fn list(&self) -> Vec<RuleBeforeForward> {
+        vec![RuleBeforeForward {
+            id: "abc".to_string(),
+            port: 5173,
+            protocol: "tcp".to_string(),
+            target: "10.10.10.0/24".to_string(),
+            scope: "network".to_string(),
+            backend: "firewalld".to_string(),
+            opened_at: 1_757_000_000,
+            expires_at: 0,
+            uid: 1000,
+        }]
+    }
+
+    async fn close(&self, port: u16, protocol: String) -> RuleBeforeForward {
+        RuleBeforeForward {
+            id: "abc".to_string(),
+            port,
+            protocol,
+            target: "10.10.10.0/24".to_string(),
+            scope: "network".to_string(),
+            backend: "firewalld".to_string(),
+            opened_at: 1_757_000_000,
+            expires_at: 0,
+            uid: 1000,
+        }
+    }
+}
+
+/// An answer this `porthole` cannot read leaves a code of its own, and the
+/// message names the half to restart.
+///
+/// Both halves matter to a script. Before this, the exit status was 1 --
+/// "something went wrong that has no more specific code" -- for the one
+/// failure no retry can clear, and the message offered two remedies because
+/// nothing on the wire ordered the two binaries. The stand-in here has no
+/// version member at all, which is exactly what a helper from before this
+/// contract answers, and that answer is what identifies it as the older
+/// half.
+///
+/// No `porthole-helper` runs in this test: the stand-in below holds
+/// `com.jacopobriccola.Porthole` on this binary's private bus for as long as
+/// the test does, which is also why it takes the same lock every other test
+/// here takes for that name.
+#[test]
+fn an_answer_this_porthole_cannot_read_exits_with_its_own_code_and_names_the_half_to_restart() {
+    let _guard = lock_helper();
+    let dir = TempDir::new().unwrap();
+    let bin = bin_dir(&dir);
+    let state = dir.path().join("state.json");
+
+    let stale = zbus::blocking::connection::Builder::address(private_bus().address.as_str())
+        .expect("the private bus address")
+        .name(porthole_core::ipc::SERVICE)
+        .expect("a well-formed name")
+        .serve_at(porthole_core::ipc::PATH, HelperFromBeforeEverything)
+        .expect("a valid object path")
+        .build()
+        .expect("a connection that owns the helper's name");
+
+    let out = cli(&state, &bin, &["close", "5173"]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert_eq!(
+        out.status.code(),
+        Some(15),
+        "a version mismatch has an exit code of its own, appended after every code that \
+         existed before it. stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("could not be reached"),
+        "the helper answered; that claim is the one this whole feature removed: {stderr}"
+    );
+    assert!(
+        stderr.contains("systemctl restart porthole-helper.service"),
+        "and the remedy the version identifies is the helper's: {stderr}"
+    );
+    assert!(
+        stderr.contains("porthole list"),
+        "which does not settle whether the close took effect -- this does: {stderr}"
+    );
+
+    drop(stale);
+}
+
+/// The same failure as `--json`, where the slug is what a script reads.
+///
+/// `docs/json-schema.md`'s promise is that a caller cannot tell whether an
+/// error came from the CLI acting locally or from the helper over the bus.
+/// This one comes from neither: it is a fact about the pair, and it needs a
+/// slug of its own rather than the `unexpected` catch-all it used to arrive
+/// as.
+#[test]
+fn the_same_failure_as_json_carries_a_kind_of_its_own() {
+    let _guard = lock_helper();
+    let dir = TempDir::new().unwrap();
+    let bin = bin_dir(&dir);
+    let state = dir.path().join("state.json");
+
+    let stale = zbus::blocking::connection::Builder::address(private_bus().address.as_str())
+        .expect("the private bus address")
+        .name(porthole_core::ipc::SERVICE)
+        .expect("a well-formed name")
+        .serve_at(porthole_core::ipc::PATH, HelperFromBeforeEverything)
+        .expect("a valid object path")
+        .build()
+        .expect("a connection that owns the helper's name");
+
+    let out = cli(&state, &bin, &["close", "5173", "--json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("`--json` must still print one JSON object ({e}): {stdout}"));
+    assert_eq!(json["error"]["kind"], "version_mismatch", "{stdout}");
+    assert_eq!(json["error"]["code"], 15, "{stdout}");
+    assert_eq!(out.status.code(), Some(15));
+
+    drop(stale);
+}
+
+/// `porthole doctor` is the command a person runs straight after being told
+/// the two halves are different versions, and it used to answer **"not
+/// answering on the bus … Install the porthole package"** -- about a package
+/// they have and a helper that had just replied.
+///
+/// The classification is the whole of it: a decode failure is
+/// `zbus::Error::Variant`, not a `MethodError`, so it fell through the arm
+/// that means "nothing owns the name". This drives the real binary against a
+/// helper that answers `list` in the shape from before the forward feature
+/// and has no version member -- what every helper deployed today is.
+#[test]
+fn doctor_does_not_tell_a_user_to_install_a_package_they_already_have() {
+    let _guard = lock_helper();
+    let dir = TempDir::new().unwrap();
+    let bin = bin_dir(&dir);
+    let state = dir.path().join("state.json");
+
+    let stale = zbus::blocking::connection::Builder::address(private_bus().address.as_str())
+        .expect("the private bus address")
+        .name(porthole_core::ipc::SERVICE)
+        .expect("a well-formed name")
+        .serve_at(porthole_core::ipc::PATH, HelperFromBeforeEverything)
+        .expect("a valid object path")
+        .build()
+        .expect("a connection that owns the helper's name");
+
+    let out = cli(&state, &bin, &["doctor", "--json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("one JSON object ({e}): {stdout}"));
+    let helper = json["checks"]
+        .as_array()
+        .expect("checks is an array")
+        .iter()
+        .find(|c| c["name"] == "Helper")
+        .expect("doctor has a Helper check")
+        .clone();
+
+    let detail = helper["detail"].as_str().unwrap_or_default();
+    let remedy = helper["remedy"].as_str().unwrap_or_default();
+    assert!(
+        !remedy
+            .to_lowercase()
+            .contains("install the porthole package"),
+        "the package is installed and the helper answered: detail={detail:?} \
+         remedy={remedy:?}"
+    );
+    assert!(
+        !detail.to_lowercase().contains("not answering"),
+        "it answered: {detail:?}"
+    );
+    assert!(
+        detail.contains("running"),
+        "and doctor has to say so, since that is what rules out the missing-package \
+         remedy: {detail:?}"
+    );
+    assert!(
+        remedy.contains("systemctl restart porthole-helper.service"),
+        "this stand-in has no version member, which says the helper is the older half: \
+         {remedy:?}"
+    );
+
+    // The negative control on the same command, in the same process: with
+    // the stale helper gone, doctor's Helper check goes back to the
+    // missing-package wording -- so the assertions above are about the
+    // classification and not about `doctor` having stopped saying it at all.
+    drop(stale);
+    let out = cli(&state, &bin, &["doctor", "--json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON object");
+    let absent = json["checks"]
+        .as_array()
+        .expect("checks is an array")
+        .iter()
+        .find(|c| c["name"] == "Helper")
+        .expect("doctor has a Helper check")
+        .clone();
+    assert!(
+        absent["remedy"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Install the porthole package"),
+        "with nothing owning the name, the missing-package remedy is the right one: \
+         {absent}"
+    );
+}
