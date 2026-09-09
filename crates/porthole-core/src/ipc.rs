@@ -30,10 +30,13 @@ pub const INTERFACE: &str = "com.jacopobriccola.Porthole1";
 /// What this build speaks, and the one thing on the wire that says which of
 /// two porthole binaries is the older half.
 ///
-/// **Raise it whenever [`SIGNATURE`] changes.** The two constants are
-/// hand-written and nothing but a test can hold them together: see
-/// [`SIGNATURE`] for the two guards that fail when a member's signature
-/// moves and this number does not.
+/// **Raise it whenever [`SIGNATURE`] changes, and append a row to
+/// [`CONTRACTS`] naming the pair.** Nothing in the type system can make a
+/// hand-written number follow a hand-written string; what holds them
+/// together is that the *pair* is what is committed. Changing the interface
+/// and updating [`SIGNATURE`] without touching this number leaves a pair no
+/// row names, and `the_version_and_the_signature_are_a_pair_that_was_shipped`
+/// fails until somebody chooses a version for the contract they just wrote.
 ///
 /// Every component ships in one package, so two porthole binaries speaking
 /// different versions is always an upgrade that left one of them behind --
@@ -59,24 +62,27 @@ pub const PROTOCOL_VERSION_ABSENT: u32 = 0;
 /// Every method and every signal of [`INTERFACE`], normalised: one line
 /// each, sorted, with argument names and documentation stripped.
 ///
-/// **This is the guard on [`PROTOCOL_VERSION`], which is a hand-kept
-/// number and would otherwise be exactly the kind this project already has
-/// an open item about** -- a number somebody has to remember to raise is a
-/// number that eventually is not raised, and then the check says "we are
-/// level" while the signatures have diverged. That is worse than no check
-/// at all: a silence with a green tick on it.
+/// **What the interface this build serves must be.** Two tests hold *that*.
+/// `the_wire_types_are_the_ones_this_digest_names` needs no bus: it rebuilds
+/// the lines that carry a wire type from that type's own `Type::SIGNATURE`,
+/// so adding a field to [`WireRule`] -- the exact change that produced the
+/// defect this whole contract exists for -- fails in `cargo test` with
+/// nothing running. `the_served_interface_is_the_one_this_digest_names`, in
+/// `porthole-helper/tests/interface_contract.rs`, introspects the real
+/// object on a private bus and compares [`signature_digest`] of what it
+/// serves against this constant, which catches what the types cannot: an
+/// argument list, a member added or removed, a member renamed, and the
+/// interface itself being renamed -- every line names it.
 ///
-/// Two tests hold it. `the_wire_types_are_the_ones_this_digest_names` needs
-/// no bus: it rebuilds the lines that carry a wire type from that type's
-/// own `Type::SIGNATURE`, so adding a field to [`WireRule`] -- the exact
-/// change that produced the defect this whole contract exists for -- fails
-/// in `cargo test` with nothing running. `the_served_interface_is_the_one
-/// _this_digest_names`, in `porthole-helper/tests/interface_contract.rs`,
-/// introspects the real object on a private bus and compares
-/// [`signature_digest`] of what it serves against this constant, which
-/// catches what the types cannot: an argument list, a member added or
-/// removed, a member renamed, and the interface itself being renamed --
-/// every line names it.
+/// **Neither of those says anything about [`PROTOCOL_VERSION`]**, and an
+/// earlier version of this comment claimed they did. Measured, by a
+/// reviewer, on exactly the path that matters: change the wire for real,
+/// update this constant as the two failures above instruct, leave the
+/// number at 1 -- 618 passed, 0 failed. A contract that moved while the
+/// number stayed put, under a green tick, which is the failure this whole
+/// pair of constants exists to prevent. [`CONTRACTS`] is what closes it:
+/// the *pair* is committed, so a changed digest belongs to no shipped
+/// version until somebody says which version it is.
 ///
 /// **Not the introspection XML itself**, which was the obvious thing to
 /// pin and is the wrong one. Measured
@@ -89,6 +95,77 @@ pub const PROTOCOL_VERSION_ABSENT: u32 = 0;
 /// test that gets re-blessed unread. (It is also not well-formed XML today:
 /// five of those doc comments contain `--`.)
 pub const SIGNATURE: &str = "\
+method com.jacopobriccola.Porthole1.Close(qs) -> ((sqssssttusqq))
+method com.jacopobriccola.Porthole1.CloseAll() -> (a(sqssssttusqq)a(ssi))
+method com.jacopobriccola.Porthole1.CloseById(sbb) -> ((sqssssttusqq))
+method com.jacopobriccola.Porthole1.DockerPorts() -> (a(sqssq))
+method com.jacopobriccola.Porthole1.Forward(qssuq) -> ((sqssssttusqq))
+method com.jacopobriccola.Porthole1.List() -> (a(sqssssttusqq))
+method com.jacopobriccola.Porthole1.Open(qssu) -> ((sqssssttusqq))
+method com.jacopobriccola.Porthole1.ProtocolVersion() -> (u)
+method com.jacopobriccola.Porthole1.Status() -> ((sbbbssssssa(sqssssttusqq)))
+signal com.jacopobriccola.Porthole1.NetworkChanged(ss)
+signal com.jacopobriccola.Porthole1.RuleClosed((sqssssttusqq)s)
+signal com.jacopobriccola.Porthole1.RuleOpened((sqssssttusqq))
+";
+
+/// One contract porthole has spoken: a protocol version, and the interface
+/// that version promised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Contract {
+    pub version: u32,
+    /// The same normal form [`SIGNATURE`] is written in -- see
+    /// [`signature_digest`].
+    pub signature: &'static str,
+}
+
+/// Every contract porthole has spoken, oldest first. **Append a row; never
+/// edit one.**
+///
+/// This is what makes [`PROTOCOL_VERSION`] something a test can hold rather
+/// than something somebody has to remember. Neither guard on [`SIGNATURE`]
+/// can see the number: both compare the interface against that string, and
+/// both are satisfied the moment the string is updated. So the string alone
+/// is not what is committed -- the *pair* is, and
+/// `the_version_and_the_signature_are_a_pair_that_was_shipped` fails when
+/// the two constants above name a pair no row here does.
+///
+/// The repair that clears it is an **append**: a row for the contract just
+/// written, with a version one higher than the last, and
+/// [`PROTOCOL_VERSION`] raised to match. That is the moment the number gets
+/// chosen, and it is a line added to a table rather than a string edited in
+/// place -- which is the whole difference between a decision and an
+/// oversight, both in the writing and in the reading of the diff.
+///
+/// **What this does not do**, stated plainly because the alternative is the
+/// defect this feature exists to remove: it cannot stop somebody editing the
+/// digest of a version that has already shipped. No in-repository check can,
+/// since every value a test compares against lives in the same repository. A
+/// row is a promise about a released version; rewriting one is rewriting
+/// history, and what this arrangement buys is that doing so is a distinct,
+/// legible act rather than the same edit as any other.
+///
+/// Public because a client that meets an unfamiliar helper can ask which of
+/// these it is speaking -- a use the container suite could take up against
+/// an installed binary, and the reason the older rows are worth keeping at
+/// all once a newer one exists.
+pub const CONTRACTS: [Contract; 1] = [Contract {
+    version: 1,
+    signature: CONTRACT_1,
+}];
+
+/// The interface protocol **1** promised: the first version porthole ever
+/// put a number on, and the one every component in this package speaks.
+///
+/// Deliberately a second spelling of what [`SIGNATURE`] holds today, in the
+/// same way `CloseReason`'s slug is spelled twice (once in `as_str`, once by
+/// serde's `rename_all`) with a test holding the two equal. There the two
+/// spellings are produced by different machinery; here they are the same
+/// text with different jobs -- this row is what version 1 *promised*, and
+/// [`SIGNATURE`] is what this build *serves*. They are equal until somebody
+/// changes the interface, and the test that notices they have stopped being
+/// equal is the one that asks for a version number.
+const CONTRACT_1: &str = "\
 method com.jacopobriccola.Porthole1.Close(qs) -> ((sqssssttusqq))
 method com.jacopobriccola.Porthole1.CloseAll() -> (a(sqssssttusqq)a(ssi))
 method com.jacopobriccola.Porthole1.CloseById(sbb) -> ((sqssssttusqq))
@@ -1321,6 +1398,107 @@ mod tests {
             SIGNATURE.lines().count(),
             expected.len()
         );
+    }
+
+    /// The guard on the number itself, which the two guards on
+    /// [`SIGNATURE`] are not.
+    ///
+    /// A reviewer measured the hole this closes: change the wire contract
+    /// for real (`DockerPorts` from `a(sqssq)` to `a(sqssqu)`), update
+    /// `SIGNATURE` as both of those guards' failure text instructs, leave
+    /// `PROTOCOL_VERSION` at 1 -- and the whole suite passed. The contract
+    /// moved, the number did not, and nothing said so. That is exactly what
+    /// this feature exists to make impossible, landed on its own constant.
+    ///
+    /// What is committed now is the **pair**. This build's two constants
+    /// have to name a contract [`CONTRACTS`] records, so an interface change
+    /// carried into `SIGNATURE` and no further leaves a pair no row names,
+    /// and the repair is to append a row -- which is where a version number
+    /// gets chosen on purpose.
+    #[test]
+    fn the_version_and_the_signature_are_a_pair_that_was_shipped() {
+        assert!(
+            CONTRACTS
+                .iter()
+                .any(|c| c.version == PROTOCOL_VERSION && c.signature == SIGNATURE),
+            "`PROTOCOL_VERSION` is {PROTOCOL_VERSION} and `SIGNATURE` is a contract no \
+             row of `CONTRACTS` names.\n\nIf you changed the interface on purpose, this \
+             is the point of this test: the contract you have just written has no \
+             version. Append a row to `CONTRACTS` -- `Contract {{ version: {}, \
+             signature: CONTRACT_{} }}`, with `CONTRACT_{}` holding the new digest -- and \
+             raise `PROTOCOL_VERSION` to {}. Do **not** edit an existing row: it is a \
+             promise about a version that has already shipped, and a client meeting a \
+             helper of that version reads it.\n\n`SIGNATURE` is now:\n{SIGNATURE}",
+            PROTOCOL_VERSION + 1,
+            PROTOCOL_VERSION + 1,
+            PROTOCOL_VERSION + 1,
+            PROTOCOL_VERSION + 1
+        );
+    }
+
+    #[test]
+    fn the_contracts_are_appended_and_never_renumbered() {
+        // The shape that makes the pairing above worth anything. Versions
+        // run 1, 2, 3... with none missing and none repeated -- a version is
+        // an ordering (`alignment` compares them with `<`), so a gap or a
+        // repeat would make "older" mean nothing. And no two rows may
+        // describe the same interface: a version raised over an unchanged
+        // contract would tell two matched binaries they are mismatched.
+        assert!(!CONTRACTS.is_empty(), "there is at least one contract");
+        for (i, contract) in CONTRACTS.iter().enumerate() {
+            assert_eq!(
+                contract.version,
+                i as u32 + 1,
+                "contracts are numbered from 1 with no gaps: row {i} says {}",
+                contract.version
+            );
+            assert!(
+                contract.version > PROTOCOL_VERSION_ABSENT,
+                "no contract may claim the number an absent member is read as"
+            );
+        }
+        for (i, a) in CONTRACTS.iter().enumerate() {
+            for b in CONTRACTS.iter().skip(i + 1) {
+                assert_ne!(
+                    a.signature, b.signature,
+                    "protocol {} and protocol {} describe the same interface, so one of \
+                     the two numbers stands for no change at all",
+                    a.version, b.version
+                );
+            }
+        }
+        assert_eq!(
+            CONTRACTS.last().expect("non-empty").version,
+            PROTOCOL_VERSION,
+            "this build speaks the newest contract there is; a row above the version \
+             this build was compiled with is a contract nothing implements"
+        );
+
+        // Every row is a digest in the form `signature_digest` produces, not
+        // an approximation of one: the comparison it feeds is exact, so a
+        // row with a stray blank line or a missing interface name would be a
+        // row no live interface could ever match.
+        for contract in &CONTRACTS {
+            assert!(
+                contract.signature.ends_with('\n'),
+                "protocol {}'s digest is not newline-terminated",
+                contract.version
+            );
+            for line in contract.signature.lines() {
+                assert!(
+                    line.starts_with("method ") || line.starts_with("signal "),
+                    "protocol {}: `{line}` is neither a method nor a signal",
+                    contract.version
+                );
+                assert!(
+                    line.contains(INTERFACE),
+                    "protocol {}: `{line}` does not name {INTERFACE}. Renaming the \
+                     interface is the one change that would make every subscription \
+                     wait forever instead of failing.",
+                    contract.version
+                );
+            }
+        }
     }
 
     #[test]

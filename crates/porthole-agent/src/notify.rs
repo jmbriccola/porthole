@@ -282,8 +282,8 @@ pub fn stale_agent_notice() -> Notification {
 /// - `None`, and `Some(Same)`: nothing said. `None` is a version read that
 ///   failed; `Same` is two binaries reporting one version and still not
 ///   understanding each other, which means a signature changed without the
-///   version being raised -- `porthole_core::ipc::SIGNATURE`'s two guards
-///   exist to make that impossible to ship, and if it is somehow true here
+///   version being raised -- `porthole_core::ipc::CONTRACTS` commits the
+///   two as a pair to keep that out of a release, and if it is true here
 ///   then the version is not evidence about anything. Both get the wording
 ///   from before there was a version: both remedies, blaming neither.
 ///

@@ -160,8 +160,9 @@ fn unreachable_title(message: &str) -> String {
 /// own `porthole_core::ipc::PROTOCOL_VERSION` could not be read, and when two
 /// binaries report the same version and still cannot read each other (a
 /// signature moved without the number moving, which
-/// `porthole_core::ipc::SIGNATURE`'s guards exist to make unshippable, and
-/// which if it happened anyway would mean the number is evidence of nothing).
+/// `porthole_core::ipc::CONTRACTS` commits the two as a pair to keep out of
+/// a release, and which if it happened anyway would mean the number is
+/// evidence of nothing).
 const UNDECODABLE_TITLE: &str =
     "Porthole and the porthole helper are different versions, so this window cannot read \
      what it answers. Close and reopen this window; if that does not help, restart \

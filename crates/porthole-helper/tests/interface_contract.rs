@@ -1,8 +1,13 @@
 //! What the helper actually serves, against what
 //! `porthole_core::ipc::SIGNATURE` says it serves.
 //!
-//! The second of the two guards on [`porthole_core::ipc::PROTOCOL_VERSION`],
-//! and the one that catches what the first cannot. `porthole-core`'s own
+//! The second of the two guards on [`porthole_core::ipc::SIGNATURE`], and
+//! the one that catches what the first cannot. (Neither guards
+//! `PROTOCOL_VERSION`: what holds the *number* to the digest is
+//! `porthole_core::ipc::CONTRACTS`, which commits the pair, and its own test
+//! `the_version_and_the_signature_are_a_pair_that_was_shipped`. An earlier
+//! version of this sentence said otherwise and was measured wrong.)
+//! `porthole-core`'s own
 //! `the_wire_types_are_the_ones_this_digest_names` rebuilds every line that
 //! carries a wire type from that type's own `Type::SIGNATURE`, which is
 //! enough for the change that produced this contract -- three members added
@@ -100,14 +105,17 @@ async fn the_served_interface_is_the_one_this_digest_names() {
 
     let served = signature_digest(&xml, INTERFACE).expect("the helper serves its own interface");
     assert_eq!(
-        served, SIGNATURE,
+        served,
+        SIGNATURE,
         "the interface this helper serves is not the one \
          `porthole_core::ipc::SIGNATURE` describes. If you changed a method or a signal \
-         on purpose, write the new digest into that constant **and raise \
-         PROTOCOL_VERSION** (it is {PROTOCOL_VERSION} now): a contract that changed \
-         while the number stayed put is a client that says \"we are level\" while the \
-         signatures have diverged, which is the one thing this pair of constants exists \
-         to prevent."
+         on purpose, write the new digest into that constant: \
+         `the_version_and_the_signature_are_a_pair_that_was_shipped` will then ask you \
+         for the version it belongs to, which is {} rather than the \
+         {PROTOCOL_VERSION} this build speaks -- a contract that changed while the \
+         number stayed put is a client saying \"we are level\" while the signatures \
+         have diverged, and committing the pair is what stops it.",
+        PROTOCOL_VERSION + 1
     );
 }
 
