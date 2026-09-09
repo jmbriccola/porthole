@@ -11,10 +11,14 @@
 //!
 //! **What they do not prove is that `open` reaches its own `announce_open`
 //! call.** An `open` that gets that far has to have changed a real firewall,
-//! which nothing in this workspace may do on a development host. Two things
+//! which nothing in this workspace may do on a development host. Three things
 //! stand in for it. The close paths below drive the real methods and show
 //! that the ones which close nothing announce nothing, so the emission is
-//! not unconditional. And `crates/porthole-cli/tests/container.rs` drives
+//! not unconditional. `crates/porthole-helper/tests/reconciled_signal.rs`
+//! goes one step further for the one announcement that needs only a *read* of
+//! the firewall: it reaches `announce_reconciled` from inside the real
+//! `close`, with a `firewall-cmd` of its own on `PATH`, so it runs on any
+//! machine. And `crates/porthole-cli/tests/container.rs` drives
 //! every emitting path against a real firewalld inside a container, gated
 //! behind `PORTHOLE_CONTAINER_TESTS=1` so none of it runs here:
 //! `signals_reach_a_subscriber_when_a_port_is_opened_and_closed` (an open,

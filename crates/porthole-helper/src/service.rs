@@ -41,16 +41,25 @@
 //!
 //! # Where the announcements are actually tested
 //!
-//! Nothing on the development host can reach an `announce_*` call from a
-//! method: a `close` that gets that far has to have removed a rule from a
-//! real firewall, and an `open` has to have added one. What runs here
-//! instead is the other half -- `crates/porthole-helper/tests/signals.rs`
-//! drives the real `close` and `close_by_id` over a real bus and checks that
-//! the paths which close nothing announce nothing, and drives the
-//! `announce_*` functions themselves against a subscriber to check the
-//! declaration and the payload.
+//! No test may reach an `announce_*` call by *changing a firewall*: a `close`
+//! that gets that far has to have removed a rule from a real one, and an
+//! `open` has to have added one, and neither is something the development
+//! host's firewall is available for. Three things stand in.
 //!
-//! The emissions themselves are measured in
+//! `crates/porthole-helper/tests/signals.rs` drives the real `close` and
+//! `close_by_id` over a real bus and checks that the paths which close
+//! nothing announce nothing, and drives the `announce_*` functions
+//! themselves against a subscriber to check the declaration and the payload.
+//!
+//! `crates/porthole-helper/tests/reconciled_signal.rs` reaches
+//! [`Porthole::announce_reconciled`] from inside the real `close` method,
+//! and does it on any machine: reconciliation only ever *reads* the
+//! firewall's rule listing, so that test writes a `firewall-cmd` of its own
+//! and puts it in front of `PATH`. It is the case that matters most --
+//! the sweep drops the record, the close then fails, and the drop is
+//! announced anyway.
+//!
+//! The emissions that really do change a firewall are measured in
 //! `crates/porthole-cli/tests/container.rs`, against a real firewalld inside
 //! a container, gated behind `PORTHOLE_CONTAINER_TESTS=1`: an open, an
 //! ordinary close, the expiry timer's own close and `close --all`

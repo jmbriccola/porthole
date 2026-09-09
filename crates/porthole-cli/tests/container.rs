@@ -1025,9 +1025,13 @@ source address=\"192.168.77.0/24\" port port=\"9999\" protocol=\"tcp\" accept'\n
 /// `announce_open`/`announce_close` directly: an `open` that gets far enough
 /// to announce anything has to have changed a real firewall, which the
 /// development host may not do. Here it can -- the container has its own
-/// firewalld in its own network namespace -- so this is what would catch a
-/// method that stopped calling its announcement at all, which no test on the
-/// host can.
+/// firewalld in its own network namespace -- so this is what would catch an
+/// `open` or a client-requested `close` that stopped calling its
+/// announcement, which no test on the host can. (The one announcement a host
+/// test does reach from inside its own method is `announce_reconciled`, in
+/// `crates/porthole-helper/tests/reconciled_signal.rs`: reconciliation only
+/// reads the firewall, so a stub `firewall-cmd` is enough for it and is not
+/// enough for these.)
 ///
 /// `dbus-monitor` is the subscriber because it is the only one these images
 /// have (`dbus-tools` on Fedora). A monitor connection is exempt from D-Bus
