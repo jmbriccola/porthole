@@ -1,9 +1,9 @@
 //! The milestone's headline claim, end to end: `porthole open` with no `sudo`
 //! anywhere.
 //!
-//! A real `porthole-helper` runs as a child process on the session bus and the
-//! real `porthole` binary drives it. What this proves and what it cannot is
-//! written out in each test.
+//! A real `porthole-helper` runs as a child process on a session bus of this
+//! test binary's own ([`private_bus`]) and the real `porthole` binary drives
+//! it. What this proves and what it cannot is written out in each test.
 //!
 //! # What this file asks of the firewall on the machine running it
 //!
@@ -47,6 +47,13 @@
 //! close it: the polkit prompt appeared, a person answered it, and the open
 //! the test expected to be refused succeeded instead.
 //!
+//! # What this file asks of the session bus on the machine running it
+//!
+//! Nothing at all either, for the same reason and by the same means: it
+//! starts a private `dbus-run-session` daemon of its own and every process
+//! below is pointed at it. See [`private_bus`] for the failure that came of
+//! not doing so.
+//!
 //! # Nothing here skips itself
 //!
 //! `start_helper` used to hand back one of four failures and the caller
@@ -67,9 +74,102 @@
 //! RPM's `%check` refuses to run as root for this reason -- see
 //! `packaging/rpm/porthole.spec`.
 
+use std::io::BufRead as _;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use tempfile::TempDir;
+
+/// The one session bus every process this file starts is pointed at, and the
+/// only bus any of them can reach.
+///
+/// `porthole-helper --session` claims [`porthole_core::ipc::SERVICE`], and
+/// that string is *also* the GTK application id of `porthole-gui`. On the
+/// ambient session bus of a developer who happens to have the GUI open the
+/// name is therefore already taken, the helper exits with `NameTaken` before
+/// it ever serves, and four of the five tests below fail. Measured on the
+/// machine this was found on, with a GUI running:
+///
+/// ```text
+/// $ busctl --user list | grep jacopobriccola
+/// com.jacopobriccola.Porthole       1634084 porthole-gui
+/// com.jacopobriccola.PortholeAgent  1629505 porthole-agent
+/// ```
+///
+/// Nothing about that is a product defect — users never run two owners of the
+/// name — but it makes this file pass or fail on whether a window is open,
+/// which is not a property of the code under test. So this file does what
+/// `tests/cli.rs`'s `isolation` does, for the same reason and by the same
+/// means: one private `dbus-run-session` daemon per test binary, whose
+/// address every helper, every CLI and the readiness probe are given.
+///
+/// The name is free on that daemon on every machine, GUI or no GUI: porthole
+/// installs a *system*-bus activation file and no session one, so a private
+/// session daemon reading the same `XDG_DATA_DIRS` has nothing porthole-shaped
+/// to activate. Verified by hand under `dbus-run-session`: `busctl --user
+/// list` there names 94 services and not one of them matches `jacopobriccola`,
+/// against 251 on the ambient bus of the machine above.
+///
+/// One thing `cli.rs` needs that this file does not: a `PATH` shim keeping the
+/// real `firewall-cmd` off the redirected system bus. Here `firewall-cmd` is
+/// already [`stub_firewalld`]'s `/bin/sh` script, which speaks to no bus at
+/// all.
+struct PrivateBus {
+    /// `dbus-run-session`, alive for as long as the pipe its inner shell
+    /// reads stays open. This process exiting closes that pipe, the shell
+    /// exits, and the daemon goes down with it — so nothing is left behind
+    /// even though this value is never dropped.
+    _daemon: Child,
+    address: String,
+}
+
+fn private_bus() -> &'static PrivateBus {
+    static BUS: OnceLock<PrivateBus> = OnceLock::new();
+    BUS.get_or_init(|| {
+        // Asserted, not skipped. A test that cannot get its own bus must fail
+        // rather than quietly run against this machine's — which is the whole
+        // of what this function exists to stop.
+        let mut daemon = Command::new("dbus-run-session")
+            .args([
+                "--",
+                "sh",
+                "-c",
+                r#"echo "$DBUS_SESSION_BUS_ADDRESS"; exec cat >/dev/null"#,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("dbus-run-session is installed");
+        let mut address = String::new();
+        std::io::BufReader::new(daemon.stdout.take().expect("stdout was piped"))
+            .read_line(&mut address)
+            .expect("the private bus prints its address");
+        let address = address.trim().to_string();
+        assert!(!address.is_empty(), "dbus-run-session printed no address");
+        PrivateBus {
+            _daemon: daemon,
+            address,
+        }
+    })
+}
+
+/// Points `command` at [`private_bus`], and at nothing else.
+///
+/// `DBUS_SYSTEM_BUS_ADDRESS` as well as the session one, though everything
+/// here is started with `--session` and so should never open the system bus:
+/// the machine running this may be a developer's own, where the *real*
+/// `porthole-helper` is on the real system bus behind a polkit prompt, and
+/// `cli.rs`'s module docs record what a test that reached it once cost. A
+/// process that ignores `--session`, or a future path that opens the system
+/// bus regardless, must find no helper rather than find that one.
+fn on_private_bus(command: &mut Command) -> &mut Command {
+    let bus = private_bus();
+    command
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
+        .env("DBUS_SYSTEM_BUS_ADDRESS", &bus.address)
+        .env_remove("DBUS_STARTER_ADDRESS")
+        .env_remove("DBUS_STARTER_BUS_TYPE")
+}
 
 /// Kills the helper however the test ends, including on a failed assertion.
 struct Helper(Child);
@@ -82,8 +182,10 @@ impl Drop for Helper {
 }
 
 /// Every test below spawns a helper claiming the *same* well-known name on
-/// the *same* session bus, and `cargo test` runs the `#[test]` functions in
-/// one process on separate threads by default. Two helpers racing for that
+/// the *same* bus — [`private_bus`] is one daemon shared by the whole test
+/// binary, exactly as `cli.rs`'s is — and `cargo test` runs the `#[test]`
+/// functions in one process on separate threads by default. Two helpers
+/// racing for that
 /// one name — or one test's `Drop` killing its helper while another test's
 /// request to "the" helper is still in flight — produced real, reproducible
 /// `Remote peer disconnected` failures during development, unrelated to
@@ -193,8 +295,8 @@ fn helper_bin() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_BIN_EXE_porthole")).with_file_name("porthole-helper")
 }
 
-/// Start `porthole-helper --session` on the ambient session bus, with `bin`
-/// ahead of its `PATH`, and hand back a handle that kills it on drop.
+/// Start `porthole-helper --session` on [`private_bus`], with `bin` ahead of
+/// its `PATH`, and hand back a handle that kills it on drop.
 ///
 /// Every way this can fail is an assertion, and each says which one it was
 /// rather than hiding all of them behind one blanket "skipped" — which is
@@ -224,7 +326,11 @@ fn start_helper(state: &Path, bin: &Path) -> Helper {
         helper.display()
     );
 
-    let mut child = Command::new(&helper)
+    let mut command = Command::new(&helper);
+    // The bus this helper serves on, and the only one it can reach — which is
+    // what keeps it off the name a developer's own `porthole-gui` may already
+    // hold. See [`private_bus`].
+    on_private_bus(&mut command)
         .arg("--session")
         .env("PORTHOLE_STATE_FILE", state)
         // The firewall this helper detects, and the only one it can reach.
@@ -232,9 +338,11 @@ fn start_helper(state: &Path, bin: &Path) -> Helper {
         // machine's own firewall, and what lets the sweep answer at all in a
         // chroot with no firewalld daemon.
         .env("PATH", path_ahead_of(bin))
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
         .spawn()
         .unwrap_or_else(|e| panic!("{} exists but would not run: {e}", helper.display()));
+    let helper_pid = child.id();
 
     // Wait for the name to appear rather than sleeping a fixed time. A
     // transient `busctl` failure is not the helper's fault, so it retries
@@ -244,6 +352,16 @@ fn start_helper(state: &Path, bin: &Path) -> Helper {
     // nothing would ever reap. Every exit from this function below either
     // hands `child` to `Helper` (whose `Drop` kills and waits it) or kills
     // and waits it here first.
+    //
+    // `--address=` rather than `--user`: `busctl --user` does honour
+    // `DBUS_SESSION_BUS_ADDRESS` (verified by hand), but honouring it is a
+    // fallback chain, and the end of that chain is the developer's own bus —
+    // where a running `porthole-gui` owns the very name this loop waits for.
+    // A probe that can be answered by the ambient bus is a probe that can
+    // report success without the helper having started. `--address` has no
+    // fallback: a bus it cannot reach is a connection error, not an answer.
+    let address = format!("--address={}", private_bus().address);
+
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -267,30 +385,32 @@ fn start_helper(state: &Path, bin: &Path) -> Helper {
         }
 
         let Ok(out) = Command::new("busctl")
-            .args(["--user", "list", "--no-legend"])
+            .args([address.as_str(), "list", "--no-legend"])
             .output()
         else {
             continue;
         };
-        if listing_names_the_helper(&String::from_utf8_lossy(&out.stdout)) {
+        if listing_names_the_helper(&String::from_utf8_lossy(&out.stdout), helper_pid) {
             return Helper(child);
         }
     }
     let _ = child.kill();
     let _ = child.wait();
     panic!(
-        "the helper is still running but never appeared on the session bus \
-         within 5s — no session bus reachable, or `busctl` unavailable. Both \
-         are broken invocations rather than reasons to report success: run \
-         under `dbus-run-session --` and with systemd's `busctl` installed."
+        "the helper is still running but never appeared on {address} within \
+         5s — the private bus this file started is not answering, or `busctl` \
+         is unavailable. Both are broken invocations rather than reasons to \
+         report success: systemd's `busctl` and `dbus-run-session` are what \
+         this file needs installed."
     );
 }
 
-/// Does this `busctl --user list --no-legend` listing show the helper's own
-/// well-known name?
+/// Does this `busctl list --no-legend` listing show the helper's own
+/// well-known name, owned by process `pid`?
 ///
 /// Each row is a name, space-padded, followed by the pid and the rest, so the
-/// name is the row's first field and is compared whole.
+/// name is the row's first field and the pid its second, and both are
+/// compared whole.
 ///
 /// [`start_helper`] used to ask `listing.contains("com.jacopobriccola.Porthole")`
 /// instead, and `com.jacopobriccola.PortholeAgent` contains that string. The
@@ -299,14 +419,27 @@ fn start_helper(state: &Path, bin: &Path) -> Helper {
 /// answered by a service that implements none of the calls these tests go on
 /// to make: it returned on its first pass, before the helper had claimed
 /// anything at all. [`the_readiness_probe_is_not_satisfied_by_the_notification_agent`]
-/// is that exact case, pinned.
+/// is that exact case, pinned. The agent is no longer on the bus this probe
+/// reads — [`private_bus`] has neither agent nor GUI on it — so that is now a
+/// guard rather than a live hazard, and it is kept because the cost of it
+/// being wrong was every test in this file reporting success having proved
+/// nothing.
+///
+/// `pid` is what closes the one race a *shared* private bus still leaves: the
+/// tests are serialised ([`HELPER_LOCK`]) and each kills its helper on the way
+/// out, but the row a `busctl` listing shows is the row the daemon has got
+/// round to forgetting, not the row the kernel has. Waiting for the name is
+/// not the same as waiting for *this* helper to own it; waiting for the name
+/// beside this child's own pid is.
 ///
 /// [`porthole_core::ipc::SERVICE`] rather than a literal, so this is the same
 /// string the helper requests rather than a second copy of it.
-fn listing_names_the_helper(listing: &str) -> bool {
-    listing
-        .lines()
-        .any(|row| row.split_whitespace().next() == Some(porthole_core::ipc::SERVICE))
+fn listing_names_the_helper(listing: &str, pid: u32) -> bool {
+    let pid = pid.to_string();
+    listing.lines().any(|row| {
+        let mut fields = row.split_whitespace();
+        fields.next() == Some(porthole_core::ipc::SERVICE) && fields.next() == Some(pid.as_str())
+    })
 }
 
 #[test]
@@ -317,6 +450,8 @@ fn the_readiness_probe_is_not_satisfied_by_the_notification_agent() {
 :1.48                              5145 porthole-agent  jmbriccola :1.48 user@1000.service - -
 com.jacopobriccola.PortholeAgent   5145 porthole-agent  jmbriccola :1.48 user@1000.service - -
 ";
+    const HELPER_PID: u32 = 6001;
+
     assert!(
         agent_only.contains(porthole_core::ipc::SERVICE),
         "the agent's name contains the helper's, which is why a substring \
@@ -324,41 +459,55 @@ com.jacopobriccola.PortholeAgent   5145 porthole-agent  jmbriccola :1.48 user@10
          stops being the one worth pinning"
     );
     assert!(
-        !listing_names_the_helper(agent_only),
+        !listing_names_the_helper(agent_only, HELPER_PID),
         "a probe waiting for the helper must not be satisfied by the agent"
     );
 
     // And it still says yes to the thing it is actually waiting for.
     let with_helper = format!(
-        "{agent_only}{}   6001 porthole-helper jmbriccola :1.49 - - -\n",
+        "{agent_only}{}   {HELPER_PID} porthole-helper jmbriccola :1.49 - - -\n",
         porthole_core::ipc::SERVICE
     );
     assert!(
-        listing_names_the_helper(&with_helper),
+        listing_names_the_helper(&with_helper, HELPER_PID),
         "the helper's own row must satisfy it: {with_helper}"
+    );
+
+    // The right name held by the wrong process is not this test's helper: on
+    // the shared private bus that is the previous test's helper, killed but
+    // not yet forgotten by the daemon, and returning on it would hand back a
+    // child that owns nothing.
+    assert!(
+        !listing_names_the_helper(&with_helper, HELPER_PID + 1),
+        "the name alone must not satisfy it -- the pid must be this helper's"
     );
 
     // A name is a whole field, never part of one: the unique-name rows above
     // carry `porthole-agent` in a later column, and a row for some future
-    // `com.jacopobriccola.PortholeSomethingElse` must not count either.
+    // `com.jacopobriccola.PortholeSomethingElse` must not count either --
+    // not even when the pid beside it is the one being waited for.
     assert!(
-        !listing_names_the_helper("com.jacopobriccola.PortholeSomethingElse 7 x y :1.50 - - -\n"),
+        !listing_names_the_helper(
+            "com.jacopobriccola.PortholeSomethingElse 7 x y :1.50 - - -\n",
+            7
+        ),
         "only the exact name counts"
     );
 }
 
-/// The CLI, with the same stub firewall on its `PATH` as the helper it talks
-/// to — so the two agree on which backend this machine has, and neither can
-/// reach the real one.
+/// The CLI, on the same [`private_bus`] and with the same stub firewall on
+/// its `PATH` as the helper it talks to — so the two find each other and
+/// agree on which backend this machine has, and neither can reach the real
+/// one of either kind.
 fn cli(state: &Path, bin: &Path, args: &[&str]) -> std::process::Output {
     let mut all = vec!["--session"];
     all.extend_from_slice(args);
-    Command::new(env!("CARGO_BIN_EXE_porthole"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_porthole"));
+    on_private_bus(&mut command)
         .args(all)
         .env("PORTHOLE_STATE_FILE", state)
-        .env("PATH", path_ahead_of(bin))
-        .output()
-        .expect("the porthole binary runs")
+        .env("PATH", path_ahead_of(bin));
+    command.output().expect("the porthole binary runs")
 }
 
 #[test]
@@ -417,7 +566,19 @@ fn the_helper_refuses_an_over_long_duration_itself() {
             .build()
             .expect("a runtime")
             .block_on(async {
-                let conn = zbus::Connection::session().await.expect("session bus");
+                // Addressed, not `Connection::session()`: that reads this
+                // *test process's* own `DBUS_SESSION_BUS_ADDRESS`, which is
+                // the developer's ambient bus — every other process here is
+                // redirected by its environment, but this one call is made
+                // in-process, where there is no child environment to set.
+                // Setting one for the whole test binary is not an option
+                // either: `std::env::set_var` is unsound with other tests'
+                // threads running.
+                let conn = zbus::connection::Builder::address(private_bus().address.as_str())
+                    .expect("the private bus address parses")
+                    .build()
+                    .await
+                    .expect("the private session bus");
                 let proxy = porthole_core::ipc::PortholeProxy::new(&conn)
                     .await
                     .expect("bind the helper's interface");

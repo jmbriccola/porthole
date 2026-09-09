@@ -117,10 +117,14 @@ jobs:
       # time.
       - name: cargo build --locked
         run: cargo build --locked
-      # dbus-run-session supplies the session bus a runner has none of;
-      # crates/porthole-cli/tests/helper_e2e.rs runs `porthole-helper
-      # --session` on it and crates/porthole-agent/tests/session.rs starts a
-      # further private bus per test. The system bus is left alone.
+      # dbus-run-session supplies the session bus a runner has none of, which
+      # crates/porthole-helper/tests/roundtrip.rs and that crate's service and
+      # signal tests need. Three suites no longer use it at all --
+      # crates/porthole-cli/tests/{cli,helper_e2e}.rs and
+      # crates/porthole-agent/tests/session.rs each start a private bus and
+      # point their own processes at it, which is what keeps helper_e2e.rs's
+      # `porthole-helper --session` off a name a developer's porthole-gui may
+      # already own. The system bus is left alone.
       # DBUS_SYSTEM_BUS_ADDRESS is deliberately not redirected job-wide:
       # measured on a machine with firewalld installed and running, that
       # redirection sends `firewall-cmd` to the private bus, where firewalld
@@ -131,9 +135,12 @@ jobs:
       # porthole process this suite starts can reach a helper on the system
       # bus while firewalld still can be reached over it.
       #
-      # One cargo test per job and no more: the helper claims a singleton bus
-      # name, and HELPER_LOCK in crates/porthole-cli/tests/helper_e2e.rs is a
-      # process-local mutex that a second cargo process cannot see.
+      # One cargo test per job and no more. Not for helper_e2e.rs's sake any
+      # more -- its helper is on a bus of its own now, so a second cargo
+      # process would collide with nothing there -- but for the suites still
+      # sharing this job's bus: crates/porthole-helper/tests/roundtrip.rs
+      # claims com.jacopobriccola.PortholeProbe on it, and a second cargo
+      # process would find that name taken and fail.
       - name: cargo test --workspace --exclude porthole-gui
         run: dbus-run-session -- cargo test --workspace --exclude porthole-gui
 

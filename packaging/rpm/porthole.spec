@@ -310,13 +310,15 @@ fi
 unset RUSTFLAGS
 
 # One private bus, standing in for both, in a chroot that has neither.
-# crates/porthole-agent/tests/session.rs spawns its own session bus per test
-# and crates/porthole-cli/tests/cli.rs gives every porthole process it starts
-# a private one of its own, so neither depends on this; what is left needing
-# a session bus is the helper's own service and signal tests and the
-# CLI-to-helper round trip, which run `porthole-helper --session` on it. The
-# system-bus address is exported alongside so nothing that asks for a system
-# bus in this chroot finds none.
+# crates/porthole-agent/tests/session.rs spawns its own session bus per test,
+# crates/porthole-cli/tests/cli.rs gives every porthole process it starts a
+# private one of its own, and its helper_e2e.rs starts one for the
+# `porthole-helper --session` it drives -- that last so the helper cannot
+# land on a session bus where something already owns its name, which on a
+# developer's machine is any session with porthole-gui open. None of the
+# three depends on this bus; what is left needing one is the helper's own
+# service, signal and round-trip tests. The system-bus address is exported
+# alongside so nothing that asks for a system bus in this chroot finds none.
 #
 # No firewall daemon is needed and none is started: every test that needs a
 # firewall to answer writes one of its own onto `PATH` -- see the

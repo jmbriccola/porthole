@@ -517,8 +517,8 @@ ip route add default via 10.10.10.1 dev eth0
 /// tears the helper down again.
 ///
 /// The wait polls `org.freedesktop.DBus.Peer.Ping` -- every D-Bus object
-/// answers it for free -- rather than `helper_e2e.rs`'s own `busctl --user
-/// list`, because these minimal container images have no `systemd` package
+/// answers it for free -- rather than `helper_e2e.rs`'s own `busctl
+/// --address=... list`, because these minimal container images have no `systemd` package
 /// and therefore no `busctl`; `dbus-send` is the one thing guaranteed to be
 /// present alongside `dbus-daemon` on every one of the three distributions.
 fn with_helper(body: &str) -> String {
