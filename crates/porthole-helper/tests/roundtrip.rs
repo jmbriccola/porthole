@@ -1,8 +1,16 @@
 //! Proves the zbus shapes the rest of this milestone is built on: a service
 //! that owns a name, a proxy that calls it, and access to the caller's
 //! credentials from the message header — which is what polkit will need.
+//!
+//! The bus is this binary's own ([`common::private_bus`]), never the
+//! developer's. `com.jacopobriccola.PortholeProbe` is a singleton name like
+//! any other, so on a shared bus a second `cargo test` finds it taken and
+//! fails on `.expect("the name is free")` — which is a fact about who else is
+//! on the machine, not about the shapes this file is here to prove.
 
-use zbus::{connection, interface, proxy};
+mod common;
+
+use zbus::{interface, proxy};
 
 struct Probe;
 
@@ -34,10 +42,9 @@ trait Probe {
 
 #[tokio::test]
 async fn a_service_and_its_proxy_agree_on_the_session_bus() {
-    // The session bus, not the system bus: this test must run unprivileged.
+    // A session bus, not the system bus: this test must run unprivileged.
     // The helper uses the same shapes on the system bus in production.
-    let _server = connection::Builder::session()
-        .expect("a session bus is available")
+    let _server = common::builder()
         .name("com.jacopobriccola.PortholeProbe")
         .expect("the name is free")
         .serve_at("/com/jacopobriccola/PortholeProbe", Probe)
@@ -46,7 +53,7 @@ async fn a_service_and_its_proxy_agree_on_the_session_bus() {
         .await
         .expect("the service starts");
 
-    let client = zbus::Connection::session().await.expect("client connects");
+    let client = common::connect().await;
     let proxy = ProbeProxy::new(&client).await.expect("proxy binds");
 
     assert_eq!(proxy.echo("hello").await.unwrap(), "echo: hello");

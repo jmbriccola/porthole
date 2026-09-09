@@ -28,7 +28,12 @@
 //!
 //! Nothing here reaches a real firewall: both halves stop at the exclusive
 //! state lock, whose path is deliberately unusable, and the only programs on
-//! `PATH` are the two stubs this file writes.
+//! `PATH` are the two stubs this file writes. Nothing here reaches a real
+//! *bus* either: both halves serve on this binary's own session bus, so a
+//! second `cargo test` cannot answer this one's calls. See
+//! `tests/common/mod.rs`.
+
+mod common;
 
 use porthole_core::cli_path::CLI_CANDIDATES;
 use porthole_core::ipc::{PortholeProxy, PATH};
@@ -86,7 +91,7 @@ async fn serve(
     state: &std::path::Path,
 ) -> (zbus::Connection, Arc<AlwaysAllow>, String) {
     let authorizer = Arc::new(AlwaysAllow::default());
-    let bus = zbus::Connection::session().await.unwrap();
+    let bus = common::connect().await;
     let service = Porthole::new(
         Box::new(Arc::clone(&authorizer)),
         bus,
@@ -94,8 +99,7 @@ async fn serve(
         std::path::PathBuf::from(CLI_CANDIDATES[0]),
     );
     let name = format!("com.jacopobriccola.PortholeTest{suffix}");
-    let conn = zbus::connection::Builder::session()
-        .unwrap()
+    let conn = common::builder()
         .name(name.clone())
         .unwrap()
         .serve_at(PATH, service)
@@ -131,6 +135,12 @@ async fn a_forward_asks_the_firewall_before_it_asks_for_a_password() {
     std::fs::create_dir(&can).unwrap();
     stub_firewalld(&can);
 
+    // Started before `PATH` is stripped, and that ordering is load-bearing:
+    // `dbus-run-session` is resolved off this process's own `PATH` at the
+    // moment of the first call, and the next statement removes it from
+    // `PATH`. Doing this lazily inside `serve` below fails with NotFound.
+    let _bus = common::private_bus();
+
     // --- Half one: a firewall with no redirect in it. --------------------
     //
     // `PATH` is this directory alone, so `firewall-cmd` and `nft` are
@@ -138,7 +148,7 @@ async fn a_forward_asks_the_firewall_before_it_asks_for_a_password() {
     std::env::set_var("PATH", &cannot);
 
     let (_server, authz, name) = serve("ForwardGateUfw", &state).await;
-    let client = zbus::Connection::session().await.unwrap();
+    let client = common::connect().await;
     let proxy = PortholeProxy::builder(&client)
         .destination(name)
         .unwrap()

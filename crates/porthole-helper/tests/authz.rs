@@ -7,7 +7,11 @@
 //! `zbus::message::Header` cannot be built outside the `zbus` crate itself
 //! (its inner `Fields` type is crate-private), so the only way to hand one to
 //! `AlwaysAllow::check` or `caller_uid` from a test is to receive one for
-//! real: serve a tiny probe object on the session bus and call it.
+//! real: serve a tiny probe object on a session bus and call it. On this
+//! binary's own session bus — see `tests/common/mod.rs`, whose first
+//! recorded failure is this file's.
+
+mod common;
 
 use porthole_helper::authz::{caller_uid, Action, AlwaysAllow, Authorizer};
 use std::sync::Arc;
@@ -57,18 +61,18 @@ impl Probe {
 }
 
 /// A unique bus name per test, so tests can run in parallel and none of them
-/// ever squats another's.
+/// ever squats another's — on [`common::private_bus`], which is what makes
+/// "per test" enough. Unique within this process is not unique on the
+/// developer's own bus, where a second `cargo test` asks for these same
+/// names; see `tests/common/mod.rs` for the failure that produced.
 async fn serve(suffix: &str, authorizer: Arc<AlwaysAllow>) -> (zbus::Connection, String) {
-    let conn = zbus::Connection::session()
-        .await
-        .expect("a session bus is available");
+    let conn = common::connect().await;
     let probe = Probe {
         conn: conn.clone(),
         authorizer,
     };
     let name = format!("com.jacopobriccola.PortholeTestProbe{suffix}");
-    let server = zbus::connection::Builder::session()
-        .unwrap()
+    let server = common::builder()
         .name(name.clone())
         .unwrap()
         .serve_at("/com/jacopobriccola/PortholeTest/Probe", probe)
@@ -80,7 +84,7 @@ async fn serve(suffix: &str, authorizer: Arc<AlwaysAllow>) -> (zbus::Connection,
 }
 
 async fn probe_proxy(name: String) -> zbus::Proxy<'static> {
-    let client = zbus::Connection::session().await.unwrap();
+    let client = common::connect().await;
     zbus::Proxy::new_owned(
         client,
         name,

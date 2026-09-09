@@ -1334,6 +1334,64 @@ mod tests {
         assert_eq!(runner.docker_reads(), 2, "the sweep has to have looked");
     }
 
+    /// The one session bus this crate's unit tests touch, started once and
+    /// shared by every test in this binary.
+    ///
+    /// The same shape as `tests/common/mod.rs`'s, written out again because a
+    /// `#[cfg(test)]` module inside the library cannot see a file under
+    /// `tests/` — integration tests link the library as an external crate, so
+    /// there is no direction in which one definition can serve both. It is
+    /// here for the same reason it is there: the test below used
+    /// `Connection::session()`, which is the *developer's* bus, and two
+    /// concurrent `cargo test` runs then delivered each other's `RuleClosed`
+    /// to each other's subscribers. Measured, with the two runs' rule ids
+    /// swapped:
+    ///
+    /// ```text
+    /// assertion `left == right` failed: the reason travels with its rule
+    ///   left: "9fe1a756-588a-4559-9f24-5fb44b708925"
+    ///  right: "726f37d1-8364-4f1d-8a84-0e76d9528b73"
+    /// ```
+    ///
+    /// Addressed rather than by environment variable: `session()` reads this
+    /// process's own `DBUS_SESSION_BUS_ADDRESS`, and `std::env::set_var` is
+    /// unsound with other tests' threads running, so an in-process connection
+    /// has to be handed the address at the call site.
+    fn private_bus_address() -> &'static str {
+        use std::io::BufRead as _;
+        use std::process::{Child, Command, Stdio};
+        use std::sync::OnceLock;
+
+        // The daemon is alive for as long as the pipe its inner shell reads
+        // stays open. This process exiting closes that pipe, the shell exits,
+        // and the daemon goes down with it -- so nothing is left behind even
+        // though this value is never dropped.
+        static BUS: OnceLock<(Child, String)> = OnceLock::new();
+        &BUS.get_or_init(|| {
+            // Asserted, not skipped: a test that cannot get its own bus must
+            // fail rather than quietly run against this machine's.
+            let mut daemon = Command::new("dbus-run-session")
+                .args([
+                    "--",
+                    "sh",
+                    "-c",
+                    r#"echo "$DBUS_SESSION_BUS_ADDRESS"; exec cat >/dev/null"#,
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("dbus-run-session is installed");
+            let mut address = String::new();
+            std::io::BufReader::new(daemon.stdout.take().expect("stdout was piped"))
+                .read_line(&mut address)
+                .expect("the private bus prints its address");
+            let address = address.trim().to_string();
+            assert!(!address.is_empty(), "dbus-run-session printed no address");
+            (daemon, address)
+        })
+        .1
+    }
+
     #[tokio::test]
     async fn a_stale_forwards_close_reaches_the_bus_as_target_gone_not_a_network_change() {
         // The tests above pin which list -- `stale` or `closed` -- a moved
@@ -1344,14 +1402,19 @@ mod tests {
         // real subscriber on a real bus, decoding the signal
         // `announce_outcome` actually sent.
         let name = "com.jacopobriccola.PortholeTestNetmonStaleReason";
-        let bus = zbus::Connection::session().await.unwrap();
+        let address = private_bus_address();
+        let bus = zbus::connection::Builder::address(address)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
         let service = Porthole::new(
             Box::new(Arc::new(AlwaysAllow::default())),
             bus,
             PathBuf::from("/nonexistent/state.json"),
             PathBuf::from("/usr/bin/porthole"),
         );
-        let server = zbus::connection::Builder::session()
+        let server = zbus::connection::Builder::address(address)
             .unwrap()
             .name(name)
             .unwrap()
@@ -1362,7 +1425,11 @@ mod tests {
             .unwrap();
         let emitter = SignalEmitter::new(&server, PATH).unwrap().into_owned();
 
-        let client = zbus::Connection::session().await.unwrap();
+        let client = zbus::connection::Builder::address(address)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
         let proxy = PortholeProxy::builder(&client)
             .destination(name)
             .unwrap()

@@ -52,7 +52,12 @@
 //!
 //! Nothing here reaches a real firewall: `PATH` is the stub directory alone,
 //! so `firewall-cmd`, `ip`, `nft` and `ufw` as this machine has them are
-//! unreachable for the whole of this process's life.
+//! unreachable for the whole of this process's life. Nothing here reaches
+//! this machine's *bus* either: the bus is one this binary starts, so a
+//! second `cargo test` cannot take the probe name below or deliver its own
+//! `RuleClosed` to the subscriber here. See `tests/common/mod.rs`.
+
+mod common;
 
 use futures_util::StreamExt;
 use porthole_core::backend::{BackendId, RuleHandle};
@@ -156,10 +161,11 @@ fn orphaned_record() -> ManagedRule {
     }
 }
 
-/// Serve the real service object under a probe name on the ambient session
-/// bus. Never the production name, and never the system bus.
+/// Serve the real service object under a probe name on this binary's own
+/// session bus. Never the production name, never the system bus, and never
+/// the developer's own session bus.
 async fn serve(state: &Path) -> (zbus::Connection, String) {
-    let bus = zbus::Connection::session().await.unwrap();
+    let bus = common::connect().await;
     let service = Porthole::new(
         Box::new(Arc::new(AlwaysAllow::default())),
         bus,
@@ -167,8 +173,7 @@ async fn serve(state: &Path) -> (zbus::Connection, String) {
         std::path::PathBuf::from(CLI_CANDIDATES[0]),
     );
     let name = "com.jacopobriccola.PortholeTestSigReconciled".to_string();
-    let conn = zbus::connection::Builder::session()
-        .unwrap()
+    let conn = common::builder()
         .name(name.clone())
         .unwrap()
         .serve_at(PATH, service)
@@ -204,6 +209,12 @@ async fn a_record_the_firewall_no_longer_has_is_announced_by_the_operation_that_
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     stub_firewalld_and_ip(&bin);
+    // Started before `PATH` is stripped, and that ordering is load-bearing:
+    // `dbus-run-session` is resolved off this process's own `PATH` at the
+    // moment of the first call, and the next statement removes it from
+    // `PATH`. Doing this lazily inside `serve` below fails with NotFound.
+    let _bus = common::private_bus();
+
     // The stub directory alone, so the machine's own firewall tooling is
     // unreachable for the rest of this process. One test in this file, so
     // there is no other thread whose subprocess this could race with.
@@ -216,7 +227,7 @@ async fn a_record_the_firewall_no_longer_has_is_announced_by_the_operation_that_
     store.save().unwrap();
 
     let (_server, name) = serve(&state_path).await;
-    let client = zbus::Connection::session().await.unwrap();
+    let client = common::connect().await;
     let proxy = PortholeProxy::builder(&client)
         .destination(name)
         .unwrap()

@@ -2,7 +2,9 @@
 //!
 //! # What each half of this file proves, and what it does not
 //!
-//! The tests in the first half use the *ambient* session bus, a probe name of
+//! The tests in the first half use this binary's own session bus (see
+//! `tests/common/mod.rs` — it used to be the *ambient* one, which is what
+//! kept the project to one `cargo test` at a time), a probe name of
 //! their own, and the same `announce_*` functions
 //! `porthole_helper::service::Porthole`'s own methods call. They prove the
 //! declaration, the payload and the subscribe-and-receive path: a signal
@@ -28,8 +30,12 @@
 //!
 //! The second half starts its own `dbus-daemon` on a config that includes the
 //! shipped `data/com.jacopobriccola.Porthole.conf`, and checks what that
-//! policy does to a signal in flight. Never the system bus: every daemon here
-//! is a private session bus this file starts and kills.
+//! policy does to a signal in flight. Never the system bus, and now never a
+//! shared one either: every bus this file touches is a private session bus
+//! it starts itself — the second half's own `dbus-daemon` per test, the
+//! first half's one `dbus-run-session` for the binary.
+
+mod common;
 
 use futures_util::StreamExt;
 use porthole_core::backend::{BackendId, RuleHandle};
@@ -64,10 +70,10 @@ fn probe_name(suffix: &str) -> String {
     format!("com.jacopobriccola.PortholeTest{suffix}")
 }
 
-/// Serve the real service object under a probe name on the ambient session
-/// bus, and hand back a connection signals can be emitted from.
+/// Serve the real service object under a probe name on [`common::private_bus`],
+/// and hand back a connection signals can be emitted from.
 async fn serve(suffix: &str, state: &Path) -> (zbus::Connection, String) {
-    let bus = zbus::Connection::session().await.unwrap();
+    let bus = common::connect().await;
     let service = Porthole::new(
         Box::new(Arc::new(AlwaysAllow::default())),
         bus,
@@ -75,8 +81,7 @@ async fn serve(suffix: &str, state: &Path) -> (zbus::Connection, String) {
         std::path::PathBuf::from(CLI_CANDIDATES[0]),
     );
     let name = probe_name(suffix);
-    let conn = zbus::connection::Builder::session()
-        .unwrap()
+    let conn = common::builder()
         .name(name.clone())
         .unwrap()
         .serve_at(PATH, service)
@@ -88,7 +93,7 @@ async fn serve(suffix: &str, state: &Path) -> (zbus::Connection, String) {
 }
 
 async fn proxy_to(name: &str) -> PortholeProxy<'static> {
-    let client = zbus::Connection::session().await.unwrap();
+    let client = common::connect().await;
     PortholeProxy::builder(&client)
         .destination(name.to_string())
         .unwrap()

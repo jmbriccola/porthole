@@ -1,4 +1,5 @@
-//! Drives the real service object over a real session bus with a fake
+//! Drives the real service object over a real session bus — this binary's
+//! own, never the developer's; see `tests/common/mod.rs` — with a fake
 //! authorizer, so every method is exercised end to end without root and
 //! without polkit.
 //!
@@ -9,6 +10,8 @@
 //! `crates/porthole-cli/tests/container.rs`, where the firewall goes away
 //! with its container.
 
+mod common;
+
 use porthole_core::cli_path::CLI_CANDIDATES;
 use porthole_core::ipc::{PortholeProxy, PATH};
 use porthole_helper::authz::{Action, AlwaysAllow};
@@ -17,7 +20,9 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 /// A unique bus name per test, so tests can run in parallel and none of them
-/// ever squats the production name.
+/// ever squats the production name. Unique *within this process*, which is
+/// enough only because [`common::private_bus`] is this process's alone — on a
+/// shared bus a second `cargo test` asks for these very names.
 fn probe_name(suffix: &str) -> String {
     format!("com.jacopobriccola.PortholeTest{suffix}")
 }
@@ -27,7 +32,7 @@ async fn serve(
     state: &std::path::Path,
 ) -> (zbus::Connection, Arc<AlwaysAllow>, String) {
     let authorizer = Arc::new(AlwaysAllow::default());
-    let bus = zbus::Connection::session().await.unwrap();
+    let bus = common::connect().await;
     let service = Porthole::new(
         Box::new(Arc::clone(&authorizer)),
         bus,
@@ -39,8 +44,7 @@ async fn serve(
         std::path::PathBuf::from(CLI_CANDIDATES[0]),
     );
     let name = probe_name(suffix);
-    let conn = zbus::connection::Builder::session()
-        .unwrap()
+    let conn = common::builder()
         .name(name.clone())
         .unwrap()
         .serve_at(PATH, service)
@@ -56,7 +60,7 @@ async fn list_is_empty_before_anything_is_opened() {
     let dir = TempDir::new().unwrap();
     let (_server, _authz, name) = serve("List", &dir.path().join("state.json")).await;
 
-    let client = zbus::Connection::session().await.unwrap();
+    let client = common::connect().await;
     let proxy = PortholeProxy::builder(&client)
         .destination(name)
         .unwrap()
@@ -102,7 +106,7 @@ async fn opening_towards_everyone_asks_for_the_stronger_action() {
     std::fs::write(&not_a_directory, "").expect("the temp dir is writable");
     let (_server, authz, name) = serve("Any", &not_a_directory.join("state.json")).await;
 
-    let client = zbus::Connection::session().await.unwrap();
+    let client = common::connect().await;
     let proxy = PortholeProxy::builder(&client)
         .destination(name)
         .unwrap()
@@ -164,7 +168,7 @@ async fn a_forward_of_a_port_no_container_could_publish_is_refused_unauthorized(
     let dir = TempDir::new().unwrap();
     let (_server, authz, name) = serve("ForwardZero", &dir.path().join("state.json")).await;
 
-    let client = zbus::Connection::session().await.unwrap();
+    let client = common::connect().await;
     let proxy = PortholeProxy::builder(&client)
         .destination(name)
         .unwrap()
@@ -214,7 +218,7 @@ async fn docker_ports_is_reachable_and_authorized_like_list() {
     let dir = TempDir::new().unwrap();
     let (_server, authz, name) = serve("Docker", &dir.path().join("state.json")).await;
 
-    let client = zbus::Connection::session().await.unwrap();
+    let client = common::connect().await;
     let proxy = PortholeProxy::builder(&client)
         .destination(name)
         .unwrap()
@@ -239,7 +243,7 @@ async fn an_invalid_protocol_is_refused_before_anything_is_authorized() {
     let dir = TempDir::new().unwrap();
     let (_server, authz, name) = serve("Proto", &dir.path().join("state.json")).await;
 
-    let client = zbus::Connection::session().await.unwrap();
+    let client = common::connect().await;
     let proxy = PortholeProxy::builder(&client)
         .destination(name)
         .unwrap()
@@ -263,7 +267,7 @@ async fn a_duration_over_the_ceiling_is_refused() {
     let dir = TempDir::new().unwrap();
     let (_server, authz, name) = serve("Ceiling", &dir.path().join("state.json")).await;
 
-    let client = zbus::Connection::session().await.unwrap();
+    let client = common::connect().await;
     let proxy = PortholeProxy::builder(&client)
         .destination(name)
         .unwrap()
@@ -285,7 +289,7 @@ async fn port_zero_is_not_a_port() {
     let dir = TempDir::new().unwrap();
     let (_server, _authz, name) = serve("Zero", &dir.path().join("state.json")).await;
 
-    let client = zbus::Connection::session().await.unwrap();
+    let client = common::connect().await;
     let proxy = PortholeProxy::builder(&client)
         .destination(name)
         .unwrap()
@@ -305,7 +309,7 @@ async fn closing_something_that_is_not_open_says_so() {
     let dir = TempDir::new().unwrap();
     let (_server, _authz, name) = serve("Missing", &dir.path().join("state.json")).await;
 
-    let client = zbus::Connection::session().await.unwrap();
+    let client = common::connect().await;
     let proxy = PortholeProxy::builder(&client)
         .destination(name)
         .unwrap()

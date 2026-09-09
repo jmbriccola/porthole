@@ -117,14 +117,19 @@ jobs:
       # time.
       - name: cargo build --locked
         run: cargo build --locked
-      # dbus-run-session supplies the session bus a runner has none of, which
-      # crates/porthole-helper/tests/roundtrip.rs and that crate's service and
-      # signal tests need. Three suites no longer use it at all --
-      # crates/porthole-cli/tests/{cli,helper_e2e}.rs and
-      # crates/porthole-agent/tests/session.rs each start a private bus and
-      # point their own processes at it, which is what keeps helper_e2e.rs's
-      # `porthole-helper --session` off a name a developer's porthole-gui may
-      # already own. The system bus is left alone.
+      # dbus-run-session supplies the session bus a runner has none of. No
+      # suite in this job still needs it: every test target that wants a bus
+      # now starts a private one and addresses its own connections at it --
+      # crates/porthole-cli/tests/{cli,helper_e2e}.rs,
+      # crates/porthole-agent/tests/session.rs, and, as of the commit that
+      # rewrote this comment, every bus-using test in porthole-helper
+      # (crates/porthole-helper/tests/common/mod.rs, plus the one in
+      # src/netmon.rs's own test module). Measured: the whole command below
+      # passes 594 tests with DBUS_SESSION_BUS_ADDRESS pointing at a
+      # nonexistent socket, and again with it unset altogether. The wrapper
+      # stays because a runner with no session bus is a worse place to
+      # discover a future test that wants one, and it costs nothing. The
+      # system bus is left alone.
       # DBUS_SYSTEM_BUS_ADDRESS is deliberately not redirected job-wide:
       # measured on a machine with firewalld installed and running, that
       # redirection sends `firewall-cmd` to the private bus, where firewalld
@@ -135,12 +140,32 @@ jobs:
       # porthole process this suite starts can reach a helper on the system
       # bus while firewalld still can be reached over it.
       #
-      # One cargo test per job and no more. Not for helper_e2e.rs's sake any
-      # more -- its helper is on a bus of its own now, so a second cargo
-      # process would collide with nothing there -- but for the suites still
-      # sharing this job's bus: crates/porthole-helper/tests/roundtrip.rs
-      # claims com.jacopobriccola.PortholeProbe on it, and a second cargo
-      # process would find that name taken and fail.
+      # The "one cargo test at a time" rule that used to be stated here is
+      # lifted. It existed because test targets claimed singleton bus names on
+      # whatever session bus they were handed, so a second cargo process --
+      # another job on the same runner, another developer on the same machine,
+      # or the same person running the suite twice -- fought them for those
+      # names. Every such name is now on a bus its own test binary started.
+      #
+      # Measured on the machine this was fixed on, warm target directory, two
+      # `cargo test --workspace --exclude porthole-gui` processes started
+      # within a microsecond of each other (~13s each against ~10.9s alone,
+      # so they genuinely overlapped rather than queueing):
+      #
+      #   before: 2/2 runs failed, 6 times out of 6, in
+      #           porthole-helper's authz, service, forward_gate, roundtrip
+      #           and src/netmon.rs -- including one run's client being
+      #           answered by the other run's server
+      #   after:  4/4 pairs green, 594 passed / 0 failed / 21 ignored each,
+      #           and a 3-way run green as well
+      #
+      # Two things are still genuinely serial and are not covered by that.
+      # Concurrent cargo processes sharing one target directory block each
+      # other on cargo's own build lock (not on tests -- cargo releases it
+      # before running them). And porthole-gui, excluded here, runs its whole
+      # suite under one dbus-run-session inside its container, where
+      # crates/porthole-gui/tests/signals.rs owns the production name; that is
+      # safe because the container is per-run, not because the name is free.
       - name: cargo test --workspace --exclude porthole-gui
         run: dbus-run-session -- cargo test --workspace --exclude porthole-gui
 
