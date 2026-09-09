@@ -42,3 +42,17 @@ NoNewPrivileges=yes
 # helper on its own, until a client next addresses the bus name. Left as is
 # here: changing Restart= in light of that is a packaging-milestone decision
 # with its own review, not a side effect of adding the monitor.
+#
+# With **no rule open** the helper now ends itself: five minutes after the
+# last request or the last close it gives up this BusName and exits, and the
+# bus activates a new one the moment a client wants it
+# (porthole_helper::retire). Two things about that are this unit's business.
+# First, it is why there is still no Restart=: a service that retires on
+# purpose and is restarted automatically would be a perpetual daemon again by
+# another route. Second, systemd sends SIGTERM within microseconds of a
+# Type=dbus unit releasing its BusName -- measured -- so the helper handles
+# SIGTERM and lets a retirement already under way finish; TimeoutStopSec's
+# default of 90s is ample for a drain measured in tens of milliseconds, and
+# systemd records the exit as `Deactivated successfully` either way. The
+# helper never retires while a rule is open, because that is exactly when the
+# monitor above is needed.

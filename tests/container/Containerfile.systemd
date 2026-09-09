@@ -1,0 +1,48 @@
+# The image where porthole is **installed**, not driven by hand.
+#
+# Every other image here runs `porthole-helper --session` as a child process
+# of the test's own shell, which is the only shape available without an init
+# system. That shape cannot answer the questions this image exists for,
+# because all of them are questions about systemd:
+#
+#   - a `Type=dbus` unit that gives up its `BusName` is sent `SIGTERM` within
+#     microseconds, measured, and a helper that did not handle it would be
+#     killed in the middle of its own retirement;
+#   - what systemd *records* when the helper exits by itself -- `Result=`,
+#     `NRestarts=`, and whether anything lands at warning level or above;
+#   - whether repeated activate-and-exit cycles trip the start rate limiter,
+#     which counts failed starts and must not count clean ones;
+#   - whether the bus really re-activates the unit after it has gone.
+#
+# So this one carries systemd as PID 1, a system bus, and firewalld, and the
+# test installs the shipped `data/` files into the paths the packages use.
+# No Rust toolchain and no copy of the binaries: those are built once on the
+# host as static musl binaries and bind-mounted in at container-run time,
+# exactly as the other four images do it.
+#
+# `polkit` is installed and is expected **not** to start in a rootless podman
+# container (measured: `Failed to keep CAP_SYS_ADMIN`, status `217/USER`).
+# It is here anyway, because it is what makes the failure legible when it
+# happens rather than a mystery about the bus, and because the one method the
+# tests here use -- `org.freedesktop.DBus.Peer.Ping` and
+# `com.jacopobriccola.Porthole1.ProtocolVersion` -- deliberately involves no
+# authorizer at all.
+FROM registry.fedoraproject.org/fedora:44
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+      systemd \
+      dbus-broker \
+      dbus-tools \
+      firewalld \
+      iproute \
+      nftables \
+      polkit \
+      procps-ng \
+    && dnf clean all \
+    && systemctl enable dbus-broker.service
+
+# Nothing about porthole is baked in: the unit, the D-Bus activation file,
+# the bus policy and the polkit actions are installed by the test from this
+# repository's own `data/` directory, so what runs here is the shipped
+# arrangement and not a second copy of it that could drift.
+CMD ["/sbin/init"]

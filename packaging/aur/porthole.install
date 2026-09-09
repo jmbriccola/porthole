@@ -65,10 +65,13 @@ post_install() {
 post_upgrade() {
 	# End the helper the previous version left running.
 	#
-	# porthole-helper has no idle timeout and no last-rule-closed shutdown
-	# (crates/porthole-helper/src/netmon.rs says so outright): once the bus
-	# has activated it, it runs until something stops it. Nothing else on
-	# this distribution is that something. pre_remove does not run on an
+	# porthole-helper retires itself -- with no rule open and nothing in
+	# flight it gives up the bus name and exits after five minutes
+	# (crates/porthole-helper/src/retire.rs) -- so on the ordinary machine
+	# an upgrade has no process to end and the next call starts the new
+	# binary. What is left is the machine where somebody is using porthole
+	# at that moment: an open port pins the helper for as long as it stays
+	# open, and nothing else on this distribution ends it. pre_remove does not run on an
 	# upgrade -- that is the whole point of its name -- and neither systemd
 	# pacman hook reaches the process: 30-systemd-daemon-reload-system
 	# reloads the manager, which restarts nothing, and
