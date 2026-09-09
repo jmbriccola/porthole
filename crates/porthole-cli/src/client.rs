@@ -224,6 +224,83 @@ async fn answered<T>(proxy: &PortholeProxy<'_>, outcome: zbus::Result<T>) -> Res
     }
 }
 
+/// Whether a failure is the bus saying **nobody answered**, rather than the
+/// helper saying anything at all.
+///
+/// `org.freedesktop.DBus.Error.NoReply` and nothing else. The bus daemon
+/// sends it, with the detail `Remote peer disconnected`, when the process
+/// that was going to answer a pending call went away before it did — and it
+/// is today the one failure `from_dbus` renders as *"the helper could not be
+/// reached"*, which is the worst possible sentence for a helper that is
+/// perfectly healthy and has just been replaced by a fresh instance of
+/// itself.
+///
+/// Deliberately **not** every transport failure. A `zbus::Error::InputOutput`
+/// or a closed connection is *this* process's own socket having gone, and a
+/// second call over the same proxy would fail exactly as the first did; a
+/// `MethodError` under any other name is a decision the helper made and
+/// reached us intact. Only "the peer vanished with your call outstanding" is
+/// a fact about the other end that asking again can change: the well-known
+/// name is D-Bus activated, so the second call brings up a fresh instance
+/// and is served by the owner.
+fn nobody_answered(e: &zbus::Error) -> bool {
+    matches!(
+        e,
+        zbus::Error::MethodError(name, ..)
+            if name.as_str() == "org.freedesktop.DBus.Error.NoReply"
+    )
+}
+
+/// [`answered`], plus **one** retry when nobody answered the first call.
+///
+/// This is a defect fixed in its own right, not a piece of any shutdown
+/// sequence: a helper that is restarted by a package upgrade, killed by an
+/// administrator, or lost to a crash while a call is outstanding produces
+/// exactly this error today, and `porthole` reports it as a helper it could
+/// not reach — sending a person to `porthole doctor`, to `systemctl status`
+/// and to the bus, none of which will find anything wrong.
+///
+/// **One retry, and never more.** Two calls are what a person does by hand
+/// after reading that sentence, and this makes the second one automatic; a
+/// loop would turn a helper that dies on every request into a client that
+/// hangs instead of one that reports.
+///
+/// **What the second call cannot promise, stated plainly.** `NoReply` means
+/// the reply was lost, not that the request was: a first `open` that took
+/// effect and then lost its reply is answered by the retry with
+/// `AlreadyOpen`, and a first `close` the same way with `RuleNotFound`. That
+/// is not a regression — it is precisely what the person re-running the
+/// command by hand gets today — and in both cases the message describes the
+/// state the machine is actually in. `close --all` is the one where the
+/// second answer is *quieter* than the truth (an empty list, because the
+/// first call had already closed everything), and it is quieter in exactly
+/// the same way for the hand-run second command.
+async fn answered_after_one_retry<T, F, Fut>(proxy: &PortholeProxy<'_>, call: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = zbus::Result<T>>,
+{
+    answered(proxy, once_more_if_nobody_answered(call).await).await
+}
+
+/// The retry itself, with no proxy and no classification in it, so what it
+/// decides is testable without a bus: `call` once, and exactly once more if
+/// the first attempt found [`nobody_answered`].
+///
+/// Whatever the second attempt says is the answer, including a second
+/// `NoReply` — a helper that dies on every request must report, not be asked
+/// forever.
+async fn once_more_if_nobody_answered<T, F, Fut>(mut call: F) -> zbus::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = zbus::Result<T>>,
+{
+    match call().await {
+        Err(e) if nobody_answered(&e) => call().await,
+        first => first,
+    }
+}
+
 /// A wire rule as the local types, so the CLI's renderers are unchanged.
 ///
 /// The handle is deliberately absent from the wire, so this cannot reconstruct
@@ -301,7 +378,7 @@ pub fn open(
 ) -> Result<ManagedRule> {
     block_on(async {
         let p = proxy(session).await?;
-        let wire = answered(&p, p.open(port, protocol, scope, seconds).await).await?;
+        let wire = answered_after_one_retry(&p, || p.open(port, protocol, scope, seconds)).await?;
         to_local(&wire)
     })
 }
@@ -324,11 +401,9 @@ pub fn forward(
 ) -> Result<ManagedRule> {
     block_on(async {
         let p = proxy(session).await?;
-        let wire = answered(
-            &p,
+        let wire = answered_after_one_retry(&p, || {
             p.forward(port, protocol, scope, seconds, published_port)
-                .await,
-        )
+        })
         .await?;
         to_local(&wire)
     })
@@ -337,7 +412,7 @@ pub fn forward(
 pub fn close(session: bool, port: u16, protocol: &str) -> Result<ManagedRule> {
     block_on(async {
         let p = proxy(session).await?;
-        let wire = answered(&p, p.close(port, protocol).await).await?;
+        let wire = answered_after_one_retry(&p, || p.close(port, protocol)).await?;
         to_local(&wire)
     })
 }
@@ -345,7 +420,7 @@ pub fn close(session: bool, port: u16, protocol: &str) -> Result<ManagedRule> {
 pub fn close_by_id(session: bool, id: &str, from_timer: bool, forget: bool) -> Result<ManagedRule> {
     block_on(async {
         let p = proxy(session).await?;
-        let wire = answered(&p, p.close_by_id(id, from_timer, forget).await).await?;
+        let wire = answered_after_one_retry(&p, || p.close_by_id(id, from_timer, forget)).await?;
         to_local(&wire)
     })
 }
@@ -414,7 +489,7 @@ fn wire_error_to_local(e: WireError) -> Error {
 pub fn close_all(session: bool) -> Result<(Vec<ManagedRule>, Vec<Error>)> {
     block_on(async {
         let p = proxy(session).await?;
-        let (closed, errors) = answered(&p, p.close_all().await).await?;
+        let (closed, errors) = answered_after_one_retry(&p, || p.close_all()).await?;
         let rules = closed.iter().map(to_local).collect::<Result<Vec<_>>>()?;
         Ok((rules, errors.into_iter().map(wire_error_to_local).collect()))
     })
@@ -461,7 +536,7 @@ fn docker_port_to_local(wire: &WireDockerPort) -> Result<Published> {
 pub fn docker_ports(session: bool) -> Result<Vec<Published>> {
     block_on(async {
         let p = proxy(session).await?;
-        let wire = answered(&p, p.docker_ports().await).await?;
+        let wire = answered_after_one_retry(&p, || p.docker_ports()).await?;
         wire.iter().map(docker_port_to_local).collect()
     })
 }
@@ -609,6 +684,117 @@ mod tests {
             ExitCode::VersionMismatch
         );
         assert_eq!(ExitCode::VersionMismatch as i32, 15);
+    }
+
+    /// The error a bus daemon sends when the process that was going to answer
+    /// a pending call went away before it did. Spelled as the literal name and
+    /// the literal detail rather than built from a constant in the code under
+    /// test, because it is the wire's wording and not porthole's.
+    fn nobody_answered_error() -> zbus::Error {
+        method_error(
+            "org.freedesktop.DBus.Error.NoReply",
+            "Remote peer disconnected",
+        )
+    }
+
+    #[test]
+    fn a_helper_that_vanished_mid_call_is_the_one_failure_worth_asking_again_about() {
+        assert!(
+            nobody_answered(&nobody_answered_error()),
+            "the bus said nobody answered; asking again is what activates a fresh helper"
+        );
+
+        // The negative controls, and they are the point: everything else is
+        // either a decision the helper made and delivered intact, or this
+        // process's own socket having gone -- and a second call over the same
+        // proxy would fail exactly as the first did.
+        for (name, detail) in [
+            ("com.jacopobriccola.Porthole.AlreadyOpen", "5173/tcp"),
+            ("com.jacopobriccola.Porthole.NotAuthorized", "denied"),
+            ("com.jacopobriccola.Porthole.RuleNotFound", "no such rule"),
+            (
+                "org.freedesktop.DBus.Error.ServiceUnknown",
+                "not activatable",
+            ),
+            ("org.freedesktop.DBus.Error.AccessDenied", "refused"),
+            ("org.freedesktop.DBus.Error.Failed", "boom"),
+        ] {
+            assert!(
+                !nobody_answered(&method_error(name, detail)),
+                "{name} is an answer, not the absence of one"
+            );
+        }
+        assert!(!nobody_answered(&zbus::Error::Failure(
+            "the connection was lost".to_string()
+        )));
+        assert!(!nobody_answered(&zbus::Error::Variant(
+            zbus::zvariant::Error::Message("signature mismatch".to_string())
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_call_nobody_answered_is_made_exactly_once_more() {
+        use std::cell::Cell;
+
+        // Served on the second attempt: the whole point. A helper that has
+        // just retired is activated afresh by this very call.
+        let attempts = Cell::new(0u32);
+        let served = once_more_if_nobody_answered(|| {
+            attempts.set(attempts.get() + 1);
+            let n = attempts.get();
+            async move {
+                if n == 1 {
+                    Err(nobody_answered_error())
+                } else {
+                    Ok(7u32)
+                }
+            }
+        })
+        .await;
+        assert_eq!(served.unwrap(), 7);
+        assert_eq!(attempts.get(), 2, "one retry, and it was taken");
+
+        // Once more and never again: a helper that dies on every request has
+        // to report, not turn the client into something that keeps asking.
+        let attempts = Cell::new(0u32);
+        let gave_up = once_more_if_nobody_answered(|| {
+            attempts.set(attempts.get() + 1);
+            async { Err::<u32, _>(nobody_answered_error()) }
+        })
+        .await;
+        assert!(nobody_answered(
+            &gave_up.expect_err("both attempts found nobody")
+        ));
+        assert_eq!(attempts.get(), 2, "exactly two, not a loop");
+
+        // The negative control on the retry itself: a decision the helper
+        // made is not asked a second time. Without this, a retried `open`
+        // whose refusal was a real refusal would charge a second polkit
+        // prompt, and a retried `close --all` would report an empty second
+        // answer over a first one that had closed something.
+        let attempts = Cell::new(0u32);
+        let refused = once_more_if_nobody_answered(|| {
+            attempts.set(attempts.get() + 1);
+            async {
+                Err::<u32, _>(method_error(
+                    "com.jacopobriccola.Porthole.NotAuthorized",
+                    "denied by policy",
+                ))
+            }
+        })
+        .await;
+        assert!(refused.is_err());
+        assert_eq!(attempts.get(), 1, "an answer must not be asked for twice");
+
+        // And a first call that simply worked is one call.
+        let attempts = Cell::new(0u32);
+        let plain = once_more_if_nobody_answered(|| {
+            attempts.set(attempts.get() + 1);
+            async { Ok::<u32, zbus::Error>(1) }
+        })
+        .await;
+        assert_eq!(plain.unwrap(), 1);
+        assert_eq!(attempts.get(), 1);
     }
 
     #[test]
