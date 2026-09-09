@@ -1328,8 +1328,9 @@ async fn a_close_this_agent_cannot_read_stops_it_and_says_so_on_screen() {
     // Both remedies here, and that is the version working rather than
     // failing: this stand-in reports the *current* protocol and then sends
     // a body from before it, which is a contradiction no deployed pair can
-    // produce -- `porthole_core::ipc::SIGNATURE`'s two guards are what stop
-    // a signature moving while the number stays put. So the number is not
+    // produce -- `porthole_core::ipc::CONTRACTS` commits the version and
+    // the digest as a pair, so a signature that moved while the number
+    // stayed put is a contract no row names. So the number is not
     // evidence about which half is old, and the notice must not name one on
     // the strength of it. `a_list_this_agent_cannot_read_stops_it_instead_
     // of_listening_anyway` is where a helper really is the older half, and
@@ -1854,5 +1855,99 @@ async fn a_helper_from_before_the_version_existed_is_served_exactly_as_before() 
         "an absent version member is an answer, not a failure, and the journal records \
          which answer: {journal}"
     );
+    // And it records the answer the helper actually gave. `0` is what an
+    // absent member is *read* as, so that one comparison orders every case;
+    // no helper reports it, and a journal line saying one did sends its
+    // reader looking for a version that does not exist.
+    assert!(
+        !journal.contains("protocol 0"),
+        "no helper answers `0`; this stand-in answered nothing at all: {journal}"
+    );
+    assert!(
+        journal.contains("answers no protocol version at all"),
+        "which is what the line has to say instead: {journal}"
+    );
     assert!(agent.is_running());
+}
+
+/// A **second** upgrade in one login session is repaired like the first.
+///
+/// The bound on the self-replacement is one attempt per helper version, not
+/// one per process, and this is the case that distinguishes them. A bare
+/// "already tried once" flag survives a successful recovery: the agent that
+/// came back would carry it for the rest of the login, so the next upgrade
+/// would go unrepaired -- and the line it printed instead would assert that
+/// the installed agent is the old one, which after the first recovery it is
+/// not.
+///
+/// The no-loop property is unchanged and is asserted here too: each version
+/// buys exactly one attempt, so the last helper -- which never moves again --
+/// is not retried.
+#[tokio::test]
+async fn a_second_upgrade_in_one_session_is_repaired_like_the_first() {
+    let bus = Bus::start();
+
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let _notifications = serve_notifications(&bus, shown.clone(), 15).await;
+
+    // The first upgrade: a helper one version ahead, which never moves. The
+    // agent replaces itself once and then stops trying, exactly as
+    // `an_agent_that_is_still_the_older_half_after_replacing_itself_does_not_loop`
+    // requires.
+    let first = serve_helper(
+        &bus,
+        VersionedHelper {
+            first: PROTOCOL_VERSION + 1,
+            rest: PROTOCOL_VERSION + 1,
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+    )
+    .await;
+
+    let mut agent = Agent::start(&bus);
+    until("the agent to settle after the first upgrade", || {
+        agent.journal().contains("listening for uid").then_some(())
+    })
+    .await;
+    assert_eq!(
+        replacements(&agent.journal()),
+        1,
+        "one attempt for the first helper version: {}",
+        agent.journal()
+    );
+
+    // The second upgrade, in the same session: the helper goes away and one
+    // two versions ahead takes the name.
+    first.release_name(SERVICE).await.unwrap();
+    let _second = serve_helper(
+        &bus,
+        VersionedHelper {
+            first: PROTOCOL_VERSION + 2,
+            rest: PROTOCOL_VERSION + 2,
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+    )
+    .await;
+
+    until("the agent to try again for the newer helper", || {
+        (replacements(&agent.journal()) == 2).then_some(())
+    })
+    .await;
+
+    // And still no loop: the second attempt's own agent carries the version
+    // it was started for, so the helper that has stopped moving is not
+    // retried.
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let journal = agent.journal();
+    assert_eq!(
+        replacements(&journal),
+        2,
+        "one attempt per helper version, and this session saw two versions: {journal}"
+    );
+    assert!(
+        journal.contains("has already started itself afresh for that same helper version"),
+        "and the refusal names the version it is refusing for, rather than claiming this \
+         agent has had its one chance for the session: {journal}"
+    );
+    assert!(agent.is_running(), "{journal}");
 }

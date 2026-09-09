@@ -82,19 +82,31 @@ use std::path::{Path, PathBuf};
 /// a system-bus name owned by something else entirely.
 const AGENT_SERVICE: &str = "com.jacopobriccola.PortholeAgent";
 
-/// Set in the environment of the agent [`replace_this_agent`] starts, and
-/// read by that agent to make the replacement happen **at most once** per
-/// start.
+/// Set in the environment of the agent [`replace_this_agent`] starts, to
+/// **the helper version that prompted the replacement**, and read by that
+/// agent to bound how often it may try.
 ///
-/// Without it the pathological case loops for as long as anything keeps
+/// Without a bound the pathological case loops for as long as anything keeps
 /// starting agents: a machine whose *installed* `porthole-agent` really is
 /// older than its helper would re-execute the same old binary, find the same
 /// answer, and go round again -- a busy loop, not a slow one, since nothing
-/// in the path sleeps. The marker is what turns that into one attempt and a
-/// journal line, and `tests/session.rs`'s
+/// in the path sleeps. `tests/session.rs`'s
 /// `an_agent_that_is_still_the_older_half_after_replacing_itself_does_not_loop`
-/// is what proves it, against a helper that never stops reporting a newer
-/// version.
+/// is what proves the bound holds, against a helper that never stops
+/// reporting a newer version.
+///
+/// **A version rather than a flag**, and the difference is a real case: a
+/// bare "already tried" survives a *successful* recovery, so a second
+/// upgrade in the same login session would not be repaired -- and the
+/// journal line refusing it would assert that the installed agent is the old
+/// one, which after the first recovery it is not. Carrying the version
+/// bounds the attempts at one per helper version, which keeps the no-loop
+/// property (a helper that never moves is never retried) and repairs every
+/// upgrade that does move it.
+///
+/// A value in the environment of a session that never came from an agent
+/// disables the replacement for helpers at or below it -- an environment
+/// variable is a small surface, and this is what it does.
 const REEXECED: &str = "PORTHOLE_AGENT_REEXECED";
 
 /// How many notifications can be waiting for a click at once.
@@ -403,6 +415,14 @@ async fn main() -> std::process::ExitCode {
             // this one. Being replaced wins; the agent that took the name
             // makes this same check for itself at its own start-up.
             //
+            // A replacement started from here loses `pending`: the new image
+            // begins with an empty list, so a click on a notification that
+            // was already on screen is answered by the journal line in
+            // `on_action` rather than by an `open`. That is the same refusal
+            // an id pushed off `MAX_PENDING` gets, and it is the direction
+            // that cannot open a port nobody asked for -- against which the
+            // alternative is an agent that cannot read the helper at all.
+            //
             // A refutable pattern for the same reason the first branch has
             // one: this stream is `None` when no match rule could be
             // installed, and `next_owner` keeps that branch inert rather
@@ -523,14 +543,31 @@ async fn realign(system: &zbus::Connection) -> Option<Alignment> {
              this agent"
         ),
         Alignment::HelperIsOlder => eprintln!(
-            "porthole-agent: the helper speaks porthole's protocol {version} and this agent \
-             speaks {PROTOCOL_VERSION}, so the helper is the older half; restarting it \
-             needs privilege, so this agent carries on and says which half to restart if \
-             a message it cannot read arrives"
+            "porthole-agent: {} and this agent speaks {PROTOCOL_VERSION}, so the helper is \
+             the older half; restarting it needs privilege, so this agent carries on and \
+             says which half to restart if a message it cannot read arrives",
+            what_the_helper_said(version)
         ),
         Alignment::ThisOneIsOlder => replace_this_agent(version),
     }
     Some(alignment)
+}
+
+/// What the helper actually answered, for a journal line to report.
+///
+/// **0 is not a number any helper reports** -- `porthole_core::ipc`'s own
+/// constant says so in terms. It is what an absent member is *read* as, so
+/// that one comparison orders every case; writing it into a sentence as the
+/// helper's own answer states something no helper ever said, and sends the
+/// reader of that journal looking for a version 0 that does not exist.
+fn what_the_helper_said(version: u32) -> String {
+    if version == porthole_core::ipc::PROTOCOL_VERSION_ABSENT {
+        "the helper answers no protocol version at all, which is what a porthole helper \
+         from before this contract does"
+            .to_string()
+    } else {
+        format!("the helper speaks porthole's protocol {version}")
+    }
 }
 
 /// Start again from the binary on disk, which after a package upgrade is
@@ -544,9 +581,11 @@ async fn realign(system: &zbus::Connection) -> Option<Alignment> {
 /// half was old and guessing wrong shows a notice five times over against a
 /// helper left behind by the same upgrade.
 ///
-/// **At most once per start**, through [`REEXECED`], and that guard is not
-/// theoretical: a machine whose installed agent really is the older half
-/// answers the same way every time.
+/// **At most once per helper version**, through [`REEXECED`], and that
+/// bound is not theoretical: a machine whose installed agent really is the
+/// older half answers the same way every time. Per *version* rather than per
+/// process, so that a second upgrade in one session is repaired like the
+/// first -- see [`REEXECED`].
 ///
 /// **The path, not `/proc/self/exe`.** That symlink names the *inode*, and
 /// after an upgrade the inode is still this old binary -- re-running it
@@ -558,13 +597,14 @@ async fn realign(system: &zbus::Connection) -> Option<Alignment> {
 fn replace_this_agent(helper_version: u32) {
     use std::os::unix::process::CommandExt as _;
 
-    if std::env::var_os(REEXECED).is_some() {
+    if already_tried_for(helper_version) {
         eprintln!(
             "porthole-agent: the helper speaks porthole's protocol {helper_version} and this \
-             agent speaks {PROTOCOL_VERSION}; this agent has already started itself afresh \
-             once and is still the older half, so the porthole-agent installed here is the \
-             one from before the upgrade. Not trying again -- carrying on, and a message \
-             this agent cannot read will say so on screen"
+             agent speaks {PROTOCOL_VERSION}; an agent in this session has already started \
+             itself afresh for that same helper version and is still the older half, so the \
+             porthole-agent installed here is the one from before the upgrade. Not trying \
+             again -- carrying on, and a message this agent cannot read will say so on \
+             screen"
         );
         return;
     }
@@ -594,12 +634,34 @@ fn replace_this_agent(helper_version: u32) {
     // through `claim_session`'s own `ReplaceExisting`.
     let e = std::process::Command::new(&path)
         .args(std::env::args_os().skip(1))
-        .env(REEXECED, "1")
+        .env(REEXECED, helper_version.to_string())
         .exec();
     eprintln!(
         "porthole-agent: could not re-execute {}: {e}; carrying on as the older half",
         path.display()
     );
+}
+
+/// Whether an agent in this session has already replaced itself for a helper
+/// at least this new.
+///
+/// `>=` rather than `==`, so the bound cannot be walked around by a helper
+/// that goes *backwards*: a downgrade to a version still ahead of this build
+/// is the same unrepairable situation as the one already tried, and trying
+/// again would be the loop the marker exists to stop. A helper that moves
+/// *forward* is a new upgrade, and gets its own attempt.
+///
+/// A value that is not a number at all counts as "already tried": it did not
+/// come from [`replace_this_agent`], and guessing about it in the direction
+/// that re-executes is the direction that can loop.
+fn already_tried_for(helper_version: u32) -> bool {
+    let Ok(value) = std::env::var(REEXECED) else {
+        return false;
+    };
+    match value.trim().parse::<u32>() {
+        Ok(tried) => tried >= helper_version,
+        Err(_) => true,
+    }
 }
 
 /// Where this process's own binary is **now**, given what `current_exe`
