@@ -249,7 +249,9 @@ pub fn signature_digest(xml: &str, interface: &str) -> Result<String, String> {
         }
     }
     if lines.is_empty() {
-        return Err(format!("interface `{interface}` declares no members at all"));
+        return Err(format!(
+            "interface `{interface}` declares no members at all"
+        ));
     }
     lines.sort();
     Ok(lines.join("\n") + "\n")
@@ -1412,11 +1414,13 @@ mod tests {
             Alignment::ThisOneIsOlder,
             "a helper ahead of this build makes *this* the half to replace"
         );
-        assert!(
-            PROTOCOL_VERSION > PROTOCOL_VERSION_ABSENT,
-            "0 must stay below every version a helper can report, or an absent member \
-             would read as a helper from the future"
-        );
+        // 0 must stay below every version a helper can report, or an absent
+        // member would read as a helper from the future -- and the agent's
+        // answer to that is to replace *itself*, which would be the wrong
+        // half every time. A compile-time assertion rather than a runtime
+        // one, since both sides are constants: this way the impossible
+        // arrangement does not build.
+        const _: () = assert!(PROTOCOL_VERSION > PROTOCOL_VERSION_ABSENT);
     }
 
     #[test]
