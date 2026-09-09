@@ -26,6 +26,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use zbus::zvariant::OwnedValue;
 
+/// The session name one agent per session holds, spelled here because an
+/// integration test cannot reach into the binary's own `AGENT_SERVICE`.
+/// `crates/porthole-agent/src/main.rs` is where the real one lives; a rename
+/// there that is not made here turns the two tests below into tests of a name
+/// nothing claims.
+const AGENT_SERVICE: &str = "com.jacopobriccola.PortholeAgent";
+
 const NOTIFICATIONS_SERVICE: &str = "org.freedesktop.Notifications";
 const NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
 const NOTIFICATIONS_INTERFACE: &str = "org.freedesktop.Notifications";
@@ -262,6 +269,18 @@ impl FakeHelper {
         rule.protocol = protocol;
         rule
     }
+}
+
+/// Which connection currently holds [`AGENT_SERVICE`], as the bus reports it.
+///
+/// `None` while nobody holds it, which is an ordinary answer here: between
+/// one agent releasing the name and the next taking it there is a moment when
+/// it is unowned.
+async fn agent_name_owner(dbus: &zbus::fdo::DBusProxy<'_>) -> Option<String> {
+    dbus.get_name_owner(AGENT_SERVICE.try_into().expect("a well-formed bus name"))
+        .await
+        .ok()
+        .map(|owner| owner.to_string())
 }
 
 /// Poll until `f` answers, or give up after [`DEADLINE`].
@@ -774,12 +793,25 @@ async fn a_missing_notification_service_does_not_kill_the_agent() {
     assert!(agent.is_running(), "{}", agent.journal());
 }
 
+/// Two agents in one session leave exactly one, and it is the newer one.
+///
+/// porthole ships both a systemd user unit and an XDG autostart entry --
+/// desktops differ in which they honour, and one that honours both starts
+/// two agents. One of them has to stop.
+///
+/// **Which one changed, and why.** It used to be the second: the name went
+/// to whoever got there first and a later agent found it taken and exited.
+/// After an upgrade that meant the *stale* agent kept the name -- the user
+/// bus outlives a login session -- so every newly started agent exited,
+/// `systemctl --user restart` could not help (the stale process is not the
+/// unit's), and the user got no notifications at all with nothing but a
+/// journal line to say so. So the newer agent takes the name now.
+///
+/// What has not changed is what this test is really for: one close, one
+/// notification. Two live agents would announce every close twice, and that
+/// is the thing the name exists to prevent.
 #[tokio::test]
-async fn a_second_agent_in_one_session_stops_instead_of_doubling_every_notice() {
-    // porthole ships both a systemd user unit and an XDG autostart entry --
-    // desktops differ in which they honour, and one that honours both would
-    // start two agents. The second must stop, and the first must be left
-    // alone doing its job.
+async fn a_newer_agent_takes_the_name_and_the_older_one_stops() {
     let bus = Bus::start();
     let uid = our_uid();
 
@@ -818,28 +850,69 @@ async fn a_second_agent_in_one_session_stops_instead_of_doubling_every_notice() 
         .await
         .unwrap();
 
+    // The bus's own view of who owns the name, which is the fact this test
+    // is about. Read from a third connection rather than inferred from
+    // either agent's journal: a flag passed to `RequestName` proves nothing
+    // about who ended up with the name.
+    let watcher = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let dbus = zbus::fdo::DBusProxy::new(&watcher).await.unwrap();
+
     let mut first = Agent::start(&bus);
     until("the first agent to start listening", || {
         first.journal().contains("listening for uid").then_some(())
     })
     .await;
+    let first_owner = agent_name_owner(&dbus)
+        .await
+        .expect("the first agent owns the name once it is listening");
 
     let mut second = Agent::start(&bus);
-    let status = until("the second agent to exit", || {
-        second.child.try_wait().expect("waitable")
+
+    // The name changed hands. Not "the second is running" and not "the first
+    // said something": the unique connection behind AGENT_SERVICE is a
+    // different one than it was.
+    let deadline = std::time::Instant::now() + DEADLINE;
+    let second_owner = loop {
+        match agent_name_owner(&dbus).await {
+            Some(owner) if owner != first_owner => break owner,
+            _ => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out: the name never changed hands (still {first_owner}). \
+                     first: {} second: {}",
+                    first.journal(),
+                    second.journal()
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    assert_ne!(first_owner, second_owner);
+
+    let status = until("the older agent to exit", || {
+        first.child.try_wait().expect("waitable")
     })
     .await;
     assert!(
         status.success(),
-        "a second agent is an ordinary thing to be, not a failure: {status:?}"
+        "being replaced is an ordinary thing to happen, not a failure: {status:?}"
     );
     assert!(
-        second.journal().contains("already has an agent"),
+        first.journal().contains("a newer agent took"),
         "it must say why it stopped: {}",
+        first.journal()
+    );
+    assert!(
+        second.is_running(),
+        "the agent that took the name must be the one left: {}",
         second.journal()
     );
 
-    // One close, one notification -- not two.
+    // One close, one notification -- not two. The point of the name.
     helper
         .emit_signal(
             None::<()>,
@@ -853,7 +926,87 @@ async fn a_second_agent_in_one_session_stops_instead_of_doubling_every_notice() 
     until("a notification", || shown.lock().unwrap().first().cloned()).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(shown.lock().unwrap().len(), 1);
-    assert!(first.is_running());
+    assert!(second.is_running());
+}
+
+/// The one case replacement cannot fix, and the one this defect was
+/// reported from: a holder that will not give the name up.
+///
+/// `ReplaceExisting` only takes a name from an owner that asked for
+/// `AllowReplacement`. Every agent of this version does; an agent from
+/// before this change did not -- so the first upgrade past it still meets a
+/// stale agent that keeps the name. What must not happen again is that the
+/// user finds out from the journal or not at all.
+///
+/// The squatter here is this test's own connection, holding the name without
+/// offering replacement: exactly the pre-upgrade agent's request, made by
+/// forty lines of test code instead of an old binary.
+#[tokio::test]
+async fn an_agent_that_cannot_take_the_name_says_so_on_screen_not_only_in_the_journal() {
+    let bus = Bus::start();
+
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let _notifications = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(NOTIFICATIONS_SERVICE)
+        .unwrap()
+        .serve_at(
+            NOTIFICATIONS_PATH,
+            FakeNotifications {
+                shown: shown.clone(),
+                id: 11,
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let squatter = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let reply = squatter
+        .request_name_with_flags(
+            AGENT_SERVICE,
+            zbus::fdo::RequestNameFlags::DoNotQueue.into(),
+        )
+        .await
+        .expect("the name is free");
+    assert_eq!(
+        reply,
+        zbus::fdo::RequestNameReply::PrimaryOwner,
+        "the squatter has to actually hold the name for this test to mean anything"
+    );
+
+    let mut agent = Agent::start(&bus);
+    let status = until("the agent to give up", || {
+        agent.child.try_wait().expect("waitable")
+    })
+    .await;
+    assert!(
+        status.success(),
+        "giving up is not a failure a service manager should restart: {status:?}"
+    );
+
+    let notice = until("the notice", || shown.lock().unwrap().first().cloned()).await;
+    assert!(
+        notice.summary.to_lowercase().contains("porthole"),
+        "a notification with no porthole in it says nothing about porthole: {notice:?}"
+    );
+    assert!(
+        notice.body.contains("older") && notice.body.contains("upgrade"),
+        "the notice has to name the likely cause, or it is not actionable: {notice:?}"
+    );
+    assert!(
+        notice.actions.is_empty(),
+        "no button: the agent is gone by the time anyone could click one: {notice:?}"
+    );
+    assert!(
+        !agent.journal().is_empty(),
+        "the journal line stays too -- the notice is in addition to it, not instead"
+    );
 }
 
 #[tokio::test]

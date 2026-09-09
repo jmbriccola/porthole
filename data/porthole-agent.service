@@ -19,9 +19,11 @@ ExecStart=/usr/local/bin/porthole-agent
 # failure this binary must survive -- a session with no notification service
 # -- it survives by carrying on rather than by exiting. Every reason it stops
 # at start-up exits 0: no session bus, no system bus, no notification
-# interface, or a second agent already holding
-# com.jacopobriccola.PortholeAgent. The unit therefore stays stopped and is
-# never marked failed, and a headless login does not loop.
+# interface, or com.jacopobriccola.PortholeAgent held by something that will
+# not give it up. So does being replaced by a newer agent, which is not a
+# failure at all: restarting there would take the name straight back and the
+# two would trade it. The unit therefore stays stopped and is never marked
+# failed, and a headless login does not loop.
 #
 # The single non-zero exit is the system bus connection ending while the
 # agent is running. It cannot rebuild that connection from inside its own
@@ -41,9 +43,11 @@ RestartSec=5s
 
 # porthole also ships data/porthole-agent.desktop, because desktops differ in
 # which of the two they honour. A desktop that honours both starts two
-# agents; the second finds the bus name taken, says so, and exits, so this
-# unit and that file can both be installed without every close being
-# announced twice.
+# agents; the one started last takes the bus name and the other stops, so
+# this unit and that file can both be installed without every close being
+# announced twice. Last rather than first, so that `systemctl --user restart`
+# after a package upgrade replaces the agent that is running instead of
+# exiting into it.
 #
 # No hardening directives: the agent reads two buses and writes nothing. The
 # privileged half is porthole-helper.service, which carries its own.

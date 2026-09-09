@@ -225,6 +225,38 @@ pub trait Notifications {
     fn notification_closed(&self, id: u32, reason: u32) -> zbus::Result<()>;
 }
 
+/// What to say when this agent could not take the session name and so is not
+/// going to announce anything.
+///
+/// On screen rather than only in the journal, and that is the whole point of
+/// it. The failure it reports is silent by construction: the agent exits, the
+/// unit is `inactive (dead)` as it would be after any ordinary start-up
+/// refusal, and nothing closes or misbehaves -- ports still open and close on
+/// time, they are simply announced by whatever holds the name, if it still
+/// can. A user found out by opening the journal, which is not a thing anyone
+/// does unprompted.
+///
+/// **What is actually known**, and the wording says no more: some other
+/// connection holds the name and would not give it up. An agent of this
+/// version always gives it up -- that is what `AllowReplacement` in
+/// `claim_session` means -- so the holder is not one, and an older one left
+/// running is by far the likeliest thing it is. "Most likely" and not "is":
+/// nothing here has asked the bus who owns the name.
+///
+/// No action button. The agent shows this on its way out, so there would be
+/// nobody left to answer a click.
+pub fn stale_agent_notice() -> Notification {
+    Notification {
+        summary: "Porthole notifications did not start".to_string(),
+        body: "Another process already holds porthole's session name and would not give \
+               it up. A current porthole-agent always would, so this is most likely an \
+               older one still running from before an upgrade. Log out and back in, or \
+               stop that process, to get notifications again."
+            .to_string(),
+        actions: Vec::new(),
+    }
+}
+
 /// Show one, and hand back the id the server gave it.
 ///
 /// The id is what ties a later `ActionInvoked` back to the rule this was

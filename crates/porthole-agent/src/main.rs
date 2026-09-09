@@ -13,11 +13,16 @@
 //! remembers is which notification was about which rule, so a `Reopen` click
 //! has something to re-send (see [`Pending`]).
 //!
-//! It does own one session-bus name, and only to refuse to be started twice.
-//! porthole ships both a systemd user unit and an XDG autostart entry,
-//! because desktops differ in which they honour, and a desktop that honours
-//! both would otherwise show every close twice. Whichever copy loses the
-//! name says so and exits.
+//! It does own one session-bus name, and only so that a session never has two
+//! agents at once. porthole ships both a systemd user unit and an XDG
+//! autostart entry, because desktops differ in which they honour, and a
+//! desktop that honours both would otherwise show every close twice.
+//!
+//! The name goes to the agent started **last**: each one asks for it with
+//! replacement allowed and takes it from whoever holds it, and the one that
+//! loses it stops. That is what makes `systemctl --user restart` mean
+//! something after an upgrade -- see [`claim_session`], which is also where
+//! the one case that cannot be taken over is handled, and said out loud.
 //!
 //! # Order of operations at start-up, and why it is that order
 //!
@@ -37,14 +42,17 @@
 //! original request with the original duration -- an `open` for a rule that
 //! permitted and a `forward` for one that redirected, which are two different
 //! methods and not two spellings of one -- and a bus with no notification
-//! service at all leaves the process running. What none of that touches is a
+//! service at all leaves the process running. Two of them are about the name:
+//! a second agent takes it from the first, which the bus is asked about
+//! rather than either agent's journal, and one that meets a holder refusing
+//! to yield puts a notice on the screen. What none of that touches is a
 //! real notification daemon (the stand-in answers `Notify` and emits
 //! `ActionInvoked`, it does not draw anything), the real helper, or polkit --
 //! so "the prompt appears and the port comes back" is not covered by any test
 //! in this repository.
 //!
-//! The start-up ordering above is not covered either. All three tests bring
-//! their stand-in helper up before the agent, so none of them exercises an
+//! The start-up ordering above is not covered either. Every test there that
+//! stands a helper up does so before the agent, so none of them exercises an
 //! agent whose subscription is what the helper is started into, and nothing
 //! here would fail if that ordering were reversed.
 //!
@@ -62,10 +70,10 @@ use notify::{NotificationsProxy, REOPEN};
 use porthole_core::ipc::{PortholeProxy, WireRule};
 
 /// The session-bus name one agent per session holds. Not an interface: this
-/// process serves nothing, and the name exists only so a second copy can
-/// discover it is a second copy. Deliberately not the helper's own
-/// `com.jacopobriccola.Porthole`, which is a system-bus name owned by
-/// something else entirely.
+/// process serves nothing, and the name exists only so that a session's
+/// agents can settle which of them is the agent -- see [`claim_session`].
+/// Deliberately not the helper's own `com.jacopobriccola.Porthole`, which is
+/// a system-bus name owned by something else entirely.
 const AGENT_SERVICE: &str = "com.jacopobriccola.PortholeAgent";
 
 /// How many notifications can be waiting for a click at once.
@@ -105,18 +113,25 @@ enum Ended {
     SystemBus,
     /// The session bus went away, which is the session itself ending.
     SessionBus,
+    /// A newer agent took [`AGENT_SERVICE`]. Not a failure and not a loss:
+    /// one agent still owns the name and announces closes, and it is the
+    /// other one. See [`claim_session`].
+    Replaced,
 }
 
 impl Ended {
-    /// `1` for a lost system bus, `0` for a lost session bus.
+    /// `1` for a lost system bus, `0` for the two that are not failures.
     ///
-    /// These must not collapse to one value: `Restart=on-failure` in
+    /// `SystemBus` must not collapse into the others: `Restart=on-failure` in
     /// `data/porthole-agent.service` is what brings a new agent after a lost
-    /// system bus, and it can only tell the two apart by this number.
+    /// system bus, and it can only tell them apart by this number. Restarting
+    /// after `Replaced` would be worse than useless -- the new agent would
+    /// take the name back from the one that just took it, and the two would
+    /// trade it for as long as the start limit allowed.
     fn exit_code(self) -> u8 {
         match self {
             Ended::SystemBus => 1,
-            Ended::SessionBus => 0,
+            Ended::SessionBus | Ended::Replaced => 0,
         }
     }
 
@@ -127,6 +142,10 @@ impl Ended {
                  service manager starts a new agent"
             }
             Ended::SessionBus => "the session bus connection ended; stopping",
+            Ended::Replaced => {
+                "a newer agent took this session's agent name; stopping so closes are not \
+                 announced twice"
+            }
         }
     }
 }
@@ -135,10 +154,13 @@ impl Ended {
 ///
 /// Every start-up failure below exits `SUCCESS`. None of them is a
 /// condition a restart could change -- no session bus, no system bus, no
-/// notification interface, or a second agent already holding
-/// [`AGENT_SERVICE`] -- so the unit stays stopped rather than looping. The
-/// same goes for the session bus ending: that is the session itself going
-/// away, and there is no screen left to notify.
+/// notification interface, no way to watch for a replacement, or
+/// [`AGENT_SERVICE`] held by something that will not yield it -- so the unit
+/// stays stopped rather than looping. The same goes for the session bus
+/// ending: that is the session itself going away, and there is no screen
+/// left to notify. And for being replaced by a newer agent, which is a
+/// success in the plainest sense: the job is being done, by the process that
+/// took over.
 ///
 /// Losing the **system** bus mid-run is the one case that exits `FAILURE`.
 /// The agent cannot rebuild that connection from inside its own loop, and
@@ -157,8 +179,12 @@ async fn main() -> std::process::ExitCode {
             return std::process::ExitCode::SUCCESS;
         }
     };
-    // First, and before anything is woken or subscribed to: a second agent
-    // in one session would show every close twice.
+    // Before the claim, not after: see `watch_for_replacement`.
+    let Some(mut replaced) = watch_for_replacement(&session).await else {
+        return std::process::ExitCode::SUCCESS;
+    };
+    // First, and before anything is woken or subscribed to: two agents in
+    // one session would show every close twice.
     if !claim_session(&session).await {
         return std::process::ExitCode::SUCCESS;
     }
@@ -263,6 +289,23 @@ async fn main() -> std::process::ExitCode {
                     pending.len()
                 );
                 pending.clear();
+            }
+            // Ahead of the three below on purpose. A newer agent has the
+            // name and is about to be subscribed to the same signals; from
+            // this point on, anything this process announces is announced
+            // twice. Stopping first can leave a close announced by neither
+            // -- see `claim_session` for why that is the direction chosen.
+            //
+            // The bus sends `NameLost` only to the connection that lost the
+            // name, and this connection asked for one name, so there is
+            // nothing here to filter.
+            lost = replaced.next() => {
+                match lost {
+                    Some(_) => break Ended::Replaced,
+                    // The stream is on the session connection, so its end is
+                    // that connection's end.
+                    None => break Ended::SessionBus,
+                }
             }
             close = closes.next() => {
                 let Some(signal) = close else {
@@ -510,40 +553,120 @@ fn original_duration(rule: &WireRule) -> u32 {
     u32::try_from(rule.expires_at.saturating_sub(rule.opened_at)).unwrap_or(u32::MAX)
 }
 
-/// Take the session-bus name that means "this session already has an agent",
-/// or report that somebody else has it.
+/// Watch for this connection losing [`AGENT_SERVICE`] to somebody else.
 ///
-/// `DoNotQueue` rather than the default: a second agent must find out now and
-/// stop, not sit in a queue waiting to inherit the name if the first one ever
-/// exits, quietly turning into a live second agent later.
+/// Created **before** [`claim_session`] requests the name, which is
+/// `Connection::request_name_with_flags`'s own documented caveat: a
+/// `NameLost` emitted between the request and the stream's creation is one
+/// this process never sees.
 ///
-/// Anything other than becoming the primary owner is a reason to stop, and
-/// that includes a bus that refuses the request outright -- there is no
-/// reading of either outcome under which starting a second notifier is the
-/// better answer.
+/// An agent that cannot watch for this must not start at all. It would be
+/// replaceable and unable to notice it had been replaced, which is a live
+/// second agent announcing every close twice -- the one thing the name exists
+/// to prevent.
+async fn watch_for_replacement(session: &zbus::Connection) -> Option<zbus::fdo::NameLostStream> {
+    let dbus = zbus::fdo::DBusProxy::new(session)
+        .await
+        .inspect_err(|e| eprintln!("porthole-agent: could not bind the bus's own interface: {e}"))
+        .ok()?;
+    dbus.receive_name_lost()
+        .await
+        .inspect_err(|e| {
+            eprintln!(
+                "porthole-agent: could not watch for a newer agent taking {AGENT_SERVICE}, and \
+                 an agent that cannot notice it was replaced would announce every close \
+                 twice; stopping: {e}"
+            )
+        })
+        .ok()
+}
+
+/// Take the session-bus name that means "this session's agent is this one",
+/// taking it from an older agent if one holds it.
+///
+/// **`ReplaceExisting` and `AllowReplacement`, added after an upgrade left a
+/// user with no notifications at all.** An agent from a previous login held
+/// the name -- the user bus outlives a login session, so it can -- and every
+/// agent started since, including the one `systemctl --user restart` started,
+/// found the name taken and exited. `restart` could not help: the stale
+/// process is not the unit's, so systemd had nothing to stop. The failure was
+/// silent, and the running agent was the one from before the upgrade.
+///
+/// That agent was not merely redundant, it was deaf, which is why the user
+/// saw nothing at all rather than one notification per close. `RuleClosed`
+/// carries a [`WireRule`], and the forward feature added three members to it:
+/// the body's signature went from `((sqssssttu)s)` to `((sqssssttusqq)s)`,
+/// and zbus refuses the whole signal on a signature mismatch. Measured, not
+/// inferred -- a message built with the current type and read with the old
+/// one answers `Signature mismatch: got ((sqssssttusqq)s), expected
+/// ((sqssssttu)s)`, and this binary's own loop drops a signal whose `args()`
+/// fails. So a stale agent holding the name announces nothing whatsoever.
+///
+/// So the newer agent wins. `AllowReplacement` is the half that matters next
+/// time: it is what lets the agent after this one take the name from it, and
+/// an agent that did not offer it would recreate exactly the situation above.
+/// `ReplaceExisting` only works against an owner that offered replacement, so
+/// it cannot take the name from a pre-upgrade agent -- that case is the
+/// `NameTaken` arm below, which is why that arm now puts something on the
+/// screen instead of a line in a journal nobody reads.
+///
+/// Exactly one agent still owns the name at any moment, so the double
+/// announcement the name exists to prevent is still excluded. What replacing
+/// costs is a moment: the replaced agent stops when its `NameLost` arrives,
+/// and the newer one subscribes to the helper's signals just after taking the
+/// name, so a close falling between the two is announced by neither. That
+/// direction is the deliberate one -- the alternative order overlaps the two
+/// agents' subscriptions instead, and announces some closes twice.
+///
+/// `DoNotQueue` for the reason it was always here: an agent that cannot have
+/// the name must find out now and stop, not sit in a queue and quietly turn
+/// into a live second agent later.
 async fn claim_session(session: &zbus::Connection) -> bool {
     use zbus::fdo::{RequestNameFlags, RequestNameReply};
-    match session
-        .request_name_with_flags(AGENT_SERVICE, RequestNameFlags::DoNotQueue.into())
-        .await
-    {
+    let flags = RequestNameFlags::AllowReplacement
+        | RequestNameFlags::ReplaceExisting
+        | RequestNameFlags::DoNotQueue;
+    match session.request_name_with_flags(AGENT_SERVICE, flags).await {
         Ok(RequestNameReply::PrimaryOwner) => true,
         // Measured rather than assumed: with `DoNotQueue`, this zbus reports
         // a name somebody else holds as `Error::NameTaken` and not as one of
         // the other replies. Both readings say the same thing, so both are
         // handled here rather than one of them falling through to the
         // catch-all below and being reported as a bus failure.
+        //
+        // With `ReplaceExisting` above, reaching this arm means the holder
+        // refused to be replaced -- so it is not an agent of this version,
+        // and the user is about to have no notifications without being told.
+        // Hence the notice: see `notify::stale_agent_notice`.
         Ok(_) | Err(zbus::Error::NameTaken) => {
             eprintln!(
-                "porthole-agent: this session already has an agent ({AGENT_SERVICE} is taken); \
-                 stopping so closes are not announced twice"
+                "porthole-agent: {AGENT_SERVICE} is held by something that will not give it \
+                 up, so this agent is stopping; a porthole-agent of this version would have \
+                 yielded, so that is most likely an older one still running"
             );
+            announce_stale_agent(session).await;
             false
         }
         Err(e) => {
             eprintln!("porthole-agent: could not claim {AGENT_SERVICE}, so stopping: {e}");
             false
         }
+    }
+}
+
+/// Put [`notify::stale_agent_notice`] on the screen, if there is a screen.
+///
+/// Best effort by construction: this runs while the agent is giving up, and
+/// a session with no notification service is exactly the session where the
+/// journal line above is all there can be. Failing to show it must not turn
+/// a quiet stop into a noisy one.
+async fn announce_stale_agent(session: &zbus::Connection) {
+    let shown = match NotificationsProxy::new(session).await {
+        Ok(proxy) => notify::show(&proxy, &notify::stale_agent_notice()).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = shown {
+        eprintln!("porthole-agent: and could not say so on screen either: {e}");
     }
 }
 
@@ -565,6 +688,11 @@ mod tests {
         // agent every time they log out.
         assert_eq!(Ended::SystemBus.exit_code(), 1);
         assert_eq!(Ended::SessionBus.exit_code(), 0);
+        // And being replaced is not a failure either. `on-failure` here would
+        // start an agent that takes the name straight back from the one that
+        // just took it, and the two would trade it until the start limit
+        // stopped them.
+        assert_eq!(Ended::Replaced.exit_code(), 0);
     }
 
     #[test]
@@ -572,6 +700,14 @@ mod tests {
         // The journal line is the only record of why an agent stopped.
         assert!(Ended::SystemBus.reason().contains("system bus"));
         assert!(Ended::SessionBus.reason().contains("session bus"));
+        // This one lost no bus, and must not read as though it had: the
+        // agent is fine, it simply is not the session's agent any more.
+        let replaced = Ended::Replaced.reason();
+        assert!(replaced.contains("newer agent"), "{replaced}");
+        assert!(
+            !replaced.contains("bus connection ended"),
+            "a replaced agent's connections are both alive: {replaced}"
+        );
     }
 
     /// An arbitrary but fixed opening time, so a duration in a check below

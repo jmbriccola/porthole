@@ -80,7 +80,7 @@ yourself.
 | `data/icons/hicolor/symbolic/apps/com.jacopobriccola.Porthole-symbolic.svg` | `/usr/share/icons/hicolor/symbolic/apps/` | The single-colour variant the same spec expects alongside the full-colour icon, used in menus, lists and high-contrast themes rather than shown standalone. |
 | `target/release/porthole-agent` (built, not in `data/`) | `/usr/local/bin/porthole-agent` (a packaged install may instead use `/usr/bin/porthole-agent`) | The session agent: it listens on the system bus for the helper's `RuleClosed` signal and turns each one into a desktop notification. Nothing reads this path back the way the helper reads the CLI's, but the systemd unit below names it absolutely: install it here, or change that unit's `ExecStart=` to wherever you put it. The autostart entry needs no such edit — a desktop entry's `Exec=` is looked up on `$PATH`. |
 | `data/porthole-agent.service` | `/usr/lib/systemd/user/` | The systemd **user** unit for the agent — user, not system: one agent per logged-in session, running as that user, because a notification goes to a session and not to a machine. `WantedBy=graphical-session.target` is what starts it, so it needs enabling once per user (`systemctl --user enable porthole-agent.service`), unlike the helper, which nothing has to enable. |
-| `data/porthole-agent.desktop` | `/etc/xdg/autostart/` | The same job for desktops that start session services from XDG autostart rather than through systemd. Both are shipped on purpose: desktops differ in which they honour, and one that honours both starts two agents — the second finds the agent's session bus name already taken and exits, so installing both never doubles a notification. |
+| `data/porthole-agent.desktop` | `/etc/xdg/autostart/` | The same job for desktops that start session services from XDG autostart rather than through systemd. Both are shipped on purpose: desktops differ in which they honour, and one that honours both starts two agents — the one started last takes the agent's session bus name and the other stops, so installing both never doubles a notification. |
 | `data/com.jacopobriccola.Porthole.metainfo.xml` | `/usr/share/metainfo/` | AppStream metadata: what a software centre (GNOME Software, KDE Discover) reads for the name, summary, description and screenshot it shows *before* anyone has installed anything. Without this file the desktop entry above still makes the app launchable once installed, but a software centre listing it has nothing to show beside a bare name. |
 
 These paths mirror where `firewalld` — one of the three firewalls porthole
@@ -197,11 +197,26 @@ is looked up on `$PATH`.
 **Both start files, on purpose.** Desktops differ in which of the two they
 honour, and there is no way to tell from here which yours does. A desktop
 that honours only one starts one agent; a desktop that honours both starts a
-second, which finds the session bus name
-`com.jacopobriccola.PortholeAgent` already taken, says so in the journal and
-exits — so installing both does not announce every close twice. If you know
-your desktop starts XDG autostart entries and not user units, the
-`systemctl --user enable` above is redundant rather than wrong.
+second, which takes the session bus name `com.jacopobriccola.PortholeAgent`
+from the first, whereupon the first stops — so installing both does not
+announce every close twice. If you know your desktop starts XDG autostart
+entries and not user units, the `systemctl --user enable` above is redundant
+rather than wrong.
+
+**The name goes to the agent started last**, which is what makes
+`systemctl --user restart porthole-agent.service` work after a package
+upgrade. The user bus outlives a login session, so an agent from a previous
+login can still be running and still holding the name; before this, every
+newly started agent found the name taken and exited, and `restart` could not
+help — the stale process is not the unit's, so systemd had nothing to stop.
+The result was an upgrade that silently left the old agent in charge.
+
+One case that cannot be taken over remains, and it is the last time you
+should see it: an agent from *before* this change does not offer its name for
+replacement, so the first restart after upgrading past it still meets a
+holder that will not yield. That agent now says so on the screen rather than
+only in the journal — "Porthole notifications did not start" — and logging
+out and back in clears it for good.
 
 `WantedBy=graphical-session.target` is what starts the unit, so whether
 `enable` alone is enough depends on your desktop actually reaching that
@@ -214,9 +229,12 @@ no screen.
 ending while the agent is running. The agent cannot rebuild it, so closes
 would otherwise stop being announced with nothing to show anything had gone
 wrong. Every other reason the agent stops exits 0 on purpose — no session
-bus, no system bus at start-up, no notification service, or a second agent
-already holding the bus name — so the unit stays stopped rather than looping,
-and a headless login does not fight systemd's start limit. That also bounds
+bus, no system bus at start-up, no notification service, a holder of the bus
+name that will not yield it, or a newer agent taking that name — so the unit
+stays stopped rather than looping, and a headless login does not fight
+systemd's start limit. The last of those is why the restart must not happen:
+a replaced agent that came back would take the name straight off the agent
+that replaced it, and the two would trade it. That also bounds
 the restart itself: a replacement agent that still finds no system bus fails
 during start-up, which exits 0, and `on-failure` does not restart a success.
 
@@ -231,6 +249,18 @@ Expect `porthole-agent: listening for uid <your uid>`. For an end-to-end
 check, `porthole open 5173 --for 70s` and wait: the notification appears when
 the expiry timer closes the port, and the journal above records either the
 notification the agent sent or the reason it could not show one.
+
+On a desktop that honours **both** start files, `status` can say
+`inactive (dead)` while notifications work perfectly well: the two agents
+start moments apart, the later one takes the name, and the earlier one stops
+with a success status, which is what keeps the unit from restarting into a
+tug of war. Its journal says `a newer agent took this session's agent name`.
+Which unit the survivor belongs to is a race, so `status` on the unit is not
+the question to ask; who owns the name is:
+
+```bash
+busctl --user status com.jacopobriccola.PortholeAgent
+```
 
 ### From a package: notifications start at the next login
 

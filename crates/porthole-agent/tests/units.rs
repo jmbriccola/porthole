@@ -44,10 +44,11 @@ fn the_user_unit_is_started_by_the_graphical_session_and_restarted_only_on_failu
     );
 
     // Never `Restart=always`. Every start-up failure exits 0 on purpose --
-    // no session bus, no system bus, a second agent already holding the
-    // name -- so that the unit stays stopped instead of looping. `always`
-    // would restart those too, which is exactly the headless-login loop the
-    // exit statuses are arranged to avoid.
+    // no session bus, no system bus, a holder of the name that will not
+    // yield it -- and so does being replaced by a newer agent, so that the
+    // unit stays stopped instead of looping. `always` would restart those
+    // too: the headless-login loop the exit statuses are arranged to avoid,
+    // and a pair of agents trading the name between them.
     assert!(
         !directives.contains(&"Restart=always"),
         "`always` restarts the exits that are deliberately 0: {directives:?}"
