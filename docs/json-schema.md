@@ -614,3 +614,14 @@ and `io_error` are distinct kinds locally, but both collapse into the same
 `unexpected` kind once they cross the bus, since the helper's own error type
 has no request-specific meaning worth distinguishing on the wire for either
 one.
+
+One kind belongs to neither side and can only ever appear over the bus:
+`version_mismatch`, exit code 15. It is not a failure the helper reported —
+the helper answered, and this `porthole` could not read the answer, because
+the two are built against different shapes of the same wire type. No retry
+clears it; one of the two binaries has to be replaced, and `message` names
+which one whenever the helper is new enough to say (it reports the version of
+the interface it speaks; one from before that member says nothing, which is
+itself the answer that it is the older half). It says nothing about whether
+the request took effect: `porthole list` reads the state file the helper
+writes, and is what settles that.

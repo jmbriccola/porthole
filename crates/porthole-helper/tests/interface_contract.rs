@@ -27,8 +27,18 @@
 //! interface's doc comments contain `--`.
 //!
 //! Nothing here touches this machine's real buses, no firewall is read or
-//! written, and the object is never asked to do anything: `Introspect` is
-//! answered by zbus itself.
+//! written, and the object is never asked to do anything beyond answering
+//! its own version: `Introspect` is answered by zbus itself.
+//!
+//! Three of the four tests below serve the object under a probe name of
+//! their own, the rule every test binary in this crate follows. The fourth
+//! claims `com.jacopobriccola.Porthole` itself, and has to: the function it
+//! exercises -- `porthole_core::ipc::read_protocol_version`, which is what
+//! every component actually calls -- asks for that name by default, and the
+//! three answers it can get are distinguished by who owns it. The bus is
+//! this binary's own private one, so the name is nobody else's here, and the
+//! three answers are one test rather than three so that they cannot race
+//! each other for it.
 
 mod common;
 
@@ -180,5 +190,92 @@ async fn a_client_that_disagrees_about_every_other_type_still_reads_the_version(
         stale.protocol_version().await.unwrap(),
         PROTOCOL_VERSION,
         "the one member a mismatched pair still has to agree on"
+    );
+}
+
+/// A helper with none of this: the interface as it stood before the version
+/// member existed, which is every helper installed today.
+struct HelperFromBeforeVersions;
+
+#[zbus::interface(name = "com.jacopobriccola.Porthole1")]
+impl HelperFromBeforeVersions {
+    async fn list(&self) -> Vec<porthole_core::ipc::WireRule> {
+        Vec::new()
+    }
+}
+
+/// [`porthole_core::ipc::read_protocol_version`] itself -- the function
+/// every component calls -- against the three answers it can get, over a
+/// real bus.
+///
+/// **One test for all three, and it claims the production name.** The three
+/// answers are distinguished by *who owns
+/// `com.jacopobriccola.Porthole`*, which is what that function asks for by
+/// default, so they cannot be separate tests in one binary without racing
+/// each other for the name. The bus is this binary's own private one (see
+/// `tests/common`), so the name is nobody else's here.
+#[tokio::test]
+async fn the_three_answers_a_version_read_can_get_are_told_apart() {
+    let client = common::connect().await;
+
+    // Nothing owns the name and nothing can be activated to it: a machine
+    // where porthole is not installed. This must stay an error -- reading it
+    // as version 0 would turn "not installed" into "out of date", and the
+    // agent goes on listening for the first and says something about the
+    // second.
+    let absent = porthole_core::ipc::read_protocol_version(&client)
+        .await
+        .expect_err("nothing owns the helper's name on this bus");
+    assert!(
+        !porthole_core::ipc::is_undecodable(&absent),
+        "and it is not a decode failure either: {absent}"
+    );
+
+    // A helper from before the member existed. Its answer -- `UnknownMethod`
+    // from zbus's own object server -- is information, not a failure.
+    let old = common::builder()
+        .name(porthole_core::ipc::SERVICE)
+        .unwrap()
+        .serve_at(PATH, HelperFromBeforeVersions)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(
+        porthole_core::ipc::read_protocol_version(&client)
+            .await
+            .expect("an absent member is an answer"),
+        porthole_core::ipc::PROTOCOL_VERSION_ABSENT
+    );
+    assert_eq!(
+        porthole_core::ipc::alignment(porthole_core::ipc::PROTOCOL_VERSION_ABSENT),
+        porthole_core::ipc::Alignment::HelperIsOlder
+    );
+    old.release_name(porthole_core::ipc::SERVICE)
+        .await
+        .expect("and gives the name back");
+
+    // And the real object, which answers with the constant.
+    let state = TempDir::new().unwrap();
+    let bus = common::connect().await;
+    let service = Porthole::new(
+        Box::new(Arc::new(AlwaysAllow::default())),
+        bus,
+        state.path().join("state.json"),
+        std::path::PathBuf::from(CLI_CANDIDATES[0]),
+    );
+    let _current = common::builder()
+        .name(porthole_core::ipc::SERVICE)
+        .unwrap()
+        .serve_at(PATH, service)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(
+        porthole_core::ipc::read_protocol_version(&client)
+            .await
+            .expect("the current helper answers"),
+        PROTOCOL_VERSION
     );
 }
