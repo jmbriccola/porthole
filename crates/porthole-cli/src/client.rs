@@ -85,6 +85,7 @@ fn from_dbus(e: zbus::Error) -> Error {
             // below is what checks the two halves against each other.
             "ForwardUnsupported" => ("forward_unsupported", ExitCode::ForwardUnsupported),
             "NotPublishedByContainer" => ("not_published_by_container", ExitCode::NotForwardable),
+            "NothingListening" => ("nothing_listening", ExitCode::NotForwardable),
             "DockerUnreadable" => ("docker_unreadable", ExitCode::NotForwardable),
             "ExternalPortInUse" => ("external_port_in_use", ExitCode::ExternalPortInUse),
             "ForwardCheckUnavailable" => (
@@ -265,6 +266,7 @@ fn static_kind(kind: &str) -> &'static str {
         "state_error" => "state_error",
         "forward_unsupported" => "forward_unsupported",
         "not_published_by_container" => "not_published_by_container",
+        "nothing_listening" => "nothing_listening",
         "docker_unreadable" => "docker_unreadable",
         "external_port_in_use" => "external_port_in_use",
         "forward_check_unavailable" => "forward_check_unavailable",
@@ -562,7 +564,8 @@ mod tests {
 
     #[test]
     fn every_refusal_a_forward_has_survives_the_bus_with_its_own_code_and_kind() {
-        // All six used to arrive as `com.jacopobriccola.Porthole.Failed`,
+        // Every one of them used to arrive as
+        // `com.jacopobriccola.Porthole.Failed`,
         // because `HelperError::from` had a `_ => Failed` arm and no arm of
         // their own: a user on a firewall that cannot redirect got exit 1 and
         // the kind `unexpected` instead of 12 and `forward_unsupported`, and
@@ -579,6 +582,10 @@ mod tests {
             (
                 "com.jacopobriccola.Porthole.NotPublishedByContainer",
                 Error::NotPublishedByContainer(String::new()),
+            ),
+            (
+                "com.jacopobriccola.Porthole.NothingListening",
+                Error::NothingListening(String::new()),
             ),
             (
                 "com.jacopobriccola.Porthole.DockerUnreadable",
@@ -615,18 +622,24 @@ mod tests {
             );
         }
 
-        // The pair that shares a code: one exit status, two kinds, exactly as
-        // `porthole_core::error`'s own test requires of the local variants.
-        let unpublished = from_dbus(method_error(
+        // The three that share a code: one exit status, three kinds, exactly
+        // as `porthole_core::error`'s own test requires of the local
+        // variants. A client that collapsed any two of them would leave a
+        // script unable to tell a mistyped port from a service it cannot
+        // forward, which is the whole reason they are separate names.
+        let sharing_ten = [
             "com.jacopobriccola.Porthole.NotPublishedByContainer",
-            "x",
-        ));
-        let unreadable = from_dbus(method_error(
+            "com.jacopobriccola.Porthole.NothingListening",
             "com.jacopobriccola.Porthole.DockerUnreadable",
-            "x",
-        ));
-        assert_eq!(unpublished.exit_code(), unreadable.exit_code());
-        assert_ne!(unpublished.kind(), unreadable.kind());
+        ]
+        .map(|name| from_dbus(method_error(name, "x")));
+        for reported in &sharing_ten {
+            assert_eq!(reported.exit_code(), ExitCode::NotForwardable);
+        }
+        let mut kinds: Vec<&str> = sharing_ten.iter().map(|e| e.kind()).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        assert_eq!(kinds.len(), sharing_ten.len(), "two of them share a slug");
     }
 
     fn wire_rule() -> WireRule {
@@ -727,7 +740,7 @@ mod tests {
     ///
     /// Both functions had exactly one caller -- `wire_error_to_local`, for
     /// `close_all`'s per-rule failures -- and `close_all` cannot produce a
-    /// forward failure, so nothing in the workspace ever exercised the six
+    /// forward failure, so nothing in the workspace ever exercised the
     /// forward arms of either. Deleting `14 => ExitCode::AlreadyReachable`
     /// *and* the `"already_reachable"` slug together left every test green.
     ///
@@ -763,6 +776,7 @@ mod tests {
             },
             Error::ForwardUnsupported(String::new()),
             Error::NotPublishedByContainer(String::new()),
+            Error::NothingListening(String::new()),
             Error::DockerUnreadable(String::new()),
             Error::ExternalPortInUse {
                 port: 0,

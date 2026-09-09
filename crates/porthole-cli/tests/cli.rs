@@ -1523,13 +1523,12 @@ fn each_refusal_a_forward_can_reach_has_its_own_exit_code() {
          -j DNAT --to-destination 172.17.0.9:80'";
 
     let cases: [(&str, &str, i64, &str); 3] = [
-        // Docker answered, and no container publishes the port.
-        (
-            "unpublished",
-            "echo '-N DOCKER'",
-            10,
-            "not_published_by_container",
-        ),
+        // Docker answered, no container publishes the port, and nothing on
+        // this machine is on it either -- the narrower of the two answers
+        // that share exit 10. Its counterpart, a port something *is* on, is
+        // driven below by a listener this test binds itself, because it is
+        // the only one of the pair that cannot be arranged with a stub.
+        ("nothing on it", "echo '-N DOCKER'", 10, "nothing_listening"),
         // Docker could not be asked at all -- the same exit code as above and
         // a different kind, which is the only thing that tells them apart.
         (
@@ -1574,6 +1573,48 @@ fn each_refusal_a_forward_can_reach_has_its_own_exit_code() {
         assert_eq!(json["error"]["code"], expected_code, "{name}");
         assert_eq!(json["error"]["kind"], expected_kind, "{name}");
     }
+
+    // The other half of exit 10, and it needs a real socket: a port nothing
+    // publishes but something is listening on. The refusal is the same `no`
+    // as the "nothing on it" case above, and the two used to arrive with one
+    // message and one slug -- so a person told to check the number was told
+    // it about a port they could see was in use, and a person whose service
+    // simply was not running was told to stop trying.
+    //
+    // Bound on loopback deliberately: that is the shape that matters here
+    // (`631` on the machine this was reported from), and it is also the one
+    // the external-port check further down does *not* refuse, so a pass here
+    // cannot be the external-port refusal wearing this one's number.
+    let mine = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let held = mine.local_addr().unwrap().port().to_string();
+
+    let dir = TempDir::new().unwrap();
+    let bin = bin_dir(&dir);
+    stub_firewalld_and_ip(&bin);
+    stub(&bin, "iptables", "echo '-N DOCKER'");
+    let mut command = porthole_command(&["forward", &held, "--dry-run", "--json"]);
+    command
+        .env("PORTHOLE_STATE_FILE", state_path(&dir))
+        .env("PATH", path_ahead_of(&bin));
+    let out = run(command, None);
+
+    assert_eq!(code(&out), 10, "stderr: {}", stderr(&out));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    assert_eq!(
+        json["error"]["kind"],
+        "not_published_by_container",
+        "a port something is listening on is not a port nothing is on: {}",
+        stdout(&out)
+    );
+    let message = json["error"]["message"].as_str().expect("a message");
+    assert!(
+        message.contains(&held),
+        "the refusal must name the port it is about: {message}"
+    );
+    assert!(
+        !message.contains("nothing on this machine is listening"),
+        "and must not say the port is idle while this test holds a socket on it: {message}"
+    );
 
     // The external port already carries something the redirect would take
     // traffic from. A real listener of this test's own, on `0.0.0.0` --

@@ -494,12 +494,19 @@ impl<'a> Engine<'a> {
     ///
     /// **Docker is read first.** Until that read returns, nothing about the
     /// request has been decided. A failed read yields
-    /// [`Error::DockerUnreadable`] and a successful read with no match yields
-    /// [`Error::NotPublishedByContainer`] -- two variants because they are
-    /// two facts, and reporting the first as the second would tell a user a
-    /// port is not published when porthole never found out. They share an
-    /// exit code; the variant and [`Error::kind`] are what carry the
-    /// difference.
+    /// [`Error::DockerUnreadable`] -- its own variant because reporting it as
+    /// "no container publishes that port" would tell a user porthole checked
+    /// when it never found out.
+    ///
+    /// A successful read with no match is refused too, and which refusal it
+    /// is depends on a second read: [`no_container_publishes`] asks `/proc`
+    /// whether anything is listening on the port at all, and yields
+    /// [`Error::NothingListening`] when nothing is and
+    /// [`Error::NotPublishedByContainer`] when something is or when the read
+    /// itself failed. Two facts that ask opposite things of a person -- look
+    /// again at the number, or stop trying to forward this port -- so they
+    /// are two variants. All three share an exit code; the variant and
+    /// [`Error::kind`] are what carry the difference.
     ///
     /// **That same read settles one more thing**, before anything else is
     /// consulted: a published mapping that is not restricted to a loopback
@@ -633,12 +640,19 @@ impl<'a> Engine<'a> {
             .copied()
             .filter(|p| p.host_port == published_port && p.protocol == req.protocol)
             .collect();
-        let mapping = *matching.first().ok_or_else(|| {
-            Error::NotPublishedByContainer(format!(
-                "{published_port}/{} is not published by any container",
-                req.protocol
-            ))
-        })?;
+        let mapping = match matching.first() {
+            Some(mapping) => *mapping,
+            // One refusal used to cover two situations that ask for
+            // opposite things from a person: a port something is listening
+            // on, which cannot be forwarded as it stands, and a port nothing
+            // is on at all, which is a mistyped number or a service that was
+            // never started. `no_container_publishes` tells them apart with
+            // the same `/proc` read the external-port check makes further
+            // down -- made here rather than earlier, and only on the way out,
+            // so a forward that succeeds reads `/proc` exactly once, where it
+            // always did.
+            None => return Err(no_container_publishes(published_port, req.protocol, procfs)),
+        };
 
         // Decided from Docker's answer and nothing else, which is why it
         // sits here: right after the read that produced it, beside the
@@ -1185,6 +1199,79 @@ impl<'a> Engine<'a> {
             rules: self.state.rules().to_vec(),
         })
     }
+}
+
+/// Why a forward was refused for a port Docker's table has no rule for.
+///
+/// Docker has already answered, and the answer is no. What is left to say is
+/// what the person should do next, and that turns on something Docker cannot
+/// tell them: whether anything is on the port at all.
+///
+/// - Something is listening on it. The port exists, it is just not one
+///   `porthole forward` can redirect to: a redirect points at the container
+///   address in Docker's own rule, and there is no such rule. Nothing the
+///   person retypes will change that, so the message says to stop rather
+///   than to try again.
+/// - Nothing is listening on it. Most likely a mistyped number or a service
+///   that was never started -- worth another look, which is the opposite
+///   advice.
+/// - The `/proc` read failed. Then porthole knows neither, and says neither:
+///   the refusal keeps the wording and the `kind` it had before this
+///   distinction existed, because claiming a port is idle on the strength of
+///   a read that did not happen is exactly the failure this split exists to
+///   fix.
+///
+/// **What the scan can and cannot see.** It reads `/proc/net/tcp` and
+/// `/proc/net/tcp6` in porthole's own network namespace, which is the host's
+/// for both the CLI and the helper. A socket in some other namespace is not
+/// in it -- but neither is such a socket reachable on this host's port, which
+/// is the port under discussion. TCP only, which is the whole of the
+/// question here: `forward` refuses a UDP request further up, before the
+/// Docker read this follows.
+///
+/// Every binding counts, loopback included. The external-port check below
+/// asks a narrower question -- would a redirect take this socket's traffic --
+/// and answers it for network-facing bindings only. Here the question is
+/// merely whether anything is there.
+fn no_container_publishes(published_port: u16, protocol: Protocol, procfs: &dyn ProcFs) -> Error {
+    let listeners = match crate::listening::scan(procfs) {
+        Ok(listeners) => listeners,
+        Err(e) => {
+            return Error::NotPublishedByContainer(format!(
+                "{published_port}/{protocol} is not published by any container. Whether \
+                 anything else on this machine is listening on it, porthole cannot say: \
+                 reading this machine's listening sockets failed ({e})"
+            ))
+        }
+    };
+
+    let Some(service) = listeners
+        .iter()
+        .find(|s| s.port == published_port && s.protocol == protocol)
+    else {
+        return Error::NothingListening(format!(
+            "{published_port}/{protocol} is not published by any container, and nothing on \
+             this machine is listening on it either: porthole read this machine's listening \
+             TCP sockets and found none on that port. Check the port number, and that the \
+             container you meant to forward is running -- `docker ps` says what is \
+             published, `porthole listen` what is listening"
+        ));
+    };
+
+    // The same shape the external-port refusal uses for the same fact, so
+    // the two read as one voice: a name when porthole has one, and no
+    // placeholder when it does not.
+    let held = match &service.process {
+        Some(name) => format!("`{name}` is listening on it"),
+        None => "something on this machine is listening on it".to_string(),
+    };
+    Error::NotPublishedByContainer(format!(
+        "{published_port}/{protocol} is not published by any container: {held}, on {}, and no \
+         Docker rule points that port at one. A forward redirects to the container address \
+         in such a rule, so there is nothing here for it to point at -- this port cannot be \
+         forwarded as it stands, whatever the listener is bound to",
+        service.address
+    ))
 }
 
 #[cfg(test)]
@@ -2940,12 +3027,16 @@ mod tests {
 
         let runner = DockerRunner::new(DockerChain::Reads("-N DOCKER\n"), Vec::new());
         let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+        // Something is on 3000, and no container publishes it: the refusal
+        // this variant is for. Which of the two exit-10 refusals a
+        // published port with no Docker rule gets is decided by `/proc` --
+        // see `a_port_nothing_is_on_is_not_refused_as_a_port_something_is_on`.
         let err = engine
             .forward(
                 &forward_req(EXTERNAL_PORT),
                 PUBLISHED_PORT,
                 1000,
-                &nothing_listening(),
+                &FakeProcFs::new(PROC_NET_TCP_3000_DOCKER_PROXY),
             )
             .unwrap_err();
         assert!(
@@ -2984,6 +3075,119 @@ mod tests {
         assert!(
             !text.contains("is not published"),
             "the message must not read like the answer it does not have: {text}"
+        );
+    }
+
+    /// The refusal met on a real machine: `forward 631`, where 631 is
+    /// listening on loopback and is not a container, and `forward 22222`,
+    /// where nothing is on 22222 at all, produced one identical sentence.
+    ///
+    /// The two ask opposite things of a person -- stop trying to forward
+    /// this port, and look at the number again -- so the message and the
+    /// `kind` a script reads have to differ. The exit code does not: 10 is
+    /// documented as one code for several facts, and codes are appended,
+    /// never renumbered.
+    #[test]
+    fn a_port_nothing_is_on_is_not_refused_as_a_port_something_is_on() {
+        let backend = FakeBackend::new();
+        let clock = FixedClock(NOW);
+        // The port is published by nobody in all three cases below. What
+        // changes is only what `/proc` says.
+        let chain = DockerChain::Reads("-N DOCKER\n");
+
+        let harness = Harness::new();
+        let runner = DockerRunner::new(chain, Vec::new());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+        let silent = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &nothing_listening(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(silent, Error::NothingListening(_)),
+            "nothing is on the port, and that is its own answer: {silent}"
+        );
+        assert_eq!(silent.kind(), "nothing_listening");
+        assert_eq!(silent.exit_code(), ExitCode::NotForwardable);
+        let silent = silent.to_string();
+        assert!(
+            silent.contains("3000/tcp"),
+            "the message must name the port asked about: {silent}"
+        );
+        assert!(
+            silent.contains("nothing on this machine is listening"),
+            "and say the thing that makes this case different: {silent}"
+        );
+
+        let harness = Harness::new();
+        let runner = DockerRunner::new(chain, Vec::new());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+        let held = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                // One loopback listener on 3000, owned by something that is
+                // not a container -- the shape of the owner's own `631`.
+                &FakeProcFs::new(PROC_NET_TCP_3000_DOCKER_PROXY).with_socket(67372, 4242, "cupsd"),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(held, Error::NotPublishedByContainer(_)),
+            "something is on the port; that is the other answer: {held}"
+        );
+        assert_eq!(held.kind(), "not_published_by_container");
+        assert_eq!(held.exit_code(), ExitCode::NotForwardable);
+        let held = held.to_string();
+        assert!(
+            held.contains("cupsd") && held.contains("127.0.0.1"),
+            "the message must name what holds the port and where: {held}"
+        );
+        assert!(
+            !held.contains("nothing on this machine is listening"),
+            "and must not claim the port is idle while naming what is on it: {held}"
+        );
+        assert_ne!(
+            held, silent,
+            "one sentence for both situations is the defect this test exists for"
+        );
+
+        // And the third reading, which is neither: `/proc` could not be
+        // read, so porthole knows nothing about what is on the port and must
+        // claim nothing. This is where a distinction the code cannot make
+        // would get invented.
+        let harness = Harness::new();
+        let runner = DockerRunner::new(chain, Vec::new());
+        let mut engine = make_engine(&backend, &runner, &clock, harness.store());
+        let unknown = engine
+            .forward(
+                &forward_req(EXTERNAL_PORT),
+                PUBLISHED_PORT,
+                1000,
+                &FakeProcFs::new(PROC_NET_TCP_EMPTY).with_tcp6_unreadable(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(unknown, Error::NotPublishedByContainer(_)),
+            "a failed read must not be reported as the narrower answer: {unknown}"
+        );
+        assert_eq!(
+            unknown.kind(),
+            "not_published_by_container",
+            "the slug that claims least is the one an unread /proc gets"
+        );
+        let unknown = unknown.to_string();
+        assert!(
+            unknown.contains("cannot say"),
+            "the message must say it does not know: {unknown}"
+        );
+        assert!(
+            !unknown.contains("nothing on this machine is listening"),
+            "an empty /proc/net/tcp beside an unreadable /proc/net/tcp6 is not proof \
+             the port is idle: {unknown}"
         );
     }
 

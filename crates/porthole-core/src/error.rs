@@ -33,8 +33,10 @@ pub enum ExitCode {
     /// A command that offers a choice had nothing to offer.
     NothingToOffer = 9,
     /// The port named is not published by a container, or Docker could not be
-    /// read at all. One code for two facts: the exit status does not say
-    /// which, and [`Error::kind`] and the variant are what do.
+    /// read at all. One code for three facts — nothing is listening on the
+    /// port, something is and no container publishes it, or Docker was never
+    /// read — and the exit status does not say which. [`Error::kind`] and the
+    /// variant are what do.
     NotForwardable = 10,
     /// The external port a forward would use is already carrying something a
     /// redirect would take traffic from.
@@ -97,7 +99,7 @@ pub struct ForwardRefusal {
 /// rules refuses a forward too, with [`ExitCode::BackendUnavailable`] — but
 /// that is `open`'s refusal, in `open`'s own words, shared rather than a
 /// forward's own. `Engine::forward`'s doc says where in the order it sits.
-pub const FORWARD_REFUSALS: [ForwardRefusal; 6] = [
+pub const FORWARD_REFUSALS: [ForwardRefusal; 7] = [
     ForwardRefusal {
         code: ExitCode::ForwardUnsupported,
         kind: "forward_unsupported",
@@ -117,6 +119,11 @@ pub const FORWARD_REFUSALS: [ForwardRefusal; 6] = [
         code: ExitCode::NotForwardable,
         kind: "not_published_by_container",
         phrase: "a published port no container publishes",
+    },
+    ForwardRefusal {
+        code: ExitCode::NotForwardable,
+        kind: "nothing_listening",
+        phrase: "a port nothing on this machine answers on at all",
     },
     ForwardRefusal {
         code: ExitCode::AlreadyReachable,
@@ -182,15 +189,41 @@ pub enum Error {
     #[error("{0}")]
     ForwardUnsupported(String),
 
-    /// No container publishes the port a forward was asked for.
+    /// No container publishes the port a forward was asked for, and
+    /// something on this machine is listening on it — or porthole could not
+    /// find out whether anything is.
     ///
     /// Docker's table was read and the port is not in it. That is an answer.
     /// [`Error::DockerUnreadable`] is the absence of one. The two share an
     /// exit code, so a caller that needs to tell them apart reads
     /// [`Error::kind`] or matches the variant; the message of each says only
     /// what that one knows.
+    ///
+    /// [`Error::NothingListening`] is the third of the set: same exit code
+    /// again, and it is this one narrowed by a `/proc` read that found no
+    /// socket on the port at all. This variant is what remains — a socket
+    /// was found, or the read failed and porthole is claiming nothing about
+    /// what is there.
     #[error("{0}")]
     NotPublishedByContainer(String),
+
+    /// No container publishes the port a forward was asked for, and nothing
+    /// on this machine is listening on it either.
+    ///
+    /// Two reads decide it, both of which returned: Docker's own table has
+    /// no rule for the port, and `/proc/net/tcp`(6) has no listening socket
+    /// on it. A user who gets this has most likely mistyped the port or not
+    /// started the service, where [`Error::NotPublishedByContainer`] means
+    /// something is there and `porthole forward` cannot redirect to it.
+    /// Those are different things to do next, which is why they are
+    /// different variants rather than one message covering both.
+    ///
+    /// The exit code is [`ExitCode::NotForwardable`], the same as the two
+    /// above: codes are appended, never renumbered, and this is not a new
+    /// answer to "can this be forwarded" — it is a sharper account of the
+    /// same no. `kind` is what tells a script which of the three it got.
+    #[error("{0}")]
+    NothingListening(String),
 
     /// Docker's table could not be read, so whether the port is published is
     /// unknown.
@@ -301,9 +334,9 @@ impl Error {
             Error::NoNetwork(_) => ExitCode::NoNetwork,
             Error::NothingToOffer(_) => ExitCode::NothingToOffer,
             Error::ForwardUnsupported(_) => ExitCode::ForwardUnsupported,
-            Error::NotPublishedByContainer(_) | Error::DockerUnreadable(_) => {
-                ExitCode::NotForwardable
-            }
+            Error::NotPublishedByContainer(_)
+            | Error::NothingListening(_)
+            | Error::DockerUnreadable(_) => ExitCode::NotForwardable,
             Error::ExternalPortInUse { .. } => ExitCode::ExternalPortInUse,
             Error::ForwardCheckUnavailable(_) => ExitCode::ForwardCheckUnavailable,
             Error::AlreadyReachable(_) => ExitCode::AlreadyReachable,
@@ -329,6 +362,7 @@ impl Error {
             Error::NothingToOffer(_) => "nothing_to_offer",
             Error::ForwardUnsupported(_) => "forward_unsupported",
             Error::NotPublishedByContainer(_) => "not_published_by_container",
+            Error::NothingListening(_) => "nothing_listening",
             Error::DockerUnreadable(_) => "docker_unreadable",
             Error::ExternalPortInUse { .. } => "external_port_in_use",
             Error::ForwardCheckUnavailable(_) => "forward_check_unavailable",
@@ -585,6 +619,7 @@ mod tests {
             Error::ForwardCheckUnavailable("x".into()),
             Error::DockerUnreadable("x".into()),
             Error::NotPublishedByContainer("x".into()),
+            Error::NothingListening("x".into()),
             Error::AlreadyReachable("x".into()),
             Error::ExternalPortInUse {
                 port: 8443,
@@ -630,17 +665,29 @@ mod tests {
 
     #[test]
     fn an_unread_docker_and_an_unpublished_port_share_a_code_but_not_a_kind() {
-        // One exit status covers both, so a script reading `$?` alone cannot
-        // tell "no container publishes that port" from "porthole never found
-        // out". `kind` is what carries the difference to a caller, and this
-        // is the assertion that keeps the two slugs from collapsing into one.
+        // One exit status covers all three, so a script reading `$?` alone
+        // cannot tell "no container publishes that port" from "nothing is on
+        // that port at all" from "porthole never found out". `kind` is what
+        // carries the difference to a caller, and this is the assertion that
+        // keeps the three slugs from collapsing into one.
         let unpublished = Error::NotPublishedByContainer("3000/tcp is not published".into());
+        let silent = Error::NothingListening("nothing is listening on 3000/tcp".into());
         let unreadable = Error::DockerUnreadable("could not read Docker's table".into());
 
         assert_eq!(unpublished.exit_code(), ExitCode::NotForwardable);
+        assert_eq!(silent.exit_code(), ExitCode::NotForwardable);
         assert_eq!(unreadable.exit_code(), ExitCode::NotForwardable);
-        assert_ne!(unpublished.kind(), unreadable.kind());
+        let kinds = [unpublished.kind(), silent.kind(), unreadable.kind()];
+        let mut distinct = kinds.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            kinds.len(),
+            "the three facts behind exit 10 must not share a slug: {kinds:?}"
+        );
         assert_eq!(unpublished.kind(), "not_published_by_container");
+        assert_eq!(silent.kind(), "nothing_listening");
         assert_eq!(unreadable.kind(), "docker_unreadable");
     }
 

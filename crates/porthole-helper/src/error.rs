@@ -25,7 +25,7 @@ pub enum HelperError {
     /// `CommandFailed`: its own name keeps the `state_error` kind slug intact
     /// across the bus.
     State(String),
-    // The six refusals `forward` has of its own, each under a name of its own
+    // The refusals `forward` has of its own, each under a name of its own
     // for the reason `CommandFailed` and `State` have theirs: the client maps
     // the name back to the code and the kind slug the same failure carries
     // locally. Both ends are checked --
@@ -35,13 +35,19 @@ pub enum HelperError {
     // for what they map back to.
     /// The detected firewall cannot redirect a port at all.
     ForwardUnsupported(String),
-    /// No container publishes the port `forward` was given. Shares a code
-    /// with `DockerUnreadable` below and differs from it by kind, exactly as
-    /// the two local variants do: one is Docker's answer, the other is the
-    /// absence of one.
+    /// No container publishes the port `forward` was given, and something is
+    /// listening on it — or porthole could not find out whether anything is.
+    /// Shares a code with `NothingListening` and `DockerUnreadable` below and
+    /// differs from both by kind, exactly as the three local variants do.
     NotPublishedByContainer(String),
+    /// No container publishes the port `forward` was given, and nothing on
+    /// the machine is listening on it either. The narrower half of the pair
+    /// above: a mistyped port or an unstarted service, rather than something
+    /// that is there and cannot be redirected to.
+    NothingListening(String),
     /// Docker's table could not be read, so whether the port is published is
-    /// unknown. The other half of the pair above.
+    /// unknown. The third of the set above, and the one that is the absence
+    /// of an answer rather than an answer.
     DockerUnreadable(String),
     /// The port a forward would give the local network is already carrying
     /// something a redirect would take traffic from.
@@ -65,7 +71,7 @@ pub enum HelperError {
 
 /// Every core error, named one at a time.
 ///
-/// **No wildcard arm, deliberately.** The six refusals `forward` has of its
+/// **No wildcard arm, deliberately.** The refusals `forward` has of its
 /// own were all added to [`Error`] with a code and a kind slug of their own,
 /// and every one of them arrived at a client as exit 1 and the kind
 /// `unexpected`, because a `_ => Failed` arm absorbed them silently. With
@@ -92,6 +98,7 @@ impl From<Error> for HelperError {
             Error::State { .. } => HelperError::State(text),
             Error::ForwardUnsupported(_) => HelperError::ForwardUnsupported(text),
             Error::NotPublishedByContainer(_) => HelperError::NotPublishedByContainer(text),
+            Error::NothingListening(_) => HelperError::NothingListening(text),
             Error::DockerUnreadable(_) => HelperError::DockerUnreadable(text),
             Error::ExternalPortInUse { .. } => HelperError::ExternalPortInUse(text),
             Error::ForwardCheckUnavailable(_) => HelperError::ForwardCheckUnavailable(text),
@@ -154,6 +161,10 @@ mod tests {
             (
                 Error::NotPublishedByContainer("x".into()),
                 "com.jacopobriccola.Porthole.NotPublishedByContainer",
+            ),
+            (
+                Error::NothingListening("x".into()),
+                "com.jacopobriccola.Porthole.NothingListening",
             ),
             (
                 Error::DockerUnreadable("x".into()),

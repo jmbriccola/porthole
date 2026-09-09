@@ -3408,11 +3408,16 @@ fn a_forward_is_refused_when_the_external_port_already_answers_and_the_refusal_n
     // The loopback listener did not refuse: the request got as far as the
     // external-port check, which means `docker-proxy` on 127.0.0.1:3000 was
     // looked at and passed over.
-    assert!(
-        !refusal.contains(r#""kind":"not_published_by_container""#),
-        "the request must have found the container -- if it did not, the exit 11 above \
-         would be about a port nothing publishes: {refusal}"
-    );
+    // Both slugs, because "no container publishes that port" arrives under
+    // either depending on whether anything is listening on it, and this
+    // guard is about the fact rather than about which of the two words it.
+    for slug in ["not_published_by_container", "nothing_listening"] {
+        assert!(
+            !refusal.contains(&format!(r#""kind":"{slug}""#)),
+            "the request must have found the container -- if it did not, the exit 11 above \
+             would be about a port nothing publishes: {refusal}"
+        );
+    }
 
     assert!(
         extract_marker(&stdout, "STATE").contains(r#""rules":[]"#),

@@ -38,8 +38,9 @@ Exit codes:
   8  No usable network
   9  There was nothing to choose from. `porthole devices add` found
      no device on this network to offer.
-  10 `porthole forward` was given a port no container publishes, or
-     Docker could not be read at all. The message says which.
+  10 `porthole forward` has no container to redirect to: nothing is
+     listening on the port, something is and no container publishes
+     it, or Docker could not be read at all. The message says which.
   11 The port `porthole forward` would give the local network is
      already carrying something a redirect would take traffic from.
      Three sources are checked and the message says which found it:

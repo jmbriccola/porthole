@@ -252,9 +252,13 @@ asked and answered, and would have failed with `already_reachable` (exit
 
 `forward` has refusals `open` does not, each with its own `kind` and exit
 code in the error object below: `forward_unsupported` (`12`) when the
-detected firewall cannot redirect a port at all, `not_published_by_container`
-and `docker_unreadable` (both `10`, and the two are told apart by `kind`
-alone) when no container publishes the port or Docker could not be read,
+detected firewall cannot redirect a port at all, `not_published_by_container`,
+`nothing_listening` and `docker_unreadable` (all three `10`, and told apart by
+`kind` alone) when there is no container to redirect to — respectively:
+something on this machine is listening on the port and no container publishes
+it, so it cannot be forwarded as it stands; nothing is listening on it at all,
+which is usually a mistyped number or a service that was never started; or
+Docker could not be read, so porthole never found out,
 `external_port_in_use` (`11`) when the port the local network would connect
 to already carries something a redirect would take traffic from — a porthole
 rule, a container Docker publishes on that port at an address the network
