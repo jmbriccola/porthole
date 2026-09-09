@@ -721,6 +721,23 @@ struct HelperFromBeforeEverything;
 
 #[zbus::interface(name = "com.jacopobriccola.Porthole1")]
 impl HelperFromBeforeEverything {
+    /// The shape `porthole doctor` asks for, and the one whose *return*
+    /// signature the forward feature changed: `a(sqssssttu)` where this
+    /// build expects `a(sqssssttusqq)`.
+    async fn list(&self) -> Vec<RuleBeforeForward> {
+        vec![RuleBeforeForward {
+            id: "abc".to_string(),
+            port: 5173,
+            protocol: "tcp".to_string(),
+            target: "10.10.10.0/24".to_string(),
+            scope: "network".to_string(),
+            backend: "firewalld".to_string(),
+            opened_at: 1_757_000_000,
+            expires_at: 0,
+            uid: 1000,
+        }]
+    }
+
     async fn close(&self, port: u16, protocol: String) -> RuleBeforeForward {
         RuleBeforeForward {
             id: "abc".to_string(),
@@ -824,4 +841,91 @@ fn the_same_failure_as_json_carries_a_kind_of_its_own() {
     assert_eq!(out.status.code(), Some(15));
 
     drop(stale);
+}
+
+/// `porthole doctor` is the command a person runs straight after being told
+/// the two halves are different versions, and it used to answer **"not
+/// answering on the bus … Install the porthole package"** -- about a package
+/// they have and a helper that had just replied.
+///
+/// The classification is the whole of it: a decode failure is
+/// `zbus::Error::Variant`, not a `MethodError`, so it fell through the arm
+/// that means "nothing owns the name". This drives the real binary against a
+/// helper that answers `list` in the shape from before the forward feature
+/// and has no version member -- what every helper deployed today is.
+#[test]
+fn doctor_does_not_tell_a_user_to_install_a_package_they_already_have() {
+    let _guard = lock_helper();
+    let dir = TempDir::new().unwrap();
+    let bin = bin_dir(&dir);
+    let state = dir.path().join("state.json");
+
+    let stale = zbus::blocking::connection::Builder::address(private_bus().address.as_str())
+        .expect("the private bus address")
+        .name(porthole_core::ipc::SERVICE)
+        .expect("a well-formed name")
+        .serve_at(porthole_core::ipc::PATH, HelperFromBeforeEverything)
+        .expect("a valid object path")
+        .build()
+        .expect("a connection that owns the helper's name");
+
+    let out = cli(&state, &bin, &["doctor", "--json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("one JSON object ({e}): {stdout}"));
+    let helper = json["checks"]
+        .as_array()
+        .expect("checks is an array")
+        .iter()
+        .find(|c| c["name"] == "Helper")
+        .expect("doctor has a Helper check")
+        .clone();
+
+    let detail = helper["detail"].as_str().unwrap_or_default();
+    let remedy = helper["remedy"].as_str().unwrap_or_default();
+    assert!(
+        !remedy
+            .to_lowercase()
+            .contains("install the porthole package"),
+        "the package is installed and the helper answered: detail={detail:?} \
+         remedy={remedy:?}"
+    );
+    assert!(
+        !detail.to_lowercase().contains("not answering"),
+        "it answered: {detail:?}"
+    );
+    assert!(
+        detail.contains("running"),
+        "and doctor has to say so, since that is what rules out the missing-package \
+         remedy: {detail:?}"
+    );
+    assert!(
+        remedy.contains("systemctl restart porthole-helper.service"),
+        "this stand-in has no version member, which says the helper is the older half: \
+         {remedy:?}"
+    );
+
+    // The negative control on the same command, in the same process: with
+    // the stale helper gone, doctor's Helper check goes back to the
+    // missing-package wording -- so the assertions above are about the
+    // classification and not about `doctor` having stopped saying it at all.
+    drop(stale);
+    let out = cli(&state, &bin, &["doctor", "--json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON object");
+    let absent = json["checks"]
+        .as_array()
+        .expect("checks is an array")
+        .iter()
+        .find(|c| c["name"] == "Helper")
+        .expect("doctor has a Helper check")
+        .clone();
+    assert!(
+        absent["remedy"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Install the porthole package"),
+        "with nothing owning the name, the missing-package remedy is the right one: \
+         {absent}"
+    );
 }

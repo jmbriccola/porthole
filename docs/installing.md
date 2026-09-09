@@ -429,7 +429,13 @@ agent that cannot read the helper" above. Restarting the helper is still what
 puts the two halves back in step; what changed is that skipping it is now
 something you are told about instead of something you infer from silence.
 
-Each of the three also **names which half to restart**, rather than offering
+`porthole doctor` says it too, and it is the command a person runs next: it
+reports the helper as **running, and answering something this porthole cannot
+read**, rather than as a package to install. That wording is the whole point —
+until it was fixed, `doctor` answered "not answering on the bus … Install the
+porthole package", about a package the person already had.
+
+Each of the four also **names which half to restart**, rather than offering
 both and leaving the person to try them in turn: the helper reports the
 version of the interface it speaks, and a client compares it with its own. The
 agent goes further and replaces itself when it is the one that is behind (see

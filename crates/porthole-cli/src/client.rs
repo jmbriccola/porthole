@@ -188,6 +188,19 @@ fn version_mismatch(e: &zbus::Error, alignment: Option<porthole_core::ipc::Align
 /// call costs nothing in the ordinary path, and every other failure goes
 /// through [`from_dbus`] unchanged.
 ///
+/// **Why not read the version first, before every call, and refuse when it
+/// disagrees?** Because that would refuse against every helper installed
+/// today. A helper from before this contract has no version member and is
+/// read as 0 (see [`porthole_core::ipc::read_protocol_version`]), while its
+/// *wire* is the same one this build speaks -- measured: the installed
+/// release helper's introspection is identical to a build of the current
+/// tree. A `porthole` that compared the numbers up front would exit 15 on a
+/// machine where every command works, for an incompatibility that does not
+/// exist, from the moment the package was upgraded until somebody restarted
+/// a service. So the number is never a reason to refuse work here: it is
+/// read after something has actually failed to decode, and all it decides is
+/// which half the message names.
+///
 /// Read afresh, over the same connection: `read_protocol_version` builds a
 /// proxy for that one call, for the reason its own doc comment records. A
 /// version this cannot read at all leaves the wording from before the
