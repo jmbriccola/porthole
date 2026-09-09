@@ -63,6 +63,12 @@ Exit codes:
      Docker's own DNAT rule for the port, and nothing else: no `-d`
      is every interface, and a `-d` naming any other address is that
      address, whether or not this machine holds it.
+  15 porthole and the porthole helper are different versions:
+     the helper answered and this command could not read the
+     answer. Retrying changes nothing; one of the two has to be
+     replaced, and the message names which one when the helper
+     is new enough to say. `porthole list` is what says whether
+     the request took effect.
 
 No permanent rules:
   Every rule porthole writes is a runtime rule, so a reboot closes

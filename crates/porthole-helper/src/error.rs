@@ -112,7 +112,13 @@ impl From<Error> for HelperError {
             | Error::Io(_)
             // Already rendered by some other helper, with its own kind and
             // code. Nothing in this process builds one.
-            | Error::Remote { .. } => HelperError::Failed(text),
+            | Error::Remote { .. }
+            // A client that could not read what this helper sent. It is a
+            // fact about the pair rather than about anything the helper
+            // decided, and the helper is the half that cannot observe it:
+            // nothing here builds one, and one arriving here would mean a
+            // client's error had been handed to the server.
+            | Error::VersionMismatch(_) => HelperError::Failed(text),
         }
     }
 }

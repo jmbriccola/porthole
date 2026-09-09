@@ -130,14 +130,85 @@ fn from_dbus(e: zbus::Error) -> Error {
     // list` reads the state file the helper writes, so it is the thing that
     // answers that question rather than this sentence.
     if porthole_core::ipc::is_undecodable(&e) {
-        return Error::Unexpected(format!(
-            "the porthole helper answered, and porthole could not read the answer: {e}. \
-             porthole and the porthole helper are different versions -- `porthole list` \
-             says what is open, and restarting porthole-helper.service after an upgrade \
-             is what replaces the older half."
-        ));
+        return Error::VersionMismatch(version_mismatch(&e, None));
     }
     Error::Unexpected(format!("the helper could not be reached: {e}"))
+}
+
+/// What to say about an answer this build could not read, given whatever
+/// the helper's own [`porthole_core::ipc::PROTOCOL_VERSION`] said about
+/// which of the two is the older half.
+///
+/// The first two sentences are the same in all three cases, because what
+/// happened is the same in all three: the helper answered, the answer could
+/// not be read, and whether the request took effect is a question for
+/// `porthole list` -- `open`'s *arguments* did not change across the
+/// upgrade that produced the measured case, so a helper whose reply is
+/// unreadable may well have done exactly what was asked.
+///
+/// What the version changes is the last sentence: a remedy named instead of
+/// two offered. `None` keeps the wording from before there was a version on
+/// the wire, and so does [`porthole_core::ipc::Alignment::Same`] -- two
+/// binaries reporting one version and still unable to read each other means
+/// a signature moved without the number moving, and then the number is not
+/// evidence about anything.
+fn version_mismatch(e: &zbus::Error, alignment: Option<porthole_core::ipc::Alignment>) -> String {
+    use porthole_core::ipc::Alignment;
+    let remedy = match alignment {
+        Some(Alignment::HelperIsOlder) => {
+            "The porthole helper is the older half: restart it with `systemctl restart \
+             porthole-helper.service`."
+        }
+        Some(Alignment::ThisOneIsOlder) => {
+            "This command is the older half: the porthole helper on this machine speaks a \
+             newer version of porthole than this `porthole` does. Reinstall porthole, or \
+             finish the upgrade that was interrupted."
+        }
+        Some(Alignment::Same) | None => {
+            "restarting porthole-helper.service after an upgrade is what replaces the \
+             older half."
+        }
+    };
+    let joiner = if alignment.is_some_and(|a| a != Alignment::Same) {
+        "says what is open."
+    } else {
+        "says what is open, and"
+    };
+    format!(
+        "the porthole helper answered, and porthole could not read the answer: {e}. \
+         porthole and the porthole helper are different versions -- `porthole list` \
+         {joiner} {remedy}"
+    )
+}
+
+/// [`from_dbus`], plus the one question that needs a second round trip.
+///
+/// Asked only about an answer this build could not read, which is a
+/// terminal condition rather than something a retry fixes -- so the extra
+/// call costs nothing in the ordinary path, and every other failure goes
+/// through [`from_dbus`] unchanged.
+///
+/// Read afresh, over the same connection: `read_protocol_version` builds a
+/// proxy for that one call, for the reason its own doc comment records. A
+/// version this cannot read at all leaves the wording from before the
+/// version existed rather than a guess.
+async fn from_call(proxy: &PortholeProxy<'_>, e: zbus::Error) -> Error {
+    if !porthole_core::ipc::is_undecodable(&e) {
+        return from_dbus(e);
+    }
+    let alignment = porthole_core::ipc::read_protocol_version(proxy.inner().connection())
+        .await
+        .ok()
+        .map(porthole_core::ipc::alignment);
+    Error::VersionMismatch(version_mismatch(&e, alignment))
+}
+
+/// One call's outcome, with [`from_call`]'s classification on the failure.
+async fn answered<T>(proxy: &PortholeProxy<'_>, outcome: zbus::Result<T>) -> Result<T> {
+    match outcome {
+        Ok(value) => Ok(value),
+        Err(e) => Err(from_call(proxy, e).await),
+    }
 }
 
 /// A wire rule as the local types, so the CLI's renderers are unchanged.
@@ -217,10 +288,7 @@ pub fn open(
 ) -> Result<ManagedRule> {
     block_on(async {
         let p = proxy(session).await?;
-        let wire = p
-            .open(port, protocol, scope, seconds)
-            .await
-            .map_err(from_dbus)?;
+        let wire = answered(&p, p.open(port, protocol, scope, seconds).await).await?;
         to_local(&wire)
     })
 }
@@ -243,10 +311,12 @@ pub fn forward(
 ) -> Result<ManagedRule> {
     block_on(async {
         let p = proxy(session).await?;
-        let wire = p
-            .forward(port, protocol, scope, seconds, published_port)
-            .await
-            .map_err(from_dbus)?;
+        let wire = answered(
+            &p,
+            p.forward(port, protocol, scope, seconds, published_port)
+                .await,
+        )
+        .await?;
         to_local(&wire)
     })
 }
@@ -254,7 +324,7 @@ pub fn forward(
 pub fn close(session: bool, port: u16, protocol: &str) -> Result<ManagedRule> {
     block_on(async {
         let p = proxy(session).await?;
-        let wire = p.close(port, protocol).await.map_err(from_dbus)?;
+        let wire = answered(&p, p.close(port, protocol).await).await?;
         to_local(&wire)
     })
 }
@@ -262,10 +332,7 @@ pub fn close(session: bool, port: u16, protocol: &str) -> Result<ManagedRule> {
 pub fn close_by_id(session: bool, id: &str, from_timer: bool, forget: bool) -> Result<ManagedRule> {
     block_on(async {
         let p = proxy(session).await?;
-        let wire = p
-            .close_by_id(id, from_timer, forget)
-            .await
-            .map_err(from_dbus)?;
+        let wire = answered(&p, p.close_by_id(id, from_timer, forget).await).await?;
         to_local(&wire)
     })
 }
@@ -334,7 +401,7 @@ fn wire_error_to_local(e: WireError) -> Error {
 pub fn close_all(session: bool) -> Result<(Vec<ManagedRule>, Vec<Error>)> {
     block_on(async {
         let p = proxy(session).await?;
-        let (closed, errors) = p.close_all().await.map_err(from_dbus)?;
+        let (closed, errors) = answered(&p, p.close_all().await).await?;
         let rules = closed.iter().map(to_local).collect::<Result<Vec<_>>>()?;
         Ok((rules, errors.into_iter().map(wire_error_to_local).collect()))
     })
@@ -381,7 +448,7 @@ fn docker_port_to_local(wire: &WireDockerPort) -> Result<Published> {
 pub fn docker_ports(session: bool) -> Result<Vec<Published>> {
     block_on(async {
         let p = proxy(session).await?;
-        let wire = p.docker_ports().await.map_err(from_dbus)?;
+        let wire = answered(&p, p.docker_ports().await).await?;
         wire.iter().map(docker_port_to_local).collect()
     })
 }
@@ -465,6 +532,70 @@ mod tests {
             unreachable.contains("could not be reached"),
             "{unreachable}"
         );
+    }
+
+    #[test]
+    fn the_message_names_the_half_the_version_identified_and_the_code_is_its_own() {
+        use porthole_core::error::ExitCode;
+        use porthole_core::ipc::Alignment;
+
+        let unreadable = zbus::Error::Variant(zbus::zvariant::Error::Message(
+            "Signature mismatch: got `(sqssssttu)`, expected `(sqssssttusqq)`".to_string(),
+        ));
+
+        let helper_older = version_mismatch(&unreadable, Some(Alignment::HelperIsOlder));
+        assert!(
+            helper_older.contains("systemctl restart porthole-helper.service"),
+            "{helper_older}"
+        );
+        assert!(
+            !helper_older.contains("Reinstall porthole"),
+            "one remedy, not both, once the version has said which: {helper_older}"
+        );
+
+        let this_one_older = version_mismatch(&unreadable, Some(Alignment::ThisOneIsOlder));
+        assert!(
+            this_one_older.contains("Reinstall porthole"),
+            "{this_one_older}"
+        );
+        assert!(
+            !this_one_older.contains("restart porthole-helper.service"),
+            "restarting the newer half would change nothing: {this_one_older}"
+        );
+
+        // Nothing known, and the same for two binaries that report one
+        // version and still cannot read each other -- that combination means
+        // a signature moved without the number moving, so the number is not
+        // evidence.
+        let unknown = version_mismatch(&unreadable, None);
+        assert_eq!(
+            unknown,
+            version_mismatch(&unreadable, Some(Alignment::Same))
+        );
+        assert!(unknown.contains("porthole-helper.service"), "{unknown}");
+
+        // Three wordings, not one wording three times.
+        assert_ne!(helper_older, this_one_older);
+        assert_ne!(helper_older, unknown);
+        assert_ne!(this_one_older, unknown);
+
+        // And every one of them keeps the three things that do not depend on
+        // any version: the helper answered, zbus's own text naming the two
+        // signatures, and where to find out whether the request took effect.
+        for message in [&helper_older, &this_one_older, &unknown] {
+            assert!(message.contains("could not read the answer"), "{message}");
+            assert!(message.contains("Signature mismatch"), "{message}");
+            assert!(message.contains("porthole list"), "{message}");
+            assert!(!message.contains("could not be reached"), "{message}");
+        }
+
+        // The code is the one a script branches on, and it is appended
+        // rather than borrowed from any existing one.
+        assert_eq!(
+            Error::VersionMismatch(unknown).exit_code(),
+            ExitCode::VersionMismatch
+        );
+        assert_eq!(ExitCode::VersionMismatch as i32, 15);
     }
 
     #[test]

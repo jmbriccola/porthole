@@ -137,16 +137,16 @@ mod tests {
         // without it, a parse that stopped matching would check nothing and
         // pass.
         assert!(
-            declared.len() >= 15,
+            declared.len() >= 16,
             "parsed {} ExitCode variants out of porthole-core's source, fewer than the \
-             15 it had when this was written; codes are only ever appended, so the \
+             16 it had when this was written; codes are only ever appended, so the \
              parse has stopped matching: {declared:?}",
             declared.len()
         );
 
         let in_help = codes_named_in_help();
         assert!(
-            in_help.len() >= 15,
+            in_help.len() >= 16,
             "the help text's `Exit codes:` block was parsed as naming {} codes, which \
              is fewer than the enum has -- the block parse has stopped matching the \
              text: {in_help:?}",
