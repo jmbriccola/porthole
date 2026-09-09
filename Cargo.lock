@@ -1043,6 +1043,7 @@ dependencies = [
  "ipnet",
  "libc",
  "porthole-core",
+ "serde",
  "tempfile",
  "tokio",
  "zbus",

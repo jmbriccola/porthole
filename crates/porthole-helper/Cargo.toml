@@ -27,5 +27,10 @@ tokio.workspace = true
 
 [dev-dependencies]
 libc.workspace = true
+# `tests/interface_contract.rs` builds a client against the *previous*
+# shape of `WireRule` -- nine members, not twelve -- to show that a pair
+# that cannot read each other's rules can still read each other's version.
+# That stand-in type needs its own derives; nothing in `src/` does.
+serde.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
