@@ -267,10 +267,14 @@ jobs:
           fi
           podman --version
           podman info --format '{{.Host.Security.Rootless}}'
-      # The ten #[ignore]d tests in crates/porthole-cli/tests/container.rs:
-      # the three backends and reconcile::sweep against a real ufw, a real
-      # firewalld and a real nftables, each inside its own container's own
-      # network namespace. run.sh builds the musl binaries they need, sets
+      # The #[ignore]d tests in crates/porthole-cli/tests/container.rs (26 of
+      # them at the time of writing, and the number is deliberately not
+      # asserted anywhere -- a count in a comment is a claim that goes stale
+      # silently, which this one already did once): the three backends and
+      # reconcile::sweep against a real ufw, a real firewalld and a real
+      # nftables, the forward suite against a real Docker, and the helper's
+      # idle exit against a machine where porthole is installed under
+      # systemd -- each inside its own container's own network namespace. run.sh builds the musl binaries they need, sets
       # PORTHOLE_CONTAINER_TESTS=1 and passes --ignored --test-threads=1.
       # Nothing in that file skips: once opted in, a missing podman or a
       # stale binary panics rather than reporting a pass.

@@ -20,13 +20,27 @@
 # host as static musl binaries and bind-mounted in at container-run time,
 # exactly as the other four images do it.
 #
-# `polkit` is installed and is expected **not** to start in a rootless podman
-# container (measured: `Failed to keep CAP_SYS_ADMIN`, status `217/USER`).
-# It is here anyway, because it is what makes the failure legible when it
-# happens rather than a mystery about the bus, and because the one method the
-# tests here use -- `org.freedesktop.DBus.Peer.Ping` and
-# `com.jacopobriccola.Porthole1.ProtocolVersion` -- deliberately involves no
-# authorizer at all.
+# `polkit` **does** start here, and that is worth saying because it is not
+# free and the spike that preceded this image could not manage it: polkit
+# failed there with `Failed to keep CAP_SYS_ADMIN`, status `217/USER`, so
+# every measurement in it ran with no authorizer anywhere. What it takes is
+# what `SystemdContainer::start` already passes for the Docker image --
+# `--cap-add=...SYS_ADMIN...` together with `--security-opt seccomp=unconfined`
+# -- and the setup in `container.rs` asserts it rather than hoping, ending
+# with `systemctl is-active polkit` under `set -e`.
+#
+# That is the main thing this image newly buys. Two of the tests using it
+# drive a real `porthole open` and `porthole close` through the shipped
+# `com.jacopobriccola.Porthole.policy`, so the `auth_admin` path is exercised
+# against a real firewalld rather than stepped around. The container adds one
+# polkit rule granting root those actions, because `auth_admin` needs an
+# authentication agent to answer the prompt and a container has none; the
+# shipped policy itself is installed unmodified and is still what decides.
+#
+# The two calls that need no authorizer -- `org.freedesktop.DBus.Peer.Ping`
+# and `com.jacopobriccola.Porthole1.ProtocolVersion` -- are used by the tests
+# whose subject is activation itself, so that what those measure is the bus
+# starting a helper and nothing else.
 FROM registry.fedoraproject.org/fedora:44
 
 RUN dnf install -y --setopt=install_weak_deps=False \

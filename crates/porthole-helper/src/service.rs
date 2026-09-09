@@ -713,6 +713,16 @@ impl Porthole {
     /// admission check exists for -- an announcement no subscriber can
     /// receive, a rule opened by a process about to exit -- is reachable
     /// through it.
+    ///
+    /// Two consequences follow from being outside the gate, and both are
+    /// harmless enough to be worth stating rather than leaving to be
+    /// rediscovered. It does not count as in flight, so its reply can be lost
+    /// to an exit the drain did not wait for -- the same `NoReply` every
+    /// client already retries on, for a value that is a compile-time
+    /// constant. And it does not stamp the activity clock, so a client that
+    /// called nothing else could not hold the helper open; nothing in this
+    /// workspace does that, and a client that only ever asks which version it
+    /// is talking to is not using porthole.
     async fn protocol_version(&self) -> u32 {
         porthole_core::ipc::PROTOCOL_VERSION
     }

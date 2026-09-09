@@ -434,12 +434,22 @@ impl SystemdContainer {
     }
 
     /// Wait until PID 1 has finished starting, rather than sleeping a guessed
-    /// fixed time. `degraded` is the expected steady state, not a problem:
-    /// `dbus.socket` and `systemd-logind.service` fail in this image (no
-    /// `dbus-broker` package, and no seat to manage), and neither is anything
-    /// these tests use -- the system bus firewalld needs is started by hand
-    /// by [`FIREWALLD_DAEMON_SETUP`], exactly as in the three non-systemd
-    /// images.
+    /// fixed time. `degraded` is accepted as a steady state as well as
+    /// `running`, and which of the two appears depends on the image:
+    ///
+    /// - [`DOCKER_IMAGE`] carries no `dbus-broker` package and no seat to
+    ///   manage, so `dbus.socket` and `systemd-logind.service` fail there and
+    ///   the system is `degraded`. Neither is anything those tests use: the
+    ///   system bus firewalld needs is started by hand by
+    ///   [`FIREWALLD_DAEMON_SETUP`], exactly as in the three non-systemd
+    ///   images.
+    /// - [`SYSTEMD_IMAGE`] installs *and enables* `dbus-broker`, and its own
+    ///   setup starts firewalld and polkit as real units, so it generally
+    ///   reaches `running`.
+    ///
+    /// Both are accepted because what this waits for is PID 1 having finished,
+    /// not a particular verdict on the units — every test that needs a unit
+    /// asserts on that unit itself.
     fn wait_for_systemd(&self) {
         for _ in 0..120 {
             let out = self.exec("systemctl is-system-running 2>&1 || true");

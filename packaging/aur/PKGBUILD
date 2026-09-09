@@ -114,8 +114,9 @@ sha256sums=('SKIP')
 # porthole-helper retires itself once nothing is open, so on an idle machine
 # an upgrade resolves itself; on one where a port is open right then, the
 # helper is pinned and an upgrade that ends no process leaves the previous
-# version's root daemon serving the new version's clients. No hook in the list above covers that -- reloading the manager
-# restarts nothing -- and systemd's fourth one,
+# version's root daemon serving the new version's clients. No hook in the
+# list above covers that -- reloading the manager restarts nothing -- and
+# systemd's fourth one,
 # 35-systemd-enqueue-marked.hook, restarts only units something has marked
 # `needs-restart`, which on Arch nothing does. Both of them also run
 # PostTransaction, after the scriptlet, which is why post_upgrade does its
