@@ -339,6 +339,56 @@ centre that reads AppStream metadata (GNOME Software, KDE Discover) should
 show the summary and description from the `.metainfo.xml` file once you find
 the app there, not just a bare name.
 
+## Upgrading: the helper restarts, the ports stay
+
+`porthole-helper` has no idle timeout and no last-rule-closed shutdown. Once
+the bus has activated it, it runs until something stops it — so unless the
+upgrade ends that process, the machine goes on serving the new version's
+clients from the **previous version's** root daemon, out of a binary that is
+no longer on disk. On a Debian machine, `readlink /proc/$(systemctl show -p
+MainPID --value porthole-helper.service)/exe` said
+`/usr/libexec/porthole-helper (deleted)` after exactly that.
+
+The reason it is worth a maintainer script is that the failure is silent.
+porthole's D-Bus wire format has already changed incompatibly once — adding a
+forward's three members to `WireRule` moved the `RuleClosed` signal from
+`((sqssssttu)s)` to `((sqssssttusqq)s)` — and zbus drops a signal whose
+signature does not match rather than raising anything. A stale component does
+not fail, it goes quiet, and the first thing you notice is closes no longer
+being announced.
+
+So all three packages end the old helper process on an upgrade, and start no
+helper on a first install:
+
+| | |
+| --- | --- |
+| RPM | `%systemd_postun_with_restart porthole-helper.service`, guarded by rpm's own "this is an upgrade, not an erase" test |
+| Debian | `dh_installsystemd --no-start --restart-after-upgrade`, which puts `deb-systemd-invoke try-restart` in `postinst` behind dpkg's "was there a previous version" test |
+| Arch | `post_upgrade` in the pacman scriptlet: `systemctl daemon-reload`, then `systemctl try-restart` |
+
+Try-restart semantics on all three, and not plain `restart`: a machine whose
+helper was not running acquires no root daemon as the price of a version bump.
+Debian and Arch call `try-restart` by name; the RPM macro instead marks the
+unit `needs-restart` for systemd's own rpm trigger to act on at the end of the
+transaction, which on systemd 259 leaves an inactive unit inactive and gives
+an active one a new PID — measured, because "marked" and "started" are not the
+same word. Each does a `daemon-reload` before its restart, since the unit file
+may be the thing that changed; on Arch that reload is in the scriptlet rather
+than left to pacman's own `daemon-reload` hook, which is `PostTransaction` and
+so runs after the scriptlet, not before it.
+
+**An upgrade closes nothing.** Every port porthole had open is still open when
+it finishes, in the firewall and in the record of it: `RuntimeDirectoryPreserve=yes`
+in `porthole-helper.service` is what keeps `/run/porthole` and the state file
+across the restart, and each opening's automatic close is a transient systemd
+timer living outside the helper process. Losing the access you arranged would
+be a bad way to learn a new version had shipped.
+
+What the restart does cost is a moment. The network-change monitor runs
+**inside** the helper, so a subnet change landing between the old process
+ending and the new one starting is not seen; expiry is unaffected, being
+systemd's timer rather than the helper's.
+
 ## Uninstalling: what closes the ports, and when it does not
 
 The three packages each close every port porthole has open before their files

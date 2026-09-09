@@ -103,17 +103,27 @@ sha256sums=('SKIP')
 # unit a user enables for their own session.
 #
 # What porthole.install does carry -- see package_porthole()'s install= below
-# -- is a pre_remove and a post_install. The pre_remove is the one that had
-# to exist: removing this package has to close the ports porthole still has
-# open, because after the removal nothing is left that could. A hook could
-# have done that too (`Operation = Remove`, `When = PreTransaction`,
+# -- is a pre_remove, a post_upgrade and a post_install. The pre_remove is the
+# one that had to exist: removing this package has to close the ports porthole
+# still has open, because after the removal nothing is left that could. A hook
+# could have done that too (`Operation = Remove`, `When = PreTransaction`,
 # `Target = usr/bin/porthole`); it would ship an installed file of its own to
 # do what a scriptlet does with none, and would put the remove/upgrade split
 # in a Trigger clause instead of in the name of the function that runs. The
-# post_install writes one notice and touches nothing: the agent's two start
-# files both run when a session begins, so neither starts it in the session
-# doing the installing, and a close nobody is told about is the failure this
-# whole package exists to avoid. porthole.install says the rest.
+# post_upgrade is the same hazard on the other side of that split:
+# porthole-helper has no idle timeout, so an upgrade that ends no process
+# leaves the previous version's root daemon serving the new version's
+# clients. No hook in the list above covers that -- reloading the manager
+# restarts nothing -- and systemd's fourth one,
+# 35-systemd-enqueue-marked.hook, restarts only units something has marked
+# `needs-restart`, which on Arch nothing does. Both of them also run
+# PostTransaction, after the scriptlet, which is why post_upgrade does its
+# own daemon-reload before its try-restart. The post_install writes one
+# notice and touches nothing: the
+# agent's two start files both run when a session begins, so neither starts
+# it in the session doing the installing, and a close nobody is told about is
+# the failure this whole package exists to avoid. porthole.install says the
+# rest.
 
 prepare() {
 	cd "$pkgbase-$pkgver"

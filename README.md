@@ -167,6 +167,19 @@ its AppStream metainfo, for a machine with no desktop. `PREFIX` defaults to
 [docs/installing.md](docs/installing.md), which also covers installing each
 piece by hand.
 
+### Upgrading it
+
+An upgrade closes nothing and restarts the privileged helper. The restart is
+the part that has to happen: `porthole-helper` has no idle timeout, so an
+upgrade that ends no process leaves the previous version's root daemon serving
+the new version's clients out of a binary already replaced on disk — and a
+D-Bus signal whose signature no longer matches is dropped rather than raised,
+so what you would see is not an error but notifications quietly stopping. All
+three packages do it, each in its own packaging system's terms, and none of
+them starts a helper on a machine where one was not already running.
+[docs/installing.md](docs/installing.md) has the three spellings and what the
+restart costs.
+
 ### Removing it
 
 Removing the package closes every port porthole still has open — every

@@ -67,9 +67,12 @@ if [ -z "$DPKG_ROOT" ] && [ "$1" = remove ] && [ -d /run/systemd/system ] ; then
 	# root daemon running from a deleted binary, still holding
 	# com.jacopobriccola.Porthole and still able to open ports.
 	#
-	# The upgrade case is dh_installsystemd's: it puts its own
-	# `deb-systemd-invoke stop` in preinst, and the next client call
-	# re-activates the helper on the new binary.
+	# The upgrade case is dh_installsystemd's and is a different act: with
+	# --restart-after-upgrade alongside --no-start it puts a
+	# `deb-systemd-invoke try-restart` in postinst, guarded on dpkg having
+	# passed a previous version, so an upgrade ends the old helper process
+	# and brings the new binary up in its place. Nothing of that reaches
+	# here; this stop is for removals only.
 	deb-systemd-invoke stop porthole-helper.service >/dev/null || true
 fi
 

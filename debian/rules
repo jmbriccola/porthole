@@ -103,19 +103,46 @@ override_dh_auto_clean:
 # install time: the bus starts it when a client first addresses the name. So
 # --no-enable --no-start.
 #
-# What those two produce, read out of the built package rather than inferred:
-# a preinst that runs `deb-systemd-invoke stop porthole-helper.service` on an
-# upgrade, a postrm that runs `systemctl --system daemon-reload` on a remove,
-# and no dh_installsystemd snippet in postinst at all. A fresh install
-# therefore starts no helper, and an upgrade leaves the old one stopped for
-# the next client call to re-activate on the new binary. (--no-start also
-# turns off dh_installsystemd's own restart-after-upgrade default: it sets
-# RESTART_AFTER_UPGRADE only when NO_START is empty.)
+# --restart-after-upgrade is not the opposite of --no-start, and the two
+# together are not a contradiction. dh_installsystemd branches on both
+# (debhelper 13.24.2, /usr/bin/dh_installsystemd, read rather than inferred):
+# with NO_START and RESTART_AFTER_UPGRADE both set it emits the
+# postinst-systemd-restartnostart autoscript with RESTART_ACTION=try-restart,
+# which is guarded by `if [ -n "$2" ]` -- dpkg passes the old version there
+# only on an upgrade. So a fresh install still starts nothing, and an upgrade
+# runs `systemctl --system daemon-reload` and then
+# `deb-systemd-invoke try-restart porthole-helper.service` after the new files
+# are in place. try-restart and not restart: a machine whose helper was not
+# running must not acquire a root daemon as a side effect of a version bump.
 #
-# The gap that stop opens is real and is not repaired here. An opened rule's
-# automatic close is a transient systemd timer outside this process and
-# survives; the helper's network-change monitor is inside it, so a subnet
-# change between the stop and the next client call goes unnoticed.
+# Setting it explicitly is what it takes, because --no-start alone leaves it
+# off: dh_installsystemd defaults RESTART_AFTER_UPGRADE to 1 only when
+# NO_START is empty. What --no-start alone produced instead was a preinst
+# holding `deb-systemd-invoke stop porthole-helper.service` -- emitted
+# `unless ($dh{R_FLAG} || $dh{RESTART_AFTER_UPGRADE})`, so setting
+# --restart-after-upgrade is also what removes it -- and no postinst snippet
+# at all. That stop already kept the previous version's root daemon from
+# serving the new version's clients, which is the failure that matters:
+# porthole's D-Bus wire format has already changed incompatibly once (three
+# members added to WireRule moved RuleClosed from ((sqssssttu)s) to
+# ((sqssssttusqq)s)), and zbus drops a signal whose signature does not match
+# rather than raising anything -- a stale component goes quiet, it does not
+# fail.
+#
+# What the move to try-restart buys is the window after that: stop left the
+# helper down until the next client call, and the helper's network-change
+# monitor runs inside the helper process, so a subnet change in that window
+# went unnoticed. (An opened rule's automatic close does not share the gap:
+# it is a transient systemd timer outside the process.) try-restart brings
+# the helper back on the new binary at the end of the upgrade instead, and
+# leaves the state file behind it -- RuntimeDirectoryPreserve=yes in
+# data/porthole-helper.service is what keeps /run/porthole across the
+# restart. packaging/rpm/porthole.spec's %systemd_postun_with_restart and
+# packaging/aur/porthole.install's post_upgrade are the same decision on the
+# other two distributions, each spelled in its own terms -- that RPM macro on
+# current systemd-rpm-macros runs no restart itself, it marks the unit
+# `needs-restart` for systemd's own rpm trigger to act on at the end of the
+# transaction.
 #
 # --no-start also suppresses the stop-on-remove dh_installsystemd would
 # otherwise put in prerm -- it emits that one `unless NO_START`. That stop is
@@ -124,7 +151,8 @@ override_dh_auto_clean:
 # -pporthole because the unit is only in that package; without it
 # dh_installsystemd stops on porthole-gui, which installs no units at all.
 override_dh_installsystemd:
-	dh_installsystemd -pporthole --no-enable --no-start porthole-helper.service
+	dh_installsystemd -pporthole --no-enable --no-start --restart-after-upgrade \
+	  porthole-helper.service
 
 # porthole-agent.service is the other decision, and it is a different one:
 # WantedBy=graphical-session.target, Restart=on-failure, enabled globally so a

@@ -1,9 +1,11 @@
 # porthole -- pacman install scriptlet for the base package.
 #
-# Two functions. `pre_remove` is the one that had to exist: removal has to
-# close what porthole opened, because nothing else will. `post_install` only
-# says something -- that the notification agent is not running yet -- and
-# says it once.
+# Three functions. `pre_remove` is the one that had to exist: removal has to
+# close what porthole opened, because nothing else will. `post_upgrade` is
+# the same hazard in its other form: an upgrade has to end the helper the
+# previous version left running, because nothing else will either.
+# `post_install` only says something -- that the notification agent is not
+# running yet -- and says it once.
 #
 # Every other way a porthole rule ends needs porthole to still be installed:
 # the expiry timer re-executes /usr/bin/porthole, `close` and the
@@ -25,7 +27,10 @@
 # that has to be made -- an upgrade must close nothing, or it takes away the
 # access the user arranged as the price of a version bump -- is then the name
 # of the function rather than a Trigger clause. There is no pre_upgrade here,
-# so an upgrade closes nothing.
+# so an upgrade closes nothing -- and neither does the post_upgrade added
+# below: a `try-restart` ends the helper process, while every rule it opened
+# stays in the firewall and in the state file, which
+# `RuntimeDirectoryPreserve=yes` keeps across the restart.
 
 post_install() {
 	# Say, once, that notifications do not work yet.
@@ -55,6 +60,79 @@ post_install() {
 		porthole: open. For the session you are in, without logging out:
 		porthole:     systemctl --user start porthole-agent.service
 	NOTICE
+}
+
+post_upgrade() {
+	# End the helper the previous version left running.
+	#
+	# porthole-helper has no idle timeout and no last-rule-closed shutdown
+	# (crates/porthole-helper/src/netmon.rs says so outright): once the bus
+	# has activated it, it runs until something stops it. Nothing else on
+	# this distribution is that something. pre_remove does not run on an
+	# upgrade -- that is the whole point of its name -- and neither systemd
+	# pacman hook reaches the process: 30-systemd-daemon-reload-system
+	# reloads the manager, which restarts nothing, and
+	# 35-systemd-enqueue-marked acts only on units something has marked
+	# `needs-restart`, which on Arch nothing does. Measured: with this
+	# function absent both hooks ran ("Reloading system manager
+	# configuration", "Enqueuing marked services") and the helper's PID was
+	# the same before and after, its /proc/PID/exe reading
+	# `/usr/libexec/porthole-helper (deleted)`. That is the same hazard
+	# pre_remove's last line was written for, in its upgrade form.
+	#
+	# The failure that makes it worth a scriptlet is that it is silent.
+	# porthole's D-Bus wire format has already changed incompatibly once:
+	# adding three members to WireRule moved the RuleClosed signal from
+	# ((sqssssttu)s) to ((sqssssttusqq)s), and zbus drops a signal whose
+	# signature does not match instead of raising anything. A stale helper
+	# does not fail against a new agent, it goes quiet -- the user stops
+	# being told their port closed and has no reason to suspect the upgrade.
+	#
+	# `try-restart` rather than `stop`: both end the stale process, and
+	# D-Bus activation would start the new binary on the next call either
+	# way, but try-restart is a no-op when the unit is not active, so an
+	# upgrade on a machine where nobody has opened a port acquires no root
+	# daemon -- and where the helper *was* running, it comes back on the new
+	# binary now rather than at the next client call. That window is not
+	# nothing: the network-change monitor runs inside the helper process, so
+	# a subnet change while it is down goes unnoticed. (An opened rule's
+	# automatic close is a transient systemd timer outside the process and
+	# survives regardless.) packaging/rpm/porthole.spec's
+	# %systemd_postun_with_restart and debian/rules' `--no-start
+	# --restart-after-upgrade` are the same decision on the other two
+	# distributions, each in its own terms: Debian's ends as a postinst
+	# `deb-systemd-invoke try-restart`, while that RPM macro on current
+	# systemd-rpm-macros runs no restart itself -- it marks the unit
+	# `needs-restart` for systemd's own rpm trigger to act on at the end of
+	# the transaction.
+	#
+	# daemon-reload first, and here rather than left to pacman: the systemd
+	# hook that reloads the manager is a PostTransaction hook, so it runs
+	# after this function, and a try-restart before it would start the new
+	# binary under the unit definition the *previous* version installed.
+	#
+	# No ordering hazard of pre_remove's kind. That one has to stop the
+	# helper after `porthole close --all` because stopping first would let
+	# the close D-Bus-activate it again; nothing here calls porthole at all.
+	#
+	# Arch does have a more idiomatic spelling of these two lines, and it is
+	# not taken: /usr/share/libalpm/scripts/systemd-hook carries a `restart`
+	# operation ("For use by other packages", `systemctl try-restart "$@"`)
+	# meant to be reached from a package's own PostTransaction pacman hook,
+	# after the daemon-reload one. Using it means shipping an installed file,
+	# and the install layout is the Makefile's -- checked path by path by
+	# crates/porthole-cli/tests/install_layout.rs on every `cargo test` --
+	# so a file only pacman would ever read has no place in it. Same reason
+	# the PKGBUILD gives for pre_remove being a scriptlet and not a hook.
+	#
+	# Relative paths and the run/systemd/system test, for pre_remove's
+	# reasons: pacman runs a scriptlet with the install root as its working
+	# directory, and with no systemd running there is no unit to restart.
+	[[ -d run/systemd/system ]] || return 0
+
+	systemctl daemon-reload >/dev/null 2>&1 || true
+	systemctl try-restart porthole-helper.service >/dev/null 2>&1 || true
+	return 0
 }
 
 pre_remove() {
@@ -103,10 +181,11 @@ pre_remove() {
 	fi
 
 	# After the close, not before: stopping first would leave the close to
-	# D-Bus-activate the helper again. Arch has no scriptlet stopping this
-	# unit otherwise -- the systemd pacman hook only reloads the manager --
-	# so without this line removal leaves a root daemon running from a
-	# deleted binary, still holding com.jacopobriccola.Porthole.
+	# D-Bus-activate the helper again. Nothing else reaches this unit on a
+	# removal -- post_upgrade above does not run on one, and the systemd
+	# pacman hook only reloads the manager -- so without this line removal
+	# leaves a root daemon running from a deleted binary, still holding
+	# com.jacopobriccola.Porthole.
 	systemctl stop porthole-helper.service >/dev/null 2>&1 || true
 	return 0
 }
