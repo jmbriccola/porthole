@@ -107,7 +107,7 @@
 
 use adw::prelude::*;
 use porthole_core::backend::NO_FIREWALL_MESSAGE;
-use porthole_core::ipc::WireStatus;
+use porthole_core::ipc::{Alignment, WireStatus};
 
 /// [`StatusBar::set_status`]'s title for a confirmed no-firewall detection
 /// -- short, and deliberately makes no claim beyond that. See this module's
@@ -152,13 +152,49 @@ fn unreachable_title(message: &str) -> String {
 /// signatures goes on [`StatusBar::line`] underneath, verbatim, rather than
 /// into a banner nobody could read at a glance.
 ///
-/// It names both remedies because nothing here can tell which half is the
-/// older one -- a signature mismatch names two signatures and does not
-/// order them. It does not say "could not reach": the helper answered.
+/// It does not say "could not reach": the helper answered.
+///
+/// **This one names both remedies, and the two below name one.** A signature
+/// mismatch names two signatures and does not order them, which is what this
+/// wording is for -- and it is still the honest wording whenever the helper's
+/// own `porthole_core::ipc::PROTOCOL_VERSION` could not be read, and when two
+/// binaries report the same version and still cannot read each other (a
+/// signature moved without the number moving, which
+/// `porthole_core::ipc::SIGNATURE`'s guards exist to make unshippable, and
+/// which if it happened anyway would mean the number is evidence of nothing).
 const UNDECODABLE_TITLE: &str =
     "Porthole and the porthole helper are different versions, so this window cannot read \
      what it answers. Close and reopen this window; if that does not help, restart \
      porthole-helper.service.";
+
+/// The helper's own version says it is the older half: the remedy is a
+/// system service, and this window cannot restart one.
+const HELPER_IS_OLDER_TITLE: &str =
+    "The porthole helper is an older version than this window, so this window cannot read \
+     what it answers. Restart it: `systemctl restart porthole-helper.service`.";
+
+/// This window is the older half.
+///
+/// **It does not offer to restart itself, and that is the recorded choice
+/// for this component** (`docs/superpowers/specs/2026-09-09-update-notifier-
+/// design.md`: «La GUI aperta non può ri-eseguirsi mentre è in uso. Se ne
+/// accorge e lo dice»). `porthole-agent` does re-execute itself, because
+/// nothing is looking at it; a window is something a person arranged on a
+/// screen, and one that vanished and came back under their hands would have
+/// reported nothing.
+const THIS_WINDOW_IS_OLDER_TITLE: &str =
+    "This window is an older version of porthole than the helper it is talking to, so it \
+     cannot read what the helper answers. Close and reopen it to start the version that \
+     is installed now.";
+
+/// Which of the three [`StatusBar::set_undecodable`] shows.
+fn undecodable_title(alignment: Option<Alignment>) -> &'static str {
+    match alignment {
+        Some(Alignment::HelperIsOlder) => HELPER_IS_OLDER_TITLE,
+        Some(Alignment::ThisOneIsOlder) => THIS_WINDOW_IS_OLDER_TITLE,
+        Some(Alignment::Same) | None => UNDECODABLE_TITLE,
+    }
+}
 
 /// [`StatusBar::set_errored`]'s wording -- deliberately not built from
 /// [`unreachable_title`] or a shared prefix with it: the helper answered
@@ -322,8 +358,14 @@ impl StatusBar {
     /// underneath rather than into the banner, the same split
     /// [`StatusBar::set_status`]'s no-firewall branch makes and for the same
     /// reason.
-    pub fn set_undecodable(&self, message: &str) {
-        self.show_banner(UNDECODABLE_TITLE);
+    ///
+    /// `alignment` is what the helper's own version said about which of the
+    /// two is behind, and it decides which of the three wordings above the
+    /// banner carries -- one remedy where the version identified a half, and
+    /// both where it did not. `None` is a version that could not be read at
+    /// all.
+    pub fn set_undecodable(&self, message: &str, alignment: Option<Alignment>) {
+        self.show_banner(undecodable_title(alignment));
         self.line.set_label(message);
         // Not a dim caption: it is the detail of the banner at the other end
         // of the window, exactly as `status.detail` is.
@@ -507,6 +549,52 @@ mod tests {
                 .contains("reopen this window"),
             "{UNDECODABLE_TITLE}"
         );
+    }
+
+    #[test]
+    fn the_banner_names_the_one_remedy_the_helpers_own_version_identified() {
+        // What the protocol version bought this window. The wording above
+        // offers two remedies and asks the person to try them in turn; with
+        // a version on the wire, two of the three cases know which one it
+        // is.
+        let helper_older = undecodable_title(Some(Alignment::HelperIsOlder));
+        assert!(
+            helper_older.contains("systemctl restart porthole-helper.service"),
+            "{helper_older}"
+        );
+        assert!(
+            !helper_older.to_lowercase().contains("reopen this window"),
+            "reopening this window would start the same version again: {helper_older}"
+        );
+
+        let window_older = undecodable_title(Some(Alignment::ThisOneIsOlder));
+        assert!(
+            window_older.to_lowercase().contains("reopen"),
+            "the window's own remedy, which is the one it cannot perform for itself: \
+             {window_older}"
+        );
+        assert!(
+            !window_older.contains("porthole-helper.service"),
+            "restarting the newer half would change nothing: {window_older}"
+        );
+
+        // Nothing known keeps the wording from before there was a version,
+        // and so does an equal version that is nonetheless unreadable --
+        // that combination means a signature moved without the number
+        // moving, so the number is evidence of nothing.
+        assert_eq!(undecodable_title(None), UNDECODABLE_TITLE);
+        assert_eq!(undecodable_title(Some(Alignment::Same)), UNDECODABLE_TITLE);
+
+        // Three wordings, not one wording three times -- and none of them
+        // claims the helper could not be reached, which is the false claim
+        // this whole case exists to have stopped making.
+        assert_ne!(helper_older, window_older);
+        assert_ne!(helper_older, UNDECODABLE_TITLE);
+        assert_ne!(window_older, UNDECODABLE_TITLE);
+        for title in [helper_older, window_older] {
+            assert!(!title.to_lowercase().contains("could not reach"), "{title}");
+            assert!(title.contains("cannot read"), "{title}");
+        }
     }
 
     #[test]

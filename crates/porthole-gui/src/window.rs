@@ -128,7 +128,7 @@ use gtk::glib;
 use porthole_core::command::RealRunner;
 use porthole_core::devices;
 use porthole_core::docker::Published;
-use porthole_core::ipc::{PortholeProxy, WireDockerPort, WireRule, WireStatus};
+use porthole_core::ipc::{Alignment, PortholeProxy, WireDockerPort, WireRule, WireStatus};
 use porthole_core::listening::RealProcFs;
 
 use crate::busy::BusyIndicator;
@@ -804,6 +804,13 @@ fn classify_failure(e: zbus::Error) -> HelperFailure {
     }
 }
 
+/// The two below are reached only for a failure that is **not**
+/// `Undecodable`: every path that can produce one routes it to
+/// [`stop_talking_to_the_helper`] first, which is where the window's answer
+/// to it lives. The arms are here because the enum has three variants and a
+/// wildcard would silently absorb a fourth; they pass `None` for the
+/// alignment because nothing on these paths has asked the helper for its
+/// version.
 fn apply_failure_to_open_now(open_now: &OpenNowSection, failure: &HelperFailure) {
     match failure {
         HelperFailure::Unreachable(message) => open_now.set_unreachable(message),
@@ -816,7 +823,7 @@ fn apply_failure_to_status_bar(status_bar: &StatusBar, failure: &HelperFailure) 
     match failure {
         HelperFailure::Unreachable(message) => status_bar.set_unreachable(message),
         HelperFailure::Errored(message) => status_bar.set_errored(message),
-        HelperFailure::Undecodable(message) => status_bar.set_undecodable(message),
+        HelperFailure::Undecodable(message) => status_bar.set_undecodable(message, None),
     }
 }
 
@@ -834,6 +841,18 @@ struct HelperSnapshot {
     rules: Result<Vec<WireRule>, HelperFailure>,
     status: Result<WireStatus, HelperFailure>,
     docker: Result<Vec<Published>, HelperFailure>,
+    /// Which of the two binaries is the older half, as the helper's own
+    /// `ProtocolVersion` answered -- and **only** when one of the three
+    /// results above could not be read at all, which is the one situation
+    /// the answer changes anything in. `None` everywhere else, and also for
+    /// a version this build could not read either: nothing is guessed from
+    /// silence.
+    ///
+    /// Read over the same connection the three calls above used, through
+    /// `porthole_core::ipc::read_protocol_version`, which builds a proxy for
+    /// the one call -- never a cached property, for the reason measured in
+    /// that function's own doc comment.
+    alignment: Option<Alignment>,
 }
 
 /// One [`WireDockerPort`] as the local type. `host_addr` empty means "no
@@ -887,11 +906,24 @@ async fn fetch_helper_snapshot() -> Result<HelperSnapshot, HelperFailure> {
             .map_err(HelperFailure::Errored),
         Err(e) => Err(classify_failure(e)),
     };
-    Ok(HelperSnapshot {
+    let mut snapshot = HelperSnapshot {
         rules,
         status,
         docker,
-    })
+        alignment: None,
+    };
+    // One more round trip, and only on the one path where the answer is
+    // worth anything: an answer this build could not read is the failure
+    // that does not go away by itself, and which half is old is what the
+    // window has to tell the person in front of it. Every other refresh
+    // pays nothing for this.
+    if first_undecodable(&snapshot).is_some() {
+        snapshot.alignment = porthole_core::ipc::read_protocol_version(&connection)
+            .await
+            .ok()
+            .map(porthole_core::ipc::alignment);
+    }
+    Ok(snapshot)
 }
 
 /// What the saved-device cache says before anything has read the address
@@ -1266,7 +1298,7 @@ fn refresh(sections: &Sections) {
                     // other two calls' results are about the same two
                     // binaries. See [`stop_talking_to_the_helper`].
                     if let Some(message) = first_undecodable(&snapshot) {
-                        stop_talking_to_the_helper(&sections, &message);
+                        stop_talking_to_the_helper(&sections, &message, snapshot.alignment);
                         return;
                     }
                     match snapshot.rules {
@@ -1292,7 +1324,9 @@ fn refresh(sections: &Sections) {
                     // carry `Undecodable` too, in principle, and is routed
                     // the same way rather than rendered and then forgotten.
                     if let HelperFailure::Undecodable(message) = &failure {
-                        stop_talking_to_the_helper(&sections, message);
+                        // `None`: no connection was made at all here, so
+                        // there was nothing to ask which half is older.
+                        stop_talking_to_the_helper(&sections, message, None);
                         return;
                     }
                     apply_failure_to_open_now(&open_now, &failure);
@@ -1369,12 +1403,12 @@ fn first_undecodable(snapshot: &HelperSnapshot) -> Option<String> {
 /// Not reversible. Nothing this process can do makes the two binaries
 /// agree, and a window that quietly came back to life would be claiming
 /// something happened that it cannot have observed.
-fn stop_talking_to_the_helper(sections: &Sections, message: &str) {
+fn stop_talking_to_the_helper(sections: &Sections, message: &str, alignment: Option<Alignment>) {
     if sections.stopped.replace(true) {
         return;
     }
     sections.open_now.set_undecodable(message);
-    sections.status_bar.set_undecodable(message);
+    sections.status_bar.set_undecodable(message, alignment);
     // The rule list is gone, so "already open" is no longer known -- the
     // same call every other failed refresh makes.
     sections.listening.set_open_ports_unknown();
@@ -1567,6 +1601,9 @@ mod tests {
                 } else {
                     Err(ordinary())
                 },
+                // Not read on this path: `first_undecodable` is what
+                // decides whether it is worth asking for at all.
+                alignment: None,
             };
             assert_eq!(
                 first_undecodable(&snapshot).as_deref(),
@@ -1581,6 +1618,7 @@ mod tests {
             rules: Err(ordinary()),
             status: Err(HelperFailure::Unreachable("no bus".to_string())),
             docker: Err(ordinary()),
+            alignment: None,
         };
         assert_eq!(first_undecodable(&ordinary_only), None);
     }

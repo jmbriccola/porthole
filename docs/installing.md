@@ -239,18 +239,46 @@ same rule type. This is not the ordinary "no helper installed" case, which
 still leaves the agent listening, and the journal keeps the whole error, which
 is where the two signatures are named.
 
-Nothing in the message says **which** half is the old one — a signature
-mismatch names two signatures and does not order them — so the notice offers
-both remedies: log out and back in, which starts the agent that is installed
-now, and restart `porthole-helper.service`, which replaces a helper still
-running from before an upgrade. Which of the two it is depends on what an
-upgrade actually restarted — see "Upgrading: the helper restarts, the ports
-stay" below.
+A signature mismatch names two signatures and does not order them, so the
+message itself cannot say **which** half is the old one. The helper answers
+that separately: `ProtocolVersion` on the same interface is a number a client
+reads before anything else, and comparing it with its own is what tells the
+two cases apart. The notice then names the remedy instead of offering both —
+restart `porthole-helper.service` when the helper is the older half, or
+replace the agent when it is. A helper from before that member existed answers
+`Unknown method`/`Unknown property`, which is itself the answer: it is older
+than anything that asks. Only when the version cannot be read at all does the
+notice fall back to naming both remedies, as it did before.
 
 The agent exits 0 here, so the unit stays stopped rather than restarting: a
 fresh agent started against the same helper would fail in exactly the same
 way, and would show that notice again at every attempt until systemd's start
 limit stopped it.
+
+### An agent that is itself the old half
+
+That is the common case — the user bus outlives a login, so an agent survives
+a package upgrade far more often than a helper does — and it is the one the
+agent settles by itself. When the helper reports a **newer** version, the
+agent starts again from its own binary on disk, which the upgrade has already
+replaced, and carries on from there. Nothing appears on the screen: it is a
+remedy that needs no privilege and no attention, so it does not ask for any.
+
+It re-runs the path, never `/proc/self/exe`: that link names the running
+*inode*, which after an upgrade is still the old binary. Once the file has
+been replaced under it, `readlink /proc/self/exe` reads `<path> (deleted)`
+while `<path>` is the new file, and the path is what gets started.
+
+**At most once per start.** A machine whose installed agent really is the
+older half would otherwise answer the same way every time and loop; instead
+the second attempt is refused, the journal says so, and the agent carries on
+listening — it can still read whatever it can read, and the first message it
+cannot stops it with the notice above.
+
+The check runs at start-up and again whenever the helper's bus name changes
+owner, which is the helper having just restarted. So the ordinary upgrade
+sequence — new package, helper restarted by the maintainer script, agent still
+running from before — resolves itself the moment the new helper appears.
 
 `WantedBy=graphical-session.target` is what starts the unit, so whether
 `enable` alone is enough depends on your desktop actually reaching that
@@ -395,10 +423,18 @@ Measured: zbus does **not** drop a mismatched signal — it delivers the message
 and the decode is what fails — and porthole was throwing that error away. It
 no longer does: the agent puts a notice on the screen and stops, the window
 says so and disables itself, and the CLI says the answer could not be read
-rather than claiming the helper was unreachable. See "An agent that cannot
-read the helper" above. Restarting the helper is still what puts the two
-halves back in step; what changed is that skipping it is now something you are
-told about instead of something you infer from silence.
+rather than claiming the helper was unreachable, with an exit status of its
+own (15) so a script can tell this apart from an ordinary failure. See "An
+agent that cannot read the helper" above. Restarting the helper is still what
+puts the two halves back in step; what changed is that skipping it is now
+something you are told about instead of something you infer from silence.
+
+Each of the three also **names which half to restart**, rather than offering
+both and leaving the person to try them in turn: the helper reports the
+version of the interface it speaks, and a client compares it with its own. The
+agent goes further and replaces itself when it is the one that is behind (see
+"An agent that is itself the old half" above), which is why an upgrade that
+restarts the helper needs nothing done about the agent afterwards.
 
 So all three packages end the old helper process on an upgrade, and start no
 helper on a first install:

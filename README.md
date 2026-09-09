@@ -600,6 +600,17 @@ different versions and switches off everything that would reach the helper,
 including the buttons whose *request* a mismatched helper still accepts.
 [docs/installing.md](docs/installing.md) has the whole of it.
 
+**And the agent now fixes the commonest case by itself.** The helper says which
+version of porthole's own interface it speaks, so a component can tell which of
+the two of them is the older half instead of only that they differ. An agent
+that finds the helper ahead of it starts again from the binary on disk — which
+after an upgrade is the new one — exactly once per start, and goes back to
+announcing closes with nobody having to log out. It is the one remedy that
+needs no privilege and no attention. The other one still does: a *helper* left
+over from an upgrade has to be restarted as a service, and every component now
+names that remedy on its own rather than offering both and asking the person to
+try them in turn.
+
 **Neither start file runs in a session that is already open, so notifications
 begin at the next login.** Installing porthole — from a package or by hand —
 puts both files in place and starts nothing. The user unit is reached through

@@ -29,7 +29,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
-use porthole_core::ipc::{WireDockerPort, WireRule, WireStatus, PATH, SERVICE};
+use porthole_core::ipc::{WireDockerPort, WireRule, WireStatus, PATH, PROTOCOL_VERSION, SERVICE};
 use porthole_gui::window::PortholeWindow;
 
 /// How long any of these will wait for the bus and a widget to settle.
@@ -190,6 +190,50 @@ impl CurrentHelper {
     async fn docker_ports(&self) -> Vec<WireDockerPort> {
         Vec::new()
     }
+
+    /// The ordinary configuration: one package, one protocol, both halves
+    /// speaking it.
+    async fn protocol_version(&self) -> u32 {
+        PROTOCOL_VERSION
+    }
+}
+
+/// A helper **newer** than this window: it answers in a shape this build
+/// cannot read, and its `ProtocolVersion` says which of the two that makes
+/// the older half.
+///
+/// The unreadable shape here is the one from *before* the forward feature,
+/// because that is the only shape this repository can write down -- a future
+/// `WireRule` is by definition one this build does not have. What is being
+/// stood in for is the property that matters and nothing else: an answer this
+/// window cannot decode, from a helper whose own version is ahead of it.
+struct HelperFromTheFuture;
+
+#[zbus::interface(name = "com.jacopobriccola.Porthole1")]
+impl HelperFromTheFuture {
+    async fn list(&self) -> Vec<RuleBeforeForward> {
+        vec![rule_before_forward(5173)]
+    }
+
+    async fn status(&self) -> StatusBeforeForward {
+        StatusBeforeForward {
+            backend: "firewalld".to_string(),
+            firewall_available: true,
+            firewall_active: true,
+            firewall_active_unknown: false,
+            firewall_version: "2.3.0".to_string(),
+            detail: "firewalld is running".to_string(),
+            location: "FedoraWorkstation".to_string(),
+            interface: "wlp2s0".to_string(),
+            address: "10.10.10.20".to_string(),
+            cidr: "10.10.10.0/24".to_string(),
+            rules: vec![rule_before_forward(5173)],
+        }
+    }
+
+    async fn protocol_version(&self) -> u32 {
+        PROTOCOL_VERSION + 1
+    }
 }
 
 /// What one case reads back off the real widgets.
@@ -316,20 +360,36 @@ fn a_helper_this_build_cannot_read_disables_the_window_and_says_why() -> Result<
             seen.banner_text
         ));
     }
-    if !seen.banner_text.contains("different versions") {
+    if !seen.banner_text.contains("older version") || !seen.banner_text.contains("cannot read") {
         return Err(format!(
-            "the banner has to say what is actually wrong: {:?}",
+            "the banner has to say what is actually wrong -- a version difference, and \
+             which side of it this window is on: {:?}",
             seen.banner_text
         ));
     }
-    if !seen.banner_text.contains("porthole-helper.service")
-        || !seen
-            .banner_text
-            .to_lowercase()
-            .contains("reopen this window")
+    // One remedy, and the right one. This stand-in has no `ProtocolVersion`
+    // member at all -- which is what every helper deployed today answers,
+    // measured read-only against the live one on the author's own machine --
+    // and an absent member is a helper from before that contract, so the
+    // older half is the helper. Before the version was on the wire this
+    // banner had to offer both and let the person try them in turn.
+    if !seen
+        .banner_text
+        .contains("systemctl restart porthole-helper.service")
     {
         return Err(format!(
-            "both remedies belong there -- nothing on the wire says which half is old: {:?}",
+            "the banner must name the half the version identified: {:?}",
+            seen.banner_text
+        ));
+    }
+    if seen
+        .banner_text
+        .to_lowercase()
+        .contains("reopen this window")
+    {
+        return Err(format!(
+            "and stop offering the window's own remedy, which would start this same \
+             version again: {:?}",
             seen.banner_text
         ));
     }
@@ -435,6 +495,65 @@ fn the_same_window_against_a_helper_it_can_read_is_not_disabled() -> Result<(), 
     Ok(())
 }
 
+/// The other half of the same question: a helper **newer** than this
+/// window, whose own version says the window is the half to replace.
+///
+/// A window cannot re-execute itself while somebody is using it -- that is
+/// the recorded choice for this component, and it is why `porthole-agent`
+/// replaces itself and this does not. So what changes here is only the
+/// sentence: it names the one remedy the person has to perform instead of
+/// two for them to try in turn.
+fn a_helper_newer_than_this_window_says_the_window_is_the_half_to_replace() -> Result<(), String> {
+    let (_listener, port) = bind_a_listener();
+    let seen = Rc::new(RefCell::new(Seen::default()));
+    let out = seen.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.WindowIsOlder",
+        move |app| {
+            *out.borrow_mut() =
+                look_at_the_window(app, port, |win| win.status_bar().is_prominent());
+        },
+    );
+    let seen = seen.borrow().clone();
+
+    if !seen.settled || !seen.banner_showing {
+        return Err(format!(
+            "the window said nothing prominent about a helper it cannot read: {:?}",
+            seen.banner_text
+        ));
+    }
+    if !seen.banner_text.to_lowercase().contains("reopen") {
+        return Err(format!(
+            "the window is the older half here, and reopening it is what starts the \
+             version that is installed: {:?}",
+            seen.banner_text
+        ));
+    }
+    if seen.banner_text.contains("porthole-helper.service") {
+        return Err(format!(
+            "the helper is the newer half; restarting it would change nothing: {:?}",
+            seen.banner_text
+        ));
+    }
+    if seen.banner_text.to_lowercase().contains("could not reach") {
+        return Err(format!("the helper answered: {:?}", seen.banner_text));
+    }
+    // Everything that is not the wording is unchanged: this is the same
+    // stopped window as the case above, and a banner that named a remedy
+    // while leaving the buttons live would be the worse of the two failures.
+    if seen.open_button_pressable {
+        return Err(
+            "\"Open a port\" is still pressable against a helper this window \
+                    cannot read"
+                .to_string(),
+        );
+    }
+    if !seen.window_still_there {
+        return Err("the window disappeared instead of saying anything".to_string());
+    }
+    Ok(())
+}
+
 fn main() {
     // Before any window exists -- see this file's own module doc.
     let address = std::env::var("DBUS_SESSION_BUS_ADDRESS")
@@ -450,6 +569,12 @@ fn main() {
     let current = zbus::blocking::connection::Builder::address(address.as_str())
         .expect("a bus address")
         .serve_at(PATH, CurrentHelper)
+        .expect("a valid object path")
+        .build()
+        .expect("a connection");
+    let newer = zbus::blocking::connection::Builder::address(address.as_str())
+        .expect("a bus address")
+        .serve_at(PATH, HelperFromTheFuture)
         .expect("a valid object path")
         .build()
         .expect("a connection");
@@ -480,6 +605,16 @@ fn main() {
     run(
         "the_same_window_against_a_helper_it_can_read_is_not_disabled",
         the_same_window_against_a_helper_it_can_read_is_not_disabled,
+    );
+    current
+        .release_name(SERVICE)
+        .expect("and can give it back too");
+    newer
+        .request_name(SERVICE)
+        .expect("the stand-in from after this build can take it");
+    run(
+        "a_helper_newer_than_this_window_says_the_window_is_the_half_to_replace",
+        a_helper_newer_than_this_window_says_the_window_is_the_half_to_replace,
     );
 
     if failed.get() {
