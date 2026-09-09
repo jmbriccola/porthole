@@ -312,6 +312,35 @@ impl WireDockerPort {
     }
 }
 
+/// Whether this error is porthole failing to **read** what the helper sent,
+/// rather than anything the helper decided or any way it could not be
+/// reached.
+///
+/// The case it exists for is measured, in
+/// `.superpowers/sdd/2026-09-07-docker-forward/spike-protocol-version.md`:
+/// the forward feature added three members to [`WireRule`], so `RuleClosed`'s
+/// body went from `((sqssssttu)s)` to `((sqssssttusqq)s)` and `list`'s return
+/// from `a(sqssssttu)` to `a(sqssssttusqq)`. A client built against one and
+/// talking to a helper built against the other gets
+/// `zbus::Error::Variant(SignatureMismatch)` — from a method's return, and
+/// from a signal's own `args()`. zbus delivers the signal either way and the
+/// stream survives it; only the decode refuses.
+///
+/// **Every `Variant` error, not only `SignatureMismatch`**, and that is
+/// deliberate: a value this build has no name for fails the same way with a
+/// serde error instead (a `CloseReason` a newer helper added, say — the
+/// signature would still be `s`), and it is the same fact about the same two
+/// binaries. What this cannot tell apart is the *direction*: zvariant reports
+/// a value porthole failed to **encode** the same way. So this is only asked
+/// about an error that came back from a call or from `args()`, where nothing
+/// porthole sent is what failed.
+///
+/// It says nothing about which of the two is older. Nothing on the wire does
+/// today; that is what a protocol version would be for, and it is not this.
+pub fn is_undecodable(e: &zbus::Error) -> bool {
+    matches!(e, zbus::Error::Variant(_))
+}
+
 /// The client side of the helper's interface.
 ///
 /// `scope` is passed as the user typed it — `subnet`, `any`, a CIDR, an IP —
@@ -765,6 +794,111 @@ mod tests {
         // `dbus-monitor` output the container suite greps -- both depend on
         // this being `s` and not the `u` a bare unit enum would default to.
         assert_eq!(CloseReason::SIGNATURE, "s");
+    }
+
+    /// [`WireRule`] as it was before the forward feature added
+    /// `container_addr`, `container_port` and `published_port` — the exact
+    /// shape a component from before that upgrade still reads with. Written
+    /// out rather than derived from `WireRule`, because deriving it from the
+    /// type under test would change with it and stop being the old shape.
+    #[derive(Debug, Clone, Serialize, Deserialize, Type)]
+    struct RuleBeforeForward {
+        id: String,
+        port: u16,
+        protocol: String,
+        target: String,
+        scope: String,
+        backend: String,
+        opened_at: u64,
+        expires_at: u64,
+        uid: u32,
+    }
+
+    /// One real `RuleClosed` body, encoded from `T` and read back as `U` —
+    /// the error zbus itself produces, not one built by hand here.
+    fn read_back<T, U>(sent: &T) -> zbus::Result<U>
+    where
+        T: serde::Serialize + Type,
+        U: serde::de::DeserializeOwned + Type,
+    {
+        zbus::message::Message::signal(PATH, INTERFACE, "RuleClosed")
+            .expect("a well-formed signal header")
+            .build(sent)
+            .expect("a body")
+            .body()
+            .deserialize::<U>()
+    }
+
+    #[test]
+    fn a_rule_from_before_the_forward_feature_cannot_be_read_and_says_so() {
+        // The defect this predicate exists for, reproduced end to end
+        // through zbus's own encoder and decoder: the two signatures really
+        // do not match, the error really is `Variant`, and a component that
+        // asks `is_undecodable` about it really does get `true`.
+        let old = RuleBeforeForward {
+            id: "abc".to_string(),
+            port: 5173,
+            protocol: "tcp".to_string(),
+            target: "10.10.10.0/24".to_string(),
+            scope: "network".to_string(),
+            backend: "firewalld".to_string(),
+            opened_at: 1_757_000_000,
+            expires_at: 1_757_003_600,
+            uid: 1000,
+        };
+        let sent = (old.clone(), CloseReason::Expired);
+        let e = read_back::<_, (WireRule, CloseReason)>(&sent)
+            .expect_err("the two bodies have different signatures");
+        assert!(
+            is_undecodable(&e),
+            "a body porthole cannot decode must be readable as exactly that: {e}"
+        );
+        assert!(
+            e.to_string().contains("ignature"),
+            "and zbus's own text is what says which signatures disagreed: {e}"
+        );
+
+        // The other direction is the same fact: a helper from before the
+        // upgrade, a client from after it.
+        let e = read_back::<_, (RuleBeforeForward, CloseReason)>(&(
+            WireRule::from_rule(&rule(Some(1_757_003_600))),
+            CloseReason::Expired,
+        ))
+        .expect_err("still two different signatures");
+        assert!(is_undecodable(&e), "{e}");
+
+        // And the negative control the whole predicate rests on: a body of
+        // the *matching* shape decodes, so "could not decode" is a real
+        // failure and not something this test would report about anything.
+        let sent = (
+            WireRule::from_rule(&rule(Some(1_757_003_600))),
+            CloseReason::Expired,
+        );
+        let (back, reason) =
+            read_back::<_, (WireRule, CloseReason)>(&sent).expect("the matching shape reads back");
+        assert_eq!(back.port, 5173);
+        assert_eq!(reason, CloseReason::Expired);
+    }
+
+    #[test]
+    fn a_helper_that_answered_and_a_helper_that_was_not_there_are_not_decode_failures() {
+        // The distinction the agent's own start-up turns on: an absent
+        // helper is ordinary and recoverable, and must not be mistaken for
+        // the one failure that means the two binaries cannot speak.
+        let answered = zbus::Error::MethodError(
+            zbus::names::OwnedErrorName::try_from("com.jacopobriccola.Porthole.NotAuthorized")
+                .unwrap(),
+            Some("not authorized: com.jacopobriccola.Porthole.List".to_string()),
+            zbus::message::Message::method_call("/", "Noop")
+                .unwrap()
+                .build(&())
+                .unwrap(),
+        );
+        assert!(!is_undecodable(&answered));
+        assert!(!is_undecodable(&zbus::Error::Failure(
+            "the connection was lost".to_string()
+        )));
+        assert!(!is_undecodable(&zbus::Error::InvalidReply));
     }
 
     #[test]

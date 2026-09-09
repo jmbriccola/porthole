@@ -20,4 +20,8 @@ tokio.workspace = true
 zbus.workspace = true
 
 [dev-dependencies]
+# For the one thing these tests cannot express without it: a stand-in helper
+# that serves the *previous* shape of `WireRule`, so a real signature
+# mismatch crosses a real bus. See `tests/session.rs`.
+serde.workspace = true
 tempfile.workspace = true

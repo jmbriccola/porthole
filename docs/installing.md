@@ -152,6 +152,9 @@ is ordinary (no helper installed, or none activatable) and the agent goes on
 listening. It is worth naming rather than glossing over, because it means the
 agent starting is enough to start the privileged helper.
 
+One kind of failure there is **not** ordinary, and the agent stops for it —
+see "An agent that cannot read the helper" below.
+
 The second is a `Reopen` click on a notification it is currently showing. Two
 of the four reasons above carry that button — an expiry, and a container that
 moved — and what it re-sends depends on the rule the notification was about:
@@ -218,6 +221,37 @@ holder that will not yield. That agent now says so on the screen rather than
 only in the journal — "Porthole notifications did not start" — and logging
 out and back in clears it for good.
 
+### An agent that cannot read the helper
+
+The two halves of porthole exchange typed messages, and their shapes change
+between versions: the forward feature added three fields to the rule a
+`RuleClosed` carries, so its signature went from `((sqssssttu)s)` to
+`((sqssssttusqq)s)`. An agent on one side of that change cannot read a helper
+on the other. Measured, on the owner's own machine: the agent is handed the
+message and the *decode* is what fails — and until this was fixed, that error
+was thrown away and the loop went round again, so a stale agent announced
+**nothing at all, for any close, in silence**, for as long as it ran.
+
+It now stops instead, and says so on the screen first: *"Porthole
+notifications stopped"*. The same thing happens if the start-up `List` above
+is what comes back unreadable, rather than a close — that answer carries the
+same rule type. This is not the ordinary "no helper installed" case, which
+still leaves the agent listening, and the journal keeps the whole error, which
+is where the two signatures are named.
+
+Nothing in the message says **which** half is the old one — a signature
+mismatch names two signatures and does not order them — so the notice offers
+both remedies: log out and back in, which starts the agent that is installed
+now, and restart `porthole-helper.service`, which replaces a helper still
+running from before an upgrade. Which of the two it is depends on what an
+upgrade actually restarted — see "Upgrading: the helper restarts, the ports
+stay" below.
+
+The agent exits 0 here, so the unit stays stopped rather than restarting: a
+fresh agent started against the same helper would fail in exactly the same
+way, and would show that notice again at every attempt until systemd's start
+limit stopped it.
+
 `WantedBy=graphical-session.target` is what starts the unit, so whether
 `enable` alone is enough depends on your desktop actually reaching that
 target (GNOME does). `--now` above sidesteps the question for the session you
@@ -230,7 +264,8 @@ ending while the agent is running. The agent cannot rebuild it, so closes
 would otherwise stop being announced with nothing to show anything had gone
 wrong. Every other reason the agent stops exits 0 on purpose — no session
 bus, no system bus at start-up, no notification service, a holder of the bus
-name that will not yield it, or a newer agent taking that name — so the unit
+name that will not yield it, a helper whose messages it cannot read, or a
+newer agent taking that name — so the unit
 stays stopped rather than looping, and a headless login does not fight
 systemd's start limit. The last of those is why the restart must not happen:
 a replaced agent that came back would take the name straight off the agent
@@ -349,13 +384,21 @@ no longer on disk. On a Debian machine, `readlink /proc/$(systemctl show -p
 MainPID --value porthole-helper.service)/exe` said
 `/usr/libexec/porthole-helper (deleted)` after exactly that.
 
-The reason it is worth a maintainer script is that the failure is silent.
-porthole's D-Bus wire format has already changed incompatibly once — adding a
-forward's three members to `WireRule` moved the `RuleClosed` signal from
-`((sqssssttu)s)` to `((sqssssttusqq)s)` — and zbus drops a signal whose
-signature does not match rather than raising anything. A stale component does
-not fail, it goes quiet, and the first thing you notice is closes no longer
-being announced.
+The reason it is worth a maintainer script is that a stale component cannot do
+its job. porthole's D-Bus wire format has already changed incompatibly once —
+adding a forward's three members to `WireRule` moved the `RuleClosed` signal
+from `((sqssssttu)s)` to `((sqssssttusqq)s)` — and a client built against one
+shape cannot read a message built with the other.
+
+It used to be silent as well, and that half is fixed rather than lived with.
+Measured: zbus does **not** drop a mismatched signal — it delivers the message
+and the decode is what fails — and porthole was throwing that error away. It
+no longer does: the agent puts a notice on the screen and stops, the window
+says so and disables itself, and the CLI says the answer could not be read
+rather than claiming the helper was unreachable. See "An agent that cannot
+read the helper" above. Restarting the helper is still what puts the two
+halves back in step; what changed is that skipping it is now something you are
+told about instead of something you infer from silence.
 
 So all three packages end the old helper process on an upgrade, and start no
 helper on a first install:

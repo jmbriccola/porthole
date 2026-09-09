@@ -32,4 +32,9 @@ tokio.workspace = true
 zbus.workspace = true
 
 [dev-dependencies]
+# For the one thing `client.rs`'s own tests cannot express without it: a
+# message body in the *previous* shape of `WireRule`, so the error zbus
+# produces for a version mismatch is a real one rather than one built by
+# hand.
+serde.workspace = true
 tempfile.workspace = true

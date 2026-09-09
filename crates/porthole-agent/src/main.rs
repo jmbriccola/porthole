@@ -45,7 +45,12 @@
 //! service at all leaves the process running. Two of them are about the name:
 //! a second agent takes it from the first, which the bus is asked about
 //! rather than either agent's journal, and one that meets a holder refusing
-//! to yield puts a notice on the screen. What none of that touches is a
+//! to yield puts a notice on the screen. Two more are about the one message
+//! this agent cannot act on: a helper whose `RuleClosed` this binary cannot
+//! decode, and one whose answer to the start-up `list` it cannot decode,
+//! each of which puts a notice on the screen and stops the process --
+//! against, in the same file, a helper that is simply absent, which leaves
+//! it running. What none of that touches is a
 //! real notification daemon (the stand-in answers `Notify` and emits
 //! `ActionInvoked`, it does not draw anything), the real helper, or polkit --
 //! so "the prompt appears and the port comes back" is not covered by any test
@@ -117,6 +122,10 @@ enum Ended {
     /// one agent still owns the name and announces closes, and it is the
     /// other one. See [`claim_session`].
     Replaced,
+    /// The helper sent something this binary could not read -- see
+    /// [`announce_undecodable`] for why that ends the process instead of
+    /// being skipped, and why it is not a failure status.
+    Undecodable,
 }
 
 impl Ended {
@@ -131,7 +140,7 @@ impl Ended {
     fn exit_code(self) -> u8 {
         match self {
             Ended::SystemBus => 1,
-            Ended::SessionBus | Ended::Replaced => 0,
+            Ended::SessionBus | Ended::Replaced | Ended::Undecodable => 0,
         }
     }
 
@@ -145,6 +154,10 @@ impl Ended {
             Ended::Replaced => {
                 "a newer agent took this session's agent name; stopping so closes are not \
                  announced twice"
+            }
+            Ended::Undecodable => {
+                "the helper sent a message this agent could not read, so nothing it says \
+                 from here on would be announced; stopping and saying so on screen"
             }
         }
     }
@@ -161,6 +174,9 @@ impl Ended {
 /// left to notify. And for being replaced by a newer agent, which is a
 /// success in the plainest sense: the job is being done, by the process that
 /// took over.
+///
+/// A helper this agent cannot read exits `SUCCESS` too, and that one is a
+/// decision rather than an inheritance -- see [`announce_undecodable`].
 ///
 /// Losing the **system** bus mid-run is the one case that exits `FAILURE`.
 /// The agent cannot rebuild that connection from inside its own loop, and
@@ -244,10 +260,24 @@ async fn main() -> std::process::ExitCode {
 
     // Not for its answer. Calling the helper is what starts it, and the
     // subscription above already exists, so whatever its start-up sweep
-    // announces arrives here instead of being sent to nobody. A failure is
-    // ordinary -- no helper installed, or none activatable -- and changes
-    // nothing about what this process does next.
+    // announces arrives here instead of being sent to nobody.
+    //
+    // Most failures here are ordinary -- no helper installed, or none
+    // activatable -- and change nothing about what this process does next.
+    // One is not: `list`'s *return* carries `WireRule`, so an answer this
+    // binary cannot decode is the same fact `on_close` below meets, arriving
+    // earlier. "Listening anyway" is the wrong answer to it, and it is the
+    // answer this printed while the user had no notifications at all: the
+    // agent that could not read `list` could not read `RuleClosed` either,
+    // and it said so once, to a journal, and carried on for the rest of the
+    // login. See [`announce_undecodable`].
     if let Err(e) = porthole.list().await {
+        if porthole_core::ipc::is_undecodable(&e) {
+            eprintln!("porthole-agent: could not read the helper's answer to list ({e})");
+            eprintln!("porthole-agent: {}", Ended::Undecodable.reason());
+            announce_undecodable(&notifications).await;
+            return std::process::ExitCode::from(Ended::Undecodable.exit_code());
+        }
         eprintln!("porthole-agent: could not reach the helper ({e}); listening anyway");
     }
 
@@ -311,27 +341,73 @@ async fn main() -> std::process::ExitCode {
                 let Some(signal) = close else {
                     break Ended::SystemBus;
                 };
-                let Ok(args) = signal.args() else { continue };
+                // The arm this whole binary was silent in. zbus delivers a
+                // signal whose body does not match and leaves the stream
+                // alive; only `args()` refuses, and this used to `continue`
+                // -- so an agent that could not read one `RuleClosed` could
+                // not read any of them and went on saying nothing about
+                // every close for the rest of the login. Measured, and it is
+                // what a user actually got after an upgrade. See
+                // [`announce_undecodable`].
+                let args = match signal.args() {
+                    Ok(args) => args,
+                    Err(e) => {
+                        eprintln!("porthole-agent: could not read a RuleClosed the helper sent ({e})");
+                        break Ended::Undecodable;
+                    }
+                };
                 on_close(&notifications, &mut pending, args.rule(), *args.reason(), uid).await;
             }
+            // The two below are the notification service's own signals, not
+            // the helper's, and they end differently on purpose. `ActionInvoked`
+            // is `us` and `NotificationClosed` is `uu` -- a freedesktop
+            // interface porthole does not version and has never changed --
+            // and an agent that cannot read one of them still announces
+            // every close, which is its job; what it loses is a click. So
+            // this reports and carries on where the helper's own signal
+            // stops the process. Reporting is the part that was missing:
+            // both of these discarded the error in silence too.
             action = actions.next() => {
                 let Some(signal) = action else {
                     break Ended::SessionBus;
                 };
-                let Ok(args) = signal.args() else { continue };
+                let args = match signal.args() {
+                    Ok(args) => args,
+                    Err(e) => {
+                        eprintln!(
+                            "porthole-agent: could not read an ActionInvoked from the \
+                             notification service ({e}); that click is lost, and closes are \
+                             still being announced"
+                        );
+                        continue;
+                    }
+                };
                 on_action(&porthole, &notifications, &pending, args.id, args.action_key);
             }
             dismissal = dismissals.next() => {
                 let Some(signal) = dismissal else {
                     break Ended::SessionBus;
                 };
-                let Ok(args) = signal.args() else { continue };
+                let args = match signal.args() {
+                    Ok(args) => args,
+                    Err(e) => {
+                        eprintln!(
+                            "porthole-agent: could not read a NotificationClosed from the \
+                             notification service ({e}); one notification's id stays on the \
+                             pending list until it is pushed off"
+                        );
+                        continue;
+                    }
+                };
                 pending.retain(|(id, _)| *id != args.id);
             }
         }
     };
 
     eprintln!("porthole-agent: {}", ended.reason());
+    if ended == Ended::Undecodable {
+        announce_undecodable(&notifications).await;
+    }
     std::process::ExitCode::from(ended.exit_code())
 }
 
@@ -592,15 +668,18 @@ async fn watch_for_replacement(session: &zbus::Connection) -> Option<zbus::fdo::
 /// process is not the unit's, so systemd had nothing to stop. The failure was
 /// silent, and the running agent was the one from before the upgrade.
 ///
-/// That agent was not merely redundant, it was deaf, which is why the user
+/// That agent was not merely redundant, it was mute, which is why the user
 /// saw nothing at all rather than one notification per close. `RuleClosed`
 /// carries a [`WireRule`], and the forward feature added three members to it:
-/// the body's signature went from `((sqssssttu)s)` to `((sqssssttusqq)s)`,
-/// and zbus refuses the whole signal on a signature mismatch. Measured, not
-/// inferred -- a message built with the current type and read with the old
-/// one answers `Signature mismatch: got ((sqssssttusqq)s), expected
-/// ((sqssssttu)s)`, and this binary's own loop drops a signal whose `args()`
-/// fails. So a stale agent holding the name announces nothing whatsoever.
+/// the body's signature went from `((sqssssttu)s)` to `((sqssssttusqq)s)`.
+/// Measured, not inferred -- and measured again afterwards, which corrected
+/// the half of this paragraph that used to blame zbus. **zbus delivers the
+/// signal.** The typed stream yields it, the stream stays alive and hands
+/// over later matching signals normally, and only `args()` refuses, with
+/// `Signature mismatch: got ((sqssssttusqq)s), expected ((sqssssttu)s)`. The
+/// silence was this binary's own: its loop discarded that error and went
+/// round again. It does not any more -- see [`announce_undecodable`], which
+/// is now what a stale agent does instead of announcing nothing whatsoever.
 ///
 /// So the newer agent wins. `AllowReplacement` is the half that matters next
 /// time: it is what lets the agent after this one take the name from it, and
@@ -660,6 +739,41 @@ async fn claim_session(session: &zbus::Connection) -> bool {
 /// a session with no notification service is exactly the session where the
 /// journal line above is all there can be. Failing to show it must not turn
 /// a quiet stop into a noisy one.
+/// Say on screen that this agent cannot read what the helper sends, on its
+/// way out.
+///
+/// **Why it stops rather than skips.** Both places that reach here have
+/// established the same thing: the helper and this binary disagree about the
+/// shape of `WireRule`, which every `RuleClosed` carries. That does not go
+/// away with the next signal -- the next one is the same shape -- so an
+/// agent that skipped one would skip all of them, which is precisely the
+/// failure that was reported: no desktop notification at all, for any close,
+/// in complete silence, from a still-running agent left over from before an
+/// upgrade. Carrying on is not a lesser action here; it is the whole defect.
+///
+/// **Why on screen and not only in the journal.** The same reason
+/// [`notify::stale_agent_notice`] is: the failure is invisible by
+/// construction. Ports still open and close on time, nothing crashes, the
+/// unit reads `inactive (dead)` exactly as it would after any ordinary
+/// stop. The one place it shows is a journal nobody opens unprompted -- and
+/// this agent had already written a line there, `could not reach the helper
+/// (...); listening anyway`, and nobody saw it.
+///
+/// **Why `SUCCESS` and not a restart.** `Restart=on-failure` would be a
+/// guess about which of the two binaries is the old one, and nothing here
+/// knows: `SignatureMismatch` names two signatures and says nothing about
+/// which is newer (see [`porthole_core::ipc::is_undecodable`]). Guessing
+/// wrong loops -- an upgrade on Debian or Arch leaves the *helper* running
+/// from before it, and against that helper a fresh agent fails identically,
+/// five times over, showing this notice at each attempt until systemd's
+/// start limit stops it. So the unit stays stopped, as it does for every
+/// other start-up refusal here, and the notice says what to do instead.
+async fn announce_undecodable(notifications: &NotificationsProxy<'_>) {
+    if let Err(e) = notify::show(notifications, &notify::undecodable_notice()).await {
+        eprintln!("porthole-agent: and could not say so on screen either: {e}");
+    }
+}
+
 async fn announce_stale_agent(session: &zbus::Connection) {
     let shown = match NotificationsProxy::new(session).await {
         Ok(proxy) => notify::show(&proxy, &notify::stale_agent_notice()).await,
@@ -693,6 +807,11 @@ mod tests {
         // just took it, and the two would trade it until the start limit
         // stopped them.
         assert_eq!(Ended::Replaced.exit_code(), 0);
+        // And a helper this agent cannot read is not a restart either --
+        // see `announce_undecodable` for why a restart there is a guess
+        // about which of the two binaries is old, and what it costs when
+        // the guess is wrong.
+        assert_eq!(Ended::Undecodable.exit_code(), 0);
     }
 
     #[test]
@@ -707,6 +826,16 @@ mod tests {
         assert!(
             !replaced.contains("bus connection ended"),
             "a replaced agent's connections are both alive: {replaced}"
+        );
+        // This one lost no bus either, and its connections are both alive
+        // too: what it lost is the ability to read what arrives on one of
+        // them. A journal line that read as a bus failure would send the
+        // reader looking for the wrong thing entirely.
+        let undecodable = Ended::Undecodable.reason();
+        assert!(undecodable.contains("could not read"), "{undecodable}");
+        assert!(
+            !undecodable.contains("bus connection ended"),
+            "the bus is fine; the message on it is not: {undecodable}"
         );
     }
 

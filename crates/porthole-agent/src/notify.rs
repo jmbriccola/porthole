@@ -257,6 +257,41 @@ pub fn stale_agent_notice() -> Notification {
     }
 }
 
+/// What to say when this agent cannot read what the helper sends, and is
+/// therefore stopping rather than announcing nothing.
+///
+/// On screen for the same reason [`stale_agent_notice`] is, and the failure
+/// it reports is the one that made that notice necessary in the first place:
+/// a user upgraded, an agent from before the upgrade went on running, and no
+/// close was announced at any point afterwards, in silence. `crate::
+/// announce_undecodable` is where the decision to stop is argued.
+///
+/// **What is actually known**, and the wording claims no more: a message
+/// arrived from the helper that this binary could not read. That means the
+/// two are built against different shapes of the same wire type -- nothing
+/// here can say **which of them is the older**, because a signature mismatch
+/// names two signatures and does not order them. So both remedies are
+/// offered rather than one: the agent is replaced by logging out and back
+/// in, and the helper by restarting its service. One notice, one wording,
+/// for both places that reach it -- an agent that stops at start-up and one
+/// that stops mid-run leave the user in exactly the same position.
+///
+/// No action button: the agent shows this on its way out, so there would be
+/// nobody left to answer a click.
+pub fn undecodable_notice() -> Notification {
+    Notification {
+        summary: "Porthole notifications stopped".to_string(),
+        body: "porthole-agent could not read a message the porthole helper sent, so it \
+               would have announced nothing at all from here on. It has stopped instead \
+               of staying silent. The two are from different versions of porthole: log \
+               out and back in to start the agent that is installed now, and if closes \
+               are still not announced, restart porthole-helper.service — that is the \
+               half left over from before the upgrade."
+            .to_string(),
+        actions: Vec::new(),
+    }
+}
+
 /// Show one, and hand back the id the server gave it.
 ///
 /// The id is what ties a later `ActionInvoked` back to the rule this was
@@ -449,6 +484,35 @@ mod tests {
                 .is_empty(),
             "porthole must not argue at one click with whatever removed the rule"
         );
+    }
+
+    #[test]
+    fn the_undecodable_notice_offers_both_remedies_and_blames_neither_half() {
+        // Nothing on the wire says which of the two binaries is the old one
+        // -- a signature mismatch names two signatures and does not order
+        // them -- so a notice that told the user to restart one of them
+        // would be right half the time and would send the other half
+        // looking in the wrong place. Both remedies, and no claim about
+        // which is needed.
+        let n = undecodable_notice();
+        assert!(
+            n.body.contains("Log out and back in") || n.body.contains("log out and back in"),
+            "the agent's own remedy must be there: {}",
+            n.body
+        );
+        assert!(
+            n.body.contains("porthole-helper.service"),
+            "and the helper's, since it may be the older half: {}",
+            n.body
+        );
+        assert!(
+            n.actions.is_empty(),
+            "the agent is on its way out; a button would have nobody to answer it"
+        );
+        // And it must not read as the other notice: that one is about a
+        // name a second process holds, which is a different thing to go
+        // looking for.
+        assert_ne!(n.summary, stale_agent_notice().summary);
     }
 
     #[test]

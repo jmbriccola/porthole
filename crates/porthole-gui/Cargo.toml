@@ -96,6 +96,16 @@ name = "busy"
 path = "tests/busy.rs"
 harness = false
 
+# Same reasoning again, plus one of its own: `tests/version_mismatch.rs`
+# serves the *previous* shape of `WireRule` under the helper's well-known
+# name, which only one connection can hold at a time -- so it cannot share
+# `tests/signals.rs`'s stand-in, which serves the current shape. It sets
+# `DBUS_SYSTEM_BUS_ADDRESS` for the same process-wide reason that file does.
+[[test]]
+name = "version_mismatch"
+path = "tests/version_mismatch.rs"
+harness = false
+
 # Same reasoning again, and one addition of its own: `tests/identity.rs`
 # runs `app::build()`, which sets `prgname` -- process-wide state, and the
 # state whose value that file's whole point is to measure. Every other
@@ -121,3 +131,10 @@ tokio.workspace = true
 # `window.rs`'s own `subscribe`. `porthole-agent` already takes this
 # dependency for the same job on the same signals.
 futures-util.workspace = true
+
+[dev-dependencies]
+# For the one thing these tests cannot express without it: a stand-in helper
+# and a message body in the *previous* shape of `WireRule`, so a real
+# signature mismatch is what the window meets. See `window.rs`'s own tests
+# and `tests/signals.rs`.
+serde.workspace = true

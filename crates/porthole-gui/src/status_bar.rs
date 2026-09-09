@@ -81,6 +81,17 @@
 //! refusal, which was true of a polkit denial and false of everything
 //! else that reaches the same code path).
 //!
+//! And a fourth, for the reason the third exists: an answer that arrived
+//! and that this build could not **read**, because the helper is built
+//! against a different shape of the same wire type.
+//! [`StatusBar::set_undecodable`] is that case. It used to reach
+//! [`StatusBar::set_unreachable`] -- a `SignatureMismatch` is not a
+//! `MethodError`, so it fell through to it -- and this window told a person
+//! it could not reach a helper that had just replied. Its title is split
+//! from its detail the way the no-firewall case is: the short sentence a
+//! person can act on in the banner, and zbus's own text naming the two
+//! signatures on the line underneath, verbatim.
+//!
 //! The ordinary line carries a second, unrelated distinction:
 //! `enforcing`/`not running`/`status unknown`, for a *different* pair of
 //! facts than any of the three above -- whether a firewall that **is**
@@ -128,6 +139,26 @@ fn no_firewall_banner_title(status: &WireStatus) -> &'static str {
 fn unreachable_title(message: &str) -> String {
     format!("Could not reach the porthole helper — {message}")
 }
+
+/// The fourth prominent case, and the only one that is about this window
+/// rather than about the helper: the helper answered, and this build could
+/// not **read** the answer -- see `window.rs`'s own `HelperFailure` doc
+/// comment, and `porthole_core::ipc::is_undecodable` for what is measured
+/// behind it.
+///
+/// Short, authored for this surface, and split the way
+/// [`NO_FIREWALL_TITLE`] is split from `status.detail`: this sentence is
+/// what a person can act on, and the zbus text that names the two
+/// signatures goes on [`StatusBar::line`] underneath, verbatim, rather than
+/// into a banner nobody could read at a glance.
+///
+/// It names both remedies because nothing here can tell which half is the
+/// older one -- a signature mismatch names two signatures and does not
+/// order them. It does not say "could not reach": the helper answered.
+const UNDECODABLE_TITLE: &str =
+    "Porthole and the porthole helper are different versions, so this window cannot read \
+     what it answers. Close and reopen this window; if that does not help, restart \
+     porthole-helper.service.";
 
 /// [`StatusBar::set_errored`]'s wording -- deliberately not built from
 /// [`unreachable_title`] or a shared prefix with it: the helper answered
@@ -285,6 +316,20 @@ impl StatusBar {
         self.show_banner(&errored_title(message));
     }
 
+    /// The fourth prominent case: the helper answered and this build could
+    /// not read the answer -- see [`UNDECODABLE_TITLE`]. `message` is the
+    /// zbus text naming the two signatures, and it goes on the line
+    /// underneath rather than into the banner, the same split
+    /// [`StatusBar::set_status`]'s no-firewall branch makes and for the same
+    /// reason.
+    pub fn set_undecodable(&self, message: &str) {
+        self.show_banner(UNDECODABLE_TITLE);
+        self.line.set_label(message);
+        // Not a dim caption: it is the detail of the banner at the other end
+        // of the window, exactly as `status.detail` is.
+        self.line.remove_css_class("dim-label");
+    }
+
     /// Shared by all three prominent cases: reveals the banner with
     /// `title`, and clears the ordinary line's own text. Without the
     /// second half, a confirmed claim from an earlier, successful refresh
@@ -428,6 +473,39 @@ mod tests {
         assert!(
             errored.contains("not authorized"),
             "the helper's own error reason must survive verbatim: {errored}"
+        );
+    }
+
+    #[test]
+    fn a_message_this_build_cannot_read_is_a_fourth_wording_and_claims_no_unreachability() {
+        // The fourth fact, pinned apart from the other three exactly as they
+        // are pinned apart from each other. The helper answered -- "could
+        // not reach" is the other case's claim, and it is the one the GUI
+        // actually made for this before, since a `SignatureMismatch` is not
+        // a `MethodError` and fell straight through to `Unreachable`.
+        let unreachable = unreachable_title("could not reach the porthole helper: timed out");
+        let errored = errored_title("not authorized: com.jacopobriccola.Porthole.List");
+        assert_ne!(UNDECODABLE_TITLE, unreachable);
+        assert_ne!(UNDECODABLE_TITLE, errored);
+        assert_ne!(UNDECODABLE_TITLE, NO_FIREWALL_TITLE);
+        assert!(
+            !UNDECODABLE_TITLE.to_lowercase().contains("could not reach"),
+            "the helper answered here: {UNDECODABLE_TITLE}"
+        );
+        assert!(
+            !UNDECODABLE_TITLE.to_lowercase().contains("reachable"),
+            "and this says nothing about whether any port is: {UNDECODABLE_TITLE}"
+        );
+        // Both remedies, since nothing on the wire says which half is older.
+        assert!(
+            UNDECODABLE_TITLE.contains("porthole-helper.service"),
+            "{UNDECODABLE_TITLE}"
+        );
+        assert!(
+            UNDECODABLE_TITLE
+                .to_lowercase()
+                .contains("reopen this window"),
+            "{UNDECODABLE_TITLE}"
         );
     }
 

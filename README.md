@@ -589,6 +589,17 @@ and exits. A session with no notification service running is survived rather
 than reported: it keeps listening, and the closes are still in the helper's
 journal.
 
+One thing it does not survive, deliberately: a helper whose messages it cannot
+read. The two halves exchange typed messages whose shape changes between
+versions, and an agent left running from before an upgrade used to announce
+nothing at all, for any close, in complete silence — it was handed each
+message and threw the decode error away. It now says so on the screen and
+stops, so that whatever starts the agent brings up the one that is installed.
+The window does the equivalent without disappearing: it says the two are
+different versions and switches off everything that would reach the helper,
+including the buttons whose *request* a mismatched helper still accepts.
+[docs/installing.md](docs/installing.md) has the whole of it.
+
 **Neither start file runs in a session that is already open, so notifications
 begin at the next login.** Installing porthole — from a package or by hand —
 puts both files in place and starts nothing. The user unit is reached through

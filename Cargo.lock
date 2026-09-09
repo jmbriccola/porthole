@@ -983,6 +983,7 @@ dependencies = [
  "futures-util",
  "libc",
  "porthole-core",
+ "serde",
  "tempfile",
  "tokio",
  "zbus",
@@ -997,6 +998,7 @@ dependencies = [
  "clap_mangen",
  "libc",
  "porthole-core",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1027,6 +1029,7 @@ dependencies = [
  "ipnet",
  "libadwaita",
  "porthole-core",
+ "serde",
  "tokio",
  "zbus",
 ]

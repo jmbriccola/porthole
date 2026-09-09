@@ -407,6 +407,14 @@ const UNREACHABLE_TITLE: &str = "Porthole helper unreachable";
 /// `HelperFailure` doc comment.
 const ERRORED_TITLE: &str = "Porthole helper reported an error";
 
+/// [`OpenNowSection::set_undecodable`]'s title -- the helper answered, and
+/// this build could not read the answer at all. A third failure title rather
+/// than a rewording of either other one: "unreachable" is false (the helper
+/// replied) and "reported an error" is false too (the helper reported a
+/// rule list; this window is what could not read it). See
+/// `porthole_core::ipc::is_undecodable`.
+const UNDECODABLE_TITLE: &str = "Porthole could not read the helper's answer";
+
 /// Who the rule lets in: the scope word, or the network it names.
 fn towards_for(rule: &WireRule) -> &str {
     if rule.scope == "anywhere" {
@@ -878,6 +886,20 @@ impl OpenNowSection {
     /// claim here. `message` is the helper's own text, verbatim.
     pub fn set_errored(&self, message: &str) {
         apply_error(&self.inner, ERRORED_TITLE, message);
+    }
+
+    /// The third failure state: the helper answered, and this build could
+    /// not read what it sent -- the two are built against different shapes
+    /// of the same wire type. Same widget as the other two, a title of its
+    /// own (see [`UNDECODABLE_TITLE`]), and the same verbatim `message`
+    /// convention: what goes in the description is zbus's own text naming
+    /// the two signatures.
+    ///
+    /// Unlike the other two, this one is not expected to be replaced by a
+    /// later refresh: `window.rs` stops refreshing when it reaches here,
+    /// because every later answer would be equally unreadable.
+    pub fn set_undecodable(&self, message: &str) {
+        apply_error(&self.inner, UNDECODABLE_TITLE, message);
     }
 
     /// `Some` only while the list is confirmed empty -- once there is a

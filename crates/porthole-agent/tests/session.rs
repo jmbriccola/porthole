@@ -1169,3 +1169,292 @@ async fn a_click_after_the_notification_service_restarted_never_reopens_a_stale_
     );
     assert!(agent.is_running());
 }
+
+/// [`WireRule`] as it was before the forward feature -- nine members, not
+/// twelve.
+///
+/// This is the whole of what an agent from before that upgrade is built
+/// against, and serving it from a stand-in helper is how these tests put a
+/// real signature mismatch on a real bus. Spelled out rather than derived
+/// from `WireRule` on purpose: a shape derived from the type under test
+/// would follow it forward and stop being the old one.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, zbus::zvariant::Type)]
+struct RuleBeforeForward {
+    id: String,
+    port: u16,
+    protocol: String,
+    target: String,
+    scope: String,
+    backend: String,
+    opened_at: u64,
+    expires_at: u64,
+    uid: u32,
+}
+
+fn rule_before_forward(port: u16, uid: u32) -> RuleBeforeForward {
+    RuleBeforeForward {
+        id: "abc".to_string(),
+        port,
+        protocol: "tcp".to_string(),
+        target: "10.10.10.0/24".to_string(),
+        scope: "network".to_string(),
+        backend: "firewalld".to_string(),
+        opened_at: OPENED_AT,
+        expires_at: EXPIRES_AT,
+        uid,
+    }
+}
+
+/// A helper whose `list` answers in the shape from before the forward
+/// feature: `a(sqssssttu)` where this agent expects `a(sqssssttusqq)`.
+///
+/// The agent calls `list` once at start-up for the call's own sake, and it
+/// is that call's *return* signature that the upgrade changed -- so this is
+/// the very first thing a mismatched pair says to each other, and it used to
+/// be answered with `listening anyway`.
+struct HelperFromBeforeForward;
+
+#[zbus::interface(name = "com.jacopobriccola.Porthole1")]
+impl HelperFromBeforeForward {
+    async fn list(&self) -> Vec<RuleBeforeForward> {
+        vec![rule_before_forward(5173, OUR_UID)]
+    }
+}
+
+/// A close the agent cannot read stops it, on screen.
+///
+/// The defect measured on 2026-09-09 and reported by the owner: after an
+/// upgrade, an agent from before it went on running and announced **nothing
+/// at all, for any close**, in silence. zbus was not what dropped those
+/// signals -- it delivers them and keeps the stream alive; the agent's own
+/// loop discarded the `args()` error and went round again.
+///
+/// Everything here is real: the mismatch is a body of the previous shape put
+/// on a real bus by a real `emit_signal`, and what is asserted is what a
+/// person would see -- a notification, and a process that stopped.
+#[tokio::test]
+async fn a_close_this_agent_cannot_read_stops_it_and_says_so_on_screen() {
+    let bus = Bus::start();
+    let uid = our_uid();
+
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let _notifications = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(NOTIFICATIONS_SERVICE)
+        .unwrap()
+        .serve_at(
+            NOTIFICATIONS_PATH,
+            FakeNotifications {
+                shown: shown.clone(),
+                id: 7,
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    // A helper that answers `list` in the *current* shape, so start-up gets
+    // past it and this test is about the signal and nothing else.
+    let helper = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(SERVICE)
+        .unwrap()
+        .serve_at(PATH, FakeHelper::default())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let mut agent = Agent::start(&bus);
+    until("the agent to start listening", || {
+        agent.journal().contains("listening for uid").then_some(())
+    })
+    .await;
+
+    // The positive control, first and in this same process: a close of the
+    // current shape is announced. Without it, a later "the agent stopped"
+    // could be an agent that never worked.
+    helper
+        .emit_signal(
+            None::<()>,
+            PATH,
+            INTERFACE,
+            "RuleClosed",
+            &(wire_rule(5173, uid), CloseReason::Expired),
+        )
+        .await
+        .unwrap();
+    let announced = until("the ordinary close to be announced", || {
+        shown.lock().unwrap().first().cloned()
+    })
+    .await;
+    assert!(announced.body.contains("5173/tcp"), "{announced:?}");
+    assert!(agent.is_running(), "{}", agent.journal());
+
+    // And now the same signal in the shape from before the upgrade.
+    helper
+        .emit_signal(
+            None::<()>,
+            PATH,
+            INTERFACE,
+            "RuleClosed",
+            &(rule_before_forward(8080, uid), CloseReason::Expired),
+        )
+        .await
+        .unwrap();
+
+    let notice = until("the notice about a message it could not read", || {
+        shown.lock().unwrap().get(1).cloned()
+    })
+    .await;
+    assert!(
+        notice.summary.to_lowercase().contains("porthole"),
+        "a notification with no porthole in it says nothing about porthole: {notice:?}"
+    );
+    assert!(
+        notice.body.contains("could not read"),
+        "the notice has to say what happened, not merely that something did: {notice:?}"
+    );
+    assert!(
+        notice.body.contains("porthole-helper.service")
+            && notice.body.to_lowercase().contains("log out"),
+        "and both remedies, since nothing here knows which half is old: {notice:?}"
+    );
+
+    let status = until("the agent to stop", || {
+        agent.child.try_wait().expect("waitable")
+    })
+    .await;
+    assert!(
+        status.success(),
+        "stopping here is not a failure to restart into: a fresh agent meets the same \
+         helper and fails the same way: {status:?}"
+    );
+
+    let journal = agent.journal();
+    assert!(
+        journal.contains("could not read a RuleClosed"),
+        "the journal keeps the whole error, which is where the two signatures are: {journal}"
+    );
+    assert!(
+        journal.contains("ignature"),
+        "and zbus's own text names them: {journal}"
+    );
+}
+
+/// The same fact arriving earlier: the start-up `list` this agent makes for
+/// the call's own sake carries `WireRule` in its answer.
+///
+/// This is the loud failure that already existed and was already ignored --
+/// `could not reach the helper (Signature mismatch: ...); listening anyway`,
+/// written to a journal by an agent that then went on to announce nothing
+/// for the rest of the login. "Listening anyway" is a true sentence about a
+/// helper that is not installed and a false promise about one whose language
+/// this binary does not speak.
+#[tokio::test]
+async fn a_list_this_agent_cannot_read_stops_it_instead_of_listening_anyway() {
+    let bus = Bus::start();
+
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let _notifications = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(NOTIFICATIONS_SERVICE)
+        .unwrap()
+        .serve_at(
+            NOTIFICATIONS_PATH,
+            FakeNotifications {
+                shown: shown.clone(),
+                id: 3,
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let _helper = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(SERVICE)
+        .unwrap()
+        .serve_at(PATH, HelperFromBeforeForward)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let mut agent = Agent::start(&bus);
+    let status = until("the agent to stop", || {
+        agent.child.try_wait().expect("waitable")
+    })
+    .await;
+    assert!(status.success(), "{status:?}");
+
+    let notice = until("the notice", || shown.lock().unwrap().first().cloned()).await;
+    assert!(notice.body.contains("could not read"), "{notice:?}");
+
+    let journal = agent.journal();
+    assert!(
+        !journal.contains("listening anyway"),
+        "this is not the recoverable case, and must not be described as it: {journal}"
+    );
+    assert!(
+        !journal.contains("listening for uid"),
+        "an agent that cannot read the helper is not listening to anything: {journal}"
+    );
+}
+
+/// And the other half of that distinction, which is the whole reason the
+/// first one is allowed to stop: a helper that is simply **absent** is
+/// ordinary and recoverable, and nothing here may treat it as a version
+/// mismatch.
+///
+/// Nothing owns `com.jacopobriccola.Porthole` on this bus and nothing can be
+/// activated to, which is exactly a machine where the helper is not
+/// installed yet, or not installed at all. The agent keeps listening, and
+/// puts nothing on the screen: there is nothing wrong to report.
+#[tokio::test]
+async fn an_absent_helper_leaves_the_agent_listening_and_shows_nothing() {
+    let bus = Bus::start();
+
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let _notifications = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(NOTIFICATIONS_SERVICE)
+        .unwrap()
+        .serve_at(
+            NOTIFICATIONS_PATH,
+            FakeNotifications {
+                shown: shown.clone(),
+                id: 5,
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let mut agent = Agent::start(&bus);
+    until("the agent to start listening", || {
+        agent.journal().contains("listening for uid").then_some(())
+    })
+    .await;
+
+    let journal = agent.journal();
+    assert!(
+        journal.contains("listening anyway"),
+        "the absent helper still has to be reported as the ordinary thing it is: {journal}"
+    );
+    // Long enough that an agent on its way out would have gone.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        agent.is_running(),
+        "an absent helper is recoverable -- the agent waits for it: {}",
+        agent.journal()
+    );
+    assert!(
+        shown.lock().unwrap().is_empty(),
+        "and nothing is put on the user's screen about it: {:?}",
+        shown.lock().unwrap()
+    );
+}

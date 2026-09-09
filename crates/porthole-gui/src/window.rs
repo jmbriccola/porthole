@@ -49,6 +49,13 @@
 //! `status_bar.rs`'s module docs for why conflating any pair of them is
 //! this project's characteristic defect.
 //!
+//! A fourth joined them once it was measured: an answer this build could not
+//! **read**, because the helper is built against a different shape of the
+//! same wire type. It used to render as the first -- "could not reach the
+//! porthole helper", about a helper that had just replied -- and it is the
+//! one of the four that no later refresh can undo. See [`HelperFailure`] and
+//! [`stop_talking_to_the_helper`], which is what this window does about it.
+//!
 //! ## What is open changes without this window doing anything
 //!
 //! A rule runs out its own clock. Someone runs `porthole close` in a
@@ -159,8 +166,17 @@ struct Sections {
     /// in either `None` case, so it needs no finer distinction than this;
     /// the "Listening" section does, and keeps its own.
     docker: Rc<RefCell<Option<Vec<Published>>>>,
+    /// The header bar's own "Open a port" button -- held here for one
+    /// reason: it is the one control that reaches the helper without going
+    /// through a section, and [`stop_talking_to_the_helper`] has to be able
+    /// to switch it off.
+    open_button: gtk::Button,
     /// Whether a refresh is already scheduled -- see [`schedule_refresh`].
     refresh_pending: Rc<Cell<bool>>,
+    /// Whether this window has stopped talking to the helper for good --
+    /// see [`stop_talking_to_the_helper`], which is the only thing that sets
+    /// it, and which is not reversible from inside this process.
+    stopped: Rc<Cell<bool>>,
     /// The header bar's own busy indication, held for as long as a helper
     /// round trip is outstanding -- see [`refresh`], and `busy.rs` for what
     /// it is allowed to mean.
@@ -204,6 +220,7 @@ pub struct PortholeWindow {
     devices: Rc<RefCell<DeviceSnapshot>>,
     docker: Rc<RefCell<Option<Vec<Published>>>>,
     refresh_pending: Rc<Cell<bool>>,
+    stopped: Rc<Cell<bool>>,
     busy: BusyIndicator,
 }
 
@@ -383,6 +400,7 @@ impl PortholeWindow {
             Rc::new(RefCell::new(Err(DEVICES_NOT_READ_YET.to_string())));
         let docker: Rc<RefCell<Option<Vec<Published>>>> = Rc::new(RefCell::new(None));
         let refresh_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let stopped: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
         let sections_for_open = Sections {
             window: window.clone(),
@@ -391,7 +409,9 @@ impl PortholeWindow {
             status_bar: status_bar.clone(),
             devices: devices.clone(),
             docker: docker.clone(),
+            open_button: open_button.clone(),
             refresh_pending: refresh_pending.clone(),
+            stopped: stopped.clone(),
             busy: busy.clone(),
         };
         open_button.connect_clicked(move |_| {
@@ -412,7 +432,9 @@ impl PortholeWindow {
             status_bar: status_bar.clone(),
             devices: devices.clone(),
             docker: docker.clone(),
+            open_button: open_button.clone(),
             refresh_pending: refresh_pending.clone(),
+            stopped: stopped.clone(),
             busy: busy.clone(),
         };
         listening.connect_open_requested(move |port| {
@@ -431,7 +453,9 @@ impl PortholeWindow {
             status_bar: status_bar.clone(),
             devices: devices.clone(),
             docker: docker.clone(),
+            open_button: open_button.clone(),
             refresh_pending: refresh_pending.clone(),
+            stopped: stopped.clone(),
             busy: busy.clone(),
         };
         listening.connect_forward_requested(move |published_port| {
@@ -452,7 +476,9 @@ impl PortholeWindow {
             status_bar: status_bar.clone(),
             devices: devices.clone(),
             docker: docker.clone(),
+            open_button: open_button.clone(),
             refresh_pending: refresh_pending.clone(),
+            stopped: stopped.clone(),
             busy: busy.clone(),
         };
         let devices_action = gtk::gio::SimpleAction::new(DEVICES_ACTION_NAME, None);
@@ -498,6 +524,7 @@ impl PortholeWindow {
             devices,
             docker,
             refresh_pending,
+            stopped,
             busy,
         }
     }
@@ -514,7 +541,9 @@ impl PortholeWindow {
             status_bar: self.status_bar.clone(),
             devices: self.devices.clone(),
             docker: self.docker.clone(),
+            open_button: self.open_button.clone(),
             refresh_pending: self.refresh_pending.clone(),
+            stopped: self.stopped.clone(),
             busy: self.busy.clone(),
         }
     }
@@ -738,12 +767,37 @@ fn helper_message(e: &zbus::Error) -> String {
 /// wire's own error name would let a future caller do that, if it became
 /// worth a fourth rendering); what changed here is only that the wording
 /// no longer claims a specific one.
+/// A third fact joined the two above once it was measured, and the two could
+/// not hold it: the helper answered, and **this build could not read the
+/// answer**. `porthole_core::ipc::is_undecodable` is what recognises it, and
+/// its own doc comment is where the measurement lives. It arrives as
+/// `zbus::Error::Variant`, which is not a `MethodError` -- so before this
+/// existed it fell straight through to `Unreachable`, and this window told
+/// the user "could not reach the porthole helper" about a helper that had
+/// just replied. That is the same false claim `status_bar.rs`'s own module
+/// doc calls this project's characteristic defect, made about the one case
+/// where the truth is neither of the other two.
+///
+/// It is also the only one of the three that does not go away by itself:
+/// `Unreachable` and `Errored` can both be true now and false at the next
+/// refresh, and this cannot -- the next answer is built by the same two
+/// binaries and is equally unreadable. That is why it is the only one that
+/// stops the window asking; see [`stop_talking_to_the_helper`].
 enum HelperFailure {
     Unreachable(String),
     Errored(String),
+    Undecodable(String),
 }
 
 fn classify_failure(e: zbus::Error) -> HelperFailure {
+    // Asked first: a decode failure is not a `MethodError`, so the order
+    // below does not actually matter today -- it is written this way so that
+    // it would still not matter if it ever did.
+    if porthole_core::ipc::is_undecodable(&e) {
+        return HelperFailure::Undecodable(format!(
+            "porthole could not read the porthole helper's answer: {e}"
+        ));
+    }
     match &e {
         zbus::Error::MethodError(..) => HelperFailure::Errored(helper_message(&e)),
         _ => HelperFailure::Unreachable(format!("could not reach the porthole helper: {e}")),
@@ -754,6 +808,7 @@ fn apply_failure_to_open_now(open_now: &OpenNowSection, failure: &HelperFailure)
     match failure {
         HelperFailure::Unreachable(message) => open_now.set_unreachable(message),
         HelperFailure::Errored(message) => open_now.set_errored(message),
+        HelperFailure::Undecodable(message) => open_now.set_undecodable(message),
     }
 }
 
@@ -761,6 +816,7 @@ fn apply_failure_to_status_bar(status_bar: &StatusBar, failure: &HelperFailure) 
     match failure {
         HelperFailure::Unreachable(message) => status_bar.set_unreachable(message),
         HelperFailure::Errored(message) => status_bar.set_errored(message),
+        HelperFailure::Undecodable(message) => status_bar.set_undecodable(message),
     }
 }
 
@@ -912,6 +968,9 @@ const SIGNAL_COALESCE: std::time::Duration = std::time::Duration::from_millis(20
 /// arrives while that refresh is in flight schedules the next one rather
 /// than being dropped into it.
 fn schedule_refresh(sections: &Sections) {
+    if sections.stopped.get() {
+        return;
+    }
     if sections.refresh_pending.replace(true) {
         return;
     }
@@ -1150,6 +1209,14 @@ fn open_tcp_ports(rules: &[WireRule]) -> Vec<u16> {
 /// not merely infer it from an empty list (see its own module doc for the
 /// bug that produced).
 fn refresh(sections: &Sections) {
+    // Nothing after a helper this window cannot read -- see
+    // [`stop_talking_to_the_helper`]. Every read below would come back in
+    // the same unreadable shape, and the two that do not touch the helper
+    // (the `/proc` scan and the address book) would keep repainting rows
+    // under a banner saying this window has stopped asking.
+    if sections.stopped.get() {
+        return;
+    }
     {
         let sections = sections.clone();
         glib::spawn_future_local(async move {
@@ -1194,6 +1261,14 @@ fn refresh(sections: &Sections) {
             let _busy = busy.begin();
             match with_timeout(fetch_helper_snapshot(), HELPER_TIMEOUT).await {
                 Some(Ok(snapshot)) => {
+                    // Before anything is rendered from this snapshot: one
+                    // unreadable answer settles the whole window, and the
+                    // other two calls' results are about the same two
+                    // binaries. See [`stop_talking_to_the_helper`].
+                    if let Some(message) = first_undecodable(&snapshot) {
+                        stop_talking_to_the_helper(&sections, &message);
+                        return;
+                    }
                     match snapshot.rules {
                         Ok(rules) => {
                             let open_ports = open_tcp_ports(&rules);
@@ -1212,6 +1287,14 @@ fn refresh(sections: &Sections) {
                     apply_docker(&sections, snapshot.docker.ok());
                 }
                 Some(Err(failure)) => {
+                    // The one case where no call was even attempted -- a
+                    // connection or a proxy that could not be made. It can
+                    // carry `Undecodable` too, in principle, and is routed
+                    // the same way rather than rendered and then forgotten.
+                    if let HelperFailure::Undecodable(message) = &failure {
+                        stop_talking_to_the_helper(&sections, message);
+                        return;
+                    }
                     apply_failure_to_open_now(&open_now, &failure);
                     apply_failure_to_status_bar(&status_bar, &failure);
                     listening.set_open_ports_unknown();
@@ -1233,6 +1316,75 @@ fn refresh(sections: &Sections) {
             }
         });
     }
+}
+
+/// The first of one refresh's three answers this build could not read, if
+/// any -- all three, because `list`, `status` and `docker_ports` are three
+/// independent results (see [`HelperSnapshot`]) and any of them can be the
+/// one carrying a type that changed. `WireStatus` embeds the same
+/// `WireRule`, so in the measured case `list` and `status` fail together and
+/// `docker_ports` does not; nothing here depends on that staying true.
+fn first_undecodable(snapshot: &HelperSnapshot) -> Option<String> {
+    [
+        snapshot.rules.as_ref().err(),
+        snapshot.status.as_ref().err(),
+        snapshot.docker.as_ref().err(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|failure| match failure {
+        HelperFailure::Undecodable(message) => Some(message.clone()),
+        _ => None,
+    })
+}
+
+/// Say that this window and the helper are built against different shapes of
+/// the same wire type, and stop the window doing anything that would reach
+/// the helper again.
+///
+/// **Why not simply exit, the way `porthole-agent` does.** A window is
+/// something a person is looking at and has arranged on a screen; one that
+/// vanishes under their hands has reported nothing. The choice recorded for
+/// this case (`docs/superpowers/specs/2026-09-09-update-notifier-design.md`:
+/// *«La GUI aperta non può ri-eseguirsi mentre è in uso. Se ne accorge e lo
+/// dice»*) is that it notices and says so, rather than going on talking to a
+/// helper it was not built for. So the window and everything in it stay
+/// exactly where they were, readable, and what changes is that it stops
+/// asking and stops offering.
+///
+/// **Why the buttons go insensitive, and not merely the refresh.** This is
+/// the half that is not cosmetic. A stale window's `open` sends `(qssu)` and
+/// a current helper's `open` still takes `(qssu)`, so the request goes
+/// through and **the port really opens** -- it is the reply this window
+/// cannot read. Leaving the buttons live would let a person press Open, be
+/// told it failed, and have a hole in their firewall anyway. Every button
+/// that reaches the helper is behind one of the two widgets switched off
+/// here, and sensitivity is inherited in GTK, so a "Listening" row rebuilt
+/// after this point by an in-flight `/proc` scan is unpressable too.
+///
+/// The saved-devices menu stays live on purpose: the address book is
+/// client-side and never crosses the bus (see this module's own doc
+/// comment), so it is the one thing here that still works.
+///
+/// Not reversible. Nothing this process can do makes the two binaries
+/// agree, and a window that quietly came back to life would be claiming
+/// something happened that it cannot have observed.
+fn stop_talking_to_the_helper(sections: &Sections, message: &str) {
+    if sections.stopped.replace(true) {
+        return;
+    }
+    sections.open_now.set_undecodable(message);
+    sections.status_bar.set_undecodable(message);
+    // The rule list is gone, so "already open" is no longer known -- the
+    // same call every other failed refresh makes.
+    sections.listening.set_open_ports_unknown();
+    // The Docker state is deliberately left as it was. Whatever a previous
+    // refresh confirmed about Docker is no less true than the `/proc` rows
+    // beside it, and `set_docker_unavailable`'s own note says the helper
+    // "could not be reached, or answered with an error", which is the one
+    // thing that did not happen here.
+    sections.listening.widget().set_sensitive(false);
+    sections.open_button.set_sensitive(false);
 }
 
 /// Hands one **completed** `docker_ports` outcome to both places that need
@@ -1294,6 +1446,9 @@ mod tests {
             HelperFailure::Unreachable(message) => {
                 panic!("a MethodError must classify as Errored, not Unreachable: {message}")
             }
+            HelperFailure::Undecodable(message) => {
+                panic!("this answer was read successfully; it just said no: {message}")
+            }
         }
     }
 
@@ -1319,7 +1474,115 @@ mod tests {
             HelperFailure::Unreachable(message) => {
                 panic!("a MethodError must classify as Errored, not Unreachable: {message}")
             }
+            HelperFailure::Undecodable(message) => {
+                panic!("this answer was read successfully; it just said no: {message}")
+            }
         }
+    }
+
+    #[test]
+    fn an_answer_this_build_cannot_read_is_neither_unreachable_nor_errored() {
+        // The measured case, built by zbus's own decoder rather than by
+        // hand: a `list` answered in the shape from before the forward
+        // feature. Before this classification existed it landed in
+        // `Unreachable` -- a `SignatureMismatch` is not a `MethodError` --
+        // and this window said "could not reach the porthole helper" about a
+        // helper that had just answered.
+        #[derive(serde::Serialize, zbus::zvariant::Type)]
+        struct RuleBeforeForward {
+            id: String,
+            port: u16,
+            protocol: String,
+            target: String,
+            scope: String,
+            backend: String,
+            opened_at: u64,
+            expires_at: u64,
+            uid: u32,
+        }
+        let old = vec![RuleBeforeForward {
+            id: "abc".to_string(),
+            port: 5173,
+            protocol: "tcp".to_string(),
+            target: "10.10.10.0/24".to_string(),
+            scope: "network".to_string(),
+            backend: "firewalld".to_string(),
+            opened_at: 1_757_000_000,
+            expires_at: 1_757_003_600,
+            uid: 1000,
+        }];
+        let e = zbus::message::Message::signal("/", "com.jacopobriccola.Porthole1", "Listed")
+            .unwrap()
+            .build(&(old,))
+            .unwrap()
+            .body()
+            .deserialize::<(Vec<WireRule>,)>()
+            .expect_err("the two list signatures disagree");
+
+        match classify_failure(e) {
+            HelperFailure::Undecodable(message) => {
+                assert!(
+                    !message.contains("could not reach"),
+                    "the helper answered: {message}"
+                );
+                assert!(
+                    message.contains("could not read"),
+                    "and what failed was reading it: {message}"
+                );
+            }
+            HelperFailure::Unreachable(message) => {
+                panic!("the helper answered; this is not unreachable: {message}")
+            }
+            HelperFailure::Errored(message) => {
+                panic!("the helper reported no error; this window could not read it: {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn one_unreadable_answer_out_of_three_is_enough_to_settle_the_window() {
+        // `list`, `status` and `docker_ports` are three independent results
+        // on purpose, so that one failing does not throw away another that
+        // succeeded -- but this particular failure is not about one call, it
+        // is about the two binaries, so any one of the three carrying it is
+        // what the window acts on. Each position checked, so a future
+        // rewrite that only looks at `rules` fails here.
+        let unreadable = || HelperFailure::Undecodable("cannot read this".to_string());
+        let ordinary = || HelperFailure::Errored("not authorized".to_string());
+
+        for position in 0..3 {
+            let snapshot = HelperSnapshot {
+                rules: if position == 0 {
+                    Err(unreadable())
+                } else {
+                    Err(ordinary())
+                },
+                status: if position == 1 {
+                    Err(unreadable())
+                } else {
+                    Err(ordinary())
+                },
+                docker: if position == 2 {
+                    Err(unreadable())
+                } else {
+                    Err(ordinary())
+                },
+            };
+            assert_eq!(
+                first_undecodable(&snapshot).as_deref(),
+                Some("cannot read this"),
+                "position {position}"
+            );
+        }
+
+        // And the negative control: three ordinary failures are not this
+        // case, and must go on rendering as themselves.
+        let ordinary_only = HelperSnapshot {
+            rules: Err(ordinary()),
+            status: Err(HelperFailure::Unreachable("no bus".to_string())),
+            docker: Err(ordinary()),
+        };
+        assert_eq!(first_undecodable(&ordinary_only), None);
     }
 
     #[test]
@@ -1335,6 +1598,9 @@ mod tests {
             }
             HelperFailure::Errored(message) => {
                 panic!("a non-MethodError must classify as Unreachable, not Errored: {message}")
+            }
+            HelperFailure::Undecodable(message) => {
+                panic!("nothing came back to be read here at all: {message}")
             }
         }
     }

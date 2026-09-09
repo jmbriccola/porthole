@@ -116,6 +116,27 @@ fn from_dbus(e: zbus::Error) -> Error {
             code,
         };
     }
+    // Reached, and answered, and the answer could not be read -- which
+    // "could not be reached" below would deny. See
+    // `porthole_core::ipc::is_undecodable`: this is what a `porthole` and a
+    // `porthole-helper` from either side of an upgrade say to each other,
+    // and it is the CLI's copy of the fact `porthole-agent` and
+    // `porthole-gui` each now handle in their own way.
+    //
+    // What it deliberately does not claim is whether the request took
+    // effect. `open`'s *arguments* did not change across the upgrade that
+    // produced this, so a helper that could not be understood may well have
+    // done exactly what was asked; only the reply was unreadable. `porthole
+    // list` reads the state file the helper writes, so it is the thing that
+    // answers that question rather than this sentence.
+    if porthole_core::ipc::is_undecodable(&e) {
+        return Error::Unexpected(format!(
+            "the porthole helper answered, and porthole could not read the answer: {e}. \
+             porthole and the porthole helper are different versions -- `porthole list` \
+             says what is open, and restarting porthole-helper.service after an upgrade \
+             is what replaces the older half."
+        ));
+    }
     Error::Unexpected(format!("the helper could not be reached: {e}"))
 }
 
@@ -378,6 +399,72 @@ mod tests {
                 .build(&())
                 .unwrap(),
         )
+    }
+
+    #[test]
+    fn an_answer_the_cli_cannot_read_is_not_reported_as_a_helper_it_could_not_reach() {
+        // The helper answered. Saying "the helper could not be reached"
+        // sends a person to `porthole doctor`, to `systemctl status`, to the
+        // bus -- everywhere except the one thing that is true, which is that
+        // the two binaries are from either side of an upgrade.
+        //
+        // The error is built by zbus's own decoder rather than by hand: an
+        // `open` answered with the rule shape from before the forward
+        // feature.
+        #[derive(serde::Serialize, zbus::zvariant::Type)]
+        struct RuleBeforeForward {
+            id: String,
+            port: u16,
+            protocol: String,
+            target: String,
+            scope: String,
+            backend: String,
+            opened_at: u64,
+            expires_at: u64,
+            uid: u32,
+        }
+        let old = RuleBeforeForward {
+            id: "abc".to_string(),
+            port: 5173,
+            protocol: "tcp".to_string(),
+            target: "10.10.10.0/24".to_string(),
+            scope: "network".to_string(),
+            backend: "firewalld".to_string(),
+            opened_at: 1_757_000_000,
+            expires_at: 1_757_003_600,
+            uid: 1000,
+        };
+        let e = zbus::message::Message::method_call("/", "Noop")
+            .unwrap()
+            .build(&(old,))
+            .unwrap()
+            .body()
+            .deserialize::<(WireRule,)>()
+            .expect_err("the two rule signatures disagree");
+
+        let rendered = from_dbus(e).to_string();
+        assert!(
+            !rendered.contains("could not be reached"),
+            "the helper answered: {rendered}"
+        );
+        assert!(
+            rendered.contains("could not read the answer"),
+            "and what failed was reading it: {rendered}"
+        );
+        assert!(
+            rendered.contains("porthole list"),
+            "the request may well have taken effect, and this is where that is \
+             settled: {rendered}"
+        );
+
+        // The negative control on the same function: an error that really is
+        // a helper nobody could reach keeps its own sentence.
+        let unreachable =
+            from_dbus(zbus::Error::Failure("the connection was lost".to_string())).to_string();
+        assert!(
+            unreachable.contains("could not be reached"),
+            "{unreachable}"
+        );
     }
 
     #[test]
