@@ -224,57 +224,10 @@ async fn answered<T>(proxy: &PortholeProxy<'_>, outcome: zbus::Result<T>) -> Res
     }
 }
 
-/// Whether a failure is the bus saying **nobody answered**, rather than the
-/// helper saying anything at all.
-///
-/// `org.freedesktop.DBus.Error.NoReply` and nothing else. The bus daemon
-/// sends it, with the detail `Remote peer disconnected`, when the process
-/// that was going to answer a pending call went away before it did — and it
-/// is today the one failure `from_dbus` renders as *"the helper could not be
-/// reached"*, which is the worst possible sentence for a helper that is
-/// perfectly healthy and has just been replaced by a fresh instance of
-/// itself.
-///
-/// Deliberately **not** every transport failure. A `zbus::Error::InputOutput`
-/// or a closed connection is *this* process's own socket having gone, and a
-/// second call over the same proxy would fail exactly as the first did; a
-/// `MethodError` under any other name is a decision the helper made and
-/// reached us intact. Only "the peer vanished with your call outstanding" is
-/// a fact about the other end that asking again can change: the well-known
-/// name is D-Bus activated, so the second call brings up a fresh instance
-/// and is served by the owner.
-fn nobody_answered(e: &zbus::Error) -> bool {
-    matches!(
-        e,
-        zbus::Error::MethodError(name, ..)
-            if name.as_str() == "org.freedesktop.DBus.Error.NoReply"
-    )
-}
-
-/// Whether the helper answered that it was **retiring**, which is the one
-/// refusal on this interface that is not about the request at all.
-///
-/// A helper with no rule open and nothing in flight gives up the bus name and
-/// exits (`porthole_helper::retire`). From the instant it decides to, it
-/// refuses every request rather than serving it — because a request served
-/// after that point would emit an announcement no subscriber can receive, and
-/// could open a rule the process is about to exit with. The refusal is only
-/// ever sent once the name is already gone, so asking again reaches the fresh
-/// instance the bus activates rather than the one that is leaving.
-fn helper_was_retiring(e: &zbus::Error) -> bool {
-    matches!(
-        e,
-        zbus::Error::MethodError(name, ..)
-            if name.as_str() == "com.jacopobriccola.Porthole.Retiring"
-    )
-}
-
-/// The two failures a second call can turn into service, and nothing else.
-fn worth_asking_again(e: &zbus::Error) -> bool {
-    nobody_answered(e) || helper_was_retiring(e)
-}
-
-/// [`answered`], plus **one** retry when the first call is [`worth_asking_again`].
+/// [`answered`], plus **one** retry when the first call is one to ask again
+/// rather than report -- [`porthole_core::ipc::worth_asking_again`], which is
+/// where the two names and what a retry can and cannot promise are written
+/// down, because every component that talks this interface meets them.
 ///
 /// This is a defect fixed in its own right, not a piece of any shutdown
 /// sequence: a helper that is restarted by a package upgrade, killed by an
@@ -308,7 +261,7 @@ where
 
 /// The retry itself, with no proxy and no classification in it, so what it
 /// decides is testable without a bus: `call` once, and exactly once more if
-/// the first attempt was [`worth_asking_again`].
+/// the first attempt was [`porthole_core::ipc::worth_asking_again`].
 ///
 /// Whatever the second attempt says is the answer, including a second
 /// `NoReply` — a helper that dies on every request must report, not be asked
@@ -319,7 +272,7 @@ where
     Fut: std::future::Future<Output = zbus::Result<T>>,
 {
     match call().await {
-        Err(e) if worth_asking_again(&e) => call().await,
+        Err(e) if porthole_core::ipc::worth_asking_again(&e) => call().await,
         first => first,
     }
 }
@@ -720,77 +673,6 @@ mod tests {
         )
     }
 
-    #[test]
-    fn a_helper_that_vanished_mid_call_is_the_one_failure_worth_asking_again_about() {
-        assert!(
-            nobody_answered(&nobody_answered_error()),
-            "the bus said nobody answered; asking again is what activates a fresh helper"
-        );
-
-        // The negative controls, and they are the point: everything else is
-        // either a decision the helper made and delivered intact, or this
-        // process's own socket having gone -- and a second call over the same
-        // proxy would fail exactly as the first did.
-        for (name, detail) in [
-            ("com.jacopobriccola.Porthole.AlreadyOpen", "5173/tcp"),
-            ("com.jacopobriccola.Porthole.NotAuthorized", "denied"),
-            ("com.jacopobriccola.Porthole.RuleNotFound", "no such rule"),
-            (
-                "org.freedesktop.DBus.Error.ServiceUnknown",
-                "not activatable",
-            ),
-            ("org.freedesktop.DBus.Error.AccessDenied", "refused"),
-            ("org.freedesktop.DBus.Error.Failed", "boom"),
-        ] {
-            assert!(
-                !nobody_answered(&method_error(name, detail)),
-                "{name} is an answer, not the absence of one"
-            );
-        }
-        assert!(!nobody_answered(&zbus::Error::Failure(
-            "the connection was lost".to_string()
-        )));
-        assert!(!nobody_answered(&zbus::Error::Variant(
-            zbus::zvariant::Error::Message("signature mismatch".to_string())
-        )));
-    }
-
-    #[test]
-    fn a_helper_that_was_retiring_is_the_other_failure_worth_asking_again_about() {
-        // The one refusal on this interface that is not about the request:
-        // the helper had already given up the bus name when this arrived and
-        // deliberately did not act on it, so the second call reaches the
-        // fresh instance the bus activates. Spelled as the literal wire name,
-        // because that name is the contract with
-        // `porthole_helper::error::HelperError::Retiring` and nothing in
-        // either file makes a rename fail to compile.
-        let retiring = method_error(
-            "com.jacopobriccola.Porthole.Retiring",
-            "the porthole helper was retiring when this request arrived",
-        );
-        assert!(helper_was_retiring(&retiring));
-        assert!(worth_asking_again(&retiring));
-        assert!(
-            !nobody_answered(&retiring),
-            "it is an answer, and a deliberate one -- just not one about the request"
-        );
-
-        // The negative control that matters most here: no other refusal the
-        // helper can send is retried. A retried `open` whose refusal was real
-        // would charge a second polkit prompt.
-        for name in [
-            "com.jacopobriccola.Porthole.NotAuthorized",
-            "com.jacopobriccola.Porthole.AlreadyOpen",
-            "com.jacopobriccola.Porthole.Failed",
-            "com.jacopobriccola.Porthole.RetiringSoon",
-        ] {
-            assert!(
-                !helper_was_retiring(&method_error(name, "x")),
-                "{name} must not be read as a retirement"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn a_call_nobody_answered_is_made_exactly_once_more() {
         use std::cell::Cell;
@@ -821,7 +703,7 @@ mod tests {
             async { Err::<u32, _>(nobody_answered_error()) }
         })
         .await;
-        assert!(nobody_answered(
+        assert!(porthole_core::ipc::worth_asking_again(
             &gave_up.expect_err("both attempts found nobody")
         ));
         assert_eq!(attempts.get(), 2, "exactly two, not a loop");

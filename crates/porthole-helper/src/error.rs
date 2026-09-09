@@ -223,7 +223,8 @@ mod tests {
         // reports to a person.
         assert_eq!(
             HelperError::Retiring("x".into()).name().as_str(),
-            "com.jacopobriccola.Porthole.Retiring"
+            porthole_core::ipc::RETIRING_ERROR,
+            "the name zbus derives from this variant and the one              `porthole_core::ipc::worth_asking_again` matches on are two              spellings of one wire fact, and nothing makes a rename of either              fail to compile"
         );
     }
 

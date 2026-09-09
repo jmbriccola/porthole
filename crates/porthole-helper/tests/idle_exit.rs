@@ -36,7 +36,7 @@
 
 use futures_util::StreamExt;
 use porthole_core::backend::{BackendId, RuleHandle};
-use porthole_core::ipc::{CloseReason, PortholeProxy, PATH, SERVICE};
+use porthole_core::ipc::{CloseReason, PortholeProxy, PATH, RETIRING_ERROR, SERVICE};
 use porthole_core::model::{Protocol, Target};
 use porthole_core::state::{ManagedRule, StateStore};
 use std::io::BufRead as _;
@@ -495,19 +495,6 @@ async fn a_call_arriving_while_the_old_helper_still_drains_is_served_by_a_fresh_
     );
 }
 
-/// Whether a client should ask this one again rather than report it -- the
-/// same two names `porthole-cli`'s own `worth_asking_again` retries on, spelled
-/// out here rather than shared, because what this file is checking is that the
-/// helper never produces a *third* kind of failure across a retirement.
-fn worth_asking_again(e: &zbus::Error) -> bool {
-    matches!(
-        e,
-        zbus::Error::MethodError(name, ..)
-            if name.as_str() == "com.jacopobriccola.Porthole.Retiring"
-                || name.as_str() == "org.freedesktop.DBus.Error.NoReply"
-    )
-}
-
 #[tokio::test]
 #[cfg_attr(
     not(debug_assertions),
@@ -543,7 +530,7 @@ async fn no_announcement_is_lost_across_a_run_of_retirements() {
         // failure, or a second failure on the retry, fails the test.
         let closed = match proxy.close_all().await {
             Ok(v) => v,
-            Err(e) if worth_asking_again(&e) => {
+            Err(e) if porthole_core::ipc::worth_asking_again(&e) => {
                 retried += 1;
                 proxy.close_all().await.unwrap_or_else(|e| {
                     panic!("round {round}: the retry failed too: {e}\n{}", bus.log())
@@ -725,7 +712,7 @@ async fn a_request_that_races_the_decision_to_retire_is_refused_rather_than_serv
                 match proxy.list().await {
                     Ok(rules) => assert!(rules.is_empty(), "nothing was ever opened"),
                     Err(zbus::Error::MethodError(name, detail, _))
-                        if name.as_str() == "com.jacopobriccola.Porthole.Retiring" =>
+                        if name.as_str() == RETIRING_ERROR =>
                     {
                         refusals += 1;
                         assert!(
@@ -744,7 +731,7 @@ async fn a_request_that_races_the_decision_to_retire_is_refused_rather_than_serv
                     // routed to an instance that then went before answering
                     // it. Counted rather than passed over, and reported below.
                     Err(zbus::Error::MethodError(name, _, _))
-                        if name.as_str() == "org.freedesktop.DBus.Error.NoReply" =>
+                        if name.as_str() == porthole_core::ipc::NO_REPLY_ERROR =>
                     {
                         unanswered += 1;
                         assert!(proxy
