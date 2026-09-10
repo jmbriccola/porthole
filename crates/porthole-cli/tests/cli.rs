@@ -56,35 +56,46 @@
 //! test fails. The two runs described above hung for more than five hundred
 //! seconds each, on a machine whose owner was somewhere else.
 //!
-//! # Seven tests that a release build must not run
+//! # Twelve tests that a release build must not run, and what enforces it
 //!
 //! `PORTHOLE_STATE_FILE` and `PORTHOLE_DEVICES_FILE` are honoured only where
 //! `cfg!(debug_assertions)` holds, deliberately: a release binary runs
 //! privileged and must not take the location of its state or its address book
-//! from the environment. Seven tests below depend on being honoured, so they
+//! from the environment. Twelve tests below depend on being honoured, so they
 //! carry `#[cfg_attr(not(debug_assertions), ignore = ...)]` and a
 //! `cargo test --release` reports them as `ignored`, **by name**, with the
 //! reason attached. That is the arrangement `helper_e2e.rs` already had for
 //! the same shape of problem; this file did not, and a release run of it was
-//! simply red.
+//! simply red: 42 passed, 7 failed.
 //!
-//! Failing was not the worst of it, and this is why the attribute is not
-//! tidiness. Measured here on 2026-09-10, `cargo test --release -p
-//! porthole-cli --test cli`: 42 passed, 7 failed -- and among the seven,
+//! **The attribute is not the enforcement**, because forgetting an attribute
+//! is exactly what happened. [`refuse_a_release_build_the_address_book`] and
+//! [`refuse_a_release_build_the_state_file`] are called from the two helpers
+//! that seed a book and a state file, so a test that reaches for either
+//! without the attribute fails in `cargo test --release` at its own setup,
+//! before it can start a process. Read those two functions for why that is an
+//! assertion and not a comment.
+//!
+//! In short: under `--release` the override is not lost, the **real** file is
+//! used instead.
 //! `the_picker_hides_containers_and_shows_a_name_where_the_resolver_has_one`
-//! drives `porthole devices add` to completion, so with the override ignored
-//! it **saved a device into the invoking user's own
-//! `~/.config/porthole/devices.toml`**. It survived only because that book's
-//! existing entries and the stub neighbour table happened to agree. Three
-//! more of the seven read that same real book, and two read the machine's
-//! real `/run/porthole/state.json`.
+//! drives `porthole devices add` to a save, and on two occasions it saved this
+//! file's fabricated `router` fixture into a real person's
+//! `~/.config/porthole/devices.toml`.
+//! `devices_rm_of_something_that_is_not_there_fails_rather_than_reporting_success`
+//! is the same hazard unfired: `devices rm phone` against a real book that
+//! holds a `phone` is a delete. Five of the twelve used to *pass* under
+//! `--release` while reading that real book, their own setup inert -- which is
+//! a green tick for a premise that never held.
 //!
-//! What is *not* claimed: this does not stop a release run reading the real
-//! state file. Nearly every test here sets `PORTHOLE_STATE_FILE` through
+//! What is *not* claimed. This does not stop a release run reading the real
+//! state file: nearly every test here sets `PORTHOLE_STATE_FILE` through
 //! [`porthole`], and under `--release` all of them read
 //! `/run/porthole/state.json` -- most simply do not care what is in it, which
-//! is why they pass. What the seven ignores remove is every release
-//! assertion that depended on the override, and the only write.
+//! is why they pass, and why the assertion is not in [`porthole`]. Nor does it
+//! cover a test that writes a state file with `std::fs::write` rather than
+//! [`write_state`]. What the twelve ignores remove is every release assertion
+//! that depended on the override, and both writes.
 
 use std::ffi::OsString;
 use std::io::{BufRead as _, Read as _, Write as _};
@@ -281,9 +292,8 @@ fn porthole(args: &[&str], state: &Path) -> Output {
 }
 
 /// `porthole` with the address book pointed at a file of this test's own.
-/// `PORTHOLE_DEVICES_FILE` is honoured in debug builds only, which is what
-/// a test binary always is.
 fn porthole_with_devices(args: &[&str], state: &Path, devices: &Path) -> Output {
+    refuse_a_release_build_the_address_book();
     let mut command = porthole_command(args);
     command
         .env("PORTHOLE_STATE_FILE", state)
@@ -294,7 +304,80 @@ fn porthole_with_devices(args: &[&str], state: &Path, devices: &Path) -> Output 
 /// A book with one device in it, written straight to disk -- `devices add`
 /// is an interactive prompt and cannot be driven from here.
 fn write_book(path: &Path, body: &str) {
+    refuse_a_release_build_the_address_book();
     std::fs::write(path, body).expect("the temp dir is writable");
+}
+
+/// Stop a release build here, before it can reach the invoking user's own
+/// address book.
+///
+/// `PORTHOLE_DEVICES_FILE` is honoured only where `cfg!(debug_assertions)`
+/// holds (`porthole_core::devices::default_path_from`), deliberately: a
+/// release binary runs privileged and must not take a config path from its
+/// environment. What that means for a test is not that the override is
+/// *lost* -- it is that the real book is used instead, and the real book is
+/// `$XDG_CONFIG_HOME/porthole/devices.toml` or `~/.config/porthole/devices.toml`
+/// belonging to whoever ran `cargo test`.
+///
+/// **That is not hypothetical.** It happened twice on the developer's own
+/// machine, in the audit's release run and in the run that measured it for
+/// this change: `the_picker_hides_containers_and_shows_a_name_where_the_
+/// resolver_has_one` drives `porthole devices add` to a save, and it saved
+/// this file's fabricated `router` fixture -- MAC `50:e6:36:51:42:fd`,
+/// which appears nowhere but in test sources -- into that person's real
+/// address book, where it remains, resolving to nothing.
+/// `devices_rm_of_something_that_is_not_there_fails_rather_than_reporting_success`
+/// is the same hazard waiting: it runs `devices rm phone`, and on a real book
+/// that happens to hold a device called `phone`, that is a delete.
+///
+/// So this is an assertion and not a comment. Every test that seeds or reads
+/// a book of its own carries
+/// `#[cfg_attr(not(debug_assertions), ignore = ...)]`, and this is what makes
+/// forgetting one a red test rather than a write into somebody's home
+/// directory.
+/// `#[cfg]` on the statement rather than `assert!(cfg!(debug_assertions))`,
+/// which clippy rejects as an assertion on a constant -- and it is right that
+/// it is one. The condition is a compile-time fact, so the honest spelling is
+/// code that exists only in the build it is about.
+fn refuse_a_release_build_the_address_book() {
+    #[cfg(not(debug_assertions))]
+    panic!(
+        "PORTHOLE_DEVICES_FILE is honoured in debug builds only, so this release \
+         build would ignore the book this test set up and use the invoking user's \
+         own ~/.config/porthole/devices.toml instead -- reading it, and on any \
+         path that saves or forgets a device, writing it. This test needs \
+         `#[cfg_attr(not(debug_assertions), ignore = ...)]`. See this function's \
+         own comment for the two occasions it was needed and did not exist."
+    );
+}
+
+/// The same refusal for the state file: `PORTHOLE_STATE_FILE` is honoured
+/// only where `cfg!(debug_assertions)` holds
+/// (`porthole_core::state::state_path_from`), so a release build reads
+/// `/run/porthole/state.json` -- the machine's real one -- instead of what a
+/// test wrote.
+///
+/// Called from [`write_state`] and not from [`porthole`], and the difference
+/// is the whole point. Nearly every test in this file goes through
+/// [`porthole`] to check an exit code or a refusal that never touches the
+/// state file at all; asserting there would claim those tests depend on the
+/// override, which is false, and would put the forty-odd of them back to
+/// failing under `--release`. Seeding state and then expecting the binary to
+/// read it back is what [`write_state`] means, and that is what depends on it.
+///
+/// **The limit, stated rather than left to be discovered**: a test that writes
+/// a state file with `std::fs::write` instead of [`write_state`] is not
+/// covered by this.
+/// Spelled with `#[cfg]` for the reason
+/// [`refuse_a_release_build_the_address_book`] gives.
+fn refuse_a_release_build_the_state_file() {
+    #[cfg(not(debug_assertions))]
+    panic!(
+        "PORTHOLE_STATE_FILE is honoured in debug builds only, so this release \
+         build would ignore the state file this test just wrote and read \
+         /run/porthole/state.json -- the machine's real one -- instead. This test \
+         needs `#[cfg_attr(not(debug_assertions), ignore = ...)]`."
+    );
 }
 
 fn code(out: &Output) -> i32 {
@@ -956,6 +1039,10 @@ fn open_towards_a_saved_device_that_is_absent_exits_device_unreachable() {
 }
 
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "PORTHOLE_DEVICES_FILE is honoured in debug builds only, so a --release binary reads the invoking user's own address book instead of this test's"
+)]
 fn a_to_that_looks_like_a_failed_network_keeps_the_network_error() {
     let dir = TempDir::new().unwrap();
     let book = dir.path().join("devices.toml");
@@ -978,6 +1065,10 @@ fn a_to_that_looks_like_a_failed_network_keeps_the_network_error() {
 }
 
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "PORTHOLE_DEVICES_FILE is honoured in debug builds only, so a --release binary reads the invoking user's own address book instead of this test's"
+)]
 fn a_bad_duration_is_refused_before_a_device_is_resolved() {
     // Resolution shells out; `--for 999h` is refusable without doing that.
     // What this pins is the ordering: the duration error, not a device one.
@@ -1054,6 +1145,10 @@ fn devices_rm_honours_json_and_reports_what_it_forgot() {
 }
 
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "PORTHOLE_DEVICES_FILE is honoured in debug builds only, and this test runs `devices rm`: against the invoking user's own address book that is a delete, not a no-op"
+)]
 fn devices_rm_of_something_that_is_not_there_fails_rather_than_reporting_success() {
     let dir = TempDir::new().unwrap();
     let book = dir.path().join("devices.toml");
@@ -1075,6 +1170,10 @@ fn devices_rm_of_something_that_is_not_there_fails_rather_than_reporting_success
 /// and without touching this machine's own. `devices add` reads its book and
 /// asks `ip` before it prompts for anything, so nothing here needs stdin.
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "PORTHOLE_DEVICES_FILE is honoured in debug builds only, so a --release binary reads the invoking user's own address book instead of this test's"
+)]
 fn devices_add_with_nothing_to_offer_honours_json_and_exits_nine() {
     let dir = TempDir::new().unwrap();
     let bin = dir.path().join("bin");
@@ -1115,6 +1214,10 @@ fn devices_add_with_nothing_to_offer_honours_json_and_exits_nine() {
 /// the exit code is the specific one rather than 1, which the README
 /// documents as "unexpected failure" and this is not.
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "PORTHOLE_DEVICES_FILE is honoured in debug builds only, so a --release binary reads the invoking user's own address book instead of this test's"
+)]
 fn devices_add_with_nothing_to_offer_is_not_reported_as_an_unexpected_failure() {
     let dir = TempDir::new().unwrap();
     let bin = dir.path().join("bin");
@@ -1343,6 +1446,7 @@ fn the_picker_hides_containers_and_shows_a_name_where_the_resolver_has_one() {
 /// privileged process at all -- which is what lets the rendering of a
 /// forward be asserted on every machine this suite runs on.
 fn write_state(path: &Path, rules: &str) {
+    refuse_a_release_build_the_state_file();
     std::fs::write(path, format!(r#"{{"schema_version":1,"rules":[{rules}]}}"#))
         .expect("the temp dir is writable");
 }

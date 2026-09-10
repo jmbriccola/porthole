@@ -111,7 +111,7 @@ longer fails the tests that need PORTHOLE_STATE_FILE, PORTHOLE_DEVICES_FILE
 or the helper's --session, all three of which are still honoured only where
 cfg!(debug_assertions) holds: those tests carry
 #[cfg_attr(not(debug_assertions), ignore = ...)] and a release run reports
-them as ignored, by name. Measured: 42 passed, 0 failed, 7 ignored.
+them as ignored, by name. Measured: 37 passed, 0 failed, 12 ignored.
 
 What debian/control is missing is dbus-run-session and busctl, which the
 suite now needs on PATH and which packaging/rpm/porthole.spec declares as

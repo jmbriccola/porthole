@@ -183,9 +183,11 @@ check() {
 	# debug builds only, because a release binary must not take those paths
 	# from its environment -- now carry
 	# #[cfg_attr(not(debug_assertions), ignore = ...)], so a release run
-	# reports them as ignored by name. There are seven of them, not the four
-	# this comment used to claim; `forward` and the device book added three
-	# and nothing noticed. Measured: 42 passed, 0 failed, 7 ignored.
+	# reports them as ignored by name. There are twelve of them, not the four
+	# this comment used to claim; `forward` and the device book added three,
+	# and five more were passing under --release against the invoking user's
+	# own address book with their own setup inert. Measured: 37 passed,
+	# 0 failed, 12 ignored.
 	cargo test --release --locked -p porthole-core
 }
 

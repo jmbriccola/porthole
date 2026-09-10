@@ -75,9 +75,12 @@ endif
 # privileged and must not take those paths from its environment. What
 # changed is that the tests depending on them now carry
 # #[cfg_attr(not(debug_assertions), ignore = ...)], so a release run reports
-# them as ignored, by name, with the reason. Seven in cli.rs, four in
-# helper_e2e.rs. Measured: `cargo test --release -p porthole-cli --test cli`
-# -> 42 passed, 0 failed, 7 ignored.
+# them as ignored, by name, with the reason. Twelve in cli.rs, four in
+# helper_e2e.rs, and in cli.rs two assert-at-setup guards make forgetting the
+# attribute a red test rather than a write into the invoking user's own
+# ~/.config/porthole/devices.toml, which is what it had already been twice.
+# Measured: `cargo test --release -p porthole-cli --test cli`
+# -> 37 passed, 0 failed, 12 ignored.
 #
 # What does stand in the way is a build-dependency that debian/control does
 # not declare. The requirement moved from "a system bus exists" to
