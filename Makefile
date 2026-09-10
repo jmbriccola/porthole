@@ -15,6 +15,20 @@ CARGO   ?= cargo
 PROFILE ?= release
 TARGETDIR ?= target
 
+# How many rustc processes `build`/`build-gui` may run at once. The numbers
+# behind the 8, and why this is min(nproc, 8) rather than a flat 8, are in
+# tests/container/run.sh next to the same expression; the short of it is that
+# cargo does not clamp `jobs` to the core count, and debian/rules, the RPM
+# spec and the AUR PKGBUILD all reach these targets on builders whose core
+# count is not this developer's. min() leaves any machine of 8 cores or fewer
+# building exactly as it does today.
+#
+# `?=` means CARGO_BUILD_JOBS from the environment wins; `export` is what puts
+# it where cargo reads it, since cargo takes it as an environment variable and
+# not as a make variable.
+CARGO_BUILD_JOBS ?= $(shell n=$$(nproc 2>/dev/null || echo 1); if [ "$$n" -lt 8 ]; then echo "$$n"; else echo 8; fi)
+export CARGO_BUILD_JOBS
+
 # Where the built binaries are read from, and where build.rs leaves the man
 # pages and completions. Overridable together for an out-of-tree build.
 BINSRC    ?= $(TARGETDIR)/$(PROFILE)
