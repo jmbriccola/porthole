@@ -6,6 +6,16 @@
 //! invisible to anyone using porthole as an application. This is where one
 //! is created.
 //!
+//! ## The way out
+//!
+//! An `adw::HeaderBar`'s close button, and Escape. This panel had neither
+//! visible: without a header bar an `adw::Dialog` draws no close button, so
+//! the title this dialog sets was rendered nowhere and nothing on screen
+//! offered to dismiss it. The bar added in [`DevicesDialog::new`] draws
+//! both. Escape is libadwaita's own and always worked from a keyboard
+//! inside the panel; `tests/devices_dialog.rs` presses the close button and
+//! checks the panel is gone, rather than checking a button is there.
+//!
 //! ## Two ways to name a device, one rule for each field
 //!
 //! `porthole devices add` is discovery-only: it prints the neighbour table
@@ -816,6 +826,29 @@ impl DevicesDialog {
         let toast_overlay = adw::ToastOverlay::new();
         toast_overlay.set_child(Some(&scroller));
 
+        // The same repair the open dialog carries, and for the same reason:
+        // without an `adw::HeaderBar` an `adw::Dialog` draws no close button,
+        // so this panel had no visible way to dismiss it, and the title it
+        // has always set was rendered nowhere. The bar draws both. The
+        // `adw::ToolbarView` around it is `window.rs`'s own construction,
+        // and it keeps the bar outside the scroller below, so the way out
+        // never scrolls away from a list that grows every time a device is
+        // saved.
+        //
+        // **No Cancel here, unlike the open dialog.** That one is a form
+        // that ends in a single consequential act, and "Cancel" there names
+        // abandoning the request. This is a management panel: its button
+        // saves one device and the panel stays open for the next, so a
+        // Cancel beside it would name backing out of a *save* -- an act
+        // that is already over or has not started -- rather than closing the
+        // panel. Two controls a step apart meaning different kinds of "no"
+        // is worse than the one the close button already provides.
+        let header_bar = adw::HeaderBar::new();
+
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&header_bar);
+        toolbar_view.set_content(Some(&toast_overlay));
+
         // `follows_content_size`, which the open dialog does not need and
         // this one does: that dialog is handed its target list before it is
         // presented, and this one fills in afterwards -- the address book
@@ -829,8 +862,14 @@ impl DevicesDialog {
             .title("Saved devices")
             .content_width(420)
             .follows_content_size(true)
-            .child(&toast_overlay)
+            .child(&toolbar_view)
             .build();
+        // Where the keyboard starts -- the name field, which is the first
+        // thing a person fills in. Named rather than left to the tab order
+        // for the reason the open dialog's own `set_focus` records: what
+        // libadwaita grabs on its own is whatever comes first in that order,
+        // and the header bar added above now comes before the form.
+        dialog.set_focus(Some(&name_row));
 
         let inner = Rc::new(Inner {
             dialog,

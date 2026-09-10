@@ -118,6 +118,147 @@ fn named_choice(mac: &str, address: &str, name: Option<&str>) -> NeighbourChoice
     }
 }
 
+// ---------------------------------------------------------------------
+// The ways out of this panel. Two, not the open dialog's three: there is
+// no Cancel here, and `devices_dialog.rs`'s own construction comment says
+// why -- this is a management panel whose button saves one device and
+// leaves the panel open for the next, so "Cancel" beside it would name
+// backing out of a save rather than closing anything.
+// ---------------------------------------------------------------------
+
+/// Drains the main context *and lets real time pass between rounds*.
+///
+/// The plain `pump_main_context` above is enough for everything else in
+/// this file, and not for these two: presenting an `adw::Dialog` and
+/// dismissing one both run on the frame clock, which non-blocking
+/// iterations never advance. Same helper, same reason, as
+/// `tests/open_dialog.rs`'s own -- duplicated because each `harness = false`
+/// target is its own binary.
+fn settle() {
+    for _ in 0..10 {
+        pump_main_context();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    pump_main_context();
+}
+
+/// The panel's own close button, found by the `close` style class GTK puts
+/// on the one an `adw::HeaderBar` draws. `None` when there is no header bar,
+/// which is the state this milestone repaired.
+fn close_button_of(dialog: &adw::Dialog) -> Option<gtk::Button> {
+    fn walk(widget: &gtk::Widget, found: &mut Vec<gtk::Button>) {
+        if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+            if button.has_css_class("close") {
+                found.push(button.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(w) = child {
+            walk(&w, found);
+            child = w.next_sibling();
+        }
+    }
+    let mut found = Vec::new();
+    walk(dialog.clone().upcast_ref::<gtk::Widget>(), &mut found);
+    found.into_iter().next()
+}
+
+/// Until this milestone the saved-devices panel had no visible way to close
+/// it either, for the identical reason the open dialog did not: no header
+/// bar, so no close button.
+///
+/// The press is real and what is asserted is that the panel is gone, not
+/// that a button exists.
+fn the_close_button_dismisses_the_saved_devices_panel() -> Result<(), String> {
+    let outcome = Rc::new(RefCell::new(Err("activation never ran".to_string())));
+    let seen = outcome.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.DevicesCloseButton",
+        move |app| {
+            let win = PortholeWindow::new_without_initial_load(app);
+            win.present();
+            let dialog = DevicesDialog::new();
+            dialog.present(Some(&*win));
+            settle();
+
+            let mut result: Result<(), String> = Ok(());
+            if win.visible_dialog().is_none() {
+                result = Err("fixture setup: the panel was never on screen".to_string());
+            }
+            if result.is_ok() {
+                match close_button_of(dialog.dialog()) {
+                    Some(button) => {
+                        button.emit_clicked();
+                        settle();
+                        if win.visible_dialog().is_some() {
+                            result =
+                                Err("pressing the close button left the panel on screen"
+                                    .to_string());
+                        }
+                    }
+                    None => {
+                        result = Err(
+                            "the panel carries no close button -- an adw::Dialog draws one \
+                             only where an adw::HeaderBar asks for it"
+                                .to_string(),
+                        )
+                    }
+                }
+            }
+            *seen.borrow_mut() = result;
+        },
+    );
+    outcome.replace(Err("activation never ran".to_string()))
+}
+
+/// And the keyboard is inside the panel the moment it opens, which is what
+/// libadwaita's own Escape shortcut needs in order to ever see the key --
+/// see `tests/open_dialog.rs`'s own Escape case for the mechanism and for
+/// the one step of a real keypress this container cannot supply.
+///
+/// Checked here as well as there because the header bar added to this panel
+/// introduces focusable widgets ahead of its form, exactly as the open
+/// dialog's does, and what libadwaita grabs on its own is whatever comes
+/// first in tab order.
+fn the_saved_devices_panel_holds_the_keyboard_when_it_opens() -> Result<(), String> {
+    let outcome = Rc::new(RefCell::new(Err("activation never ran".to_string())));
+    let seen = outcome.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.DevicesInitialFocus",
+        move |app| {
+            let win = PortholeWindow::new_without_initial_load(app);
+            win.present();
+            let dialog = DevicesDialog::new();
+            dialog.present(Some(&*win));
+            settle();
+
+            let panel: gtk::Widget = dialog.dialog().clone().upcast();
+            let focus = gtk::prelude::GtkWindowExt::focus(&*win);
+            let mut inside = false;
+            let mut current = focus.clone();
+            while let Some(w) = current {
+                if w == panel {
+                    inside = true;
+                    break;
+                }
+                current = w.parent();
+            }
+            *seen.borrow_mut() = if inside {
+                Ok(())
+            } else {
+                Err(format!(
+                    "a freshly presented panel must hold the keyboard, or Escape reaches \
+                     nothing until the user clicks into it: the focus is on {}",
+                    focus
+                        .map(|f| f.type_().name().to_string())
+                        .unwrap_or_else(|| "nothing at all".to_string())
+                ))
+            };
+        },
+    );
+    outcome.replace(Err("activation never ran".to_string()))
+}
+
 /// A picker row carries whatever the resolver answered for its address, and
 /// a row it answered nothing for carries no substitute for one.
 ///
@@ -636,6 +777,14 @@ fn main() {
 
     type Case = (&'static str, fn() -> Result<(), String>);
     let cases: Vec<Case> = vec![
+        (
+            "the_close_button_dismisses_the_saved_devices_panel",
+            the_close_button_dismisses_the_saved_devices_panel,
+        ),
+        (
+            "the_saved_devices_panel_holds_the_keyboard_when_it_opens",
+            the_saved_devices_panel_holds_the_keyboard_when_it_opens,
+        ),
         (
             "saving_a_device_puts_it_in_the_book_and_then_in_the_open_dialog",
             saving_a_device_puts_it_in_the_book_and_then_in_the_open_dialog,
