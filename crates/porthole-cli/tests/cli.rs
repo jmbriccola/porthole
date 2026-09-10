@@ -1247,6 +1247,292 @@ fn devices_add_with_nothing_to_offer_is_not_reported_as_an_unexpected_failure() 
     );
 }
 
+/// Stop a release build before `porthole update` can reach the invoking
+/// user's own `~/.config/porthole/update.toml`.
+///
+/// `PORTHOLE_UPDATE_FILE` is honoured in debug builds only
+/// (`porthole_core::update::default_path_from`), for the reason
+/// `PORTHOLE_DEVICES_FILE` is: a release binary must not take a config path
+/// from its environment. What that means here is the same hazard
+/// [`refuse_a_release_build_the_address_book`] documents, one file over:
+/// `porthole update --enable` under `--release` would not fail, it would
+/// write consent into the real file belonging to whoever ran `cargo test` --
+/// and consent is the one setting in porthole whose whole point is that a
+/// person, not a program, decided it.
+///
+/// Spelled with `#[cfg]` for the reason that function gives.
+fn refuse_a_release_build_the_update_file() {
+    #[cfg(not(debug_assertions))]
+    panic!(
+        "PORTHOLE_UPDATE_FILE is honoured in debug builds only, so this release build \
+         would ignore the settings file this test set up and read -- and, on --enable or \
+         --disable, write -- the invoking user's own \
+         ~/.config/porthole/update.toml instead. This test needs \
+         `#[cfg_attr(not(debug_assertions), ignore = ...)]`."
+    );
+}
+
+/// `porthole update` with its settings file and its `PATH` both this test's
+/// own: no package manager but the stubs in `bin`, and no consent but the
+/// one in `settings`.
+fn porthole_update(args: &[&str], bin: &Path, settings: &Path) -> Output {
+    refuse_a_release_build_the_update_file();
+    let mut command = porthole_command(args);
+    command
+        .env("PORTHOLE_UPDATE_FILE", settings)
+        // `bin` alone, so a package manager really installed on the machine
+        // running these tests cannot answer instead of the stub -- and so
+        // that a test asserting "no package manager claims this" is not
+        // quietly answered by the developer's own rpm.
+        .env("PATH", bin);
+    run(command, None)
+}
+
+/// The exit code is the contract, so a test drives exit codes: a stub that
+/// exits `status` and prints `stdout`, and nothing else.
+fn stub_exiting(bin: &Path, name: &str, status: i32, stdout: &str) {
+    stub(
+        bin,
+        name,
+        &format!("cat <<'PORTHOLE_STUB_EOF'\n{stdout}\nPORTHOLE_STUB_EOF\nexit {status}"),
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "PORTHOLE_UPDATE_FILE is honoured in debug builds only, so a --release binary reads the invoking user's own ~/.config/porthole/update.toml instead of this test's"
+)]
+fn update_reads_the_exit_code_and_a_reworded_listing_does_not_change_the_answer() {
+    // The spec's own verification item, driven through real processes: the
+    // verdict comes from `dnf check-update`'s exit code, and changing the
+    // text of its output leaves that verdict alone. Three listings, one exit
+    // code -- English, an invented translation, and silence.
+    let dir = TempDir::new().unwrap();
+    let settings = dir.path().join("update.toml");
+
+    for listing in [
+        "porthole.x86_64    0.2.0-1.fc44    updates",
+        "porthole.x86_64    0.2.0-1.fc44    aggiornamenti disponibili",
+        "",
+    ] {
+        let bin = dir.path().join("bin");
+        let _ = std::fs::remove_dir_all(&bin);
+        std::fs::create_dir_all(&bin).unwrap();
+        // rpm claims porthole's binary: rpm(8)'s EXIT STATUS is "on success,
+        // 0 is returned", and this query succeeding is the claim.
+        stub_exiting(&bin, "rpm", 0, "porthole-0.1.0-1.fc44.x86_64");
+        // 100: dnf5-check-upgrade(8), "DNF5 will exit with code 100 if
+        // updates are available ... 0 if no updates are available".
+        stub_exiting(&bin, "dnf", 100, listing);
+
+        let out = porthole_update(&["update"], &bin, &settings);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        assert!(
+            stdout(&out).contains("available to install"),
+            "listing {listing:?} changed the verdict, which only the exit code may \
+             decide: {}",
+            stdout(&out)
+        );
+    }
+
+    // And the other direction, which is the half that matters: text that
+    // reads exactly like an update, under the exit code that says there is
+    // none.
+    let bin = dir.path().join("bin");
+    let _ = std::fs::remove_dir_all(&bin);
+    std::fs::create_dir_all(&bin).unwrap();
+    stub_exiting(&bin, "rpm", 0, "porthole-0.1.0-1.fc44.x86_64");
+    stub_exiting(&bin, "dnf", 0, "porthole.x86_64    0.2.0-1.fc44    updates");
+
+    let out = porthole_update(&["update"], &bin, &settings);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("Nothing to update"),
+        "0 is what says there is nothing, whatever the listing reads: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "PORTHOLE_UPDATE_FILE is honoured in debug builds only, so a --release binary reads the invoking user's own ~/.config/porthole/update.toml instead of this test's"
+)]
+fn update_on_a_source_install_offers_nothing_and_says_why() {
+    // porthole must never offer to overwrite a hand-installed tree. rpm is
+    // present and answers; it does not claim the binary (rpm(8): a nonzero
+    // failure code), and that is the whole of what makes this a source
+    // install.
+    let dir = TempDir::new().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    stub_exiting(
+        &bin,
+        "rpm",
+        1,
+        "file /usr/local/bin/porthole is not owned by any package",
+    );
+    // A dnf that would answer "yes, an update" if it were ever asked. It must
+    // not be: the question stops at the ownership answer.
+    stub_exiting(&bin, "dnf", 100, "porthole.x86_64  0.2.0-1.fc44  updates");
+    let settings = dir.path().join("update.toml");
+
+    let out = porthole_update(&["update"], &bin, &settings);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let said = stdout(&out);
+    assert!(
+        said.contains("from source"),
+        "a source install has to be named as one: {said}"
+    );
+    assert!(
+        !said.contains("available to install"),
+        "nothing may be offered for a tree porthole did not install: {said}"
+    );
+    assert!(
+        !said.contains("0.2.0"),
+        "and the dnf stub must never have been reached at all: {said}"
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "PORTHOLE_UPDATE_FILE is honoured in debug builds only, so a --release binary reads the invoking user's own ~/.config/porthole/update.toml instead of this test's"
+)]
+fn update_on_apt_says_it_did_not_find_out_rather_than_nothing_to_update() {
+    // The finding `porthole_core::update`'s own module doc states: apt-get(8)
+    // and apt(8) document only "zero on normal operation, decimal 100 on
+    // error", so there is no exit code meaning "an update is available".
+    // Reporting that absence as "up to date" would be a claim apt never made,
+    // on a machine that may well have an update waiting.
+    let dir = TempDir::new().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    // dpkg-query(1): 0 is "the requested query was successfully performed",
+    // which for `-S` is the package that owns the file.
+    stub_exiting(&bin, "dpkg-query", 0, "porthole: /usr/bin/porthole");
+    let settings = dir.path().join("update.toml");
+
+    let out = porthole_update(&["update", "--json"], &bin, &settings);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out))
+        .unwrap_or_else(|e| panic!("stdout must be one JSON object, got {e}: {}", stdout(&out)));
+    assert_eq!(json["update"]["packaging"], "dpkg");
+    assert_eq!(json["update"]["packaged"], true);
+    assert!(
+        json["update"]["available"].is_null(),
+        "an unanswered question is `null`, never `false`: {}",
+        stdout(&out)
+    );
+    let detail = json["update"]["detail"].as_str().expect("a detail");
+    assert!(
+        detail.contains("apt-get(8)"),
+        "and it names the documentation the absence was read from: {detail}"
+    );
+    // The command a person can run themselves is still there: being told
+    // porthole will not answer, with nothing to type, is half an answer.
+    assert!(
+        json["update"]["command"]
+            .as_str()
+            .is_some_and(|c| c.contains("apt-get")),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "PORTHOLE_UPDATE_FILE is honoured in debug builds only, and this test writes consent: a --release binary would write the invoking user's own ~/.config/porthole/update.toml"
+)]
+fn update_enable_and_disable_move_between_three_states_and_a_dry_run_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    // No package manager at all: this test is about consent, and the answer
+    // to the update question must not be what decides it.
+    let settings = dir.path().join("update.toml");
+
+    let consent_now = |bin: &Path, settings: &Path| -> String {
+        let out = porthole_update(&["update", "--json"], bin, settings);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        let json: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+        json["update"]["consent"]
+            .as_str()
+            .expect("a slug")
+            .to_string()
+    };
+
+    // Nobody has been asked, and that is not the same as having said no.
+    assert_eq!(consent_now(&bin, &settings), "never_asked");
+    assert!(
+        !settings.exists(),
+        "reading the state must not create the file: a machine nobody has asked \
+         anything on has nothing written down"
+    );
+
+    // A dry run says what it would do and writes nothing -- `--dry-run`
+    // promises to change nothing, and this is a change.
+    let out = porthole_update(&["update", "--enable", "--dry-run"], &bin, &settings);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(stdout(&out).contains("Would turn"), "{}", stdout(&out));
+    assert_eq!(
+        consent_now(&bin, &settings),
+        "never_asked",
+        "a dry run wrote consent"
+    );
+
+    let out = porthole_update(&["update", "--enable"], &bin, &settings);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(consent_now(&bin, &settings), "yes");
+
+    let out = porthole_update(&["update", "--disable"], &bin, &settings);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(consent_now(&bin, &settings), "no");
+
+    // And the two flags cannot be given together: clap refuses it, so the
+    // file is never asked to hold two answers at once.
+    let out = porthole_update(&["update", "--enable", "--disable"], &bin, &settings);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert_eq!(
+        consent_now(&bin, &settings),
+        "no",
+        "the refused invocation left the previous answer alone"
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "PORTHOLE_UPDATE_FILE is honoured in debug builds only, so a --release binary reads the invoking user's own ~/.config/porthole/update.toml instead of this test's"
+)]
+fn update_with_no_package_manager_at_all_is_not_reported_as_a_source_install() {
+    // "Nothing claims this binary" and "nothing could be asked" are different
+    // facts, and only the first is evidence of anything. A machine with no
+    // package manager on `PATH` has told porthole nothing, and porthole must
+    // not answer for it.
+    let dir = TempDir::new().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let settings = dir.path().join("update.toml");
+
+    let out = porthole_update(&["update", "--json"], &bin, &settings);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(json["update"]["packaged"], false);
+    assert!(json["update"]["available"].is_null(), "{}", stdout(&out));
+    let detail = json["update"]["detail"].as_str().expect("a detail");
+    assert!(
+        detail.contains("no package manager"),
+        "the reason has to be the one that is true: {detail}"
+    );
+    assert!(
+        !detail.contains("from source"),
+        "nothing here established that porthole was built from source: {detail}"
+    );
+}
+
 /// Puts an executable `name` in `bin`, running `body`.
 fn stub(bin: &Path, name: &str, body: &str) {
     let path = bin.join(name);

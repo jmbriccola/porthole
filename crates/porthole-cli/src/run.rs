@@ -136,7 +136,89 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
             Ok(ExitCode::Success)
         }
         Commands::Devices { command } => devices_command(cli, command),
+        Commands::Update(args) => update_command(cli, args),
     }
+}
+
+/// `porthole update`: what the local package manager says, and whether the
+/// daily check is on.
+///
+/// **Exit 0 whatever the answer**, exactly as `status` does and for the same
+/// reason: this is a question, not an operation, and it succeeded at
+/// answering. "An update is available", "there is nothing to install",
+/// "porthole was built from source" and "this packaging documents no exit
+/// code for the question" are four answers, not four failures, and a script
+/// that had to branch on the exit status to tell them apart would learn less
+/// than one reading the output. Only a failure to read or write the settings
+/// file leaves this any other way.
+///
+/// **Nothing leaves the machine and nothing is installed.** Every command it
+/// runs is a `Command::read` against a package manager already on the
+/// machine; the installing belongs to PackageKit, under PackageKit's own
+/// polkit action, from the desktop notification's own button. The privileged
+/// porthole helper is not involved at any point -- it accepts firewall
+/// operations and never a command from a client, and making it install
+/// packages would hand root to anyone who can address the bus.
+fn update_command(cli: &Cli, args: &crate::cli::UpdateArgs) -> Result<ExitCode> {
+    let path = porthole_core::update::default_path();
+    let mut settings = porthole_core::update::Settings::load(&path);
+
+    if args.enable || args.disable {
+        let consent = if args.enable {
+            porthole_core::update::Consent::Yes
+        } else {
+            porthole_core::update::Consent::No
+        };
+        // `--dry-run` promises to change nothing, and this is a change:
+        // the settings file is what the agent reads to decide whether it may
+        // check at all. So a dry run says what it would write and writes
+        // nothing, rather than quietly making the one change on the path
+        // that advertises itself as making none.
+        if !cli.dry_run {
+            settings.set_consent(consent);
+            settings.save(&path)?;
+        }
+        if cli.json {
+            println!("{}", output::json_consent_changed(consent, cli.dry_run));
+        } else {
+            output::print_consent_changed(consent, cli.dry_run);
+        }
+        return Ok(ExitCode::Success);
+    }
+
+    // Asked on demand, so the consent above does not gate it: consent is
+    // about porthole asking *on its own*, once a day, without anybody
+    // present. A person who typed this command is present and has asked.
+    let runner = make_runner(cli);
+    let install = match std::env::current_exe() {
+        Ok(binary) => porthole_core::update::how_installed(runner.as_ref(), &binary),
+        Err(e) => porthole_core::update::Install::Undetermined(format!(
+            "porthole could not find its own binary on disk, so no package manager could \
+             be asked whether it owns one: {e}"
+        )),
+    };
+    let verdict = match &install {
+        porthole_core::update::Install::Packaged(packaging) => Some(porthole_core::update::check(
+            runner.as_ref(),
+            *packaging,
+            porthole_core::update::PACKAGE,
+        )),
+        // A source install is asked nothing further, and neither is a machine
+        // that could not be asked. porthole must never offer to overwrite a
+        // tree somebody built by hand.
+        porthole_core::update::Install::Unpackaged
+        | porthole_core::update::Install::Undetermined(_) => None,
+    };
+
+    if cli.json {
+        println!(
+            "{}",
+            output::json_update(settings.consent(), &install, verdict.as_ref())
+        );
+    } else {
+        output::print_update(settings.consent(), &install, verdict.as_ref());
+    }
+    Ok(ExitCode::Success)
 }
 
 fn open(cli: &Cli, args: &crate::cli::OpenArgs) -> Result<ExitCode> {

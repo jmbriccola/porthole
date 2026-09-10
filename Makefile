@@ -95,7 +95,8 @@ MAN1 = porthole.1 \
        porthole-devices.1 \
        porthole-devices-list.1 \
        porthole-devices-add.1 \
-       porthole-devices-rm.1
+       porthole-devices-rm.1 \
+       porthole-update.1
 
 INSTALL         = install
 INSTALL_PROGRAM = $(INSTALL) -Dm755

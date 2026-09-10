@@ -132,6 +132,7 @@ const EXPECTED: &[&str] = &[
     "/usr/share/man/man1/porthole-listen.1",
     "/usr/share/man/man1/porthole-open.1",
     "/usr/share/man/man1/porthole-status.1",
+    "/usr/share/man/man1/porthole-update.1",
     "/usr/share/man/man1/porthole.1",
     "/usr/share/metainfo/com.jacopobriccola.Porthole.metainfo.xml",
     "/usr/share/polkit-1/actions/com.jacopobriccola.Porthole.policy",
