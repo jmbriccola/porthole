@@ -46,11 +46,21 @@
 //!
 //! A row's Open button is connected as it is built, in `apply`, which is
 //! the only place in this crate that constructs one. What it is connected
-//! to is the callback [`ListeningSection::connect_open_requested`] stores
-//! on the section itself, which outlives every button. So the handler is
-//! not something a caller has to reattach after a rebuild: a rendered
-//! button is a connected button, and a setter that rebuilds rows cannot
-//! produce a row whose button does nothing.
+//! to is not a closure a caller handed over but the section's own
+//! `on_open_requested` cell, read at click time, which outlives every
+//! button. So no rebuild can leave a button unwired, and a caller has
+//! nothing to reattach after one.
+//!
+//! **That is a guarantee about the connection, not about the effect.**
+//! `on_open_requested` starts as `None` in `ListeningSection::new`; the
+//! click handler clones whatever is in the cell and, on `None`, does
+//! nothing; and [`ListeningSection::connect_open_requested`] is the only
+//! thing that ever fills it, called from `window.rs` and nowhere else. A
+//! section nobody has called it on renders Open buttons that do nothing —
+//! which is every Open button in this module's own tests and in
+//! `tests/listening.rs`, neither of which calls it. What the arrangement
+//! removes is one specific way of arriving at a dead button, below, not
+//! the possibility of one.
 //!
 //! It was that, before: the connection was made from outside, after
 //! whichever setters the code that made it knew about. Two setters added

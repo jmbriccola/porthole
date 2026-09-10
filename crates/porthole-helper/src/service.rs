@@ -129,7 +129,32 @@ impl Porthole {
     }
 }
 
-#[zbus::interface(name = "com.jacopobriccola.Porthole1")]
+/// `introspection_docs = false` is what keeps the served document parseable.
+///
+/// zbus's `#[interface]` copies each member's rustdoc into an XML comment
+/// verbatim, with no escaping (`zbus_macros::iface::to_xml_docs`). XML forbids
+/// `--` inside a comment, and `--` is this project's punctuation everywhere: it
+/// produced ten "double hyphen within comment" errors out of five doc comments,
+/// so `xmllint`, `xml.etree`, `lxml` and every code generator built on a
+/// conformant parser refused the document outright. `busctl` and `gdbus` are
+/// lenient and did not notice.
+///
+/// The fix belongs here rather than in those five comments because the comments
+/// are not the defect: prose is an unbounded input to a renderer that cannot
+/// escape it, and editing five of them leaves the sixth. Turning the rendering
+/// off makes the document well-formed for any prose anyone writes next.
+///
+/// What it costs is the descriptions in the introspection XML. They are not a
+/// contract and never were -- `porthole_core::ipc::SIGNATURE` strips them,
+/// deliberately, because a wire contract that changes when prose improves gets
+/// re-blessed unread -- and the members, arguments, types and annotations a
+/// client actually needs are all attributes, which stay. zbus makes the same
+/// choice on all four of its own served interfaces (`zbus::fdo`'s
+/// `Introspectable`, `Peer`, `Properties`, `ObjectManager`).
+///
+/// `interface_contract.rs` asserts what this buys, against the real served
+/// document rather than against this attribute.
+#[zbus::interface(name = "com.jacopobriccola.Porthole1", introspection_docs = false)]
 impl Porthole {
     /// `scope` is what the user typed — `subnet`, `any`, a CIDR, an IP — and
     /// the helper parses it itself. `seconds` is 0 for until-reboot.

@@ -72,9 +72,24 @@ pub fn parse_duration(raw: &str) -> Result<Duration> {
 
     let duration = Duration::from_secs(secs);
     if duration > MAX_DURATION {
+        // The ceiling is read off `MAX_DURATION` rather than written down a
+        // second time, the same way `open_dialog`'s ceiling chip is: lowering
+        // the constant lowers this sentence with it, instead of leaving it
+        // claiming eight hours while refusing at four.
+        let hours = MAX_DURATION.as_secs() / 3600;
+        // And it names the lifetime rather than any one surface's spelling of
+        // it. `--until-reboot` is the CLI's spelling; the GUI's is a chip
+        // labelled "Until reboot", and this exact string is what
+        // `porthole-gui`'s custom-duration field puts on screen -- it renders
+        // whatever `parse_duration` returns. A flag in a window is an
+        // instruction its reader cannot carry out.
+        //
+        // "the only longer choice" is what `Lifetime` has: `For`, capped
+        // here, and `UntilReboot`. There is no third.
         return Err(Error::InvalidArgument(format!(
-            "{raw} is longer than the 8 hours porthole allows; \
-             use --until-reboot if you need it open for the rest of the session"
+            "{raw} is longer than the {hours} hours porthole allows; \
+             the only longer choice is until reboot, which lasts \
+             for the rest of the session"
         )));
     }
 
@@ -196,15 +211,30 @@ mod tests {
         // Exactly one second over the ceiling, written with a single unit.
         // porthole takes one value and one unit — never a compound like "8h1s".
         let err = parse_duration("28801s").unwrap_err();
-        assert!(err.to_string().contains("--until-reboot"), "got: {err}");
+        // "until reboot", not "--until-reboot": the message is read in a GUI
+        // dialog as well as on a terminal, and the flag is only one surface's
+        // name for the lifetime. A test pinning the flag spelling is what
+        // would have to be re-blessed to put it back.
+        assert!(err.to_string().contains("until reboot"), "got: {err}");
+        assert!(
+            !err.to_string().contains("--until-reboot"),
+            "the message must name no surface's flag: {err}"
+        );
         assert!(parse_duration("481m").is_err());
         assert!(parse_duration("24h").is_err());
     }
 
     #[test]
     fn duration_ceiling_message_names_the_limit() {
+        // The literal stays here while `parse_duration` derives it from
+        // `MAX_DURATION`, which is the pairing that makes the derivation
+        // worth having: lowering the constant changes the message and fails
+        // this, rather than leaving a sentence that promises eight hours
+        // above a refusal at four. Same arrangement as `open_dialog`'s
+        // `the_ceiling_option_is_built_from_the_shared_max_duration_constant`.
         let err = parse_duration("24h").unwrap_err().to_string();
         assert!(err.contains("8 hours"), "got: {err}");
+        assert_eq!(MAX_DURATION.as_secs(), 8 * 3600, "the literal above");
     }
 
     #[test]

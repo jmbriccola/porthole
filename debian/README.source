@@ -77,13 +77,20 @@ needs one extra apt line is the cheaper of the two.
 The network
 -----------
 
-`debian/rules` runs `cargo build --locked`, and cargo resolves the
-dependencies in Cargo.lock from crates.io. The build therefore needs network
-access, which the Debian archive's own buildds do not grant. Building for
-the archive rather than for yourself would need the crates vendored into the
-source package (`cargo vendor` plus a `.cargo/config.toml` pointing at it),
-or the dependencies packaged separately and built with dh-cargo. Neither is
-done here.
+`debian/rules` calls the source tree's own `make build`, which expands to
+`cargo build --release --locked`, and cargo resolves the dependencies in
+Cargo.lock from crates.io. The build therefore needs network access, which
+the Debian archive's own buildds do not grant. Building for the archive
+rather than for yourself would need the crates vendored into the source
+package (`cargo vendor` plus a `.cargo/config.toml` pointing at it), or the
+dependencies packaged separately and built with dh-cargo. Neither is done
+here.
+
+The RPM has since grown the first of the two, which is the shape a Debian
+equivalent would take: `%bcond_with vendor` and a second Source in
+packaging/rpm/porthole.spec, and a %prep hunk that unpacks it and writes the
+`replace-with = "vendored-sources"` stanza. Nothing is shared between the two
+packagings, so it is an example rather than a head start.
 
 CARGO_HOME is redirected to debian/cargo-home so the build does not write
 into the build user's ~/.cargo; override_dh_auto_clean removes it.
@@ -92,18 +99,25 @@ The test suite
 --------------
 
 debian/rules overrides dh_auto_test with nothing in it. `cargo test
---workspace --exclude porthole-gui` passes on a developer machine, and in a
-debian:13 container all of it passes except
-doctor_says_the_helper_is_missing_when_it_is: that test wants the Helper
-check to report a missing helper, and with no system bus in the chroot the
-check reports a missing bus instead. Running the suite under
-dbus-run-session, which supplies a session bus, does not change that -- the
-check porthole doctor makes without --session is against the system bus.
+--workspace --exclude porthole-gui` passes on a developer machine.
 
-Anyone re-adding the run should also drop --release from it. PORTHOLE_STATE_FILE,
-PORTHOLE_DEVICES_FILE and the helper's --session are gated on
-cfg!(debug_assertions); a release test build fails four more tests in
-crates/porthole-cli/tests/cli.rs for that reason alone.
+The two reasons this section gave until 2026-09-10 have both stopped being
+true, and debian/rules' own comment now carries the replacements. In short:
+crates/porthole-cli/tests/cli.rs gives every porthole process it starts a
+private bus of its own, so doctor_says_the_helper_is_missing_when_it_is no
+longer needs the machine to have a system bus -- measured with both bus
+variables pointing at nothing: 4 passed, 0 failed. And a release build no
+longer fails the tests that need PORTHOLE_STATE_FILE, PORTHOLE_DEVICES_FILE
+or the helper's --session, all three of which are still honoured only where
+cfg!(debug_assertions) holds: those tests carry
+#[cfg_attr(not(debug_assertions), ignore = ...)] and a release run reports
+them as ignored, by name. Measured: 37 passed, 0 failed, 12 ignored.
+
+What debian/control is missing is dbus-run-session and busctl, which the
+suite now needs on PATH and which packaging/rpm/porthole.spec declares as
+BuildRequires. Nothing has been measured in a debian:13 chroot since the two
+old reasons stopped applying, so declaring them is where re-adding the run
+would start, not where it would finish.
 
 Build profiles
 --------------
@@ -173,12 +187,31 @@ dh_installsystemd emits its stop-on-remove `unless NO_START`: passing
 --no-start to keep a D-Bus activated service from being started at install
 time also drops the stop. Its own comment says the rest.
 
-What removing the package does not do
--------------------------------------
+What removing the package does about open ports
+-----------------------------------------------
 
-It does not close ports porthole has open. The rules live in firewalld, ufw
-or nftables, and an opening's automatic close is a transient systemd timer
-running /usr/bin/porthole -- which the removal is deleting, so a timer that
-fires afterwards finds no binary. A reboot closes everything either way,
-because porthole writes no permanent rule; `porthole close --all` before the
-removal closes it sooner. Nothing in the maintainer scripts attempts either.
+It closes them. debian/porthole.prerm runs `timeout 60 /usr/bin/porthole
+close --all` before the helper is stopped, and the helper cancels each
+opening's transient expiry timer as it closes it -- so nothing is left
+pointing at a /usr/bin/porthole the removal is about to delete. This
+paragraph said the opposite until this commit; the close landed in 34eeebe
+and the sentence stayed behind.
+
+`remove` only. dpkg calls the same prerm for `upgrade`, `deconfigure` and
+`failed-upgrade`, and closing every open port on a version bump would take
+away access the user arranged as the price of it. `dpkg --purge` of an
+installed package runs `prerm remove` first, so purge takes this branch too.
+
+Never fatal, and that is what leaves cases still worth knowing about. The
+call can fail with no system bus, with polkit not running, or against a
+helper an earlier failed upgrade left broken; the removal then continues and
+prints a warning naming `firewall-cmd --list-rich-rules`, `ufw status
+numbered` and `nft list ruleset`. Three more removals reach no close at all,
+because the guards in the prerm exclude them: DPKG_ROOT set (an install into
+a chroot), no /run/systemd/system (a machine not running systemd, an image
+build), and /usr/bin/porthole not executable. A reboot closes everything in
+any of those cases, because porthole writes no permanent rule, and
+`porthole close --all` before the removal closes it sooner.
+
+packaging/rpm/porthole.spec's %preun and packaging/aur/porthole.install's
+pre_remove are the same decision on the other two distributions.
