@@ -447,7 +447,7 @@ fn subtitle_for(rule: &WireRule) -> String {
     }
 }
 
-// Item 7's own marking (built in `apply`, below) uses `open_dialog.rs`'s
+// The anywhere-scoped marking (built in `apply`, below) uses `open_dialog.rs`'s
 // own `anyone_note()` for its tooltip, called directly rather than kept as
 // a second, separate copy of the sentence -- an earlier version of this
 // module did exactly that, as a private constant worded slightly
@@ -570,7 +570,7 @@ fn apply(inner: &Rc<Inner>, rules: &[WireRule], listed_at: u64) {
             .subtitle(subtitle_for(rule))
             .build();
 
-        // Item 7: the most exposed state porthole can produce, marked the
+        // The most exposed state porthole can produce, marked the
         // same way the other two surfaces already mark the identical
         // (`open_dialog.rs`) or a lesser (`listening_section.rs`'s
         // `BeyondReach`) concern -- an icon, not colour alone, and no
@@ -1008,7 +1008,7 @@ impl OpenNowSection {
             .map(|r| r.close_busy.clone())
     }
 
-    /// Item 7: whether row `index` carries the "open to anyone" marking,
+    /// Whether row `index` carries the "open to anyone" marking,
     /// checked against the live widget tree -- the icon's own `parent()`
     /// -- rather than only whether `significant_icon` is `Some`. `Some`
     /// alone would only prove an icon was constructed; a future edit that
@@ -1172,9 +1172,9 @@ mod tests {
     }
 
     // `helper_message` is the one piece of the close path with no GTK, no
-    // D-Bus connection and no async runtime in it -- and it is the property
-    // the brief calls most important ("do not re-word the helper's
-    // message"), so it is unit-tested directly rather than left to the
+    // D-Bus connection and no async runtime in it -- and it carries the
+    // property that matters most here, that the helper's own message is
+    // never re-worded, so it is unit-tested directly rather than left to the
     // untestable-without-a-live-helper rest of the close path. Same shape as
     // `porthole-cli/src/client.rs`'s own `method_error` helper, used there
     // to unit-test `from_dbus`'s identical verbatim pass-through.

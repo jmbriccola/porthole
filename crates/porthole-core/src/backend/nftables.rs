@@ -679,10 +679,9 @@ impl FirewallBackend for Nftables<'_> {
         // fact that needs separate privilege. Before this fix, a permission
         // failure here propagated with `?`, so `detect()` returned `Err` for
         // an ordinary user on a genuinely installed and possibly enforcing
-        // nftables setup -- see C1 in the milestone 3 merge-wave review.
-        // Degrading to `active: false` with an explanation, rather than
-        // propagating, is what keeps that from reading as "no firewall at
-        // all".
+        // nftables setup. Degrading to `active: false` with an explanation,
+        // rather than propagating, is what keeps that from reading as "no
+        // firewall at all".
         //
         // Every failure from here degrades, not only `Error::CommandFailed`
         // (the permission-denied shape). An earlier version of this comment
@@ -1125,7 +1124,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_rule_open_writes_round_trips_through_list_rules_with_an_identical_handle() {
-        // C1: reconciliation compares handles structurally, so whatever
+        // Reconciliation compares handles structurally, so whatever
         // `open` returns must be exactly what `list_rules` reconstructs for
         // the same rule, or a live rule looks stale the moment the next
         // sweep runs. ufw needed this fixed for real -- its own version of
@@ -1553,7 +1552,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_permission_denied_chain_listing_is_still_available_not_an_error() {
-        // C1: `nft --version` works unprivileged; `nft -j list chains`
+        // `nft --version` works unprivileged; `nft -j list chains`
         // refuses for a non-root caller ("Operation not permitted (you must
         // be root)", verified against the real binary). Before this fix,
         // `health()` propagated that failure with `?`, so `detect()` returned

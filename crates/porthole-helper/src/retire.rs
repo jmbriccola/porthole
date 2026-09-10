@@ -32,8 +32,7 @@
 //! # The sequence, and why the obvious one is wrong
 //!
 //! *Release the name, then exit* is wrong twice, and the second way would
-//! have introduced a new silent failure. Both were measured
-//! (`.superpowers/sdd/2026-09-07-docker-forward/spike-helper-idle-exit.md`):
+//! have introduced a new silent failure. Both were measured, not reasoned:
 //!
 //! 1. **systemd sends `SIGTERM` 40 microseconds after a `Type=dbus` unit
 //!    releases its `BusName`.** The helper handled only `SIGINT`, so any drain

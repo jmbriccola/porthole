@@ -344,7 +344,7 @@ impl FirewallBackend for Ufw<'_> {
         // `active: false` with an explanation, rather than propagating the
         // failure with `?` as this used to, is what keeps a problem reading
         // status from reading as "no firewall at all" once it reaches
-        // `detect` -- see C1 in the milestone 3 merge-wave review.
+        // `detect`.
         //
         // The non-success `Ok` arm below does not claim *why* the exit was
         // non-zero: permission denial is the common cause, but a broken
@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn a_host_scoped_open_round_trips_through_list_rules_despite_ufws_bare_slash_32() {
-        // C1: ufw renders a `/32` source without its prefix in `status
+        // ufw renders a `/32` source without its prefix in `status
         // numbered` (`10.10.10.42`, not `10.10.10.42/32`), while `spec`
         // always writes the network form with an explicit one. Without
         // normalising both sides, the handle `open` returns and the one
@@ -666,7 +666,7 @@ mod tests {
 
     #[test]
     fn a_permission_denied_status_read_is_still_available_not_an_error() {
-        // C1: `ufw --version` works unprivileged; `ufw status` refuses
+        // `ufw --version` works unprivileged; `ufw status` refuses
         // outright for a non-root caller ("ERROR: You need to be root to run
         // this script", verified against the real binary). Before this fix,
         // `health()` propagated that failure with `?`, so `detect()` returned

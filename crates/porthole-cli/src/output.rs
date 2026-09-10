@@ -549,9 +549,10 @@ pub fn json_listening(services: &[Service], docker: Option<&[Published]>) -> Val
 ///   understated-risk bug `Binding::BeyondReach`'s own doc comment guards
 ///   against.
 /// - `LoopbackOnly` rows, labelled plainly: on an ordinary desktop these are
-///   usually the majority of the list (see `milestone-4-verified-facts.md`),
-///   and opening the firewall for one of them genuinely changes nothing,
-///   since the process is not listening on a network interface at all.
+///   usually the majority of the list -- six of the seven listening TCP
+///   sockets on the machine this was measured on -- and opening the firewall
+///   for one of them genuinely changes nothing, since the process is not
+///   listening on a network interface at all.
 pub fn print_listening(services: &[Service], docker: Option<&[Published]>) {
     print!("{}", render_listening(services, docker));
 }
@@ -1215,9 +1216,9 @@ mod tests {
 
     #[test]
     fn the_unknown_activity_state_never_reads_as_confirmed_not_running() {
-        // Follow-up to C1: `print_status` used to have only two states
-        // (running / NOT running), keyed on `active` alone. A
-        // permission-denied ufw or nftables read comes back `active: false`
+        // `print_status` used to have only two states (running / NOT
+        // running), keyed on `active` alone. A permission-denied ufw or
+        // nftables read comes back `active: false`
         // too, and printing "NOT running" for that would tell an
         // unprivileged user their port is already reachable when porthole
         // in fact could not see the ruleset at all -- false in the
@@ -1320,13 +1321,13 @@ mod tests {
 
     #[test]
     fn json_closed_never_reports_a_forgotten_rule_as_closed() {
-        // The eighth instance of this milestone's own pattern: `print_closed`
-        // was taught never to say "Closed" for a forget, in the same commit
+        // One renderer fixed and its twin left behind: `print_closed` was
+        // taught never to say "Closed" for a forget, in the same commit
         // that left this function saying exactly that in `closed` -- which
         // `docs/json-schema.md` documents as "rules that closed". A script
-        // (or a GUI reading `WireStatus`, widened one wave ago for precisely
-        // this reason) trusting `closed` here would record a port as shut
-        // that may still be open in a firewall porthole can no longer reach.
+        // (or a GUI reading `WireStatus`, widened for precisely this reason)
+        // trusting `closed` here would record a port as shut that may still
+        // be open in a firewall porthole can no longer reach.
         let json = json_closed(&[rule()], &[], 1_757_000_000, true, true, &[]);
         assert_eq!(
             json["closed"].as_array().unwrap().len(),

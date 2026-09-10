@@ -33,10 +33,10 @@
 //! that same container reflects whatever this milestone's own test process
 //! happens to have listening, not a machine anyone chose to show.
 //!
-//! The fixture below is invented, not measured -- unlike
-//! `.superpowers/sdd/milestone-4-verified-facts.md`, which this module does
-//! not draw on. It reuses the port numbers and addresses this project's own
-//! README and `docs/json-schema.md` already use as examples (`5173/tcp`,
+//! The fixture below is invented, not measured: no number in it was read off
+//! a real machine, and nothing here draws on one that was. It reuses the
+//! port numbers and addresses this project's own README and
+//! `docs/json-schema.md` already use as examples (`5173/tcp`,
 //! `10.10.10.0/24`, `firewalld 2.4.4`), so the screenshot reads as the same
 //! running example the rest of the documentation already shows, not a new
 //! one invented just for this image. The saved devices [`fixture_devices`]
@@ -273,9 +273,9 @@ fn fixture_status() -> WireStatus {
         firewall_version: "2.4.4".to_string(),
         // Not read by anything this fixture exercises (StatusBar's active
         // branch never shows it -- see `status_bar.rs`'s own `set_status`),
-        // but `WireStatus::detail` (added for `porthole-core`'s own
-        // `BackendHealth::detail`, item 5 of the milestone's task 6 review)
-        // has no default and this call site has to set something.
+        // but `WireStatus::detail` (added to carry `porthole-core`'s own
+        // `BackendHealth::detail` across the wire) has no default and this
+        // call site has to set something.
         detail: "firewalld is active and enforcing".to_string(),
         location: "FedoraWorkstation".to_string(),
         interface: "wlo1".to_string(),

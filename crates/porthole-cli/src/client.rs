@@ -711,10 +711,9 @@ mod tests {
         // time over text that had already been through it — and for
         // `AlreadyOpen`, whose template also names the port, it invented a
         // port (0) that nobody asked about, since the wire's `MethodError`
-        // carries no structured port field to refill it with. Covers the two
-        // names the reviewer's reproduction did not happen to exercise
-        // (`NotAuthorized`, `RuleNotFound`) plus every other previously-broken
-        // variant, so none of the five can regress unnoticed.
+        // carries no structured port field to refill it with. Covers every
+        // affected error name, `NotAuthorized` and `RuleNotFound` included,
+        // so none of them can regress unnoticed.
         let cases = [
             (
                 "com.jacopobriccola.Porthole.InvalidArgument",
@@ -963,7 +962,7 @@ mod tests {
 
     #[test]
     fn close_all_failures_keep_their_structured_kind_over_the_bus() {
-        // I3: close_all's per-rule failures used to be `.to_string()`'d away
+        // close_all's per-rule failures used to be `.to_string()`'d away
         // into `Error::Unexpected`, so `close --all --json` reported
         // `"kind":"unexpected"` for a failure that would have been
         // `"command_failed"` locally. `wire_error_to_local` is what

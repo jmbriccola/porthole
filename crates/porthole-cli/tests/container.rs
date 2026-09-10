@@ -51,7 +51,7 @@
 //! the bus under `--dry-run`, so the dry-run tests below invoke `porthole`
 //! directly.
 //!
-//! # One deliberate departure from a literal reading of the task brief
+//! # One deliberate departure from the obvious way to write these tests
 //!
 //! **`--until-reboot`, not `--for 5m`, for the mutating opens.** A real
 //! `--for <duration>` schedules its own close with `systemd-run`, and these
@@ -718,8 +718,7 @@ porthole --session open 5174 --until-reboot";
          # ...\" under rootless podman -- it cannot write the host's real\n\
          # network sysctls, which it has no business doing from inside a\n\
          # container anyway. Harmless: the rules load regardless, checked by\n\
-         # the very next line. Measured, not assumed -- see\n\
-         # milestone-3-verified-facts.md.\n\
+         # the very next line. Measured, not assumed.\n\
          /lib/ufw/ufw-init start || true\n\
          {}\n\
          {}\n\
@@ -746,9 +745,9 @@ porthole --session open 5174 --until-reboot";
          exists: {before_init}"
     );
 
-    // The load-bearing assertion the brief calls out by name: without this,
-    // the test would still pass even if ufw had silently lost the rule, and
-    // the whole point of the test is that it does not.
+    // The load-bearing assertion of this whole test: without this, the test
+    // would still pass even if ufw had silently lost the rule, and the whole
+    // point of the test is that it does not.
     let after_init = extract_marker(&stdout2, "AFTER_INIT");
     assert!(
         after_init.contains("5173/tcp")
@@ -2478,7 +2477,7 @@ fn a_forward_is_one_rich_rule_and_closing_takes_exactly_it_back_out() {
     let while_forwarded = extract_marker(&stdout, "RULES_WHILE_FORWARDED");
     let ours = porthole_rich_rules(while_forwarded);
     // The assertion the whole design rests on. Two rules here -- a redirect
-    // and a permit -- is the shape a spike measured to expose the *host's*
+    // and a permit -- is the shape that was measured to expose the *host's*
     // own service on the external port.
     assert_eq!(
         ours.len(),
@@ -2543,7 +2542,8 @@ fn a_forward_is_one_rich_rule_and_closing_takes_exactly_it_back_out() {
 /// machine can reach it: that is the situation `porthole forward` exists for,
 /// and phase 1 below is the proof it holds before porthole does anything.
 ///
-/// **Three things are asserted, and the third is what the spike asked for.**
+/// **Three things are asserted, and the third is the one that settled the
+/// design.**
 ///
 /// 1. The client gets the container's own body, not merely a TCP connect. A
 ///    connect-only check would pass against anything at all listening on the
@@ -3848,7 +3848,7 @@ fn every_open_across_a_run_of_retirements_reaches_a_subscriber() {
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let signals = extract_marker(&stdout, "SIGNALS");
 
-    // The control first, and it is what the spike's own first attempt at this
+    // The control first, and it is what an earlier attempt at this
     // measurement was missing: a run in which nothing ever retired would pass
     // every assertion below while measuring nothing at all.
     let journal = unit_journal(&container);

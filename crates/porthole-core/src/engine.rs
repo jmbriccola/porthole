@@ -228,7 +228,7 @@ impl<'a> Engine<'a> {
     /// that would not close); `Report::orphan_sweep_error` (`owned_rules`
     /// itself failing -- see `reconcile.rs` for why that is a different fact
     /// from `failures`, not folded into it); and `Report::foreign_backend`
-    /// (I1: a state entry recorded under a backend that is no longer the one
+    /// (a state entry recorded under a backend that is no longer the one
     /// just detected, which neither sweep direction may touch -- see that
     /// field's own doc comment). None of these abort `sweep` with `?`
     /// internally, so silently dropping any of them here would turn a real,
@@ -1059,9 +1059,9 @@ impl<'a> Engine<'a> {
 
     /// Close a rule the currently detected backend actually created.
     ///
-    /// I1 (a previous wave): a state entry recorded under a backend that is
-    /// no longer the one `detect` finds survives reconciliation rather than
-    /// being silently dropped -- correctly, since dropping it would lose the
+    /// A state entry recorded under a backend that is no longer the one
+    /// `detect` finds survives reconciliation rather than being silently
+    /// dropped -- correctly, since dropping it would lose the
     /// only record of a rule that may still be sitting in the old firewall.
     /// But that leaves this function needing a guard of its own: `rule.handle`
     /// is a `RuleHandle` variant belonging to a *different* backend than
@@ -1075,7 +1075,7 @@ impl<'a> Engine<'a> {
     /// trap.
     fn close_rule(&mut self, rule: ManagedRule, from_timer: bool) -> Result<ManagedRule> {
         if rule.backend != self.backend.id() {
-            // I4: `--forget` is the same suggestion regardless of which
+            // `--forget` is the same suggestion regardless of which
             // backend created the rule, but forgetting does not mean the
             // same thing for all three. ufw and nftables can prove a rule is
             // their own (`Ownership::Marked`), so reconciliation's orphan
@@ -1678,8 +1678,8 @@ mod tests {
 
     #[test]
     fn open_refuses_without_claiming_reachability_when_activity_is_unknown() {
-        // Follow-up to C1: refusing to open is correct in both cases `!
-        // health.active` covers, but the *reason* given must not overclaim.
+        // Refusing to open is correct in both cases `!health.active`
+        // covers, but the *reason* given must not overclaim.
         // "the firewall is not enforcing rules" is a fact only the confirmed
         // case (`FakeBackend::inactive`, covered above) can support; a
         // permission-denied read supports only "porthole could not tell."
@@ -1920,7 +1920,7 @@ mod tests {
 
     #[test]
     fn closing_a_foreign_backend_entry_refuses_with_a_plain_message_naming_forget() {
-        // I1 created this trap: a state entry recorded under a backend that
+        // The trap this catches: a state entry recorded under a backend that
         // is no longer the one `detect` finds survives reconciliation,
         // correctly -- but every backend's own `close` refuses a handle from
         // another one with wording meant for a programmer, not a user (e.g.
@@ -1959,7 +1959,7 @@ mod tests {
             text.contains("--forget"),
             "must point at the only way out: {text}"
         );
-        // I4: the recovery advice must not be the same sentence for every
+        // The recovery advice must not be the same sentence for every
         // backend -- a forgotten nftables (or ufw) rule is not permanent,
         // since reconciliation's orphan sweep closes it once that backend
         // is current again.
@@ -1976,7 +1976,7 @@ mod tests {
 
     #[test]
     fn closing_a_foreign_firewalld_entry_warns_that_forgetting_it_would_be_permanent() {
-        // I4: the opposite half of the same guard's advice. firewalld's
+        // The opposite half of the same guard's advice. firewalld's
         // ownership is `Unprovable`, so reconciliation's orphan sweep is
         // skipped for it outright (see `reconcile.rs`) -- a firewalld-backed
         // rule that gets forgotten is never swept up later the way a
@@ -2447,7 +2447,7 @@ mod tests {
 
     #[test]
     fn close_rules_outside_leaves_a_rule_broader_than_the_lost_subnet_alone() {
-        // C1: `porthole open 5173 --to 10.0.0.0/8` on a 10.10.10.0/24 machine
+        // `porthole open 5173 --to 10.0.0.0/8` on a 10.10.10.0/24 machine
         // is a deliberate, wider peer-subnet rule, not a claim about
         // 10.10.10.0/24 specifically. `10.0.0.0/8` is not a subset of the
         // 10.10.10.0/24 that was lost -- `lost.contains(&cidr)` is false --
@@ -2514,7 +2514,7 @@ mod tests {
 
     #[test]
     fn dry_run_changes_nothing_and_writes_no_state() {
-        // C3: a store starting empty can never catch "dry-run's own
+        // A store starting empty can never catch "dry-run's own
         // reconciliation sweep writes anyway" -- there is nothing for sweep
         // to find stale, so its `store.save()` (gated on `!dry_run`) never
         // even becomes reachable. A pre-existing ghost entry the backend does
@@ -2587,10 +2587,10 @@ mod tests {
 
     #[test]
     fn open_succeeds_even_when_reconciliations_own_sweep_fails() {
-        // I2: named explicitly by the brief, and previously untested --
-        // FakeBackend could not fail list_rules or owned_rules, so changing
-        // Engine::reconcile to propagate a sweep failure with `?` instead of
-        // logging and continuing would have left every existing test green.
+        // Previously untested -- FakeBackend could not fail list_rules or
+        // owned_rules, so changing Engine::reconcile to propagate a sweep
+        // failure with `?` instead of logging and continuing would have left
+        // every existing test green.
         let harness = Harness::new();
         let backend = FakeBackend::new();
         backend.fail_list_rules();
@@ -2752,7 +2752,7 @@ mod tests {
 
     #[test]
     fn status_cannot_close_a_rule_even_though_it_looks_like_an_orphan() {
-        // C2: `status` is gated by the List polkit action, not Close -- a
+        // `status` is gated by the List polkit action, not Close -- a
         // caller authorised only to look must never be able to cause a
         // close. A rule the backend holds but state does not know about
         // looks exactly like an orphan reconciliation's Apply mode would
@@ -2819,7 +2819,7 @@ mod tests {
     /// Two *different* containers publishing the same host port, each on a
     /// loopback address of its own -- `-p 127.0.0.1:3000:8080` on one and
     /// `-p 127.0.0.2:3000:8080` on the other. Docker allocates these
-    /// separately and allows both; the ledger's ruling that one host port
+    /// separately and allows both; the earlier assumption that one host port
     /// cannot hold two published mappings was wrong.
     ///
     /// Both survive `already_reachable`, which only rejects a non-loopback

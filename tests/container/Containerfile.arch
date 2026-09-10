@@ -11,8 +11,9 @@
 #
 # `socat` is the TCP listener/probe for the reachability check; `util-linux`
 # supplies `unshare` and `nsenter`, which build the peer network namespace
-# `ip netns` cannot -- rootless podman's `mount --make-shared /run/netns`
-# fails, verified in milestone-3-verified-facts.md.
+# `ip netns` cannot -- under rootless podman `ip netns` fails at
+# `mount --make-shared /run/netns`, which is why the peer namespace is built
+# by hand here.
 FROM docker.io/library/archlinux:latest
 
 RUN pacman -Syu --noconfirm --needed \

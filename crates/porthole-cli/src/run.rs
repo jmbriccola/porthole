@@ -51,7 +51,7 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
                 }
                 // Any failure to detect a backend at all -- not only the
                 // documented "no firewall installed" case -- must still
-                // answer in this shape. C1: `detect` used to also fail this
+                // answer in this shape. `detect` used to also fail this
                 // way whenever the active backend's own privileged read
                 // errored (ufw and nftables both need root to say whether
                 // they are enforcing anything), and returning `Err` here made

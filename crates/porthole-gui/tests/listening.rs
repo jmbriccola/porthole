@@ -53,9 +53,9 @@ fn activate<F: FnOnce(&adw::Application) + 'static>(app_id: &str, f: F) {
 }
 
 /// A `Service` as `porthole_core::listening::scan` would produce one, with
-/// an address consistent with `binding` -- the same fixture shape the
-/// task's own brief specifies, so a reader comparing this file to the brief
-/// can tell they match.
+/// an address consistent with `binding`: loopback for `LoopbackOnly`, the
+/// wildcard for `AllInterfaces`, the address itself for the other two. No
+/// test here asserts against a `Service` that could not exist.
 fn svc(port: u16, process: Option<&str>, binding: Binding) -> Service {
     let address = match binding {
         Binding::LoopbackOnly => IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -246,7 +246,7 @@ fn a_port_already_open_is_not_offered_again() -> Result<(), String> {
     Ok(())
 }
 
-/// I6: a helper round trip that fails must withdraw an "already open" claim
+/// A helper round trip that fails must withdraw an "already open" claim
 /// it can no longer confirm, not leave it standing on whatever
 /// `set_open_ports` last said -- `set_open_ports_unknown` is the method a
 /// caller reaches for that.
@@ -322,8 +322,8 @@ fn a_helper_failure_withdraws_a_stale_already_open_claim() -> Result<(), String>
 /// `LoopbackOnly` rows on the same port -- a genuine `127.0.0.1` +
 /// `::1` dual-stack pair -- correctly render the *same* text. There is no
 /// button to click twice here either way, so unlike the network-facing
-/// case this is not the readability problem the milestone's final wave
-/// tracks; this test only pins that the fixed wording really is fixed.
+/// case this is not the readability problem tracked against that surface;
+/// this test only pins that the fixed wording really is fixed.
 fn loopback_only_rows_share_the_same_reassurance_regardless_of_address() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
@@ -441,7 +441,7 @@ fn nothing_listening_is_a_calm_note_not_an_error() -> Result<(), String> {
     Ok(())
 }
 
-/// I5: before `set_services` has ever been called, this section must not
+/// Before `set_services` has ever been called, this section must not
 /// be sitting on the calm "Nothing else is listening" claim -- a fresh
 /// `ListeningSection` has not scanned anything yet to earn that.
 fn the_initial_state_before_any_scan_is_neither_calm_nor_populated() -> Result<(), String> {
@@ -479,7 +479,7 @@ fn the_initial_state_before_any_scan_is_neither_calm_nor_populated() -> Result<(
     Ok(())
 }
 
-/// I4: a `/proc` scan that fails outright must not leave the calm
+/// A `/proc` scan that fails outright must not leave the calm
 /// "Nothing else is listening" page up -- a stderr line is not a UI, and
 /// from the user's side "porthole could not check" and "porthole checked
 /// and found nothing" are exactly the collapse this project keeps finding.
@@ -560,7 +560,7 @@ fn a_scan_failure_does_not_render_as_the_calm_empty_state() -> Result<(), String
     Ok(())
 }
 
-/// Fix round 2, item 1: the actual bug. `refresh` (`window.rs`) runs the
+/// The actual bug this guards against. `refresh` (`window.rs`) runs the
 /// `/proc` scan and the helper's `list`/`status` round trip as two
 /// independent futures, and a scan failure calling `set_scan_failed`
 /// followed by a *successful* helper fetch calling `set_open_ports` is the
@@ -601,7 +601,7 @@ fn a_scan_failure_survives_a_later_set_open_ports() -> Result<(), String> {
     Ok(())
 }
 
-/// The other half of the same hole (I5, the loading state): with no scan
+/// The other half of the same hole (the loading state): with no scan
 /// having run at all yet, a `set_open_ports` arriving first (the helper
 /// answering before `/proc` has been read) must not manufacture the calm
 /// page either -- the loading state exists precisely to keep this section

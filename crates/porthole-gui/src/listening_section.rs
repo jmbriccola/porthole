@@ -76,13 +76,12 @@
 //!
 //! `porthole listen`'s human output (`porthole-cli`) prints a dual-stack
 //! service (one socket on `0.0.0.0`, another on `::`) as two visually
-//! identical rows, because it has no address column; that is tracked for
-//! this milestone's final wave as a defect in *that* surface. This list is a
-//! different surface and the fix is cheap here: every network-facing row's
-//! subtitle is the literal address it is bound to (`0.0.0.0`, `::`,
-//! `10.0.0.5`, ...), so two rows that share a title because they share a
-//! port still read as two distinct sockets rather than one service listed
-//! twice by mistake.
+//! identical rows, because it has no address column; that is a known defect
+//! in *that* surface. This list is a different surface and the fix is cheap
+//! here: every network-facing row's subtitle is the literal address it is
+//! bound to (`0.0.0.0`, `::`, `10.0.0.5`, ...), so two rows that share a
+//! title because they share a port still read as two distinct sockets
+//! rather than one service listed twice by mistake.
 //!
 //! ## Docker-published ports
 //!

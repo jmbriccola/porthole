@@ -21,9 +21,9 @@
 # exactly as the other four images do it.
 #
 # `polkit` **does** start here, and that is worth saying because it is not
-# free and the spike that preceded this image could not manage it: polkit
-# failed there with `Failed to keep CAP_SYS_ADMIN`, status `217/USER`, so
-# every measurement in it ran with no authorizer anywhere. What it takes is
+# free: in an earlier rootless container without the options below, polkit
+# failed with `Failed to keep CAP_SYS_ADMIN`, status `217/USER`, so every
+# measurement taken there ran with no authorizer anywhere. What it takes is
 # what `SystemdContainer::start` already passes for the Docker image --
 # `--cap-add=...SYS_ADMIN...` together with `--security-opt seccomp=unconfined`
 # -- and the setup in `container.rs` asserts it rather than hoping, ending

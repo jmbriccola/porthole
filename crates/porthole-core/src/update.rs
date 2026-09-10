@@ -3,8 +3,9 @@
 //! porthole makes no network request of its own, and this does not add one.
 //! The question is put to the **local package manager**, which is the only
 //! thing that can answer the question worth asking: not "does 0.2.0 exist
-//! somewhere" but "can this machine install it now". The design that decided
-//! that is `docs/superpowers/specs/2026-09-09-update-notifier-design.md`.
+//! somewhere" but "can this machine install it now". The two are different
+//! answers whenever a repository is a day behind, and only the second is one
+//! a person can act on.
 //!
 //! Nothing here installs anything, and nothing here is privileged. This
 //! module runs two kinds of read-only query through [`CommandRunner`] and

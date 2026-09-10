@@ -1442,11 +1442,9 @@ fn first_undecodable(snapshot: &HelperSnapshot) -> Option<String> {
 ///
 /// **Why not simply exit, the way `porthole-agent` does.** A window is
 /// something a person is looking at and has arranged on a screen; one that
-/// vanishes under their hands has reported nothing. The choice recorded for
-/// this case (`docs/superpowers/specs/2026-09-09-update-notifier-design.md`:
-/// *«La GUI aperta non può ri-eseguirsi mentre è in uso. Se ne accorge e lo
-/// dice»*) is that it notices and says so, rather than going on talking to a
-/// helper it was not built for. So the window and everything in it stay
+/// vanishes under their hands has reported nothing. The choice for this case
+/// is that it notices and says so, rather than going on talking to a helper
+/// it was not built for. So the window and everything in it stay
 /// exactly where they were, readable, and what changes is that it stops
 /// asking and stops offering.
 ///
@@ -1586,7 +1584,7 @@ mod tests {
 
     #[test]
     fn a_method_error_is_errored_not_unreachable() {
-        // I2: the helper answered here -- a typed error, not silence.
+        // The helper answered here -- a typed error, not silence.
         let e = method_error(
             "com.jacopobriccola.Porthole.NotAuthorized",
             Some("not authorized: com.jacopobriccola.Porthole.List"),
@@ -1606,7 +1604,7 @@ mod tests {
 
     #[test]
     fn a_state_failure_classifies_the_same_way_as_a_denial_not_as_unreachable() {
-        // I4: `HelperError::State` (a `StateStore` read/write failure) is
+        // `HelperError::State` (a `StateStore` read/write failure) is
         // just as much a `MethodError` as `HelperError::NotAuthorized` is,
         // and `classify_failure` does not -- cannot, from the wire alone --
         // tell them apart. Pinning this is what makes `Errored`'s own doc

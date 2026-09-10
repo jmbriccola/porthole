@@ -117,9 +117,9 @@ firewalld is current again.
 scoped to the same `source address` an ordinary open would carry. Not two.
 
 That is a measurement, not a reading of the manual. A redirect plus an accept
-for the external port was the original design, and a spike with firewalld
-2.4.4, nftables 1.1.6 and Docker 29.8.0 — packet counters at each netfilter
-hook, a client in its own network namespace — took it apart in both
+for the external port was the original design, and an experiment with
+firewalld 2.4.4, nftables 1.1.6 and Docker 29.8.0 — packet counters at each
+netfilter hook, a client in its own network namespace — took it apart in both
 directions:
 
 - **The accept is unnecessary.** With the redirect in the zone, *zero* packets
@@ -144,10 +144,10 @@ holds this, against a real firewalld, and
 `the_lan_reaches_the_container_through_the_forward_hook_and_only_on_the_port_it_was_given`
 is what shows the traffic really travels the forward path -- it counts **zero
 packets addressed to the external port** at the input hook while the forward
-hook carries the connection. (The other two bullets above are the spike's
-alone: nothing committed compares the counters with and without an accept, and
-nothing committed binds a host service to show the accept exposing it. What
-keeps that accept from being written at all is a unit test,
+hook carries the connection. (The other two bullets above rest on that
+experiment alone: nothing committed compares the counters with and without an
+accept, and nothing committed binds a host service to show the accept
+exposing it. What keeps that accept from being written at all is a unit test,
 `a_forward_writes_no_accept_for_the_external_port`.)
 
 porthole writes nothing into Docker's own chains — not `DOCKER`, not

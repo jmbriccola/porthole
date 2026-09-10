@@ -461,7 +461,7 @@ mod tests {
 
     #[test]
     fn a_state_entry_from_a_different_backend_is_reported_not_silently_dropped() {
-        // I1: `dnf install firewalld` on an nftables box (or the reverse)
+        // `dnf install firewalld` on an nftables box (or the reverse)
         // leaves a state entry recorded under a backend that is no longer
         // the one `detect` finds within this same uptime. Its `RuleHandle`
         // is a different enum variant from anything the *new* backend's
@@ -610,7 +610,7 @@ mod tests {
 
     #[test]
     fn the_safe_directions_write_survives_an_owned_rules_failure() {
-        // I1: an ambiguous nftables chain count (or any other reason
+        // An ambiguous nftables chain count (or any other reason
         // `owned_rules` might fail) must not cost porthole the drops the
         // state->firewall direction already knows are correct. Modelled here
         // with FakeBackend's own failure injection rather than a real
@@ -650,7 +650,7 @@ mod tests {
 
     #[test]
     fn read_only_never_touches_owned_rules_or_the_firewall() {
-        // C2: status and Engine::rules must never be able to close a rule,
+        // status and Engine::rules must never be able to close a rule,
         // no matter who is authorised to call them. ReadOnly mode is how:
         // it must not even call owned_rules, let alone close.
         let backend = FakeBackend::new();
