@@ -536,22 +536,35 @@ async fn no_announcement_is_lost_across_a_run_of_retirements() {
             recorded(port, "a rule the firewall lost"),
         );
 
-        // Exactly what `porthole-cli` does: one call, and one retry on the two
-        // failures a fresh instance can turn into service. A third kind of
-        // failure, or a second failure on the retry, fails the test.
-        let closed = match proxy.close_all().await {
-            Ok(v) => v,
-            Err(e) if porthole_core::ipc::worth_asking_again(&e) => {
-                retried += 1;
-                proxy.close_all().await.unwrap_or_else(|e| {
-                    panic!("round {round}: the retry failed too: {e}\n{}", bus.log())
-                })
-            }
-            Err(e) => panic!(
-                "round {round}: a failure no client can do anything about: {e}\n{}",
+        // Exactly what every porthole client does, through the one function
+        // all three of them call: one call, and one retry on the two failures
+        // a fresh instance can turn into service. Not a second copy of that
+        // decision written out here -- `porthole_core::ipc::
+        // once_more_if_worth_asking_again` is the copy, and this is the only
+        // place in the workspace that drives it against retirements that are
+        // really happening.
+        //
+        // Counted, so the arm can say how often the window was actually
+        // entered; a run in which nothing was ever retried would be a run
+        // whose crossings all fell between calls.
+        let attempts = std::cell::Cell::new(0usize);
+        let closed = porthole_core::ipc::once_more_if_worth_asking_again(|| {
+            attempts.set(attempts.get() + 1);
+            proxy.close_all()
+        })
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "round {round}: {}: {e}\n{}",
+                if attempts.get() > 1 {
+                    "the retry failed too"
+                } else {
+                    "a failure no client can do anything about"
+                },
                 bus.log()
-            ),
-        };
+            )
+        });
+        retried += attempts.get() - 1;
         assert!(closed.0.is_empty(), "the sweep had already dropped it");
 
         // The announcement for *this* round, from whichever instance served
