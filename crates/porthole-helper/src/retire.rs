@@ -68,13 +68,18 @@
 //! (`porthole_core::ipc::once_more_if_worth_asking_again`), which is what
 //! makes the whole arrangement robust rather than delicate -- and which is a
 //! defect fixed in its own right, since the same retry covers a helper killed
-//! by a package upgrade. It began in `porthole-cli` alone, which for one
-//! release left `porthole-agent` and `porthole-gui` reporting a helper
-//! between lives as one they could not reach. Measured: a caller arriving *before* the release is
-//! served; one arriving between release and exit is served by a fresh instance
-//! the bus activates in 22-31 ms; one arriving after exit likewise. The only
-//! fragile point was the request already in flight, and refusing it is what
-//! removes the fragility.
+//! by a package upgrade. It began in `porthole-cli` alone, and while it was
+//! there alone the other two each got this refusal wrong in a way of their
+//! own: `porthole-agent` reported a helper it could not reach, and
+//! `porthole-gui` reported one that had answered with an error. Measured: a
+//! caller arriving *before* the release is served; one arriving between
+//! release and exit is served by a fresh instance the bus activates in
+//! 22-31 ms; one arriving after exit likewise. The only fragile point was the
+//! request already in flight, and refusing it is what removes the fragility.
+//!
+//! A refusal that is actually sent says so in the journal -- see
+//! [`Retirement::admit`], which is where the one thing this process does *to*
+//! a client without otherwise recording it stopped being unrecorded.
 //!
 //! # What this does not fix
 //!
@@ -95,11 +100,22 @@ use tokio::sync::watch;
 /// **Five minutes.** A cold activation was measured at 642 ms in a container
 /// -- ~515 ms of it firewalld's Python CLI, run by the start-up
 /// reconciliation sweep -- and the same read-only probes are slower on a real
-/// desktop, so expect nearer a second there. What that cost is charged
-/// against is less than it looks: `porthole list` and `porthole status` never
-/// reach the helper at all, and `open` and `forward` already involve a polkit
-/// dialog measured in seconds of human time. It lands essentially on `close`
-/// alone.
+/// desktop, so expect nearer a second there. That is the number this grace was
+/// chosen against, and it has since been overtaken: `5d5b39c` skips that sweep
+/// when it could only answer "nothing", which is exactly the state an idle
+/// helper is activated into, and the same measurement is now 248-260 ms. Both
+/// figures and their conditions are set out in one place,
+/// `porthole_core::ipc::once_more_if_worth_asking_again`; the choice below
+/// does not depend on which of them a reader takes.
+///
+/// What that cost is charged against is less than it looks: `porthole list`
+/// and `porthole status` are answered by the **CLI** from the state file
+/// without a bus call at all, and `open` and `forward` already involve a
+/// polkit dialog measured in seconds of human time. It lands essentially on
+/// `close` alone -- for the CLI. `porthole-gui` is not in that argument and
+/// never was: its refresh calls `list`, `status` and `docker_ports` on the
+/// helper every time anything says what is open may have changed, so a
+/// window left open pays this cost far more often than any button does.
 ///
 /// So the grace has to cover *a person operating on ports in a burst*, and
 /// its only cost is the daemon living that much longer after the last rule
@@ -173,6 +189,25 @@ pub const SESSION_ENV: &str = "PORTHOLE_IDLE_EXIT";
 /// directly -- will show it to a person verbatim.
 const REFUSAL: &str = "the porthole helper was retiring when this request arrived and did not act \
                        on it: ask again, and the bus will start a fresh helper to serve it";
+
+/// What the journal says when a refusal is actually sent -- see
+/// [`Retirement::admit`], where the reasoning for recording it at all lives.
+///
+/// One line per refused request, so a reader counts them. It does not name the
+/// method: [`Retirement::admit`] is called with no argument by every interface
+/// method and adding one would put a hand-written name at eight call sites
+/// with nothing holding it to the method it sits in. What the line has to
+/// carry is that a client was turned away and that it was told to come back,
+/// and both of those are true of every method alike.
+///
+/// Private, and matched from tests by a phrase spelled out there -- the same
+/// arrangement `tests/idle_exit.rs` already has with `giving up` and `nothing
+/// is left to answer`. A reworded line makes those tests fail saying they
+/// measured nothing, which is loud; exporting the constant so they could
+/// import it would make a rewording silently agree with itself.
+const REFUSED_LOG: &str = "a request arrived after this helper had decided to retire and was \
+                           refused rather than served; the client is told to ask again, and the \
+                           bus serves the retry from a fresh helper";
 
 /// Whether the retirement loop should run at all.
 ///
@@ -365,6 +400,35 @@ impl Retirement {
     /// the method returns. The trailing settle in [`Retirement::retire`] is
     /// what covers that last hop, and says so at its own call site. Nothing
     /// inside a method can hold a process open past its own return.
+    ///
+    /// # The refusal is recorded, and why it was the one thing that was not
+    ///
+    /// The helper's journal is its account of what it did: every open, every
+    /// close, every record reconciliation, the decision to retire, a
+    /// `ReleaseName` that failed, a drain that overran. Turning a client's
+    /// request away was the one thing it did to somebody without saying so --
+    /// and the line it *did* write, `giving up ... and exiting`, states an
+    /// intention rather than an effect. Two instances of that line say nothing
+    /// about whether either retirement inconvenienced anybody.
+    ///
+    /// It matters most for the client this refusal is worded for. A porthole
+    /// of this version asks again and the person never learns any of it
+    /// happened; an older `porthole`, or a script driving the bus directly,
+    /// shows [`REFUSAL`] verbatim and stops -- and then the machine's only
+    /// record of why is here. An administrator reading a journal after "it
+    /// said it could not reopen my port" should find the refusal, not have to
+    /// infer it from a retirement that happened around the same time.
+    ///
+    /// It cannot become noise: only a request routed to this instance between
+    /// the decision and the release can reach this branch at all, and in
+    /// production that window is the time a `ReleaseName` takes to travel to
+    /// the bus daemon and back.
+    ///
+    /// **After the wait, not before.** A refusal is only a refusal once it can
+    /// be sent. Where the release *failed*, [`Retirement::await_release`] never
+    /// completes, this caller is answered by the process exiting with a
+    /// `NoReply`, and nothing here claims otherwise -- that path logs its own
+    /// line, in [`Retirement::retire`], saying exactly that.
     pub async fn admit(self: &Arc<Self>) -> Result<Busy, HelperError> {
         let retiring = {
             let mut book = self.lock();
@@ -381,6 +445,7 @@ impl Retirement {
         // reaches the fresh instance rather than this one.
         self.await_release().await;
         drop(busy);
+        eprintln!("porthole-helper: {REFUSED_LOG}");
         Err(HelperError::Retiring(REFUSAL.to_string()))
     }
 

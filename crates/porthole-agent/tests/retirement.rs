@@ -32,9 +32,10 @@
 //! `PORTHOLE_IDLE_PRERELEASE_MS` widens the first one deliberately -- see
 //! `porthole_helper::retire::PRERELEASE_ENV`, which exists for exactly this
 //! and says why hunting the window with load is worse than useless. Every
-//! test here enters it on purpose, and every test here then *proves* it did:
-//! see [`HELD_AT_LEAST`], without which a run whose call arrived a moment too
-//! late would be served first time, retry nothing, and pass.
+//! test here enters it on purpose, and every test here then *proves* it did,
+//! by counting the refusals the helper itself records: see [`Bus::refusals`],
+//! without which a run whose call arrived a moment too late would be served
+//! first time, retry nothing, and pass every other assertion in the file.
 //!
 //! # What this proves, and what it does not
 //!
@@ -112,8 +113,30 @@ const SUBNET: &str = "10.10.10.0/24";
 /// every workspace binary in one `target/<profile>/` directory, so it is
 /// found beside this package's own -- the same means
 /// `porthole-cli/tests/helper_e2e.rs` uses, written out there.
+///
+/// **What that costs, and it cost it once already while this file was being
+/// written.** Cargo does not build a sibling package's *binary* for
+/// `cargo test -p porthole-agent`, so what this finds is whatever the last
+/// build that did touch it left behind. Run on its own after a change to
+/// `porthole-helper`, these tests drive the previous helper -- which is how a
+/// working retry once failed here against an `admit` that did not yet write
+/// the line [`Bus::refusals`] counts. `cargo test --workspace`, which is what
+/// this project's own instructions say to run, builds both and does not have
+/// the problem.
+///
+/// Asserted rather than left to a confusing failure elsewhere: a missing
+/// binary fails here, saying what is missing.
 fn helper_bin() -> PathBuf {
-    Path::new(env!("CARGO_BIN_EXE_porthole-agent")).with_file_name("porthole-helper")
+    let path = Path::new(env!("CARGO_BIN_EXE_porthole-agent")).with_file_name("porthole-helper");
+    assert!(
+        path.is_file(),
+        "porthole-helper is not at {} -- these tests drive the real helper, and \
+         `cargo test -p porthole-agent` does not build a sibling package's binary. \
+         Run `cargo test --workspace --exclude porthole-gui`, or `cargo build -p \
+         porthole-helper` first.",
+        path.display()
+    );
+    path
 }
 
 fn write_executable(path: &Path, body: &str) {
@@ -323,6 +346,29 @@ impl Bus {
             .filter(|l| l.contains(&format!("serving {SERVICE}")))
             .count()
     }
+
+    /// How many requests an activated helper has actually **refused** because
+    /// it was retiring, counted from the line `Retirement::admit` writes when
+    /// it sends one.
+    ///
+    /// This is what says a test entered the window. A retirement that nothing
+    /// collided with is a retirement nobody had to survive, and every other
+    /// assertion in these tests is true of a run in which the call arrived a
+    /// moment late, was routed to a fresh instance, and was served first time
+    /// -- including `activations`, since a late call activates an instance
+    /// too. Measured, not supposed: a reviewer reproduced exactly that run and
+    /// found this the only thing that separates it from a real one.
+    ///
+    /// The phrase is spelled here rather than imported, the same way `giving
+    /// up` is in `porthole-helper/tests/idle_exit.rs`. A reworded log line
+    /// makes these tests fail saying they measured nothing; a constant shared
+    /// with the code under test would let a rewording agree with itself.
+    fn refusals(&self) -> usize {
+        self.log()
+            .lines()
+            .filter(|l| l.contains("refused rather than served"))
+            .count()
+    }
 }
 
 /// The agent under test, killed however the test ends.
@@ -430,20 +476,19 @@ async fn until<T>(what: &str, bus: &Bus, mut f: impl FnMut() -> Option<T>) -> T 
     }
 }
 
-/// How wide every test here makes the prerelease window, and the floor a
-/// call that really entered it must have waited.
+/// How wide every test here makes the window between the decision to retire
+/// and the release of the name.
 ///
-/// The floor is what stops these tests passing on having measured nothing.
-/// A call refused by a leaving instance is *held* until the name is released
-/// -- `Retirement::admit` answers only then, so that the client's retry
-/// cannot land back on the instance it is leaving -- so entering the window
-/// costs the caller whatever is left of it. A call that arrived after the
-/// window closed pays nothing but a cold activation, measured at ~250 ms in
-/// a container. Four seconds against a floor of one and a half is not a
-/// lottery between those two; it is the difference between them, and it is
-/// the one observable consequence a client-side retry leaves behind.
+/// Four seconds against a sub-millisecond one in production. Nothing here
+/// *measures* that width, and an earlier version of this file did: it required
+/// the call under test to have taken at least a second and a half, on the
+/// argument that a refused call is held until the name is released and a late
+/// one is not. That inference was sound and was reproduced at a 29x margin,
+/// and it is still an inference from wall-clock time on a machine running a
+/// parallel test suite. [`Bus::refusals`] replaced it with the helper saying
+/// so. The width stays wide because it still has to be comfortably wider than
+/// everything between `Agent::start` and the agent's first call.
 const PRERELEASE: u64 = 4000;
-const HELD_AT_LEAST: Duration = Duration::from_millis(1500);
 
 /// Wait until an activated helper has taken the decision to retire and is
 /// sitting in the prerelease window -- the only moment at which a request is
@@ -466,18 +511,23 @@ async fn until_it_has_decided_to_go(bus: &Bus) {
     );
 }
 
-/// Fail unless `waited` is long enough to have been spent inside the window.
+/// Fail unless the helper says it refused exactly `expected` more requests
+/// than it had before -- which is what says the call under test entered the
+/// window rather than arriving after it and being served first time.
 ///
-/// Not a performance assertion and not a timeout: see [`HELD_AT_LEAST`]. It
-/// is the guard that makes the assertion beside it mean something, and it is
-/// here rather than written out twice because both tests need exactly it.
-fn was_held_by_the_leaving_instance(what: &str, waited: Duration, bus: &Bus) {
-    assert!(
-        waited >= HELD_AT_LEAST,
-        "{what} came back in {waited:?}, which is too fast to have been refused \
-         and held by an instance that was still leaving -- the window had \
-         already closed, a fresh helper served the first attempt, and nothing \
-         here was ever asked twice. This test measured nothing.\n{}",
+/// **Exactly**, not "at least": these tests place one call each into the
+/// window and know which one, so a second refusal would mean something else
+/// was also refused and the count no longer identifies anything.
+fn refused_this_many_more(what: &str, before: usize, expected: usize, bus: &Bus) {
+    let refused = bus.refusals() - before;
+    assert_eq!(
+        refused,
+        expected,
+        "the helper refused {refused} request(s) around {what}, not {expected}. \
+         A retirement nothing collided with is one nobody had to survive: every \
+         other assertion in this test is true of a run whose call arrived a \
+         moment late and was served first time by a fresh instance. This test \
+         measured nothing.\n{}",
         bus.log()
     );
 }
@@ -581,9 +631,12 @@ async fn a_reopen_clicked_while_the_helper_is_retiring_reopens_the_port() {
     until_it_has_decided_to_go(&bus).await;
     let activations_before = bus.activations();
     assert_eq!(activations_before, 1, "log:\n{}", bus.log());
+    // Nothing has called the helper since it decided to go, so any refusal
+    // counted after this point belongs to the click below and to nothing else.
+    let refusals_before = bus.refusals();
+    assert_eq!(refusals_before, 0, "log:\n{}", bus.log());
 
     // The click, inside the window.
-    let clicked = Instant::now();
     notifications
         .emit_signal(
             None::<()>,
@@ -625,8 +678,9 @@ async fn a_reopen_clicked_while_the_helper_is_retiring_reopens_the_port() {
     .await;
     // Before anything else is believed: the click really did land inside the
     // window, rather than after it on a name nobody owned -- which would have
-    // been served first time and would have exercised no retry at all.
-    was_held_by_the_leaving_instance("the reopen", clicked.elapsed(), &bus);
+    // been served first time and would have exercised no retry at all. One
+    // refusal, because one `open` went out.
+    refused_this_many_more("the click", refusals_before, 1, &bus);
 
     // The port really is open again, read from a fresh instance rather than
     // taken from the agent's word for it.
@@ -692,15 +746,21 @@ async fn an_agent_that_starts_while_the_helper_is_retiring_still_wakes_one() {
         .expect("the first call activates a helper");
     until_it_has_decided_to_go(&bus).await;
     assert_eq!(bus.activations(), 1, "log:\n{}", bus.log());
+    let refusals_before = bus.refusals();
+    assert_eq!(refusals_before, 0, "log:\n{}", bus.log());
 
     // The agent starts inside the window.
-    let started = Instant::now();
     let agent = Agent::start(&bus);
     until("the agent to finish starting", &bus, || {
         agent.journal().contains("listening for uid").then_some(())
     })
     .await;
-    was_held_by_the_leaving_instance("the agent's start-up", started.elapsed(), &bus);
+    // Exactly one, and the number is the point: the agent makes two calls at
+    // start-up and only the second of them can be refused. `ProtocolVersion`
+    // is served by the leaving instance because it sits outside the admission
+    // check; `list` is refused. Two refusals here would mean the version read
+    // had been refused too and this test had stopped pinning that difference.
+    refused_this_many_more("the agent's start-up", refusals_before, 1, &bus);
 
     let journal = agent.journal();
     assert!(

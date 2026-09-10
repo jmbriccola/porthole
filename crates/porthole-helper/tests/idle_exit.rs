@@ -523,6 +523,18 @@ async fn no_announcement_is_lost_across_a_run_of_retirements() {
     // The grace is short and the sleep between calls sweeps a range wider than
     // it, so calls land before, during and after retirements rather than at one
     // fixed offset from them.
+    //
+    // **What this arm does not measure is the client retry**, and the number
+    // it prints at the end is what says so: an ordinary run reports `0
+    // retried` across a dozen or more real retirements. The window in which a
+    // call is refused is the time a `ReleaseName` takes to travel to the bus
+    // daemon and back, and a phase sweep does not land in it. So this proves
+    // that no announcement is lost across crossings; it proves nothing about
+    // asking again, and no claim anywhere should rest on it. Entering that
+    // window on purpose is what `PORTHOLE_IDLE_PRERELEASE_MS` is for -- see
+    // `a_request_that_races_the_decision_to_retire_is_refused_rather_than_served`
+    // below, and `porthole-agent/tests/retirement.rs`, which count refusals
+    // rather than hope for them.
     const ROUNDS: u16 = 40;
     let bus = Bus::start(150, 50);
     let proxy = bus.proxy().await;
@@ -614,9 +626,15 @@ async fn no_announcement_is_lost_across_a_run_of_retirements() {
          retired and this test measured almost nothing:\n{}",
         bus.log()
     );
+    // `{retried}` is ordinarily 0, and that is not a defect in either the
+    // helper or the retry -- see this test's own opening comment. It is
+    // printed rather than asserted for the same reason `crossings` is
+    // asserted rather than printed: one of the two says whether the test
+    // measured anything, and the other does not.
     eprintln!(
-        "{ROUNDS} rounds across {crossings} helper instances, {retried} retried, \
-         0 announcements lost"
+        "{ROUNDS} rounds across {crossings} helper instances, {retried} retried \
+         (0 is the ordinary result -- this arm does not enter the refusal \
+         window), 0 announcements lost"
     );
 }
 
