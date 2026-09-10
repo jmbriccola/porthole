@@ -859,20 +859,24 @@ async fn reopen(
 ) {
     let request = reopen_request(&rule);
     // Asked again once if the helper was between lives, and this is the click
-    // that needed it most. A notification offering `Reopen` is on screen
+    // most likely to want it. A notification offering `Reopen` is on screen
     // precisely because a rule stopped being open -- which is also what can
     // leave the helper holding nothing, and a helper holding nothing retires
-    // five minutes later. So the ordinary life of this button is: a port
-    // closes, a person reads the notification, the helper retires while they
-    // are reading it, and the click lands on a bus name nobody owns. Without
-    // the retry that click produced "Could not reopen port 5173/tcp" over a
-    // helper that was perfectly well and one call away.
+    // five minutes later. So a person reading this notification is being read
+    // to across exactly the interval in which the grace expires.
     //
-    // What the retry cannot promise is worth naming here rather than only in
-    // `porthole_core::ipc`: a first `open` that took effect and lost its
-    // reply is answered by the second with `AlreadyOpen`, and this shows that
-    // on screen. It is the truth about the machine -- the port is open --
-    // and it is what a person clicking twice would get.
+    // What that does *not* mean is that a click landing after the retirement
+    // needs anything: a helper that has gone is gone, nothing owns the name,
+    // and the bus activates a fresh instance that serves this call first
+    // time. The retry is for the sliver in the middle -- an instance that has
+    // decided to go and not finished going -- where the click used to produce
+    // "Could not reopen port 5173/tcp" over a helper that was perfectly well
+    // and one call away.
+    //
+    // What the retry cannot promise is written on
+    // `porthole_core::ipc::worth_asking_again`; what this agent then puts on
+    // screen about it is `notify::reopen_outcome`, which is also where the
+    // one answer that is not a failure is told from the ones that are.
     let outcome = match request.published_port {
         Some(published_port) => {
             once_more_if_worth_asking_again(|| {
@@ -904,13 +908,13 @@ async fn reopen(
             reopened.port, reopened.protocol, reopened.target
         ),
         Err(e) => {
-            let failure = notify::Notification {
-                summary: format!("Could not reopen port {}/{}", rule.port, rule.protocol),
-                body: format!("{e}"),
-                actions: Vec::new(),
-            };
-            if let Err(e2) = notify::show(&notifications, &failure).await {
-                eprintln!("porthole-agent: reopen failed ({e}), and so did saying so ({e2})");
+            // Not necessarily a failure -- see [`notify::reopen_outcome`],
+            // which is where the wording is decided, next to every other
+            // notification's, and which is why this arm does not build one
+            // here any more.
+            let outcome = notify::reopen_outcome(&rule, &e);
+            if let Err(e2) = notify::show(&notifications, &outcome).await {
+                eprintln!("porthole-agent: reopen answered `{e}`, and saying so failed too ({e2})");
             }
         }
     }

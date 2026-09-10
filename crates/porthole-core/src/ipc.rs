@@ -771,10 +771,14 @@ pub const NO_REPLY_ERROR: &str = "org.freedesktop.DBus.Error.NoReply";
 /// helper that sent it did not act.
 ///
 /// Here rather than in `porthole-cli`, where it started, because every
-/// component that talks this interface meets the same two names: the CLI
-/// retries on it today, and `porthole-agent` and `porthole-gui` each hold a
-/// proxy of their own. Two spellings of one wire fact is how a repair
-/// survives in one component and rots in the others.
+/// component that talks this interface meets the same two names, and all
+/// three now ask again on them through
+/// [`once_more_if_worth_asking_again`] below. Two spellings of one wire fact
+/// is how a repair survives in one component and rots in the others -- which
+/// is not hypothetical here: for the length of one branch this predicate lived
+/// in this module *so that* the other two could use it, and they did not, so
+/// the CLI recovered from a retirement and the agent and the GUI each reported
+/// one as trouble of a different kind.
 pub fn worth_asking_again(e: &zbus::Error) -> bool {
     matches!(
         e,
@@ -787,12 +791,42 @@ pub fn worth_asking_again(e: &zbus::Error) -> bool {
 /// one to [`worth_asking_again`] about. Whatever the second attempt says is
 /// the answer, including a second failure of the same kind.
 ///
+/// # What the second call costs, and under what conditions it was measured
+///
+/// Stated here once, and pointed at from everywhere else that argues from it,
+/// because this project has **two** numbers for a cold activation and they
+/// differ by one commit rather than by a mistake.
+///
+/// - **Warm** -- an instance already running, which is what a retry meets when
+///   it arrives during a drain: 22-31 ms, measured in a container.
+/// - **Cold** -- the bus starting a fresh process: **248-260 ms**, five
+///   activations in a container, *after* `5d5b39c` stopped running the
+///   start-up reconciliation sweep when it could only answer "nothing". The
+///   **642 ms** quoted by `porthole_helper::retire::GRACE` and
+///   `porthole_helper::main::reconcile_at_startup` is the same measurement
+///   *before* that change, ~515 ms of it firewalld's Python CLI running that
+///   sweep. Both are real; they are one quantity on either side of one commit,
+///   and a reader who meets them unlabelled trusts whichever they saw first.
+/// - **On a real desktop, neither** -- nobody has measured it. Extrapolating
+///   from this machine's own read-only `firewall-cmd` probes gives ~0.47 s
+///   after that commit against ~0.99 s before it, and the design
+///   (`docs/superpowers/specs/2026-09-09-helper-idle-exit-design.md`) records
+///   that measuring it for real needs the owner's consent to activate their
+///   own helper once, which no work so far has had.
+///
+/// Nothing anywhere depends on which figure is right: every argument that
+/// cites one survives at a whole second.
+///
 /// No proxy in it and no error classification, so what it decides is
 /// testable without a bus -- and so that the three components that talk this
 /// interface share one copy of the decision rather than three. It started in
-/// `porthole-cli`, which was the only client that had it; `porthole-agent`
-/// and `porthole-gui` reported a helper between lives as one they could not
-/// reach until they called this too. That is the same reason
+/// `porthole-cli`, which was the only client that had it, and the two that
+/// did not each got a helper between lives wrong in a way of their own:
+/// `porthole-agent` reported one it could not reach, and `porthole-gui`
+/// reported one that had *answered with an error* -- showing the refusal's
+/// own text under "Porthole helper reported an error", or, for the other
+/// name, the bus's `Remote peer disconnected` as though the helper had said
+/// it. One wrong answer in two spellings is the same reason
 /// [`worth_asking_again`] is here rather than there.
 ///
 /// **One retry, and never more.** Two calls are what a person does by hand
@@ -806,12 +840,25 @@ pub fn worth_asking_again(e: &zbus::Error) -> bool {
 /// `NoReply`s are a helper that cannot stay up, which is a thing to report,
 /// not to keep asking.
 ///
-/// **No delay and no backoff between the two**, deliberately. There is
-/// nothing to wait for: the refusal is sent only once the well-known name is
-/// provably gone (`porthole_helper::retire`), so the second call is routed by
-/// the bus to a fresh instance it activates -- measured at 22-31 ms warm and
-/// ~250 ms cold. A sleep would add its own wait to that and change nothing
-/// about the outcome.
+/// **No delay and no backoff between the two**, deliberately, and for two
+/// reasons of different weight.
+///
+/// The weaker one is that there is nothing to wait for: the refusal is sent
+/// only once the well-known name is provably gone
+/// (`porthole_helper::retire`), so the second call is routed by the bus to a
+/// fresh instance it activates, at the cost given above. A sleep would add its
+/// own wait to that and change no outcome.
+///
+/// The **stronger** one is that this function must contain no timer at all.
+/// What polls the future it returns is not one runtime: `porthole-gui` polls
+/// it on a GLib main context and the helper's own interface methods are
+/// polled on zbus's executor thread, which is not a tokio runtime context. A
+/// `tokio::time::sleep` there does not merely block, it panics with "there is
+/// no reactor running" and takes the executor thread with it -- measured, and
+/// recorded on `porthole_helper::retire::Retirement::released`, which is why
+/// the helper waits on a `tokio::sync` channel and not a `tokio::time` one. A
+/// backoff added here later would be that same defect, in the one function
+/// every client calls.
 ///
 /// **What the second call cannot promise** is written on
 /// [`worth_asking_again`], because it is a fact about the two names rather

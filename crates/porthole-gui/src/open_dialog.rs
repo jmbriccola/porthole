@@ -757,10 +757,17 @@ fn helper_message(e: &zbus::Error) -> String {
 ///
 /// And asked once more on the two failures a second call can turn into
 /// service, exactly as that CLI does -- see
-/// `porthole_core::ipc::once_more_if_worth_asking_again`. The press that
-/// meets a helper between lives is the one at the start of a session: nothing
-/// has been open for a while, so the helper retired, and this call is what
-/// wakes a new one.
+/// `porthole_core::ipc::once_more_if_worth_asking_again`.
+///
+/// **The press at the start of a session is not the one that needs it.** A
+/// helper that retired an hour ago is *gone*: nothing owns the name, this
+/// call activates a fresh instance, and it is served first time for the price
+/// of an activation. What the retry is for is the far narrower case of a
+/// helper that is between lives at this instant -- one that has decided to go
+/// and has not finished, or one whose reply was lost to its own exit. That
+/// window is sub-millisecond in production, which is why nothing here waits
+/// or reports on it, and why the whole cost of covering it is one extra call
+/// on a path that had already failed.
 ///
 /// A retried `open` can come back `AlreadyOpen`, when the first attempt took
 /// effect and lost its reply. The dialog shows the helper's own sentence for

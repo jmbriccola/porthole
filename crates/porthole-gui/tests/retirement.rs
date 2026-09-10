@@ -24,9 +24,14 @@
 //!
 //! **Not real:** the decision. Nothing here has a grace period, and no
 //! process exits -- the "instances" are connections in this test binary. A
-//! real helper cannot run in this container at all: it refuses to start
-//! without a root-owned `/usr/bin/porthole` (`porthole_core::cli_path`), and
-//! `cargo test -p porthole-gui` does not build one. The retirement that a
+//! real helper cannot run in this container for one plain reason: `cargo test
+//! -p porthole-gui` does not build `porthole-helper`, so there is no binary
+//! for an activation file to name. (Not the root-owned `/usr/bin/porthole`
+//! that `porthole_core::cli_path` wants: that check applies only when the
+//! helper is `euid == 0`, and a `--session` test helper never is -- it
+//! resolves the `porthole` built beside it, which is exactly why
+//! `idle_exit.rs` and the agent's own retirement test run with porthole not
+//! installed at all.) The retirement that a
 //! real `porthole-helper` really decides on, really announces and really
 //! exits from is driven in `crates/porthole-helper/tests/idle_exit.rs` and
 //! `crates/porthole-agent/tests/retirement.rs`, against the real binary on a
@@ -474,12 +479,12 @@ fn a_refresh_that_meets_a_retiring_helper_shows_what_the_next_one_says(
 
 /// The button a person is actually watching when this happens.
 ///
-/// `close` is the command the idle exit charges for -- `list` and `status`
-/// never reach the helper, and `open`/`forward` sit behind a polkit dialog
-/// measured in human seconds -- and it is the likeliest to arrive during a
-/// retirement, because closing the last rule is what starts the grace period
-/// that ends in one. Pressing it used to produce a toast carrying the
-/// helper's refusal and a row left standing.
+/// The case above is the one that happens most often -- this window's refresh
+/// calls the helper three times whenever anything says what is open may have
+/// changed. This is the one that costs most when it happens: a refresh that
+/// meets a retiring helper repaints a moment later, while a close that met one
+/// used to leave a toast carrying the helper's refusal and a row still
+/// standing over a port the person had just asked to shut.
 fn a_close_pressed_against_a_retiring_helper_closes_the_port(
     shared: &Arc<Shared>,
 ) -> Result<(), String> {
@@ -551,9 +556,14 @@ fn a_close_pressed_against_a_retiring_helper_closes_the_port(
     Ok(())
 }
 
-/// The other button, and the press most likely to meet a retirement at all:
-/// the first thing a person does after not having used porthole for a while,
-/// which is exactly the state that made the helper retire.
+/// The other button. Not "the press most likely to meet a retirement" -- an
+/// earlier version of this comment said that, on the grounds that opening a
+/// port is the first thing somebody does after not using porthole for a
+/// while, which is the state that made the helper retire. It does not follow:
+/// a helper that retired is *gone*, and a call to a gone helper activates a
+/// fresh one and is served first time. What any of these three presses has to
+/// survive is the sub-millisecond window in which one is still leaving, and
+/// none of them is likelier to land in it than another.
 ///
 /// A retried `open` can also come back `AlreadyOpen`, when the first attempt
 /// took effect and lost its reply -- that is the helper's own sentence about

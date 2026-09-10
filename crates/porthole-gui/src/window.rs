@@ -936,11 +936,20 @@ async fn fetch_helper_snapshot() -> Result<HelperSnapshot, HelperFailure> {
     // that has to be asked twice, and the fresh instance the first retry
     // activates is already serving by the time the next call goes out.
     //
+    // These three are also the calls this window is most exposed on, and the
+    // reason its exposure is nothing like `porthole-cli`'s: there `list` and
+    // `status` are answered locally from the state file and an activation
+    // lands essentially on `close` alone, while here all three cross the bus
+    // on every refresh, and a refresh runs whenever anything says what is
+    // open may have changed.
+    //
     // Nothing new appears on screen while it happens. A refresh already holds
     // the header bar's busy indication across the whole round trip (see
     // `busy.rs`), so a retry is simply that wait, one bus activation longer
-    // -- measured at 22-31 ms warm and ~250 ms cold, against the eight
-    // seconds `HELPER_TIMEOUT` allows.
+    // -- see `porthole_core::ipc::once_more_if_worth_asking_again` for the
+    // measurement and the conditions it was taken under, and note that even
+    // its slowest figure leaves the eight seconds `HELPER_TIMEOUT` allows
+    // untroubled.
     let rules = porthole_core::ipc::once_more_if_worth_asking_again(|| proxy.list())
         .await
         .map_err(classify_failure);

@@ -477,14 +477,23 @@ fn helper_message(e: &zbus::Error) -> String {
 /// Ask the helper to close rule `id`, asking once more if the first attempt
 /// found a helper between lives.
 ///
-/// `close` is the one command the helper's idle exit actually charges for:
-/// `list` and `status` never reach it, and `open`/`forward` already involve a
-/// polkit dialog measured in human seconds. It is also the command most
-/// likely to arrive during a retirement, because closing the last rule is
-/// what starts the grace period that ends in one. So a person pressing this
-/// button on a quiet machine is the likeliest person in porthole to meet a
-/// helper that is between lives -- and until this retry existed they were
-/// shown a toast saying so.
+/// **Not because this is the call most exposed to a retirement.** In this
+/// window it is not, and the argument that says otherwise is the CLI's: there
+/// `list` and `status` are answered locally from the state file and never
+/// reach the helper, so an activation lands essentially on `close` alone.
+/// This window is the opposite -- `window.rs`'s own refresh calls `list`,
+/// `status` and `docker_ports` on the helper every time anything says what is
+/// open may have changed, and it does that far more often than anybody
+/// presses a button. The refresh is where the cost and the exposure are.
+///
+/// What makes this button worth its own retry is the *consequence*, not the
+/// odds. A refresh that meets a retiring helper repaints a moment later; a
+/// close that meets one used to leave a toast carrying the helper's refusal
+/// and a row still standing over a port the person had just asked to shut,
+/// with nothing to do but press it again. It is also the press most likely of
+/// the three to arrive during one, since closing the last rule is what starts
+/// the grace period that ends in a retirement -- but that is a smaller share
+/// of a smaller number than the refresh's.
 ///
 /// What they see while it happens is unchanged: the row's own spinner and
 /// its insensitive button, both held for as long as this is outstanding by
