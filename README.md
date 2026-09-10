@@ -237,6 +237,7 @@ porthole status
 porthole doctor
 porthole listen
 porthole devices list | add | rm <name>
+porthole update [--enable | --disable]
 ```
 
 `--to <name>` opens towards a saved device — see [Saved

@@ -358,6 +358,98 @@ and it is per user — run it as the person who will be opening ports. From the
 next login onwards, whichever of the two start files your desktop honours
 takes over.
 
+## Being told a newer porthole exists
+
+porthole can notice that an update is available and say so, once, with a
+button that installs it. It is off until somebody says otherwise, and what it
+does is narrower than "an updater":
+
+**It makes no network request.** porthole has no HTTP client and no TLS
+dependency in any of its crates, and this did not add one. The question goes
+to the package manager already on the machine — which is also the only thing
+that can answer the question worth asking: not "does a newer version exist
+somewhere" but "can this machine install it now". Nothing about your machine,
+your address or how often you use porthole reaches anybody.
+
+**It reads an exit code, not a message.** A message is localised and changes
+between versions; an exit code is a contract. Which contracts exist was
+established by reading each tool's own documentation, and the answer is not
+uniform:
+
+| Manager | Contract | Where it is written |
+|---|---|---|
+| dnf | **100** updates available, **0** none | `dnf5-check-upgrade(8)`, verbatim |
+| apt | none for this question | `apt-get(8)` and `apt(8)` DIAGNOSTICS document only "zero on normal operation, decimal 100 on error" |
+| pacman | none | `pacman(8)` has no EXIT STATUS and no DIAGNOSTICS section at all |
+
+So on a Fedora-packaged install porthole answers the question, and on a
+Debian- or Arch-packaged one it reports that it will not: `porthole update`
+says it did not find out, names the documentation, and prints the command to
+run by hand. That is deliberate. Reading apt's `0` as "nothing to update"
+would be reporting an answer apt never gave, on a machine that may well have
+an update waiting. (`checkupdates(8)` from pacman-contrib *does* document an
+exit code — 2 for "no updates available" — but it answers whether *anything*
+on the system has an update, not whether porthole does.)
+
+**It never touches a source install.** The first thing the check does is ask
+each package manager whether it owns porthole's own binary. If one answers and
+does not claim it, porthole was built and installed by hand, and the check
+stops there for good: overwriting a tree porthole did not install is not
+porthole's to offer. "No manager claims it" and "no manager could be asked"
+are kept apart — only the first is evidence of anything.
+
+**The question is asked once, by the window.** What a person needs in order to
+answer is that nothing leaves the machine, and that does not fit in a
+notification, so `porthole-gui` asks at first launch. There are three states
+and not two — *never asked*, *yes*, *no* — because telling the first from the
+third is what stops porthole asking again somebody who declined. From a
+terminal:
+
+```bash
+porthole update              # ask now, and say what the answer was
+porthole update --enable     # let the agent ask once a day
+porthole update --disable    # stop it
+```
+
+The setting lives in `~/.config/porthole/update.toml`, beside `devices.toml`
+and under `$XDG_CONFIG_HOME` when that is set. Somebody who only ever uses the
+command line and never opens the window is never asked and never notified;
+`porthole update` on demand is what they have, and it works whatever the
+setting says — consent is about porthole asking *on its own*, with nobody
+present.
+
+**The install is PackageKit's.** The notification carries one button, and
+pressing it hands the request to PackageKit over the system bus, which raises
+its own polkit prompt under its own action — this machine's policy calls it
+`org.freedesktop.packagekit.system-update`, "Authentication is required to
+update software". The password is the one PackageKit asks to install any
+package; porthole gains no privilege of its own and asks for none. Where
+PackageKit is absent there is no button, and the notification shows the exact
+command instead.
+
+**The privileged porthole helper has nothing to do with any of it**, and that
+is a security property rather than a division of labour. The helper accepts a
+narrow, validated set of firewall operations and never a command from a
+client; making it install packages would mean anyone who can address its bus
+name can run code as root. The update goes through PackageKit or it does not
+go.
+
+**Afterwards.** When PackageKit reports success the agent starts again from
+the binary on disk — the same machinery that repairs an agent left behind by
+an upgrade (see "An agent that is itself the old half" above), not a second
+copy of it. Because the agent wakes for the daily check anyway, it also
+compares its own binary against the one it started from, which covers the
+person who updates from a terminal without going through porthole at all. A
+**window** that is open cannot restart itself while somebody is using it; it
+says so rather than going on talking to a helper it was not built for.
+
+One thing this does not do, and it is the reason the notifier is useful on
+fewer machines than it might be: **the shipped packages carry no repository of
+their own.** A `.rpm` downloaded by hand installs a porthole that no
+repository offers an update for, so the check will honestly find nothing.
+Adding a repository definition to the packages is what would change that, and
+it is not part of this.
+
 ## The GUI: making it appear in the app grid
 
 Building it needs GTK4/libadwaita development headers installed first — the

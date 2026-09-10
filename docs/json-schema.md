@@ -591,6 +591,71 @@ in: `Firewall`, `Helper`, `Expiry timer`, `polkit`, `State`, `Network`, `Docker`
 any check's `ok` is `false`, `0` if every check passed — a script can gate on
 the exit code without parsing the JSON at all.
 
+## `porthole update --json`
+
+```json
+{
+  "schema": 1,
+  "update": {
+    "consent": "never_asked",
+    "packaging": "rpm",
+    "packaged": true,
+    "available": true,
+    "version": "0.2.0-1.fc44",
+    "detail": "porthole 0.2.0-1.fc44 is available to install",
+    "command": "sudo dnf upgrade porthole"
+  }
+}
+```
+
+- `consent` — `"yes"`, `"no"` or `"never_asked"`. **Three values, not two.**
+  `never_asked` is a machine nobody has put the question to, and it is what
+  makes the porthole window ask at first launch; `no` is a person who was
+  asked and declined, and is what stops it asking again. A script that folded
+  the two together could not tell those apart.
+- `packaged` — whether a package manager claims porthole's own binary.
+  `false` covers two different situations, and `detail` is what separates
+  them: every manager present was asked and none claims it (a source install),
+  or no manager could be asked at all.
+- `packaging` — `"rpm"`, `"dpkg"`, `"pacman"`, or `null` when `packaged` is
+  `false`.
+- `available` — `true`, `false`, **or `null`**. `null` is every case where
+  porthole did not get an answer, and it is not a nuisance value to flatten
+  into `false`: a source install, a machine with no package manager, a manager
+  that answered in a way that answers nothing, and — on apt and pacman — a
+  question their own documentation defines no exit code for. Reporting any of
+  those as `false` would tell a script there is nothing to install on a
+  machine that may well have something. Same collapse `listen --json`'s
+  `docker_checked` exists to avoid.
+- `version` — the version the package manager listed, or `null`. **A label,
+  never the verdict.** `available` is decided by the manager's exit code
+  alone; this string is read out of its output so a notification has
+  something to name and so a notification appears once per version rather than
+  once per check. A reworded, translated or unreadable listing gives `null`
+  here and changes `available` not at all.
+- `detail` — human text, and the only place the reason for a `null` is said.
+  It may change wording.
+- `command` — what to run by hand, or `null` when porthole does not know which
+  manager owns this install.
+
+**porthole makes no network request to answer this**, and adding one was
+rejected in the design: the question goes to the package manager already on
+the machine, which is also the only thing that can answer the question worth
+asking — not "does a newer version exist somewhere" but "can this machine
+install it now". Nothing here installs anything either. See
+[docs/installing.md](installing.md) for what does.
+
+`porthole update --enable` and `--disable` print a different, smaller object,
+since they answer no question:
+
+```json
+{ "schema": 1, "dry_run": false, "update": { "consent": "yes" } }
+```
+
+Under `--dry-run` that object reports the consent that **would** have been
+written and `dry_run: true`, and nothing is written — the global flag
+promises to change nothing, and the settings file is a change.
+
 ## Errors
 
 On failure, the JSON goes to **stdout** and the process exits with `code`.
