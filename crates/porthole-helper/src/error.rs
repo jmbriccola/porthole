@@ -62,9 +62,14 @@ pub enum HelperError {
     /// This helper had already decided to retire when the request arrived, so
     /// it did not act on it -- see [`crate::retire`]. **The one refusal here
     /// that is not about the request at all**, and the one a client should
-    /// answer by asking again rather than by telling anybody anything:
-    /// `porthole-cli` retries once on this name, and the retry is served by
-    /// the fresh instance the bus activates.
+    /// answer by asking again rather than by telling anybody anything: the
+    /// CLI, the agent and the GUI all retry once on this name, through
+    /// `porthole_core::ipc::once_more_if_worth_asking_again`, and the retry
+    /// is served by the fresh instance the bus activates.
+    ///
+    /// The message still names the remedy in words, because a client without
+    /// that retry -- an older `porthole`, or a script driving the bus
+    /// directly -- shows it to a person verbatim.
     ///
     /// It has no counterpart in [`Error`], because nothing in
     /// `porthole-core` can be retiring; it is constructed by the admission

@@ -63,10 +63,14 @@
 //! holding lose their replies instead, which their callers retry just the
 //! same, against a name this process is no longer there to own.
 //!
-//! `porthole-cli` retries once on that refusal (`client.rs`), which is what
+//! Every porthole client retries once on that refusal, through the one
+//! function all three of them call
+//! (`porthole_core::ipc::once_more_if_worth_asking_again`), which is what
 //! makes the whole arrangement robust rather than delicate -- and which is a
 //! defect fixed in its own right, since the same retry covers a helper killed
-//! by a package upgrade. Measured: a caller arriving *before* the release is
+//! by a package upgrade. It began in `porthole-cli` alone, which for one
+//! release left `porthole-agent` and `porthole-gui` reporting a helper
+//! between lives as one they could not reach. Measured: a caller arriving *before* the release is
 //! served; one arriving between release and exit is served by a fresh instance
 //! the bus activates in 22-31 ms; one arriving after exit likewise. The only
 //! fragile point was the request already in flight, and refusing it is what
