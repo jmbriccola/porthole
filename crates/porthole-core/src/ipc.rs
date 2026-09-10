@@ -85,11 +85,12 @@ pub const PROTOCOL_VERSION_ABSENT: u32 = 0;
 /// version until somebody says which version it is.
 ///
 /// **Not the introspection XML itself**, which was the obvious thing to
-/// pin and is the wrong one. Measured
-/// (`.superpowers/sdd/2026-09-07-docker-forward/spike-protocol-version.md`):
-/// it is deterministic to the byte across processes, rebuilds, profiles and
-/// libcs -- and it embedded every rustdoc comment and every Rust parameter
-/// name, so four words added to a doc comment changed it and renaming
+/// pin and is the wrong one. Measured, not assumed: it is deterministic to
+/// the byte across processes, rebuilds, profiles and libcs -- eight fresh
+/// processes, a debug and a release build, and the installed glibc binary
+/// against a musl one all produced the same document -- and it embedded
+/// every rustdoc comment and every Rust parameter name, so four words added
+/// to a doc comment changed it and renaming
 /// `_seconds` to `_secs` changes it still. A contract that breaks when prose
 /// improves, in a project that spends half its time improving prose, is a
 /// test that gets re-blessed unread. (The prose is out of the document since
@@ -707,10 +708,9 @@ impl WireDockerPort {
 /// rather than anything the helper decided or any way it could not be
 /// reached.
 ///
-/// The case it exists for is measured, in
-/// `.superpowers/sdd/2026-09-07-docker-forward/spike-protocol-version.md`:
-/// the forward feature added three members to [`WireRule`], so `RuleClosed`'s
-/// body went from `((sqssssttu)s)` to `((sqssssttusqq)s)` and `list`'s return
+/// The case it exists for is measured, not supposed: the forward feature
+/// added three members to [`WireRule`], so `RuleClosed`'s body went from
+/// `((sqssssttu)s)` to `((sqssssttusqq)s)` and `list`'s return
 /// from `a(sqssssttu)` to `a(sqssssttusqq)`. A client built against one and
 /// talking to a helper built against the other gets
 /// `zbus::Error::Variant(SignatureMismatch)` — from a method's return, and
@@ -817,10 +817,10 @@ pub fn worth_asking_again(e: &zbus::Error) -> bool {
 ///   and a reader who meets them unlabelled trusts whichever they saw first.
 /// - **On a real desktop, neither** -- nobody has measured it. Extrapolating
 ///   from this machine's own read-only `firewall-cmd` probes gives ~0.47 s
-///   after that commit against ~0.99 s before it, and the design
-///   (`docs/superpowers/specs/2026-09-09-helper-idle-exit-design.md`) records
-///   that measuring it for real needs the owner's consent to activate their
-///   own helper once, which no work so far has had.
+///   after that commit against ~0.99 s before it. Measuring it for real means
+///   timing a helper activated on a live system bus, which needs either a
+///   test machine with porthole installed or the owner's consent to activate
+///   their own helper once; no work so far has had either.
 ///
 /// Nothing anywhere depends on which figure is right: every argument that
 /// cites one survives at a whole second.

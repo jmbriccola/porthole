@@ -176,10 +176,8 @@ const HELPER_IS_OLDER_TITLE: &str =
 
 /// This window is the older half.
 ///
-/// **It does not offer to restart itself, and that is the recorded choice
-/// for this component** (`docs/superpowers/specs/2026-09-09-update-notifier-
-/// design.md`: «La GUI aperta non può ri-eseguirsi mentre è in uso. Se ne
-/// accorge e lo dice»). `porthole-agent` does re-execute itself, because
+/// **It does not offer to restart itself, and that is the deliberate choice
+/// for this component.** `porthole-agent` does re-execute itself, because
 /// nothing is looking at it; a window is something a person arranged on a
 /// screen, and one that vanished and came back under their hands would have
 /// reported nothing.

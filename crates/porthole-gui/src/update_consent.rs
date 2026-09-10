@@ -4,10 +4,8 @@
 //! **Why the window and not a notification.** What a person needs in order to
 //! answer is that *nothing leaves the machine* -- the package manager already
 //! installed on it is asked, not a server -- and that does not fit in two
-//! lines of notification body. The design
-//! (`docs/superpowers/specs/2026-09-09-update-notifier-design.md`) settles it
-//! in those terms: «La domanda la pone la finestra al primo avvio, non una
-//! notifica».
+//! lines of notification body. So the question is put by the window at first
+//! launch, and never by a notification.
 //!
 //! **Three states, and this only ever writes two of them.** *Never asked* is
 //! what a machine starts in and what brings this dialog up; *yes* and *no*

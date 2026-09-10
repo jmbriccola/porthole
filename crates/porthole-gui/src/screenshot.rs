@@ -33,10 +33,10 @@
 //! that same container reflects whatever this milestone's own test process
 //! happens to have listening, not a machine anyone chose to show.
 //!
-//! The fixture below is invented, not measured -- unlike
-//! `.superpowers/sdd/milestone-4-verified-facts.md`, which this module does
-//! not draw on. It reuses the port numbers and addresses this project's own
-//! README and `docs/json-schema.md` already use as examples (`5173/tcp`,
+//! The fixture below is invented, not measured: no number in it was read off
+//! a real machine, and nothing here draws on one that was. It reuses the
+//! port numbers and addresses this project's own README and
+//! `docs/json-schema.md` already use as examples (`5173/tcp`,
 //! `10.10.10.0/24`, `firewalld 2.4.4`), so the screenshot reads as the same
 //! running example the rest of the documentation already shows, not a new
 //! one invented just for this image. The saved devices [`fixture_devices`]

@@ -22,11 +22,10 @@
 //! Introspect` on it exactly as any client would, and reduces the answer to
 //! the same normal form the constant is written in.
 //!
-//! **Not a snapshot of the XML**, which is what
-//! `.superpowers/sdd/2026-09-07-docker-forward/spike-protocol-version.md`
-//! was written to decide and decided against: that document is byte-stable
-//! across processes, rebuilds, profiles and libcs, and it embeds every
-//! rustdoc comment and every parameter name, so it changes when prose
+//! **Not a snapshot of the XML**, which was the obvious thing to pin and was
+//! measured and rejected: that document is byte-stable across processes,
+//! rebuilds, profiles and libcs, and it embeds every rustdoc comment and
+//! every parameter name, so it changes when prose
 //! improves. `porthole_core::ipc::signature_digest` strips both, which is
 //! also what let it work on the document this interface served until
 //! `service.rs` turned zbus's `introspection_docs` off: `xmllint` refused it,

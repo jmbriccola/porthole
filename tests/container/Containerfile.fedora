@@ -3,13 +3,13 @@
 # firewalld is a D-Bus system service, so this image also carries a system
 # `dbus-daemon` -- there is no systemd PID 1 in a container to start one, so
 # the test itself starts `dbus-daemon --system` and `firewalld --nofork`
-# directly. Verified empirically (see
-# .superpowers/sdd/milestone-3-verified-facts.md and the container test file
-# itself): running everything as the container's own root is enough for
-# firewalld to accept `--add-rich-rule` with no polkit agent anywhere, and
-# that an unprivileged caller in this same container is refused every
-# firewalld call instead of only the config ones -- there is no systemd here,
-# so polkit cannot resolve a subject and firewalld falls back to a uid check.
+# directly. Verified empirically, and held by the tests in
+# `crates/porthole-cli/tests/container.rs`: running everything as the
+# container's own root is enough for firewalld to accept `--add-rich-rule`
+# with no polkit agent anywhere, and an unprivileged caller in this same
+# container is refused every firewalld call instead of only the config ones --
+# there is no systemd here, so polkit cannot resolve a subject and firewalld
+# falls back to a uid check.
 #
 # No Rust toolchain, no copy of the porthole binaries: those are built once on
 # the host as a static musl binary and bind-mounted in at container-run time.

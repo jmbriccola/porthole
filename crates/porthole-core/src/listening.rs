@@ -2,9 +2,8 @@
 //!
 //! This is what makes `porthole open` pleasant: pick a port from a list
 //! instead of typing a number you half-remember. All of the difficulty here
-//! is parsing, not presentation — see
-//! `.superpowers/sdd/milestone-4-verified-facts.md` (in the source tree, not
-//! shipped) for the numbers this module was built against.
+//! is parsing, not presentation, and the numbers this module was built
+//! against are the ones below.
 //!
 //! Two details in `/proc/net/tcp`'s own format are easy to get backwards, and
 //! getting either one wrong produces a plausible-looking wrong answer rather
@@ -82,11 +81,10 @@ fn classify_v4(addr: Ipv4Addr) -> Binding {
 
 /// The same classification for a `/proc/net/tcp6` address.
 ///
-/// Measured on this machine (`.superpowers/sdd/milestone-4-verified-facts.md`,
-/// cross-checked against `ss -ltnp` during development): every real LISTEN
-/// row seen in practice is either `::` or `::1`. The v4-mapped and "anything
-/// else" arms below exist for correctness, not because either was ever
-/// observed here.
+/// Measured on the machine this was written on, cross-checked against
+/// `ss -ltnp`: every real LISTEN row seen in practice is either `::` or
+/// `::1`. The v4-mapped and "anything else" arms below exist for
+/// correctness, not because either was ever observed here.
 fn classify_v6(addr: Ipv6Addr) -> Binding {
     if addr.is_unspecified() {
         // `::` accepts v4-mapped connections on most systems (Linux's default
@@ -669,8 +667,7 @@ mod tests {
     }
 
     /// Captured from this machine's /proc/net/tcp6: one `::` listener, one
-    /// `::1` listener. See milestone-4-verified-facts.md's cross-check
-    /// against `ss -ltnp` for how these were confirmed.
+    /// `::1` listener, both confirmed against `ss -ltnp` when taken.
     const PROC_NET_TCP6: &str = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
    0: 00000000000000000000000000000000:06B4 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 47549 1 0000000000000000 100 0 0 10 0
    1: 00000000000000000000000001000000:0277 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 13902 1 0000000000000000 100 0 0 10 0
