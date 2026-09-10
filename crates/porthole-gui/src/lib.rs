@@ -14,4 +14,5 @@ pub mod open_now;
 pub mod quiet;
 pub mod screenshot;
 pub mod status_bar;
+pub mod update_consent;
 pub mod window;

@@ -50,6 +50,13 @@ pub fn build() -> adw::Application {
         gtk::Window::set_default_icon_name(APP_ID);
         let window = PortholeWindow::new(app);
         window.present();
+        // The one question porthole asks about update checks, put here --
+        // after the window is on screen, in the handler a real launch goes
+        // through -- rather than inside `PortholeWindow::new`. See
+        // `crate::update_consent::ask_if_never_asked` for both reasons. It
+        // returns `None`, and does nothing at all, on every launch after the
+        // first answered one.
+        crate::update_consent::ask_if_never_asked(&*window);
     });
     app
 }
