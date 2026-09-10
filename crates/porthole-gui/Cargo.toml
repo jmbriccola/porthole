@@ -106,6 +106,17 @@ name = "version_mismatch"
 path = "tests/version_mismatch.rs"
 harness = false
 
+# Same reasoning again, plus the same one `tests/version_mismatch.rs` has:
+# `tests/retirement.rs` hands the helper's well-known name from one stand-in
+# connection to the next, which is the whole subject of the file and which
+# only one connection can hold at a time -- so it cannot share
+# `tests/signals.rs`'s stand-in, and no other target here may have a system
+# bus while it runs.
+[[test]]
+name = "retirement"
+path = "tests/retirement.rs"
+harness = false
+
 # Same reasoning again, and one addition of its own: `tests/identity.rs`
 # runs `app::build()`, which sets `prgname` -- process-wide state, and the
 # state whose value that file's whole point is to measure. Every other

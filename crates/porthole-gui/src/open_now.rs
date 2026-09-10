@@ -474,6 +474,29 @@ fn helper_message(e: &zbus::Error) -> String {
     }
 }
 
+/// Ask the helper to close rule `id`, asking once more if the first attempt
+/// found a helper between lives.
+///
+/// `close` is the one command the helper's idle exit actually charges for:
+/// `list` and `status` never reach it, and `open`/`forward` already involve a
+/// polkit dialog measured in human seconds. It is also the command most
+/// likely to arrive during a retirement, because closing the last rule is
+/// what starts the grace period that ends in one. So a person pressing this
+/// button on a quiet machine is the likeliest person in porthole to meet a
+/// helper that is between lives -- and until this retry existed they were
+/// shown a toast saying so.
+///
+/// What they see while it happens is unchanged: the row's own spinner and
+/// its insensitive button, both held for as long as this is outstanding by
+/// the `Busy` its caller keeps across the `await` (see `busy.rs`). A retry is
+/// that same wait, one bus activation longer.
+///
+/// The retry can turn a lost reply into `RuleNotFound`: the first close took
+/// effect and its answer was lost, and the second finds nothing left to
+/// close. That message is the truth about the machine -- the port is shut --
+/// and it is what pressing the button twice would say. The row goes on
+/// standing until a refresh replaces it, which is the same thing that
+/// happens for every other failed close.
 async fn close_by_id_over_dbus(id: &str) -> Result<(), String> {
     let connection = zbus::Connection::system()
         .await
@@ -481,8 +504,7 @@ async fn close_by_id_over_dbus(id: &str) -> Result<(), String> {
     let proxy = PortholeProxy::new(&connection)
         .await
         .map_err(|e| format!("could not reach the porthole helper: {e}"))?;
-    proxy
-        .close_by_id(id, false, false)
+    porthole_core::ipc::once_more_if_worth_asking_again(|| proxy.close_by_id(id, false, false))
         .await
         .map_err(|e| helper_message(&e))?;
     Ok(())
