@@ -39,6 +39,41 @@
 //! comporta." A warning that lectures gets dismissed unread, which makes the
 //! genuinely significant choice less safe, not more.
 //!
+//! ## The ways out
+//!
+//! Three, and each is a separate path that has to actually dismiss the
+//! panel: the `adw::HeaderBar`'s own close button, the Cancel beside it,
+//! and Escape. The first two did not exist -- this dialog carried no header
+//! bar at all, so nothing on screen offered to close it, which is what the
+//! first person to use the application reported. `tests/open_dialog.rs`
+//! presses each of the three and checks the panel is gone, rather than
+//! checking a button is there.
+//!
+//! Escape is libadwaita's, not this file's: `adw_floating_sheet` hangs an
+//! Escape shortcut off the sheet that holds a presented dialog, and it
+//! fires for a key event delivered anywhere inside it. What that needs is
+//! for the keyboard to *be* inside.
+//!
+//! **It already was, and that is worth writing down because the diagnosis
+//! this milestone started from said otherwise.** That report held that
+//! nothing grabbed focus, so Escape only began working once the user had
+//! clicked into a field. Measured in this milestone's own container, on a
+//! presented dialog, with the frame clock actually advancing: libadwaita
+//! grabs focus into a freshly presented dialog itself, from a tick callback
+//! two frames after its first map (`adw-dialog.c`), and it landed on the
+//! port field's own `GtkText` -- on a fresh dialog, on one presented over
+//! another, and on one left behind when a dialog above it closed. Escape
+//! dismissed the panel in every one of those without anything being clicked
+//! first. The "focus is nowhere" reading came from draining the main context
+//! without letting real time pass, which never advances that clock; the same
+//! gap `screenshot.rs::settle` exists for.
+//!
+//! What this file therefore does about focus is narrower than "fix Escape",
+//! and the `set_focus` call in [`OpenDialog::new`] says exactly what: the
+//! header bar added above introduces focusable widgets *ahead of the form*,
+//! so what libadwaita grabs on its own would now be the Cancel button. That
+//! call is what keeps the keyboard on the port field.
+//!
 //! ## What this dialog does not do
 //!
 //! It never composes a firewall rule. Pressing "Open" builds a [`Request`] --
@@ -469,6 +504,11 @@ struct Inner {
     manage_devices_button: gtk::Button,
     on_manage_devices: RefCell<Option<Box<dyn Fn()>>>,
     open_button: gtk::Button,
+    /// The header bar's own Cancel -- see the construction comment beside
+    /// it for why it is in that corner and not next to `open_button`. It
+    /// dismisses this dialog and sends nothing; there is no state to undo,
+    /// since nothing this dialog holds has left the process.
+    cancel_button: gtk::Button,
     /// This dialog's own busy indication for the `open` its button sends.
     /// `refresh_submit_state` reads it as well as `disable_while_busy`
     /// holding `open_button`: a keystroke in the port field while the
@@ -1035,11 +1075,69 @@ impl OpenDialog {
         let toast_overlay = adw::ToastOverlay::new();
         toast_overlay.set_child(Some(&scroller));
 
+        // The way out, and the two halves of it.
+        //
+        // **The close button.** An `adw::Dialog` draws one only where a
+        // header bar asks for it -- `adw::HeaderBar`'s own
+        // `show-end-title-buttons`, which is on by default and which
+        // libadwaita renders as this dialog's close button rather than the
+        // window's. Without one this panel had no visible way to dismiss it
+        // at all, which is what the first person to use the application
+        // reported. The `adw::ToolbarView` wrapper is the same construction
+        // `window.rs` already uses to put a header bar over content, and it
+        // is what puts this bar outside the `gtk::ScrolledWindow` below it:
+        // the way out does not scroll off.
+        //
+        // **The title, which until now was set and never drawn.** This
+        // dialog has always called `set_title`, and `for_forward` has always
+        // changed it -- with nothing on screen carrying either. The header
+        // bar is what renders it, so "Open a port" and "Forward a port" are
+        // finally the words a person reads rather than only what a screen
+        // reader announces.
+        //
+        // **Cancel, and why it is here rather than beside the Open
+        // button.** It is not redundant with the close button: on a
+        // half-filled form that is about to open a port, "Cancel" names
+        // abandoning the request, which is a different sentence from a close
+        // box. There is no precedent in this crate for where a secondary
+        // action goes -- every other action row here carries exactly one
+        // button -- so the reasons for this corner, in order:
+        //
+        // - It is the far corner from the confirming action. That button is
+        //   `suggested-action` green and it opens a port; a Cancel adjacent
+        //   to it is a mis-click away from the one press in this dialog with
+        //   a consequence. Opposite ends of the panel cannot be confused.
+        // - The confirming action does not move, change size or change
+        //   prominence. Nothing about this makes opening a port easier to
+        //   reach by accident.
+        // - The header bar does not scroll and the content does. The Open
+        //   button can sit below the fold in a short window (that is what
+        //   the scroller under it exists for); a way out that could also be
+        //   below the fold would reproduce the complaint this is repairing.
+        // - It is where GNOME puts a dialog's Cancel.
+        let cancel_button = gtk::Button::builder().label("Cancel").build();
+        let header_bar = adw::HeaderBar::new();
+        header_bar.pack_start(&cancel_button);
+
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&header_bar);
+        toolbar_view.set_content(Some(&toast_overlay));
+
         let dialog = adw::Dialog::builder()
             .title("Open a port")
             .content_width(420)
-            .child(&toast_overlay)
+            .child(&toolbar_view)
             .build();
+        // Where the keyboard starts, named rather than left to the tab
+        // order. libadwaita grabs focus into a dialog itself two frame ticks
+        // after its first map (`adw-dialog.c`), and what it grabs with no
+        // focus widget set is whatever comes first in tab order -- which,
+        // now that this dialog has a header bar, is the Cancel button above
+        // rather than the port field. Measured in this milestone's container
+        // before the bar existed: focus landed on the port field's own
+        // `GtkText`. This keeps it there, so the first thing typed into a
+        // freshly opened panel is still the port.
+        dialog.set_focus(Some(&port_row));
 
         let inner = Rc::new(Inner {
             dialog,
@@ -1062,10 +1160,21 @@ impl OpenDialog {
             manage_devices_button: manage_devices_button.clone(),
             on_manage_devices: RefCell::new(None),
             open_button: open_button.clone(),
+            cancel_button: cancel_button.clone(),
             busy: busy.clone(),
             on_opened: RefCell::new(None),
         });
         busy.disable_while_busy(&open_button);
+
+        // Cancel dismisses and nothing else. Deliberately not guarded by
+        // `dialog.root().is_some()` the way the Open button's own close is
+        // (see its handler below): that one can land after the dialog was
+        // already dismissed, because it runs when a D-Bus reply arrives.
+        // This one runs from a press on a button that is on screen.
+        let inner_for_cancel = inner.clone();
+        cancel_button.connect_clicked(move |_| {
+            inner_for_cancel.dialog.close();
+        });
 
         rebuild_targets(&inner);
 
@@ -1187,11 +1296,12 @@ impl OpenDialog {
     ///   only, and the description above carries that fact rather than a
     ///   control sitting there refusing.
     ///
-    /// A fifth difference is **not** on screen and is not claimed to be: the
-    /// dialog's title. This dialog carries no `adw::HeaderBar`, so its title
-    /// is what a screen reader announces and what a test can identify it by,
-    /// never text a sighted user reads. It is set all the same, for both of
-    /// those.
+    /// A fifth difference **is** on screen, and until this dialog grew an
+    /// `adw::HeaderBar` it was not: the title. It was set here from the
+    /// start and rendered nowhere, so it announced the act to a screen
+    /// reader and identified the dialog to a test while a sighted user saw
+    /// a panel that did not say what it was. The header bar draws it now,
+    /// so "Forward a port" is read as well as announced.
     ///
     /// A sixth is an absence, which says nothing by itself: the Docker
     /// explanation is suppressed -- see `docker_alert_for` for why showing
@@ -1414,11 +1524,13 @@ impl OpenDialog {
     /// answers on yet. Read off the real `adw::EntryRow`, so a test checking
     /// it is checking what is rendered.
     ///
-    /// Worth pinning separately from [`OpenDialog::dialog`]'s own title:
-    /// this dialog has no `adw::HeaderBar`, so its title is metadata (and
-    /// what a screen reader announces), never text on screen. A check that
-    /// only compared titles would prove which constructor ran and nothing
-    /// about what a person sees.
+    /// Worth pinning separately from [`OpenDialog::dialog`]'s own title,
+    /// though no longer for the reason this comment used to give. The title
+    /// *is* on screen now -- the `adw::HeaderBar` this dialog grew draws it
+    /// -- so comparing titles is no longer a check that proves only which
+    /// constructor ran. It remains a second, independent thing: the title
+    /// names the act, and this names the number the act takes, which are
+    /// different claims that have been wrong independently.
     pub fn port_field_title(&self) -> String {
         self.inner.port_row.title().to_string()
     }
@@ -1487,6 +1599,16 @@ impl OpenDialog {
         self.inner.port_row.set_text(text);
     }
 
+    /// The real port field, for a caller that needs the widget rather than
+    /// its text or its title -- which is one caller: the check that a
+    /// freshly presented panel leaves the keyboard here rather than on the
+    /// header bar this dialog now carries. What actually holds the keyboard
+    /// is the `GtkText` libadwaita builds inside this row, so that check
+    /// asks whether the focus sits *under* what this returns.
+    pub fn port_row(&self) -> &adw::EntryRow {
+        &self.inner.port_row
+    }
+
     pub fn protocol(&self) -> Protocol {
         selected_protocol_of(&self.inner)
     }
@@ -1538,6 +1660,14 @@ impl OpenDialog {
     /// [`OpenDialog::can_submit`].
     pub fn open_button(&self) -> &gtk::Button {
         &self.inner.open_button
+    }
+
+    /// The header bar's own Cancel, for a caller that wants to press it
+    /// (`emit_clicked`) rather than read that it exists -- which is the
+    /// only thing worth checking about it: a Cancel that is present and
+    /// dismisses nothing is the defect, not the absence of one.
+    pub fn cancel_button(&self) -> &gtk::Button {
+        &self.inner.cancel_button
     }
 
     /// This dialog's own busy indication for the `open` its button sends --

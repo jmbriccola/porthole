@@ -939,11 +939,15 @@ fn facts_about(dialog: &OpenDialog) -> DialogFacts {
 /// called and what it means, that there is no protocol to choose, what the
 /// target list is headed, and what the button says.
 ///
-/// The title is checked too, but it is deliberately *not* the only thing
-/// checked: this dialog carries no `adw::HeaderBar`, so its title is
-/// metadata and a screen reader's announcement rather than text a person
-/// reads. Every other field below is something visible in the rendered
-/// image.
+/// The title is checked too, and it is no longer the weak half of this
+/// check. It used to be: this dialog carried no `adw::HeaderBar`, so the
+/// title was metadata and a screen reader's announcement rather than text
+/// anyone read, and comparing the two titles proved which constructor had
+/// run. The header bar draws it now --
+/// `each_panel_says_what_it_is_where_a_person_reads_it` is what holds that
+/// separately, by looking for the rendered label rather than the property --
+/// so a title that told the two acts apart here now tells them apart on
+/// screen as well.
 ///
 /// `forwards()` is the value the button's own handler reads to decide which
 /// method to send, so a dialog that looked right and sent an `open` would
@@ -1052,9 +1056,10 @@ fn the_forward_dialog_says_it_redirects_and_sends_a_forward() -> Result<(), Stri
         ));
     }
 
-    // The visible half. A person never sees either dialog's title, so if
-    // these were to converge the two would be indistinguishable on screen
-    // while every check above still passed.
+    // The rest of the visible half. The title above is now on screen too,
+    // but it is one line in a header bar: if these were to converge, the two
+    // panels would be telling a person to fill in the same form for two
+    // different acts, and every check above would still pass.
     if forward.port_field_title == open.port_field_title {
         return Err(format!(
             "the field takes a different number in the two acts and must not share a name: \
@@ -1126,13 +1131,406 @@ fn the_forward_dialog_says_it_redirects_and_sends_a_forward() -> Result<(), Stri
     Ok(())
 }
 
+// ---------------------------------------------------------------------
+// The ways out of the panel.
+//
+// Every check below presses something and then asks whether the panel is
+// gone, never whether a control exists: a Cancel button that is present and
+// dismisses nothing is the defect, not the absence of one. What answers
+// "gone" is `AdwApplicationWindow::visible_dialog`, the same readback
+// `tests/window.rs` uses to see a dialog appear.
+// ---------------------------------------------------------------------
+
+/// Drains the main context *and lets real time pass between rounds*.
+///
+/// Needed here and nowhere else in this file. Presenting an `adw::Dialog`
+/// and dismissing one both run on the frame clock, which non-blocking main
+/// context iterations do not advance -- libadwaita grabs focus into a freshly
+/// presented dialog from a tick callback two frames after its first map
+/// (`adw-dialog.c`), and closing one animates a sheet shut. Measured in this
+/// milestone's container with the plain pump every other case here uses: the
+/// focus after a `present()` reads as nothing at all, which is a fact about
+/// the pump and not about the dialog. `screenshot.rs::settle` is the same
+/// workaround for the same gap, duplicated rather than shared because that
+/// is a library module this `harness = false` binary cannot reach into.
+fn settle() {
+    let context = gtk::glib::MainContext::default();
+    for _ in 0..10 {
+        for _ in 0..50 {
+            while context.iteration(false) {}
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    for _ in 0..50 {
+        while context.iteration(false) {}
+    }
+}
+
+/// The panel's own close button -- the one an `adw::HeaderBar` draws at the
+/// end of the bar, found by the `close` style class GTK puts on it rather
+/// than by a position in the widget tree. `None` when the panel carries no
+/// header bar at all, which is exactly the state this milestone repaired and
+/// the state the cases below have to be able to report.
+fn close_button_of(dialog: &adw::Dialog) -> Option<gtk::Button> {
+    fn walk(widget: &gtk::Widget, found: &mut Vec<gtk::Button>) {
+        if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+            if button.has_css_class("close") {
+                found.push(button.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(w) = child {
+            walk(&w, found);
+            child = w.next_sibling();
+        }
+    }
+    let mut found = Vec::new();
+    walk(dialog.clone().upcast_ref::<gtk::Widget>(), &mut found);
+    found.into_iter().next()
+}
+
+/// Runs GTK's own bubble phase for an Escape key press delivered to
+/// `focus`: every widget from there up to the window, firing any Escape
+/// shortcut it carries and stopping at the first that reports it handled the
+/// key. Returns the widgets it fired on, so a failure can say where it got
+/// to.
+///
+/// **What this does and does not stand in for.** GDK4 exposes no way to
+/// construct a key event and this container has no XTEST client, so the one
+/// step not covered is GDK turning a physical keypress into the event. What
+/// *is* covered is everything after that: which widgets the event reaches,
+/// which of them carry an Escape shortcut, and what firing it does. The
+/// shortcut that ends up closing a presented dialog is libadwaita's own --
+/// `adw-floating-sheet.c` hangs it off the sheet the dialog is presented in
+/// -- and it only ever sees the event if the keyboard is somewhere inside
+/// that sheet, which is the whole of what this file's own code decides.
+fn escape_from(focus: &gtk::Widget) -> Vec<String> {
+    use gtk::prelude::ListModelExtManual;
+    let mut fired = Vec::new();
+    let mut current = Some(focus.clone());
+    while let Some(widget) = current {
+        for controller in widget
+            .observe_controllers()
+            .iter::<gtk::glib::Object>()
+            .flatten()
+        {
+            let Ok(shortcuts) = controller.downcast::<gtk::ShortcutController>() else {
+                continue;
+            };
+            for item in shortcuts.iter::<gtk::glib::Object>().flatten() {
+                let Ok(shortcut) = item.downcast::<gtk::Shortcut>() else {
+                    continue;
+                };
+                if shortcut
+                    .trigger()
+                    .map(|t| t.to_str().to_string())
+                    .as_deref()
+                    != Some("Escape")
+                {
+                    continue;
+                }
+                let Some(action) = shortcut.action() else {
+                    continue;
+                };
+                let handled = action.activate(gtk::ShortcutActionFlags::empty(), &widget, None);
+                fired.push(format!("{}:{handled}", widget.type_().name()));
+                if handled {
+                    return fired;
+                }
+            }
+        }
+        current = widget.parent();
+    }
+    fired
+}
+
+/// Whether `widget` is `ancestor` or sits under it.
+fn is_inside(widget: &gtk::Widget, ancestor: &gtk::Widget) -> bool {
+    let mut current = Some(widget.clone());
+    while let Some(w) = current {
+        if w == *ancestor {
+            return true;
+        }
+        current = w.parent();
+    }
+    false
+}
+
+/// The panel had no visible way to close it: an `adw::Dialog` draws a close
+/// button only where a header bar asks for one, and this dialog carried no
+/// header bar. Reported by the first person to use the application.
+///
+/// The press is a real `emit_clicked` on the real button GTK built, and what
+/// is asserted is that the panel is gone afterwards -- not that a button
+/// with the right style class exists.
+fn the_close_button_dismisses_the_panel() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate("com.jacopobriccola.Porthole.Test.CloseButton", move |app| {
+        let win = PortholeWindow::new_without_initial_load(app);
+        win.present();
+        let dialog = OpenDialog::for_port(9000);
+        dialog.present(Some(&*win));
+        settle();
+        let before = win.visible_dialog().is_some();
+        let button = close_button_of(dialog.dialog());
+        if let Some(button) = &button {
+            button.emit_clicked();
+        }
+        settle();
+        *seen.borrow_mut() = Some((before, button.is_some(), win.visible_dialog().is_some()));
+    });
+    let (before, had_button, after) = result.borrow_mut().take().ok_or("activation never ran")?;
+    if !before {
+        return Err("fixture setup: the panel was never on screen to dismiss".to_string());
+    }
+    if !had_button {
+        return Err(
+            "the panel carries no close button -- an adw::Dialog draws one only where an \
+             adw::HeaderBar asks for it"
+                .to_string(),
+        );
+    }
+    if after {
+        return Err("pressing the close button left the panel on screen".to_string());
+    }
+    Ok(())
+}
+
+/// Cancel, which is not the close button in a different hat: on a
+/// half-filled form that is about to open a port it names abandoning the
+/// request. It has to actually dismiss, and it has to send nothing -- which
+/// here means the panel is gone and `on_opened`, the hook a successful open
+/// runs, never fired.
+fn cancel_dismisses_the_panel_and_opens_nothing() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.CancelButton",
+        move |app| {
+            let win = PortholeWindow::new_without_initial_load(app);
+            win.present();
+            let dialog = OpenDialog::for_port(9000);
+            let opened = Rc::new(std::cell::Cell::new(false));
+            let opened_for_hook = opened.clone();
+            dialog.on_opened(move |_| opened_for_hook.set(true));
+            dialog.present(Some(&*win));
+            settle();
+            let before = win.visible_dialog().is_some();
+            dialog.cancel_button().emit_clicked();
+            settle();
+            *seen.borrow_mut() = Some((before, win.visible_dialog().is_some(), opened.get()));
+        },
+    );
+    let (before, after, opened) = result.borrow_mut().take().ok_or("activation never ran")?;
+    if !before {
+        return Err("fixture setup: the panel was never on screen to dismiss".to_string());
+    }
+    if after {
+        return Err("pressing Cancel left the panel on screen".to_string());
+    }
+    if opened {
+        return Err("Cancel must send nothing, and something reported an open".to_string());
+    }
+    Ok(())
+}
+
+/// The third way out, and the only one that already worked -- for a person
+/// who had first clicked into a field.
+///
+/// Two things are checked, and the first is the one that matters: the
+/// keyboard is *inside the panel* the moment it is presented. libadwaita's
+/// Escape shortcut hangs off the sheet a dialog is presented in and only
+/// fires for an event that reaches it, so a keyboard left anywhere else is a
+/// panel Escape does nothing to. The second is that firing that chain
+/// actually dismisses -- see `escape_from` for exactly which step of a real
+/// keypress this container cannot supply.
+///
+/// This is also the check that guards the header bar added in this
+/// milestone: a bar introduces focusable widgets ahead of the form, and what
+/// libadwaita grabs on its own is whatever comes first in tab order.
+fn escape_dismisses_the_panel_without_clicking_into_it_first() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.EscapeCloses",
+        move |app| {
+            let win = PortholeWindow::new_without_initial_load(app);
+            win.present();
+            let dialog = OpenDialog::for_port(9000);
+            dialog.present(Some(&*win));
+            settle();
+
+            let panel: gtk::Widget = dialog.dialog().clone().upcast();
+            let focus = gtk::prelude::GtkWindowExt::focus(&*win);
+            let inside = focus.as_ref().map(|f| is_inside(f, &panel));
+            let where_it_is = focus
+                .as_ref()
+                .map(|f| f.type_().name().to_string())
+                .unwrap_or_else(|| "nothing at all".to_string());
+            let fired = focus.as_ref().map(escape_from).unwrap_or_default();
+            settle();
+            *seen.borrow_mut() = Some((inside, where_it_is, fired, win.visible_dialog().is_some()));
+        },
+    );
+    let (inside, where_it_is, fired, still_there) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if inside != Some(true) {
+        return Err(format!(
+            "a freshly presented panel must hold the keyboard, or Escape reaches nothing \
+             until the user clicks into it: the focus is on {where_it_is}"
+        ));
+    }
+    if still_there {
+        return Err(format!(
+            "Escape left the panel on screen; the shortcuts it reached were {fired:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The keyboard lands on the port field, not on the header bar.
+///
+/// A control of the case above rather than a repeat of it: "inside the
+/// panel" is what Escape needs, and it is satisfied just as well by the
+/// Cancel button, which would mean a freshly opened panel where typing does
+/// nothing and Return backs out. The panel's first act is typing a port, so
+/// that is where the keyboard starts.
+fn the_keyboard_starts_in_the_port_field() -> Result<(), String> {
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.InitialFocus",
+        move |app| {
+            let win = PortholeWindow::new_without_initial_load(app);
+            win.present();
+            let dialog = OpenDialog::for_port(9000);
+            dialog.present(Some(&*win));
+            settle();
+            let focus = gtk::prelude::GtkWindowExt::focus(&*win);
+            // The row itself is what this file's code names; what actually takes
+            // the keyboard is the `GtkText` libadwaita builds inside it, so the
+            // question is whether the focus sits under the row.
+            let row: gtk::Widget = dialog.port_row().clone().upcast();
+            let inside = focus.as_ref().map(|f| is_inside(f, &row));
+            let where_it_is = focus
+                .map(|f| f.type_().name().to_string())
+                .unwrap_or_else(|| "nothing at all".to_string());
+            *seen.borrow_mut() = Some((inside, where_it_is));
+        },
+    );
+    let (inside, where_it_is) = result.borrow_mut().take().ok_or("activation never ran")?;
+    if inside != Some(true) {
+        return Err(format!(
+            "a freshly opened panel must be ready to have a port typed into it, and the \
+             keyboard is on {where_it_is}"
+        ));
+    }
+    Ok(())
+}
+
+/// The panel says what it is, where a person reads it.
+///
+/// Both constructors have always called `set_title`, and until this
+/// milestone nothing rendered either: the dialog carried no header bar, so
+/// the title was what a screen reader announced and what a test could
+/// identify the dialog by, and a person saw a panel that did not say what it
+/// was. Every earlier assertion about these titles therefore proved which
+/// constructor had run and nothing about the screen.
+///
+/// This one looks for a **mapped label carrying that exact text** in the
+/// panel's own widget tree, which is the difference: it fails against a
+/// title that is set and drawn nowhere.
+fn each_panel_says_what_it_is_where_a_person_reads_it() -> Result<(), String> {
+    fn has_mapped_label(root: &gtk::Widget, text: &str) -> bool {
+        if let Some(label) = root.downcast_ref::<gtk::Label>() {
+            if label.text() == text && label.is_mapped() {
+                return true;
+            }
+        }
+        let mut child = root.first_child();
+        while let Some(w) = child {
+            if has_mapped_label(&w, text) {
+                return true;
+            }
+            child = w.next_sibling();
+        }
+        false
+    }
+
+    let result = Rc::new(RefCell::new(None));
+    let seen = result.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.TitleOnScreen",
+        move |app| {
+            let win = PortholeWindow::new_without_initial_load(app);
+            win.present();
+
+            let opening = OpenDialog::for_port(9000);
+            opening.present(Some(&*win));
+            settle();
+            let open_title = opening.dialog().title().to_string();
+            let open_rendered =
+                has_mapped_label(opening.dialog().clone().upcast_ref(), &open_title);
+            opening.dialog().close();
+            settle();
+
+            let forwarding = OpenDialog::for_forward(3000);
+            forwarding.present(Some(&*win));
+            settle();
+            let forward_title = forwarding.dialog().title().to_string();
+            let forward_rendered =
+                has_mapped_label(forwarding.dialog().clone().upcast_ref(), &forward_title);
+
+            *seen.borrow_mut() = Some((open_title, open_rendered, forward_title, forward_rendered));
+        },
+    );
+    let (open_title, open_rendered, forward_title, forward_rendered) =
+        result.borrow_mut().take().ok_or("activation never ran")?;
+    if open_title.is_empty() || forward_title.is_empty() {
+        return Err("fixture setup: a panel with no title cannot render one".to_string());
+    }
+    if !open_rendered {
+        return Err(format!(
+            "the panel sets the title {open_title:?} and draws it nowhere a person can read it"
+        ));
+    }
+    if !forward_rendered {
+        return Err(format!(
+            "the forwarding panel sets the title {forward_title:?} and draws it nowhere a \
+             person can read it"
+        ));
+    }
+    Ok(())
+}
+
 /// One named check, run by `main` below -- see `tests/window.rs`'s own
 /// `Case` alias for why this is a type alias rather than spelled out
 /// inline.
 type Case = (&'static str, fn() -> Result<(), String>);
 
 fn main() {
-    let cases: [Case; 26] = [
+    let cases: [Case; 31] = [
+        (
+            "the_close_button_dismisses_the_panel",
+            the_close_button_dismisses_the_panel,
+        ),
+        (
+            "cancel_dismisses_the_panel_and_opens_nothing",
+            cancel_dismisses_the_panel_and_opens_nothing,
+        ),
+        (
+            "escape_dismisses_the_panel_without_clicking_into_it_first",
+            escape_dismisses_the_panel_without_clicking_into_it_first,
+        ),
+        (
+            "the_keyboard_starts_in_the_port_field",
+            the_keyboard_starts_in_the_port_field,
+        ),
+        (
+            "each_panel_says_what_it_is_where_a_person_reads_it",
+            each_panel_says_what_it_is_where_a_person_reads_it,
+        ),
         (
             "the_duration_chips_are_the_five_fixed_ones_and_a_custom_field",
             the_duration_chips_are_the_five_fixed_ones_and_a_custom_field,
