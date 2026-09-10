@@ -1172,9 +1172,9 @@ mod tests {
     }
 
     // `helper_message` is the one piece of the close path with no GTK, no
-    // D-Bus connection and no async runtime in it -- and it is the property
-    // the brief calls most important ("do not re-word the helper's
-    // message"), so it is unit-tested directly rather than left to the
+    // D-Bus connection and no async runtime in it -- and it carries the
+    // property that matters most here, that the helper's own message is
+    // never re-worded, so it is unit-tested directly rather than left to the
     // untestable-without-a-live-helper rest of the close path. Same shape as
     // `porthole-cli/src/client.rs`'s own `method_error` helper, used there
     // to unit-test `from_dbus`'s identical verbatim pass-through.

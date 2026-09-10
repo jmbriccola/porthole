@@ -549,9 +549,10 @@ pub fn json_listening(services: &[Service], docker: Option<&[Published]>) -> Val
 ///   understated-risk bug `Binding::BeyondReach`'s own doc comment guards
 ///   against.
 /// - `LoopbackOnly` rows, labelled plainly: on an ordinary desktop these are
-///   usually the majority of the list (see `milestone-4-verified-facts.md`),
-///   and opening the firewall for one of them genuinely changes nothing,
-///   since the process is not listening on a network interface at all.
+///   usually the majority of the list -- six of the seven listening TCP
+///   sockets on the machine this was measured on -- and opening the firewall
+///   for one of them genuinely changes nothing, since the process is not
+///   listening on a network interface at all.
 pub fn print_listening(services: &[Service], docker: Option<&[Published]>) {
     print!("{}", render_listening(services, docker));
 }

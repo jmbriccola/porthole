@@ -1415,11 +1415,11 @@ mod tests {
 
     #[test]
     fn an_undetected_backend_reports_as_no_firewall_not_as_a_bare_error() {
-        // C1: `Porthole::status` used to `?`-propagate a `detect` failure
+        // `Porthole::status` used to `?`-propagate a `detect` failure
         // straight through `HelperError`, indistinguishable, on the one
         // client that exists today (the GUI), from "the helper itself
         // could not be reached" -- a confirmed "no firewall" collapsed into
-        // an absence of information, the milestone-3 defect run backwards.
+        // an absence of information.
         let error = Error::BackendUnavailable(
             "no firewall found: none of firewalld, ufw or nftables is installed. \
              Without a firewall this port is already reachable from your network."

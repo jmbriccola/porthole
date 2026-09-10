@@ -616,7 +616,7 @@ async fn no_announcement_is_lost_across_a_run_of_retirements() {
     }
 
     // Without this the whole loop would pass against a helper that never
-    // retired at all -- which is exactly how the spike's first attempt at this
+    // retired at all -- which is exactly how an earlier attempt at this
     // measurement reported a clean run: a crossing that did not happen counts
     // as a crossing survived. The number is a floor, not an expectation.
     let crossings = bus.activations();

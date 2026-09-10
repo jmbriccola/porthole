@@ -2587,10 +2587,10 @@ mod tests {
 
     #[test]
     fn open_succeeds_even_when_reconciliations_own_sweep_fails() {
-        // I2: named explicitly by the brief, and previously untested --
-        // FakeBackend could not fail list_rules or owned_rules, so changing
-        // Engine::reconcile to propagate a sweep failure with `?` instead of
-        // logging and continuing would have left every existing test green.
+        // Previously untested -- FakeBackend could not fail list_rules or
+        // owned_rules, so changing Engine::reconcile to propagate a sweep
+        // failure with `?` instead of logging and continuing would have left
+        // every existing test green.
         let harness = Harness::new();
         let backend = FakeBackend::new();
         backend.fail_list_rules();
@@ -2819,7 +2819,7 @@ mod tests {
     /// Two *different* containers publishing the same host port, each on a
     /// loopback address of its own -- `-p 127.0.0.1:3000:8080` on one and
     /// `-p 127.0.0.2:3000:8080` on the other. Docker allocates these
-    /// separately and allows both; the ledger's ruling that one host port
+    /// separately and allows both; the earlier assumption that one host port
     /// cannot hold two published mappings was wrong.
     ///
     /// Both survive `already_reachable`, which only rejects a non-loopback

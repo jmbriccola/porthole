@@ -626,10 +626,11 @@ fn closing_something_that_is_not_open_round_trips_its_exit_code() {
     ignore = "porthole-helper --session is debug-only, so a --release build has no helper to drive"
 )]
 fn the_helper_reconciles_at_startup_with_no_client_request_at_all() {
-    // Fix round 2, item 1: the spec's mandatory acceptance test is "open a
-    // port on ufw, reboot, verify it is closed". Nothing but a start-up
-    // sweep can make that true -- the helper is D-Bus activated, so nothing
-    // runs between a reboot and the first client request, and that request
+    // The acceptance test behind porthole's "nothing survives a reboot"
+    // promise is "open a port on ufw, reboot, verify it is closed". Nothing
+    // but a start-up sweep can make that true -- the helper is D-Bus
+    // activated, so nothing runs between a reboot and the first client
+    // request, and that request
     // may never come before the machine reboots again. This seeds a phantom
     // state entry (same shape as the one above) and starts the helper --
     // and only the helper, no client call of any kind -- to prove the entry

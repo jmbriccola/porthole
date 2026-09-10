@@ -768,9 +768,9 @@ mod tests {
     fn a_signal_for_another_user_is_ignored() {
         // The system bus broadcasts to every agent on the machine. Notifying
         // a second user about the first user's ports is noise, and hands
-        // them a `Reopen` for a rule that is not theirs. The brief called it
-        // a leak as well; `list` is authorized for every user, so it is not
-        // one.
+        // them a `Reopen` for a rule that is not theirs. It is not a leak,
+        // though it looks like one: `list` is authorized for every user, so
+        // what a second user would be shown is already theirs to read.
         assert!(should_notify(&signal_from_uid(1000), 1000));
         assert!(!should_notify(&signal_from_uid(1001), 1000));
     }

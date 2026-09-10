@@ -257,14 +257,15 @@ impl FirewallBackend for Firewalld<'_> {
     /// `the_lan_reaches_the_container_through_the_forward_hook_and_only_on_the_port_it_was_given`
     /// counts **zero packets addressed to the external port** at the input
     /// hook while the forward hook carries the connection. That is the first
-    /// bullet above, on this same design rather than on a spike's throwaway
-    /// one, and it is the half that matters for whether an accept in a zone's
-    /// input chain could be carrying anything.
+    /// bullet above, on this same design rather than on the throwaway one it
+    /// was first measured against, and it is the half that matters for
+    /// whether an accept in a zone's input chain could be carrying anything.
     ///
-    /// The second and third bullets are the spike's alone. Nothing committed
-    /// compares packet counters with and without the accept, and nothing
-    /// committed binds a host service to `0.0.0.0` to show the accept
-    /// exposing it. One committed test does write an accept beside a
+    /// The second and third bullets rest on that first measurement alone.
+    /// Nothing committed compares packet counters with and without the
+    /// accept, and nothing committed binds a host service to `0.0.0.0` to
+    /// show the accept exposing it. One committed test does write an accept
+    /// beside a
     /// redirect — `a_redirect_rich_rule_renders_to_a_dnat_and_no_filter_rule`
     /// adds it as the control that makes its first assertion mean something —
     /// but it sends no packet and nothing listens behind that port, so it

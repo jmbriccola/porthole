@@ -53,9 +53,9 @@ fn activate<F: FnOnce(&adw::Application) + 'static>(app_id: &str, f: F) {
 }
 
 /// A `Service` as `porthole_core::listening::scan` would produce one, with
-/// an address consistent with `binding` -- the same fixture shape the
-/// task's own brief specifies, so a reader comparing this file to the brief
-/// can tell they match.
+/// an address consistent with `binding`: loopback for `LoopbackOnly`, the
+/// wildcard for `AllInterfaces`, the address itself for the other two. No
+/// test here asserts against a `Service` that could not exist.
 fn svc(port: u16, process: Option<&str>, binding: Binding) -> Service {
     let address = match binding {
         Binding::LoopbackOnly => IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -560,7 +560,7 @@ fn a_scan_failure_does_not_render_as_the_calm_empty_state() -> Result<(), String
     Ok(())
 }
 
-/// Fix round 2, item 1: the actual bug. `refresh` (`window.rs`) runs the
+/// The actual bug this guards against. `refresh` (`window.rs`) runs the
 /// `/proc` scan and the helper's `list`/`status` round trip as two
 /// independent futures, and a scan failure calling `set_scan_failed`
 /// followed by a *successful* helper fetch calling `set_open_ports` is the
