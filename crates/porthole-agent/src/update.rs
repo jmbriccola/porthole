@@ -173,7 +173,13 @@ pub fn update_succeeded_notice() -> Notification {
 /// that the three that are not "there is an update" are answered the same
 /// way: with nothing on screen. A daily check that announced "porthole could
 /// not find out" every day would be a daily interruption reporting no news.
-/// The journal still records each of them.
+///
+/// The journal records each of them, and that is the caller's doing rather
+/// than this function's: `crate::check_for_an_update` writes one line per
+/// verdict before it ever gets here. It matters most for the verdict that
+/// never becomes a notification and never goes away -- on a Debian or Arch
+/// machine `NoContract` is the permanent answer, and without that line the
+/// daily check would be invisible as well as inert.
 pub fn notice_for(install: &Install, verdict: &Verdict, packagekit: bool) -> Option<Notification> {
     let Install::Packaged(packaging) = install else {
         return None;

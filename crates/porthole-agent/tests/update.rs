@@ -57,6 +57,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use porthole_core::ipc::{PATH as HELPER_PATH, PROTOCOL_VERSION, SERVICE as HELPER_SERVICE};
+use porthole_core::update::{Consent, Settings};
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
@@ -155,6 +156,26 @@ impl Drop for Agent {
     }
 }
 
+/// Where `sleep` is, resolved on **this** process's `PATH`.
+///
+/// The stubs run with `PATH` set to the stub directory alone, so they may use
+/// shell builtins and nothing else -- and no builtin waits. `sleep` is
+/// therefore called from a stub by absolute path, found here, where a normal
+/// `PATH` still exists.
+fn sleep_binary() -> String {
+    let out = Command::new("sh")
+        .args(["-c", "command -v sleep"])
+        .output()
+        .expect("a shell to find `sleep` with");
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(
+        !path.is_empty(),
+        "no `sleep` on this machine's PATH, and a slow stub is how a test gets to act \
+         while a check is still in flight"
+    );
+    path
+}
+
 /// Everything one test's filesystem needs: a directory of stub package
 /// managers and a settings file of this test's own.
 struct Fixture {
@@ -218,6 +239,48 @@ impl Fixture {
         self.stub("rpm", &format!("echo rpm >> '{marker}'\nexit 0"));
         // dnf5-check-upgrade(8): "DNF5 will exit with code 100 if updates are
         // available and list them; 0 if no updates are available."
+        self.stub(
+            "dnf",
+            &format!(
+                "echo dnf >> '{marker}'\n\
+                 echo 'porthole.x86_64    0.2.0-1.fc44    porthole'\n\
+                 exit 100"
+            ),
+        );
+    }
+
+    /// A Debian-packaged machine: `dpkg-query` claims porthole's binary, and
+    /// there is no `rpm` on the stub `PATH` at all, so the ownership question
+    /// reaches dpkg the way it would on a real one.
+    ///
+    /// No update stub of any kind, because none is ever run: apt documents no
+    /// exit code meaning "an update is available", so the verdict is
+    /// `NoContract` and porthole asks nothing further. That is the permanent
+    /// state of every Debian and Arch machine, which is why it is worth a
+    /// test of its own.
+    fn a_dpkg_machine(&self) {
+        let marker = self.marker().display().to_string();
+        // dpkg-query(1): 0 is "the requested query was successfully
+        // performed", which for `-S` is the package that owns the file.
+        self.stub(
+            "dpkg-query",
+            &format!("echo dpkg-query >> '{marker}'\necho 'porthole: /usr/bin/porthole'\nexit 0"),
+        );
+    }
+
+    /// The same machine, with an `rpm` that takes `seconds` to answer.
+    ///
+    /// It records that it ran **before** sleeping, so the marker appearing
+    /// means the check has *started* rather than finished -- which is what
+    /// lets a test do something while the check is genuinely in flight,
+    /// rather than guessing at a window with a bare sleep of its own.
+    fn a_slow_rpm_machine_with_an_update(&self, seconds: &str) {
+        let marker = self.marker().display().to_string();
+        let sleep = sleep_binary();
+        self.stub(
+            "rpm",
+            &format!("echo rpm >> '{marker}'\n'{sleep}' {seconds}\nexit 0"),
+        );
         self.stub(
             "dnf",
             &format!(
@@ -678,4 +741,140 @@ async fn without_consent_the_package_manager_is_never_even_run() {
 
     assert!(agent.is_running(), "{}", agent.journal());
     assert!(second.is_running(), "{}", second.journal());
+}
+
+#[tokio::test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "PORTHOLE_UPDATE_FILE and PORTHOLE_UPDATE_INTERVAL_MS are honoured in debug builds only, so a --release binary reads the invoking user's own settings and waits ninety seconds for a check this test does not wait for"
+)]
+async fn a_packaging_that_documents_no_exit_code_says_so_in_the_journal() {
+    // The state a consenting Debian or Arch machine is in **permanently**:
+    // apt and pacman document no exit code meaning "an update is available",
+    // so the check reaches `NoContract` every day and, by design, puts
+    // nothing on screen -- a daily "could not find out" would be a daily
+    // interruption reporting no news.
+    //
+    // What it must not be is *invisible* as well as inert. Without the
+    // journal line, such a machine spawns `dpkg-query` daily forever, shows
+    // nothing, logs nothing, and the first question anyone debugging it would
+    // ask -- why do I never see an update? -- has no answer anywhere on the
+    // machine.
+    let fixture = Fixture::new();
+    fixture.consent("yes");
+    fixture.a_dpkg_machine();
+
+    let bus = Bus::start();
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let _notifications = serve_notifications(&bus, shown.clone(), 44).await;
+    let _helper = serve_helper(&bus, Arc::new(Mutex::new(Vec::new()))).await;
+    let _packagekit = serve_packagekit(
+        &bus,
+        vec![PORTHOLE_ID.to_string()],
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .await;
+
+    let mut agent = fixture.start_agent(&bus, 150);
+    let journal = until("the check to report what it could not find out", || {
+        let journal = agent.journal();
+        journal
+            .contains("did not find out whether an update is available")
+            .then_some(journal)
+    })
+    .await;
+
+    // And the line carries the reason, naming the documentation, rather than
+    // a bare "could not find out" that sends the reader nowhere.
+    assert!(
+        journal.contains("apt-get(8)"),
+        "the journal line has to say why, and name what says so: {journal}"
+    );
+    // The package manager really was asked -- so this is the answer to a
+    // question that was put, not a line printed instead of asking.
+    assert!(
+        fixture.runs() > 0,
+        "dpkg-query was never run, so nothing established the packaging at all"
+    );
+    // Nothing on screen, which is the other half of the design's decision.
+    assert!(
+        update_notices(&shown).is_empty(),
+        "a packaging that cannot answer must not produce a notification: {:?}",
+        update_notices(&shown)
+    );
+    assert!(agent.is_running(), "{journal}");
+}
+
+#[tokio::test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "PORTHOLE_UPDATE_FILE and PORTHOLE_UPDATE_INTERVAL_MS are honoured in debug builds only, so a --release binary reads the invoking user's own settings and waits ninety seconds for a check this test does not wait for"
+)]
+async fn a_consent_withdrawn_while_a_check_is_in_flight_is_not_reverted() {
+    // The one setting porthole may not own. A check reads the settings before
+    // it starts asking package managers, and the asking can take seconds --
+    // this file's own stubs make that literal. If what it wrote afterwards
+    // were the copy it read before, a `porthole update --disable` issued
+    // inside that window would be reverted to `yes`, silently and for good,
+    // and the daily checks would carry on against an instruction the person
+    // had just given.
+    let fixture = Fixture::new();
+    fixture.consent("yes");
+    fixture.a_slow_rpm_machine_with_an_update("2");
+
+    let bus = Bus::start();
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let _notifications = serve_notifications(&bus, shown.clone(), 33).await;
+    let _helper = serve_helper(&bus, Arc::new(Mutex::new(Vec::new()))).await;
+    let _packagekit = serve_packagekit(
+        &bus,
+        vec![PORTHOLE_ID.to_string()],
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .await;
+
+    let mut agent = fixture.start_agent(&bus, 150);
+    until("the agent to start listening", || {
+        agent.journal().contains("listening for uid").then_some(())
+    })
+    .await;
+
+    // The check is now genuinely in flight: `rpm` has recorded itself and is
+    // sleeping, and the agent read the settings before it spawned it.
+    until("the check to be in flight", || {
+        (fixture.runs() > 0).then_some(())
+    })
+    .await;
+
+    // Exactly what `porthole update --disable` writes, through the same type
+    // it writes it with -- not a hand-rolled file, so a change to how consent
+    // is stored reaches this test rather than going round it.
+    let mut withdrawn = Settings::load(&fixture.settings());
+    withdrawn.set_consent(Consent::No);
+    withdrawn.save(&fixture.settings()).expect("writable");
+    assert_eq!(
+        Settings::load(&fixture.settings()).consent(),
+        Consent::No,
+        "the withdrawal has to have landed before the check finishes, or this test is \
+         about nothing"
+    );
+
+    // Long enough for the sleeping `rpm` to answer, the check to finish and
+    // do whatever it does with its answer, and another tick to come round.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    assert_eq!(
+        Settings::load(&fixture.settings()).consent(),
+        Consent::No,
+        "a check that was already running wrote back the consent it had read before it \
+         started, reverting an answer the person gave while it ran"
+    );
+    // And it said nothing either: the answer arrived after the question
+    // stopped being one porthole had leave to ask.
+    assert!(
+        update_notices(&shown).is_empty(),
+        "consent was withdrawn while the check ran, and it announced anyway: {:?}",
+        update_notices(&shown)
+    );
+    assert!(agent.is_running(), "{}", agent.journal());
 }

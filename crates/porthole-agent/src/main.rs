@@ -994,9 +994,16 @@ async fn check_for_an_update(
         keep_checking: true,
     };
 
+    // Read, checked, and deliberately **not kept**. Whatever this says is
+    // stale by the time the blocking work below finishes, so the copy that
+    // eventually gets written is re-read after it -- see the merge further
+    // down, which is the whole of what stops a check in flight overwriting an
+    // answer a person gave while it was running.
     let path = core_update::default_path();
-    let mut settings = core_update::Settings::load(&path);
-    if !settings.consent().permits_checking() {
+    if !core_update::Settings::load(&path)
+        .consent()
+        .permits_checking()
+    {
         return unchanged(on_screen);
     }
 
@@ -1055,6 +1062,56 @@ async fn check_for_an_update(
         }
         return unchanged(on_screen);
     };
+
+    // What the check found, in the journal, whatever it found.
+    //
+    // Three of the four verdicts put nothing on screen -- a daily "porthole
+    // could not find out" would be a daily interruption reporting no news --
+    // and until this existed they left no trace anywhere else either. On a
+    // Debian or Arch machine `NoContract` is not a passing state but the
+    // permanent one, so a consenting user's agent ran a package manager every
+    // day forever, showed nothing, and logged nothing: the feature was not
+    // merely inert on two packagings out of three, it was *invisibly* inert,
+    // and the first question anyone debugging it would ask had no answer on
+    // the machine. One line is what makes that legible.
+    match &verdict {
+        // Announced below, if it is news, with a line of its own.
+        core_update::Verdict::Available { .. } => {}
+        core_update::Verdict::UpToDate => eprintln!(
+            "porthole-agent: porthole is up to date as far as this machine's package \
+             manager knows"
+        ),
+        core_update::Verdict::NoContract(reason) | core_update::Verdict::Unknown(reason) => {
+            eprintln!("porthole-agent: did not find out whether an update is available: {reason}")
+        }
+    }
+
+    // **Re-read, and merge only `announced`.**
+    //
+    // The settings read before the blocking work are stale by seconds -- this
+    // function's own doc says `dnf check-update` can spend them refreshing
+    // metadata -- and saving that copy back would carry the **consent** field
+    // with it. A `porthole update --disable` issued inside that window would
+    // be reverted to `yes`, silently, permanently, with the daily checks
+    // carrying on.
+    //
+    // Every other value in this file porthole may reasonably own. This one it
+    // may not: the whole reason consent exists as a stored answer is that a
+    // person and not a program decided it, and overwriting it with a stale
+    // copy is porthole overriding the one instruction whose entire purpose is
+    // to be the user's. So nothing read before the blocking work is ever
+    // written after it.
+    let mut settings = core_update::Settings::load(&path);
+    if !settings.consent().permits_checking() {
+        // Withdrawn while this check was in flight. Nothing is written and
+        // nothing is shown: the answer arrived after the question stopped
+        // being one porthole had been given leave to ask.
+        eprintln!(
+            "porthole-agent: update checks were turned off while this check was running, so \
+             nothing is said about what it found and nothing is written down"
+        );
+        return unchanged(on_screen);
+    }
 
     // Once per version, not once per check -- and the record is only written
     // when it actually moved, so an unchanged answer costs no daily write.
