@@ -27,4 +27,5 @@ pub mod model;
 pub mod net;
 pub mod reconcile;
 pub mod state;
+pub mod update;
 pub mod validate;
