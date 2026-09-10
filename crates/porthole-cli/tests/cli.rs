@@ -325,6 +325,13 @@ fn an_out_of_range_port_exits_two_and_says_the_range() {
     assert!(stderr(&out).contains("1-65535"), "got: {}", stderr(&out));
 }
 
+/// The refusal names the ceiling and the lifetime beyond it.
+///
+/// "until reboot" and not "`--until-reboot`": the same `porthole-core`
+/// message is shown in the GUI's custom-duration field, where a flag is an
+/// instruction the reader has no command line to type it on. The flag is
+/// still what this surface takes, and `porthole open --help` is where it is
+/// spelled.
 #[test]
 fn a_duration_over_eight_hours_exits_two_and_points_at_until_reboot() {
     let dir = TempDir::new().unwrap();
@@ -332,7 +339,7 @@ fn a_duration_over_eight_hours_exits_two_and_points_at_until_reboot() {
     assert_eq!(code(&out), 2);
     let message = stderr(&out);
     assert!(message.contains("8 hours"), "got: {message}");
-    assert!(message.contains("--until-reboot"), "got: {message}");
+    assert!(message.contains("until reboot"), "got: {message}");
 }
 
 #[test]
