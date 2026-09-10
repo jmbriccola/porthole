@@ -225,9 +225,12 @@ async fn answered<T>(proxy: &PortholeProxy<'_>, outcome: zbus::Result<T>) -> Res
 }
 
 /// [`answered`], plus **one** retry when the first call is one to ask again
-/// rather than report -- [`porthole_core::ipc::worth_asking_again`], which is
-/// where the two names and what a retry can and cannot promise are written
-/// down, because every component that talks this interface meets them.
+/// rather than report -- [`porthole_core::ipc::once_more_if_worth_asking_again`],
+/// which is where the retry itself now lives, with the two names it turns on
+/// and what a second call can and cannot promise, because every component
+/// that talks this interface meets them. It started here, as this function's
+/// own private helper; `porthole-agent` and `porthole-gui` now call the same
+/// one rather than a second and a third copy of it.
 ///
 /// This is a defect fixed in its own right, not a piece of any shutdown
 /// sequence: a helper that is restarted by a package upgrade, killed by an
@@ -236,45 +239,20 @@ async fn answered<T>(proxy: &PortholeProxy<'_>, outcome: zbus::Result<T>) -> Res
 /// not reach — sending a person to `porthole doctor`, to `systemctl status`
 /// and to the bus, none of which will find anything wrong.
 ///
-/// **One retry, and never more.** Two calls are what a person does by hand
-/// after reading that sentence, and this makes the second one automatic; a
-/// loop would turn a helper that dies on every request into a client that
-/// hangs instead of one that reports.
-///
-/// **What the second call cannot promise, stated plainly.** `NoReply` means
-/// the reply was lost, not that the request was: a first `open` that took
-/// effect and then lost its reply is answered by the retry with
-/// `AlreadyOpen`, and a first `close` the same way with `RuleNotFound`. That
-/// is not a regression — it is precisely what the person re-running the
-/// command by hand gets today — and in both cases the message describes the
-/// state the machine is actually in. `close --all` is the one where the
-/// second answer is *quieter* than the truth (an empty list, because the
-/// first call had already closed everything), and it is quieter in exactly
-/// the same way for the hand-run second command.
+/// What this adds on top of the shared retry is the classification: whatever
+/// the second attempt says goes through [`from_call`], so a `close --all`
+/// whose second answer is a real refusal still carries the helper's own words
+/// and the exit code milestone 1 documented.
 async fn answered_after_one_retry<T, F, Fut>(proxy: &PortholeProxy<'_>, call: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = zbus::Result<T>>,
 {
-    answered(proxy, once_more_if_worth_asking_again(call).await).await
-}
-
-/// The retry itself, with no proxy and no classification in it, so what it
-/// decides is testable without a bus: `call` once, and exactly once more if
-/// the first attempt was [`porthole_core::ipc::worth_asking_again`].
-///
-/// Whatever the second attempt says is the answer, including a second
-/// `NoReply` — a helper that dies on every request must report, not be asked
-/// forever.
-async fn once_more_if_worth_asking_again<T, F, Fut>(mut call: F) -> zbus::Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = zbus::Result<T>>,
-{
-    match call().await {
-        Err(e) if porthole_core::ipc::worth_asking_again(&e) => call().await,
-        first => first,
-    }
+    answered(
+        proxy,
+        porthole_core::ipc::once_more_if_worth_asking_again(call).await,
+    )
+    .await
 }
 
 /// A wire rule as the local types, so the CLI's renderers are unchanged.
@@ -660,82 +638,6 @@ mod tests {
             ExitCode::VersionMismatch
         );
         assert_eq!(ExitCode::VersionMismatch as i32, 15);
-    }
-
-    /// The error a bus daemon sends when the process that was going to answer
-    /// a pending call went away before it did. Spelled as the literal name and
-    /// the literal detail rather than built from a constant in the code under
-    /// test, because it is the wire's wording and not porthole's.
-    fn nobody_answered_error() -> zbus::Error {
-        method_error(
-            "org.freedesktop.DBus.Error.NoReply",
-            "Remote peer disconnected",
-        )
-    }
-
-    #[tokio::test]
-    async fn a_call_nobody_answered_is_made_exactly_once_more() {
-        use std::cell::Cell;
-
-        // Served on the second attempt: the whole point. A helper that has
-        // just retired is activated afresh by this very call.
-        let attempts = Cell::new(0u32);
-        let served = once_more_if_worth_asking_again(|| {
-            attempts.set(attempts.get() + 1);
-            let n = attempts.get();
-            async move {
-                if n == 1 {
-                    Err(nobody_answered_error())
-                } else {
-                    Ok(7u32)
-                }
-            }
-        })
-        .await;
-        assert_eq!(served.unwrap(), 7);
-        assert_eq!(attempts.get(), 2, "one retry, and it was taken");
-
-        // Once more and never again: a helper that dies on every request has
-        // to report, not turn the client into something that keeps asking.
-        let attempts = Cell::new(0u32);
-        let gave_up = once_more_if_worth_asking_again(|| {
-            attempts.set(attempts.get() + 1);
-            async { Err::<u32, _>(nobody_answered_error()) }
-        })
-        .await;
-        assert!(porthole_core::ipc::worth_asking_again(
-            &gave_up.expect_err("both attempts found nobody")
-        ));
-        assert_eq!(attempts.get(), 2, "exactly two, not a loop");
-
-        // The negative control on the retry itself: a decision the helper
-        // made is not asked a second time. Without this, a retried `open`
-        // whose refusal was a real refusal would charge a second polkit
-        // prompt, and a retried `close --all` would report an empty second
-        // answer over a first one that had closed something.
-        let attempts = Cell::new(0u32);
-        let refused = once_more_if_worth_asking_again(|| {
-            attempts.set(attempts.get() + 1);
-            async {
-                Err::<u32, _>(method_error(
-                    "com.jacopobriccola.Porthole.NotAuthorized",
-                    "denied by policy",
-                ))
-            }
-        })
-        .await;
-        assert!(refused.is_err());
-        assert_eq!(attempts.get(), 1, "an answer must not be asked for twice");
-
-        // And a first call that simply worked is one call.
-        let attempts = Cell::new(0u32);
-        let plain = once_more_if_worth_asking_again(|| {
-            attempts.set(attempts.get() + 1);
-            async { Ok::<u32, zbus::Error>(1) }
-        })
-        .await;
-        assert_eq!(plain.unwrap(), 1);
-        assert_eq!(attempts.get(), 1);
     }
 
     #[test]
