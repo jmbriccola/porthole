@@ -257,6 +257,68 @@ pub fn stale_agent_notice() -> Notification {
     }
 }
 
+/// The D-Bus error name a helper answers with when the port a request names
+/// is already open.
+///
+/// Spelled here because [`reopen_outcome`] has to tell that answer from every
+/// other refusal, and the name is what says which it is. The authority is
+/// `porthole_helper::error::HelperError::AlreadyOpen`, which derives this
+/// exact string from its own variant name through zbus's `prefix` attribute;
+/// `porthole-cli`'s `client.rs` matches the same name for the same reason.
+/// Nothing in either file makes a rename fail to compile, so
+/// `an_already_open_answer_is_not_reported_as_a_failure_to_reopen` builds the
+/// error the way the wire delivers one and checks the two halves against each
+/// other.
+const ALREADY_OPEN_ERROR: &str = "com.jacopobriccola.Porthole.AlreadyOpen";
+
+/// What to put on screen when a `Reopen` click did not come back with a rule.
+///
+/// **Not always a failure, and that is the whole of why this is a function.**
+/// The click sends `open` (or `forward`) again, and one of the answers it can
+/// get back is the helper's own `AlreadyOpen` -- whose message says, in the
+/// helper's words, that the port is open and who it is open towards. Heading
+/// that with "Could not reopen port 5173/tcp" tells a person the opposite of
+/// what the sentence underneath it tells them, about a machine where the
+/// thing they asked for is true.
+///
+/// Two ways in, and the retry this branch added makes the first of them
+/// reachable where it was not before:
+///
+/// - the first `open` **took effect and lost its reply** -- a helper killed
+///   mid-request by an upgrade or a crash -- and the retry
+///   (`porthole_core::ipc::once_more_if_worth_asking_again`) is answered by
+///   the state that first call created. Not reachable through a retirement:
+///   an instance with a request in flight cannot decide to retire at all
+///   (`porthole_helper::retire::Retirement::claim` refuses while
+///   `in_flight != 0`);
+/// - the port was **already open before the click**, because something else
+///   opened it while the notification sat on screen. That was always
+///   possible, and it read exactly as wrongly.
+///
+/// **What this does not do is call it a success.** `AlreadyOpen` says that
+/// port is open; it does not say the rule this notification was about is
+/// back, and it cannot -- the message names the target it found, which may
+/// not be the one that closed. So the notification states what the helper
+/// answered and leaves the person to read it, rather than claiming a
+/// restoration nothing here confirmed. That is the same rule the row in
+/// `porthole-gui` follows about a deadline it cannot confirm.
+pub fn reopen_outcome(rule: &WireRule, error: &zbus::Error) -> Notification {
+    let port = format!("{}/{}", rule.port, rule.protocol);
+    let already_open = matches!(
+        error,
+        zbus::Error::MethodError(name, ..) if name.as_str() == ALREADY_OPEN_ERROR
+    );
+    Notification {
+        summary: if already_open {
+            format!("Port {port} is already open")
+        } else {
+            format!("Could not reopen port {port}")
+        },
+        body: format!("{error}"),
+        actions: Vec::new(),
+    }
+}
+
 /// What to say when this agent cannot read what the helper sends, and is
 /// therefore stopping rather than announcing nothing.
 ///
@@ -360,6 +422,102 @@ mod tests {
             container_port: 0,
             published_port: 0,
         }
+    }
+
+    /// One D-Bus error as the wire delivers it, so what is matched on is the
+    /// shape a client really meets and not a string.
+    fn method_error(name: &str, detail: &str) -> zbus::Error {
+        zbus::Error::MethodError(
+            zbus::names::OwnedErrorName::try_from(name.to_string()).unwrap(),
+            Some(detail.to_string()),
+            zbus::message::Message::method_call("/", "Noop")
+                .unwrap()
+                .build(&())
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn an_already_open_answer_is_not_reported_as_a_failure_to_reopen() {
+        // The headline said the click had failed while the sentence under it
+        // said, in the helper's own words, that the port was open. Two ways
+        // to reach it, and the retry this branch added makes the first
+        // reachable: an `open` that took effect and lost its reply, and a
+        // port something else opened while the notification sat on screen.
+        let already_open = reopen_outcome(
+            &closed_rule(5173, "tcp"),
+            &method_error(
+                ALREADY_OPEN_ERROR,
+                "5173/tcp is already open (open towards 10.10.10.0/24)",
+            ),
+        );
+        assert!(
+            !already_open.summary.contains("Could not"),
+            "the port is open and this says it is not: {already_open:?}"
+        );
+        assert!(
+            already_open.summary.contains("5173/tcp"),
+            "{already_open:?}"
+        );
+        assert!(
+            already_open.body.contains("already open"),
+            "the helper's own sentence is what says what is true, verbatim: \
+             {already_open:?}"
+        );
+        // And it stops there: `AlreadyOpen` names the target it found, which
+        // need not be the one that closed, so nothing here says the rule is
+        // back.
+        assert!(
+            !already_open.summary.contains("Reopened"),
+            "nothing has confirmed the rule this notification was about: {already_open:?}"
+        );
+
+        // The negative control, and the reason this is a match on a name
+        // rather than on anything in the text: every other answer is still a
+        // failure to reopen and still says so.
+        for (name, detail) in [
+            (
+                "com.jacopobriccola.Porthole.NotAuthorized",
+                "not authorized: com.jacopobriccola.Porthole.Open",
+            ),
+            (
+                "com.jacopobriccola.Porthole.NoNetwork",
+                "this machine is not on a usable network",
+            ),
+            (
+                // A near miss, because the match is on the whole name.
+                "com.jacopobriccola.Porthole.AlreadyReachable",
+                "the container is already reachable",
+            ),
+            (
+                "org.freedesktop.DBus.Error.NoReply",
+                "Remote peer disconnected",
+            ),
+        ] {
+            let failed = reopen_outcome(&closed_rule(5173, "tcp"), &method_error(name, detail));
+            assert!(
+                failed.summary.contains("Could not reopen port 5173/tcp"),
+                "{name} is a failure to reopen: {failed:?}"
+            );
+            assert!(failed.body.contains(detail), "{failed:?}");
+        }
+
+        // And an error that is not a `MethodError` at all -- nothing
+        // answered, or the answer could not be read.
+        let lost = reopen_outcome(
+            &closed_rule(8443, "udp"),
+            &zbus::Error::Failure("the connection was lost".to_string()),
+        );
+        assert!(
+            lost.summary.contains("Could not reopen port 8443/udp"),
+            "{lost:?}"
+        );
+
+        // No button on any of them: a notification the agent shows about a
+        // click it could not carry out has nothing useful to offer a second
+        // click.
+        assert!(already_open.actions.is_empty());
+        assert!(lost.actions.is_empty());
     }
 
     /// The only kind of rule `TargetGone` is ever sent for: one that

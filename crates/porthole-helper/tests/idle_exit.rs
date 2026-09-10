@@ -523,6 +523,18 @@ async fn no_announcement_is_lost_across_a_run_of_retirements() {
     // The grace is short and the sleep between calls sweeps a range wider than
     // it, so calls land before, during and after retirements rather than at one
     // fixed offset from them.
+    //
+    // **What this arm does not measure is the client retry**, and the number
+    // it prints at the end is what says so: an ordinary run reports `0
+    // retried` across a dozen or more real retirements. The window in which a
+    // call is refused is the time a `ReleaseName` takes to travel to the bus
+    // daemon and back, and a phase sweep does not land in it. So this proves
+    // that no announcement is lost across crossings; it proves nothing about
+    // asking again, and no claim anywhere should rest on it. Entering that
+    // window on purpose is what `PORTHOLE_IDLE_PRERELEASE_MS` is for -- see
+    // `a_request_that_races_the_decision_to_retire_is_refused_rather_than_served`
+    // below, and `porthole-agent/tests/retirement.rs`, which count refusals
+    // rather than hope for them.
     const ROUNDS: u16 = 40;
     let bus = Bus::start(150, 50);
     let proxy = bus.proxy().await;
@@ -536,22 +548,35 @@ async fn no_announcement_is_lost_across_a_run_of_retirements() {
             recorded(port, "a rule the firewall lost"),
         );
 
-        // Exactly what `porthole-cli` does: one call, and one retry on the two
-        // failures a fresh instance can turn into service. A third kind of
-        // failure, or a second failure on the retry, fails the test.
-        let closed = match proxy.close_all().await {
-            Ok(v) => v,
-            Err(e) if porthole_core::ipc::worth_asking_again(&e) => {
-                retried += 1;
-                proxy.close_all().await.unwrap_or_else(|e| {
-                    panic!("round {round}: the retry failed too: {e}\n{}", bus.log())
-                })
-            }
-            Err(e) => panic!(
-                "round {round}: a failure no client can do anything about: {e}\n{}",
+        // Exactly what every porthole client does, through the one function
+        // all three of them call: one call, and one retry on the two failures
+        // a fresh instance can turn into service. Not a second copy of that
+        // decision written out here -- `porthole_core::ipc::
+        // once_more_if_worth_asking_again` is the copy, and this is the only
+        // place in the workspace that drives it against retirements that are
+        // really happening.
+        //
+        // Counted, so the arm can say how often the window was actually
+        // entered; a run in which nothing was ever retried would be a run
+        // whose crossings all fell between calls.
+        let attempts = std::cell::Cell::new(0usize);
+        let closed = porthole_core::ipc::once_more_if_worth_asking_again(|| {
+            attempts.set(attempts.get() + 1);
+            proxy.close_all()
+        })
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "round {round}: {}: {e}\n{}",
+                if attempts.get() > 1 {
+                    "the retry failed too"
+                } else {
+                    "a failure no client can do anything about"
+                },
                 bus.log()
-            ),
-        };
+            )
+        });
+        retried += attempts.get() - 1;
         assert!(closed.0.is_empty(), "the sweep had already dropped it");
 
         // The announcement for *this* round, from whichever instance served
@@ -601,9 +626,15 @@ async fn no_announcement_is_lost_across_a_run_of_retirements() {
          retired and this test measured almost nothing:\n{}",
         bus.log()
     );
+    // `{retried}` is ordinarily 0, and that is not a defect in either the
+    // helper or the retry -- see this test's own opening comment. It is
+    // printed rather than asserted for the same reason `crossings` is
+    // asserted rather than printed: one of the two says whether the test
+    // measured anything, and the other does not.
     eprintln!(
-        "{ROUNDS} rounds across {crossings} helper instances, {retried} retried, \
-         0 announcements lost"
+        "{ROUNDS} rounds across {crossings} helper instances, {retried} retried \
+         (0 is the ordinary result -- this arm does not enter the refusal \
+         window), 0 announcements lost"
     );
 }
 

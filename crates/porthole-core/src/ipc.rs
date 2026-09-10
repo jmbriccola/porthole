@@ -771,16 +771,110 @@ pub const NO_REPLY_ERROR: &str = "org.freedesktop.DBus.Error.NoReply";
 /// helper that sent it did not act.
 ///
 /// Here rather than in `porthole-cli`, where it started, because every
-/// component that talks this interface meets the same two names: the CLI
-/// retries on it today, and `porthole-agent` and `porthole-gui` each hold a
-/// proxy of their own. Two spellings of one wire fact is how a repair
-/// survives in one component and rots in the others.
+/// component that talks this interface meets the same two names, and all
+/// three now ask again on them through
+/// [`once_more_if_worth_asking_again`] below. Two spellings of one wire fact
+/// is how a repair survives in one component and rots in the others -- which
+/// is not hypothetical here: for the length of one branch this predicate lived
+/// in this module *so that* the other two could use it, and they did not, so
+/// the CLI recovered from a retirement and the agent and the GUI each reported
+/// one as trouble of a different kind.
 pub fn worth_asking_again(e: &zbus::Error) -> bool {
     matches!(
         e,
         zbus::Error::MethodError(name, ..)
             if name.as_str() == NO_REPLY_ERROR || name.as_str() == RETIRING_ERROR
     )
+}
+
+/// Make `call`, and make it **exactly once more** when the first attempt was
+/// one to [`worth_asking_again`] about. Whatever the second attempt says is
+/// the answer, including a second failure of the same kind.
+///
+/// # What the second call costs, and under what conditions it was measured
+///
+/// Stated here once, and pointed at from everywhere else that argues from it,
+/// because this project has **two** numbers for a cold activation and they
+/// differ by one commit rather than by a mistake.
+///
+/// - **Warm** -- an instance already running, which is what a retry meets when
+///   it arrives during a drain: 22-31 ms, measured in a container.
+/// - **Cold** -- the bus starting a fresh process: **248-260 ms**, five
+///   activations in a container, *after* `5d5b39c` stopped running the
+///   start-up reconciliation sweep when it could only answer "nothing". The
+///   **642 ms** quoted by `porthole_helper::retire::GRACE` and
+///   `porthole_helper::main::reconcile_at_startup` is the same measurement
+///   *before* that change, ~515 ms of it firewalld's Python CLI running that
+///   sweep. Both are real; they are one quantity on either side of one commit,
+///   and a reader who meets them unlabelled trusts whichever they saw first.
+/// - **On a real desktop, neither** -- nobody has measured it. Extrapolating
+///   from this machine's own read-only `firewall-cmd` probes gives ~0.47 s
+///   after that commit against ~0.99 s before it, and the design
+///   (`docs/superpowers/specs/2026-09-09-helper-idle-exit-design.md`) records
+///   that measuring it for real needs the owner's consent to activate their
+///   own helper once, which no work so far has had.
+///
+/// Nothing anywhere depends on which figure is right: every argument that
+/// cites one survives at a whole second.
+///
+/// No proxy in it and no error classification, so what it decides is
+/// testable without a bus -- and so that the three components that talk this
+/// interface share one copy of the decision rather than three. It started in
+/// `porthole-cli`, which was the only client that had it, and the two that
+/// did not each got a helper between lives wrong in a way of their own:
+/// `porthole-agent` reported one it could not reach, and `porthole-gui`
+/// reported one that had *answered with an error* -- showing the refusal's
+/// own text under "Porthole helper reported an error", or, for the other
+/// name, the bus's `Remote peer disconnected` as though the helper had said
+/// it. One wrong answer in two spellings is the same reason
+/// [`worth_asking_again`] is here rather than there.
+///
+/// **One retry, and never more.** Two calls are what a person does by hand
+/// after reading the refusal's own sentence, and this makes the second one
+/// automatic. A loop would turn a helper that dies on every request into a
+/// client that hangs instead of one that reports -- and it would buy nothing
+/// even against the retirement it exists for, because the instance the retry
+/// activates has a whole [`crate::ipc`]-independent grace period (five
+/// minutes, `porthole_helper::retire::GRACE`) ahead of it and cannot be
+/// retiring again by the time the second call arrives. Two consecutive
+/// `NoReply`s are a helper that cannot stay up, which is a thing to report,
+/// not to keep asking.
+///
+/// **No delay and no backoff between the two**, deliberately, and for two
+/// reasons of different weight.
+///
+/// The weaker one is that there is nothing to wait for: the refusal is sent
+/// only once the well-known name is provably gone
+/// (`porthole_helper::retire`), so the second call is routed by the bus to a
+/// fresh instance it activates, at the cost given above. A sleep would add its
+/// own wait to that and change no outcome.
+///
+/// The **stronger** one is that this function must contain no timer at all.
+/// What polls the future it returns is not one runtime: `porthole-gui` polls
+/// it on a GLib main context and the helper's own interface methods are
+/// polled on zbus's executor thread, which is not a tokio runtime context. A
+/// `tokio::time::sleep` there does not merely block, it panics with "there is
+/// no reactor running" and takes the executor thread with it -- measured, and
+/// recorded on `porthole_helper::retire::Retirement::released`, which is why
+/// the helper waits on a `tokio::sync` channel and not a `tokio::time` one. A
+/// backoff added here later would be that same defect, in the one function
+/// every client calls.
+///
+/// **What the second call cannot promise** is written on
+/// [`worth_asking_again`], because it is a fact about the two names rather
+/// than about this function: `NoReply` means the reply was lost, not the
+/// request, so a first `open` that took effect is answered by the retry with
+/// `AlreadyOpen`. That is what the person re-running the command by hand
+/// gets, and it describes the state the machine is actually in.
+pub async fn once_more_if_worth_asking_again<T, F, Fut>(mut call: F) -> zbus::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = zbus::Result<T>>,
+{
+    match call().await {
+        Err(e) if worth_asking_again(&e) => call().await,
+        first => first,
+    }
 }
 
 /// The client side of the helper's interface.
@@ -1282,6 +1376,101 @@ mod tests {
         assert!(!worth_asking_again(&zbus::Error::Variant(
             zbus::zvariant::Error::Message("signature mismatch".to_string())
         )));
+    }
+
+    #[tokio::test]
+    async fn a_call_nobody_answered_is_made_exactly_once_more() {
+        use std::cell::Cell;
+
+        // The error a bus daemon sends when the process that was going to
+        // answer a pending call went away before it did. Spelled as the
+        // literal name and the literal detail rather than built from the
+        // constant above, because it is the wire's wording and not
+        // porthole's.
+        let nobody_answered = || {
+            method_error(
+                "org.freedesktop.DBus.Error.NoReply",
+                "Remote peer disconnected",
+            )
+        };
+
+        // Served on the second attempt: the whole point. A helper that has
+        // just retired is activated afresh by this very call.
+        let attempts = Cell::new(0u32);
+        let served = once_more_if_worth_asking_again(|| {
+            attempts.set(attempts.get() + 1);
+            let n = attempts.get();
+            async move {
+                if n == 1 {
+                    Err(nobody_answered())
+                } else {
+                    Ok(7u32)
+                }
+            }
+        })
+        .await;
+        assert_eq!(served.unwrap(), 7);
+        assert_eq!(attempts.get(), 2, "one retry, and it was taken");
+
+        // The same for the other name, which is the one a helper sends on
+        // purpose rather than the one the bus sends in its absence.
+        let attempts = Cell::new(0u32);
+        let served = once_more_if_worth_asking_again(|| {
+            attempts.set(attempts.get() + 1);
+            let n = attempts.get();
+            async move {
+                if n == 1 {
+                    Err(method_error(RETIRING_ERROR, "ask again"))
+                } else {
+                    Ok(7u32)
+                }
+            }
+        })
+        .await;
+        assert_eq!(served.unwrap(), 7);
+        assert_eq!(attempts.get(), 2);
+
+        // Once more and never again: a helper that dies on every request has
+        // to report, not turn the client into something that keeps asking.
+        let attempts = Cell::new(0u32);
+        let gave_up = once_more_if_worth_asking_again(|| {
+            attempts.set(attempts.get() + 1);
+            async { Err::<u32, _>(nobody_answered()) }
+        })
+        .await;
+        assert!(worth_asking_again(
+            &gave_up.expect_err("both attempts found nobody")
+        ));
+        assert_eq!(attempts.get(), 2, "exactly two, not a loop");
+
+        // The negative control on the retry itself: a decision the helper
+        // made is not asked a second time. Without this, a retried `open`
+        // whose refusal was a real refusal would charge a second polkit
+        // prompt, and a retried `close --all` would report an empty second
+        // answer over a first one that had closed something.
+        let attempts = Cell::new(0u32);
+        let refused = once_more_if_worth_asking_again(|| {
+            attempts.set(attempts.get() + 1);
+            async {
+                Err::<u32, _>(method_error(
+                    "com.jacopobriccola.Porthole.NotAuthorized",
+                    "denied by policy",
+                ))
+            }
+        })
+        .await;
+        assert!(refused.is_err());
+        assert_eq!(attempts.get(), 1, "an answer must not be asked for twice");
+
+        // And a first call that simply worked is one call.
+        let attempts = Cell::new(0u32);
+        let plain = once_more_if_worth_asking_again(|| {
+            attempts.set(attempts.get() + 1);
+            async { Ok::<u32, zbus::Error>(1) }
+        })
+        .await;
+        assert_eq!(plain.unwrap(), 1);
+        assert_eq!(attempts.get(), 1);
     }
 
     #[test]

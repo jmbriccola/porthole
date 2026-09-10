@@ -474,6 +474,38 @@ fn helper_message(e: &zbus::Error) -> String {
     }
 }
 
+/// Ask the helper to close rule `id`, asking once more if the first attempt
+/// found a helper between lives.
+///
+/// **Not because this is the call most exposed to a retirement.** In this
+/// window it is not, and the argument that says otherwise is the CLI's: there
+/// `list` and `status` are answered locally from the state file and never
+/// reach the helper, so an activation lands essentially on `close` alone.
+/// This window is the opposite -- `window.rs`'s own refresh calls `list`,
+/// `status` and `docker_ports` on the helper every time anything says what is
+/// open may have changed, and it does that far more often than anybody
+/// presses a button. The refresh is where the cost and the exposure are.
+///
+/// What makes this button worth its own retry is the *consequence*, not the
+/// odds. A refresh that meets a retiring helper repaints a moment later; a
+/// close that meets one used to leave a toast carrying the helper's refusal
+/// and a row still standing over a port the person had just asked to shut,
+/// with nothing to do but press it again. It is also the press most likely of
+/// the three to arrive during one, since closing the last rule is what starts
+/// the grace period that ends in a retirement -- but that is a smaller share
+/// of a smaller number than the refresh's.
+///
+/// What they see while it happens is unchanged: the row's own spinner and
+/// its insensitive button, both held for as long as this is outstanding by
+/// the `Busy` its caller keeps across the `await` (see `busy.rs`). A retry is
+/// that same wait, one bus activation longer.
+///
+/// The retry can turn a lost reply into `RuleNotFound`: the first close took
+/// effect and its answer was lost, and the second finds nothing left to
+/// close. That message is the truth about the machine -- the port is shut --
+/// and it is what pressing the button twice would say. The row goes on
+/// standing until a refresh replaces it, which is the same thing that
+/// happens for every other failed close.
 async fn close_by_id_over_dbus(id: &str) -> Result<(), String> {
     let connection = zbus::Connection::system()
         .await
@@ -481,8 +513,7 @@ async fn close_by_id_over_dbus(id: &str) -> Result<(), String> {
     let proxy = PortholeProxy::new(&connection)
         .await
         .map_err(|e| format!("could not reach the porthole helper: {e}"))?;
-    proxy
-        .close_by_id(id, false, false)
+    porthole_core::ipc::once_more_if_worth_asking_again(|| proxy.close_by_id(id, false, false))
         .await
         .map_err(|e| helper_message(&e))?;
     Ok(())

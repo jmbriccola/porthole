@@ -754,6 +754,32 @@ fn helper_message(e: &zbus::Error) -> String {
 /// reaches the helper on by default, never the session bus `adw::Application`'s
 /// own id lives on (see `app.rs`'s module doc for why those are not the same
 /// bus despite sharing a name).
+///
+/// And asked once more on the two failures a second call can turn into
+/// service, exactly as that CLI does -- see
+/// `porthole_core::ipc::once_more_if_worth_asking_again`.
+///
+/// **The press at the start of a session is not the one that needs it.** A
+/// helper that retired an hour ago is *gone*: nothing owns the name, this
+/// call activates a fresh instance, and it is served first time for the price
+/// of an activation. What the retry is for is the far narrower case of a
+/// helper that is between lives at this instant -- one that has decided to go
+/// and has not finished, or one whose reply was lost to its own exit. That
+/// window is sub-millisecond in production, which is why nothing here waits
+/// or reports on it, and why the whole cost of covering it is one extra call
+/// on a path that had already failed.
+///
+/// A retried `open` can come back `AlreadyOpen`, when the first attempt took
+/// effect and lost its reply. The dialog shows the helper's own sentence for
+/// that, which names the port and who it is open towards, and the refresh
+/// behind it shows the rule -- so a person is told the port is open, which is
+/// what is true, rather than told the helper could not be reached, which is
+/// what they used to be told about a port that had just been opened.
+///
+/// Nothing new appears while it happens. The `Busy` the caller holds across
+/// this call keeps the dialog's spinner turning and its Open button
+/// insensitive for both attempts (see `busy.rs`), so a retry is one wait, not
+/// two, and the button cannot be pressed a third time in the middle of it.
 async fn open_over_dbus(
     port: u16,
     protocol: &str,
@@ -766,10 +792,11 @@ async fn open_over_dbus(
     let proxy = PortholeProxy::new(&connection)
         .await
         .map_err(|e| format!("could not reach the porthole helper: {e}"))?;
-    proxy
-        .open(port, protocol, scope, seconds)
-        .await
-        .map_err(|e| helper_message(&e))
+    porthole_core::ipc::once_more_if_worth_asking_again(|| {
+        proxy.open(port, protocol, scope, seconds)
+    })
+    .await
+    .map_err(|e| helper_message(&e))
 }
 
 /// [`open_over_dbus`]'s counterpart for the other act: the same bus, the
@@ -777,9 +804,21 @@ async fn open_over_dbus(
 /// publishes the container on, which is what the helper resolves to a
 /// container address of its own accord. This client sends no address.
 ///
-/// Sends exactly what `porthole-cli`'s own `client::forward` sends. The
-/// helper authorizes this one every time, whatever the scope; nothing here
-/// decides that, and nothing here can skip it.
+/// Sends exactly what `porthole-cli`'s own `client::forward` sends, and asks
+/// once more on the same two failures [`open_over_dbus`] does. The helper
+/// authorizes this one every time, whatever the scope; nothing here decides
+/// that, and nothing here can skip it.
+///
+/// What that authorization costs a retry, stated rather than waved at. A
+/// **refusal** a person answered comes back as the helper's own
+/// `NotAuthorized` and is never asked again -- so nobody is prompted twice
+/// for a decision they already made. A **`Retiring`** never reached polkit at
+/// all: the helper refuses before it authorizes anything
+/// (`porthole_helper::service`), so the retry is the first prompt, not a
+/// second. `NoReply` is the one that can cost a second dialog -- a helper
+/// that died with the prompt still up loses the reply and the retry asks
+/// again -- and that is exactly what a person pressing the button again
+/// would do, which before this retry existed is what they had to do.
 async fn forward_over_dbus(
     port: u16,
     protocol: &str,
@@ -793,10 +832,11 @@ async fn forward_over_dbus(
     let proxy = PortholeProxy::new(&connection)
         .await
         .map_err(|e| format!("could not reach the porthole helper: {e}"))?;
-    proxy
-        .forward(port, protocol, scope, seconds, published_port)
-        .await
-        .map_err(|e| helper_message(&e))
+    porthole_core::ipc::once_more_if_worth_asking_again(|| {
+        proxy.forward(port, protocol, scope, seconds, published_port)
+    })
+    .await
+    .map_err(|e| helper_message(&e))
 }
 
 /// Where a user chooses what to open, for how long, and towards whom.

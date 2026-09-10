@@ -20,3 +20,9 @@ zbus.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Tests only, and for one thing: `ipc::once_more_if_worth_asking_again` is
+# `async`, so the unit test that counts its attempts needs a runtime to poll
+# it in. The library itself takes no runtime and must not: what it hands back
+# is a future its callers poll wherever they already are -- a GLib main
+# context in `porthole-gui`, zbus's own executor in the helper.
+tokio.workspace = true

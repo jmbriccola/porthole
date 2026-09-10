@@ -72,7 +72,10 @@ mod notify;
 
 use futures_util::StreamExt;
 use notify::{NotificationsProxy, REOPEN};
-use porthole_core::ipc::{alignment, Alignment, PortholeProxy, WireRule, PROTOCOL_VERSION};
+use porthole_core::ipc::{
+    alignment, once_more_if_worth_asking_again, Alignment, PortholeProxy, WireRule,
+    PROTOCOL_VERSION,
+};
 use std::path::{Path, PathBuf};
 
 /// The session-bus name one agent per session holds. Not an interface: this
@@ -329,7 +332,14 @@ async fn main() -> std::process::ExitCode {
     // agent that could not read `list` could not read `RuleClosed` either,
     // and it said so once, to a journal, and carried on for the rest of the
     // login. See [`announce_undecodable`].
-    if let Err(e) = porthole.list().await {
+    //
+    // Asked again once if the helper was between lives, and here the retry
+    // is not only about the message. This call exists to *start* the helper
+    // while the subscription above already exists (see this module's own doc
+    // comment on the ordering); one that fails because the helper was
+    // retiring starts nothing, so an agent that gave up here would go on
+    // listening to a helper nobody had woken.
+    if let Err(e) = once_more_if_worth_asking_again(|| porthole.list()).await {
         if porthole_core::ipc::is_undecodable(&e) {
             eprintln!("porthole-agent: could not read the helper's answer to list ({e})");
             eprintln!("porthole-agent: {}", Ended::Undecodable.reason());
@@ -526,7 +536,15 @@ async fn main() -> std::process::ExitCode {
 /// message it cannot decode, exactly as before this contract existed. The
 /// one exception is the case it can fix by itself, below.
 async fn realign(system: &zbus::Connection) -> Option<Alignment> {
-    let version = match porthole_core::ipc::read_protocol_version(system).await {
+    // Asked again once if the helper was between lives. This is a call like
+    // any other, and a helper that has just retired answers it exactly as it
+    // answers `list`: an agent that read that as "no version" would carry on
+    // not knowing which half is old, and, for a helper that really is newer,
+    // would skip the one repair it can perform by itself.
+    let read =
+        once_more_if_worth_asking_again(move || porthole_core::ipc::read_protocol_version(system))
+            .await;
+    let version = match read {
         Ok(version) => version,
         Err(e) => {
             eprintln!(
@@ -840,27 +858,48 @@ async fn reopen(
     rule: WireRule,
 ) {
     let request = reopen_request(&rule);
+    // Asked again once if the helper was between lives, and this is the click
+    // most likely to want it. A notification offering `Reopen` is on screen
+    // precisely because a rule stopped being open -- which is also what can
+    // leave the helper holding nothing, and a helper holding nothing retires
+    // five minutes later. So a person reading this notification is being read
+    // to across exactly the interval in which the grace expires.
+    //
+    // What that does *not* mean is that a click landing after the retirement
+    // needs anything: a helper that has gone is gone, nothing owns the name,
+    // and the bus activates a fresh instance that serves this call first
+    // time. The retry is for the sliver in the middle -- an instance that has
+    // decided to go and not finished going -- where the click used to produce
+    // "Could not reopen port 5173/tcp" over a helper that was perfectly well
+    // and one call away.
+    //
+    // What the retry cannot promise is written on
+    // `porthole_core::ipc::worth_asking_again`; what this agent then puts on
+    // screen about it is `notify::reopen_outcome`, which is also where the
+    // one answer that is not a failure is told from the ones that are.
     let outcome = match request.published_port {
         Some(published_port) => {
-            porthole
-                .forward(
+            once_more_if_worth_asking_again(|| {
+                porthole.forward(
                     request.port,
                     &request.protocol,
                     &request.scope,
                     request.seconds,
                     published_port,
                 )
-                .await
+            })
+            .await
         }
         None => {
-            porthole
-                .open(
+            once_more_if_worth_asking_again(|| {
+                porthole.open(
                     request.port,
                     &request.protocol,
                     &request.scope,
                     request.seconds,
                 )
-                .await
+            })
+            .await
         }
     };
     match outcome {
@@ -869,13 +908,13 @@ async fn reopen(
             reopened.port, reopened.protocol, reopened.target
         ),
         Err(e) => {
-            let failure = notify::Notification {
-                summary: format!("Could not reopen port {}/{}", rule.port, rule.protocol),
-                body: format!("{e}"),
-                actions: Vec::new(),
-            };
-            if let Err(e2) = notify::show(&notifications, &failure).await {
-                eprintln!("porthole-agent: reopen failed ({e}), and so did saying so ({e2})");
+            // Not necessarily a failure -- see [`notify::reopen_outcome`],
+            // which is where the wording is decided, next to every other
+            // notification's, and which is why this arm does not build one
+            // here any more.
+            let outcome = notify::reopen_outcome(&rule, &e);
+            if let Err(e2) = notify::show(&notifications, &outcome).await {
+                eprintln!("porthole-agent: reopen answered `{e}`, and saying so failed too ({e2})");
             }
         }
     }

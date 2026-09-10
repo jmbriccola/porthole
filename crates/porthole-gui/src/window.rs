@@ -798,10 +798,45 @@ fn classify_failure(e: zbus::Error) -> HelperFailure {
             "porthole could not read the porthole helper's answer: {e}"
         ));
     }
+    if nobody_answered(&e) {
+        // A `MethodError` by shape and not an answer by nature: the bus
+        // sends this when the process that was going to reply went away
+        // before it did, with the detail `Remote peer disconnected`. Reading
+        // it as `Errored` put that phrase on screen under "Porthole helper
+        // reported an error", as though it were the helper's own account of
+        // something -- a sentence no part of porthole ever wrote, about a
+        // helper that reported nothing at all.
+        //
+        // Every call this window makes now asks again once on it (see
+        // `porthole_core::ipc::once_more_if_worth_asking_again`), so
+        // reaching here means two calls in a row found nobody. That is a
+        // helper that is genuinely not answering, which is what
+        // `Unreachable` says.
+        return HelperFailure::Unreachable(format!(
+            "could not reach the porthole helper: nothing answered ({e})"
+        ));
+    }
     match &e {
         zbus::Error::MethodError(..) => HelperFailure::Errored(helper_message(&e)),
         _ => HelperFailure::Unreachable(format!("could not reach the porthole helper: {e}")),
     }
+}
+
+/// Whether this is the bus reporting that nobody answered, rather than
+/// anything the helper said -- [`porthole_core::ipc::NO_REPLY_ERROR`], which
+/// is where that name is spelled and where what it means is written down.
+///
+/// Deliberately *not* `porthole_core::ipc::worth_asking_again`, which covers
+/// this name and one more. The other one, `Retiring`, is a sentence the
+/// helper composed for a person and which names its own remedy, so it goes
+/// on being rendered as what it is: the helper answering. This is the one
+/// that is a `MethodError` in shape and an absence of one in fact.
+fn nobody_answered(e: &zbus::Error) -> bool {
+    matches!(
+        e,
+        zbus::Error::MethodError(name, ..)
+            if name.as_str() == porthole_core::ipc::NO_REPLY_ERROR
+    )
 }
 
 /// The two below are reached only for a failure that is **not**
@@ -893,19 +928,46 @@ async fn fetch_helper_snapshot() -> Result<HelperSnapshot, HelperFailure> {
     let proxy = PortholeProxy::new(&connection).await.map_err(|e| {
         HelperFailure::Unreachable(format!("could not reach the porthole helper: {e}"))
     })?;
-    let rules = proxy.list().await.map_err(classify_failure);
-    let status = proxy.status().await.map_err(classify_failure);
+    // Each of the three asks again once when the first attempt was one to
+    // ask again about rather than to report -- a helper between lives, which
+    // since the idle exit is a routine event on an idle machine rather than
+    // a rare one. Independently, for the same reason the three results are
+    // independent: whichever of them arrives during a retirement is the one
+    // that has to be asked twice, and the fresh instance the first retry
+    // activates is already serving by the time the next call goes out.
+    //
+    // These three are also the calls this window is most exposed on, and the
+    // reason its exposure is nothing like `porthole-cli`'s: there `list` and
+    // `status` are answered locally from the state file and an activation
+    // lands essentially on `close` alone, while here all three cross the bus
+    // on every refresh, and a refresh runs whenever anything says what is
+    // open may have changed.
+    //
+    // Nothing new appears on screen while it happens. A refresh already holds
+    // the header bar's busy indication across the whole round trip (see
+    // `busy.rs`), so a retry is simply that wait, one bus activation longer
+    // -- see `porthole_core::ipc::once_more_if_worth_asking_again` for the
+    // measurement and the conditions it was taken under, and note that even
+    // its slowest figure leaves the eight seconds `HELPER_TIMEOUT` allows
+    // untroubled.
+    let rules = porthole_core::ipc::once_more_if_worth_asking_again(|| proxy.list())
+        .await
+        .map_err(classify_failure);
+    let status = porthole_core::ipc::once_more_if_worth_asking_again(|| proxy.status())
+        .await
+        .map_err(classify_failure);
     // A third independent result, for the same reason `rules` and `status`
     // are two: a `docker_ports` failure must not throw away a `list` that
     // already succeeded.
-    let docker = match proxy.docker_ports().await {
-        Ok(wire) => wire
-            .iter()
-            .map(published_from_wire)
-            .collect::<Result<Vec<_>, String>>()
-            .map_err(HelperFailure::Errored),
-        Err(e) => Err(classify_failure(e)),
-    };
+    let docker =
+        match porthole_core::ipc::once_more_if_worth_asking_again(|| proxy.docker_ports()).await {
+            Ok(wire) => wire
+                .iter()
+                .map(published_from_wire)
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(HelperFailure::Errored),
+            Err(e) => Err(classify_failure(e)),
+        };
     let mut snapshot = HelperSnapshot {
         rules,
         status,
@@ -918,10 +980,12 @@ async fn fetch_helper_snapshot() -> Result<HelperSnapshot, HelperFailure> {
     // window has to tell the person in front of it. Every other refresh
     // pays nothing for this.
     if first_undecodable(&snapshot).is_some() {
-        snapshot.alignment = porthole_core::ipc::read_protocol_version(&connection)
-            .await
-            .ok()
-            .map(porthole_core::ipc::alignment);
+        snapshot.alignment = porthole_core::ipc::once_more_if_worth_asking_again(|| {
+            porthole_core::ipc::read_protocol_version(&connection)
+        })
+        .await
+        .ok()
+        .map(porthole_core::ipc::alignment);
     }
     Ok(snapshot)
 }
@@ -1464,6 +1528,60 @@ mod tests {
                 .build(&())
                 .unwrap(),
         )
+    }
+
+    #[test]
+    fn nobody_answering_is_unreachable_even_though_it_arrives_as_a_method_error() {
+        // The bus sends this when the process that was going to reply went
+        // away before it did -- a helper killed by an upgrade, or the last
+        // instant of one retiring. It is a `MethodError` in shape and an
+        // absence of an answer in fact, and reading it as `Errored` put
+        // `Remote peer disconnected` on screen under "Porthole helper
+        // reported an error", as though it were the helper's own account of
+        // something. No part of porthole ever wrote that sentence.
+        //
+        // Every call this window makes now asks again once on it, so getting
+        // here means two calls in a row found nobody -- which is a helper
+        // that is genuinely not answering.
+        let e = method_error(
+            porthole_core::ipc::NO_REPLY_ERROR,
+            Some("Remote peer disconnected"),
+        );
+        match classify_failure(e) {
+            HelperFailure::Unreachable(message) => {
+                assert!(message.contains("could not reach"), "{message}");
+                assert!(
+                    message.contains("nothing answered"),
+                    "and what happened was that nobody replied: {message}"
+                );
+            }
+            HelperFailure::Errored(message) => {
+                panic!("nothing answered; the helper reported nothing: {message}")
+            }
+            HelperFailure::Undecodable(message) => {
+                panic!("there was no answer here to fail to read: {message}")
+            }
+        }
+
+        // The negative control, and the reason this is not simply
+        // `worth_asking_again`: `Retiring` is the *other* name a client asks
+        // again on, and it is a sentence the helper composed for a person
+        // which names its own remedy. A second refusal is still the helper
+        // answering, and must go on being rendered as one.
+        let retiring = method_error(
+            porthole_core::ipc::RETIRING_ERROR,
+            Some(
+                "the porthole helper was retiring when this request arrived and did not \
+                  act on it: ask again",
+            ),
+        );
+        match classify_failure(retiring) {
+            HelperFailure::Errored(message) => assert!(message.contains("ask again"), "{message}"),
+            HelperFailure::Unreachable(message) => {
+                panic!("the helper answered this one, in its own words: {message}")
+            }
+            HelperFailure::Undecodable(message) => panic!("{message}"),
+        }
     }
 
     #[test]
