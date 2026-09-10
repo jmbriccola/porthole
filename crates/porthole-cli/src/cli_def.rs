@@ -169,6 +169,28 @@ pub enum Commands {
         #[command(subcommand)]
         command: DevicesCommand,
     },
+    /// Say whether a newer porthole is available, and turn the daily check
+    /// on or off.
+    ///
+    /// Nothing leaves this machine. The question is put to the package
+    /// manager that installed porthole -- `rpm`, `dpkg` or `pacman` -- and
+    /// porthole makes no network request of its own, has no HTTP client, and
+    /// contacts no server. Run with no flags it asks once, now, and reports
+    /// what it found; `--enable` and `--disable` are what settle whether the
+    /// desktop agent asks again, once a day, on its own.
+    ///
+    /// It never installs anything. Where PackageKit is present, the desktop
+    /// notification's own button hands the request to PackageKit, which
+    /// raises its own password prompt under its own vetted action; where it
+    /// is not, porthole shows the exact command and stops there. porthole
+    /// gains no privilege of its own from any of it, and the privileged
+    /// porthole helper is not involved.
+    ///
+    /// A porthole built and installed from source is left alone: if no
+    /// package manager claims porthole's own binary, the check says so and
+    /// offers nothing, because overwriting a hand-installed tree is not
+    /// porthole's to offer.
+    Update(UpdateArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -241,6 +263,29 @@ pub struct ForwardArgs {
     /// name of a device saved with `porthole devices add`.
     #[arg(long, default_value = "subnet")]
     pub to: String,
+}
+
+/// `porthole update`'s own arguments: the two that settle consent, and
+/// nothing else.
+///
+/// **Three states, not two**, and the flags only reach two of them. A machine
+/// nobody has answered for is *never asked*, which is neither yes nor no: it
+/// is what makes the window put the question at first launch, and what stops
+/// it putting it again to somebody who has already declined. There is
+/// deliberately no flag that puts the answer back to *never asked* -- the
+/// file (`~/.config/porthole/update.toml`) is the place to do that, and a
+/// flag for it would be a way to make a person be asked again.
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    /// Let porthole ask the local package manager, once a day, whether a
+    /// newer porthole is available. Nothing leaves this machine.
+    #[arg(long, conflicts_with = "disable")]
+    pub enable: bool,
+
+    /// Stop the daily check. `porthole update` on its own still answers when
+    /// you ask it.
+    #[arg(long)]
+    pub disable: bool,
 }
 
 #[derive(Debug, Args)]

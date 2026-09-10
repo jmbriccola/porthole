@@ -128,6 +128,18 @@ name = "identity"
 path = "tests/identity.rs"
 harness = false
 
+# Same reasoning again, and one addition of its own: `tests/update_consent.rs`
+# points `PORTHOLE_UPDATE_FILE` at a temporary directory, process-wide, before
+# any case runs. Every case below reads -- and two of them write -- a real
+# `update.toml` through the real `porthole_core::update::Settings`, and none
+# of it may reach the settings of whoever is running the tests. That variable
+# is process-wide, which is the second reason this is its own `[[test]]`
+# rather than cases added to `tests/window.rs`.
+[[test]]
+name = "update_consent"
+path = "tests/update_consent.rs"
+harness = false
+
 [dependencies]
 porthole-core = { path = "../porthole-core" }
 gtk = { package = "gtk4", version = "0.9" }

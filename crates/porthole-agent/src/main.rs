@@ -69,6 +69,7 @@
 //! that. What is covered is the decision itself, as a unit test on [`Ended`].
 
 mod notify;
+mod update;
 
 use futures_util::StreamExt;
 use notify::{NotificationsProxy, REOPEN};
@@ -359,6 +360,31 @@ async fn main() -> std::process::ExitCode {
     //
     // Which bus ended decides the exit status, and therefore whether
     // anything starts a new agent: see [`main`]'s own doc comment.
+    // The daily update check, and the two things it needs to remember.
+    //
+    // `started_from` is taken now and never again: it is a fact about the
+    // image this process is running, and the whole point of comparing it is
+    // that it cannot change under a running process without the file having
+    // been replaced. Consent is *not* cached beside it -- it is read afresh
+    // at every tick, so somebody who answers the window's question, or runs
+    // `porthole update --enable`, does not have to log out for it to take
+    // effect.
+    let started_from = binary_mtime();
+    let mut update_checks = tokio::time::interval_at(
+        tokio::time::Instant::now() + update::first_check_after(),
+        update::check_every(),
+    );
+    // The update notification on screen, if one is. Kept apart from
+    // `pending` deliberately: that list is rules, an update is not one, and a
+    // click carries only an id and a key -- so the two must not be able to
+    // answer for each other.
+    let mut update_on_screen: Option<UpdateOnScreen> = None;
+    // Set false once a check has established that this porthole was installed
+    // from source. That answer cannot change under a running process, and the
+    // design asks for the check to stop rather than ask again every day about
+    // a tree porthole will never offer to replace.
+    let mut keep_checking = true;
+
     let mut pending: Pending = Vec::new();
     let ended = loop {
         tokio::select! {
@@ -387,6 +413,11 @@ async fn main() -> std::process::ExitCode {
                     pending.len()
                 );
                 pending.clear();
+                // The update notification's id is meaningless across a
+                // restart of the notification service too -- the next run
+                // starts numbering again, so an id kept from before it could
+                // be matched by a click on somebody else's notification.
+                update_on_screen = None;
             }
             // Ahead of the four below on purpose. A newer agent has the
             // name and is about to be subscribed to the same signals; from
@@ -442,6 +473,34 @@ async fn main() -> std::process::ExitCode {
                     helper = realign(&system).await;
                 }
             }
+            // Once a day, the first one shortly after start-up. **One
+            // wake-up, two jobs**, which is what makes the second free: the
+            // agent is already awake, so comparing its own binary costs
+            // nothing extra and needs no timer of its own.
+            //
+            // The branch switches itself off through `keep_checking` rather
+            // than being cancelled, so a source install stops being asked
+            // about without this loop losing a branch it would have to
+            // re-create.
+            _ = update_checks.tick(), if keep_checking => {
+                // The file under this process is not the one it was started
+                // from, which is what an upgrade made from a terminal --
+                // without porthole being involved at all -- looks like from
+                // in here. Nothing else in this process would notice, and an
+                // agent from before the upgrade is the half that goes quiet
+                // rather than failing.
+                if binary_changed_since(started_from) {
+                    restart_from_disk(
+                        "this agent's own binary on disk is not the one this process was \
+                         started from, so porthole has been replaced underneath it",
+                        None,
+                    );
+                }
+                let checked =
+                    check_for_an_update(&notifications, &system, update_on_screen).await;
+                update_on_screen = checked.on_screen;
+                keep_checking = checked.keep_checking;
+            }
             close = closes.next() => {
                 let Some(signal) = close else {
                     break Ended::SystemBus;
@@ -487,6 +546,25 @@ async fn main() -> std::process::ExitCode {
                         continue;
                     }
                 };
+                // An update click is not a `Reopen`, and both notifications
+                // can be on screen at once. The **key** is what tells the
+                // two apart, and the **id** is what says this is the update
+                // notification currently up rather than one left over from
+                // before the notification service restarted. Answering one
+                // with the other would open a firewall port because somebody
+                // pressed Update.
+                if args.action_key == update::UPDATE_NOW {
+                    match update_on_screen {
+                        Some(on_screen) if on_screen.id == args.id => {
+                            start_the_update(&notifications, &system, on_screen.packaging);
+                        }
+                        _ => eprintln!(
+                            "porthole-agent: an update click arrived for a notification this \
+                             no longer holds"
+                        ),
+                    }
+                    continue;
+                }
                 on_action(&porthole, &notifications, &pending, args.id, args.action_key);
             }
             dismissal = dismissals.next() => {
@@ -505,6 +583,13 @@ async fn main() -> std::process::ExitCode {
                     }
                 };
                 pending.retain(|(id, _)| *id != args.id);
+                // And the update notification, for the same reason and by
+                // the same rule: once it is gone from the screen, its id
+                // belongs to nobody, and a later click carrying it is not a
+                // click on it.
+                if update_on_screen.is_some_and(|on_screen| on_screen.id == args.id) {
+                    update_on_screen = None;
+                }
             }
         }
     };
@@ -613,8 +698,6 @@ fn what_the_helper_said(version: u32) -> String {
 /// rpm and dpkg do, and the stripped path is the new file). See
 /// [`binary_on_disk`].
 fn replace_this_agent(helper_version: u32) {
-    use std::os::unix::process::CommandExt as _;
-
     if already_tried_for(helper_version) {
         eprintln!(
             "porthole-agent: the helper speaks porthole's protocol {helper_version} and this \
@@ -626,6 +709,44 @@ fn replace_this_agent(helper_version: u32) {
         );
         return;
     }
+    restart_from_disk(
+        &format!(
+            "the helper speaks porthole's protocol {helper_version} and this agent speaks \
+             {PROTOCOL_VERSION}, so this agent is the older half"
+        ),
+        Some((REEXECED, helper_version.to_string())),
+    );
+}
+
+/// Start again from the binary on disk, and return only if that could not be
+/// done.
+///
+/// **One copy of the machinery, two reasons to reach it.** The protocol
+/// version finds one of them ([`replace_this_agent`]): a helper newer than
+/// this agent means the agent is what an upgrade left behind. The daily
+/// update check finds the other ([`binary_changed_since`]): the file under
+/// this process is not the one it was started from, which is what an upgrade
+/// made from a terminal, without porthole being involved at all, looks like
+/// from in here. The two differ in what they know and in what they say; the
+/// path resolution, the argument forwarding and the `exec` are the same act
+/// and are written once.
+///
+/// **The path, not `/proc/self/exe`.** That symlink names the *inode*, and
+/// after an upgrade the inode is still the old binary -- re-running it would
+/// be a loop with extra steps. See [`binary_on_disk`], where the measurement
+/// behind that lives.
+///
+/// `reason` is a clause, not a sentence: it is joined to `; re-executing
+/// <path>`, and `crates/porthole-agent/tests/session.rs` counts that word to
+/// tell how many times this has happened.
+///
+/// Returns only on failure: on success this process is gone. The bus
+/// connections go with it -- their sockets are close-on-exec -- so the
+/// session name is released and the agent started here takes it back through
+/// [`claim_session`]'s own `ReplaceExisting`.
+fn restart_from_disk(reason: &str, extra_env: Option<(&str, String)>) {
+    use std::os::unix::process::CommandExt as _;
+
     let Some(path) = std::env::current_exe()
         .inspect_err(|e| {
             eprintln!("porthole-agent: could not find its own binary on disk ({e})");
@@ -634,30 +755,57 @@ fn replace_this_agent(helper_version: u32) {
         .and_then(|current| binary_on_disk(&current))
     else {
         eprintln!(
-            "porthole-agent: the helper speaks porthole's protocol {helper_version} and this \
-             agent speaks {PROTOCOL_VERSION}, but this agent's own binary is not where it \
-             was started from any more, so there is nothing to start instead of it"
+            "porthole-agent: {reason}, but this agent's own binary is not where it was \
+             started from any more, so there is nothing to start instead of it"
         );
         return;
     };
     eprintln!(
-        "porthole-agent: the helper speaks porthole's protocol {helper_version} and this \
-         agent speaks {PROTOCOL_VERSION}, so this agent is the older half; re-executing \
-         {} , which is the binary an upgrade has already replaced",
+        "porthole-agent: {reason}; re-executing {}, which is the binary on disk now",
         path.display()
     );
-    // Returns only on failure: on success this process is gone. The bus
-    // connections go with it -- their sockets are close-on-exec -- so the
-    // session name is released and the agent started here takes it back
-    // through `claim_session`'s own `ReplaceExisting`.
-    let e = std::process::Command::new(&path)
-        .args(std::env::args_os().skip(1))
-        .env(REEXECED, helper_version.to_string())
-        .exec();
+    let mut command = std::process::Command::new(&path);
+    command.args(std::env::args_os().skip(1));
+    if let Some((key, value)) = extra_env {
+        command.env(key, value);
+    }
+    let e = command.exec();
     eprintln!(
-        "porthole-agent: could not re-execute {}: {e}; carrying on as the older half",
+        "porthole-agent: could not re-execute {}: {e}; carrying on",
         path.display()
     );
+}
+
+/// The modification time of this agent's own binary **on disk**, or `None`
+/// when it cannot be read.
+///
+/// [`binary_on_disk`] rather than `current_exe` unchanged, for that
+/// function's own reason: after an upgrade the running inode's link reads
+/// `<path> (deleted)` while `<path>` is the new file, and it is the new
+/// file's time this wants.
+fn binary_mtime() -> Option<std::time::SystemTime> {
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|current| binary_on_disk(&current))?;
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Whether the binary on disk is a different file from the one this process
+/// started from.
+///
+/// **`None` on either side is not a change**, and that is the whole of the
+/// care this needs. A time that could not be read at start-up, or cannot be
+/// read now, is not evidence that anything was upgraded -- and treating it as
+/// one would put every machine whose binary this cannot stat into a restart
+/// at every tick, which is a loop rather than a repair.
+///
+/// Not a comparison against "newer": a downgrade replaces the file too, and
+/// the agent that should be running is the one on disk either way.
+fn binary_changed_since(started_from: Option<std::time::SystemTime>) -> bool {
+    match (started_from, binary_mtime()) {
+        (Some(started), Some(now)) => started != now,
+        _ => false,
+    }
 }
 
 /// Whether an agent in this session has already replaced itself for a helper
@@ -789,6 +937,278 @@ fn on_action(
     let notifications = notifications.clone();
     let rule = rule.clone();
     tokio::spawn(async move { reopen(porthole, notifications, rule).await });
+}
+
+/// The update notification currently on screen, and what it was about.
+///
+/// The packaging is carried rather than looked up again when the button is
+/// pressed: it is what the failure notice names a command from, and asking
+/// the machine a second time could answer differently while a person is
+/// looking at a notification composed from the first answer.
+#[derive(Debug, Clone, Copy)]
+struct UpdateOnScreen {
+    id: u32,
+    packaging: porthole_core::update::Packaging,
+}
+
+/// What one day's check left behind.
+struct Checked {
+    on_screen: Option<UpdateOnScreen>,
+    /// `false` only for a source install -- see [`check_for_an_update`].
+    keep_checking: bool,
+}
+
+/// Ask, once, whether a newer porthole is available, and put it on screen if
+/// it is worth saying.
+///
+/// **Consent first, and nothing is run without it.** A machine whose owner
+/// has not said yes is not checked at all: no subprocess, no package manager,
+/// nothing. That is what makes the promise in the window's own question true.
+///
+/// **The subprocesses go to the blocking pool.** This agent's runtime is
+/// `current_thread`, `porthole_core::command::RealRunner` blocks, and
+/// `dnf check-update` can spend seconds refreshing metadata -- a close
+/// arriving meanwhile must not wait behind it. `spawn_blocking` is what keeps
+/// the signal loop answering, and it is the reason this function is `async`
+/// while the work it does is not.
+///
+/// **A source install ends the checking.** Not just this check: the answer
+/// cannot change under a running process, and asking again tomorrow would be
+/// asking again about a tree porthole will never offer to replace. That is
+/// the design's "stops, silently, and does not retry", and the silence is
+/// literal -- one journal line, nothing on screen.
+///
+/// Everything else keeps checking, including the two answers that are not
+/// answers (`NoContract`, `Unknown`). Those may be about a machine that is
+/// merely between states, and neither is evidence of anything that would make
+/// tomorrow's question pointless.
+async fn check_for_an_update(
+    notifications: &NotificationsProxy<'_>,
+    system: &zbus::Connection,
+    on_screen: Option<UpdateOnScreen>,
+) -> Checked {
+    use porthole_core::update::{self as core_update, Install};
+
+    let unchanged = |on_screen| Checked {
+        on_screen,
+        keep_checking: true,
+    };
+
+    // Read, checked, and deliberately **not kept**. Whatever this says is
+    // stale by the time the blocking work below finishes, so the copy that
+    // eventually gets written is re-read after it -- see the merge further
+    // down, which is the whole of what stops a check in flight overwriting an
+    // answer a person gave while it was running.
+    let path = core_update::default_path();
+    if !core_update::Settings::load(&path)
+        .consent()
+        .permits_checking()
+    {
+        return unchanged(on_screen);
+    }
+
+    let looked = tokio::task::spawn_blocking(|| {
+        let runner = porthole_core::command::RealRunner;
+        // The binary on disk, for `binary_on_disk`'s own reason: after an
+        // upgrade the running inode's link reads `<path> (deleted)`, and a
+        // package manager asked about that string owns nothing.
+        let binary = std::env::current_exe()
+            .ok()
+            .and_then(|current| binary_on_disk(&current))?;
+        let install = core_update::how_installed(&runner, &binary);
+        let verdict = match &install {
+            Install::Packaged(packaging) => Some(core_update::check(
+                &runner,
+                *packaging,
+                core_update::PACKAGE,
+            )),
+            // A source install, or a machine that could not be asked, is
+            // asked nothing further.
+            Install::Unpackaged | Install::Undetermined(_) => None,
+        };
+        Some((install, verdict))
+    })
+    .await;
+
+    let (install, verdict) = match looked {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            eprintln!(
+                "porthole-agent: could not find this agent's own binary on disk, so no \
+                 package manager could be asked about it; not looking for an update this time"
+            );
+            return unchanged(on_screen);
+        }
+        Err(e) => {
+            eprintln!("porthole-agent: looking for an update panicked ({e}); carrying on");
+            return unchanged(on_screen);
+        }
+    };
+
+    if let Install::Unpackaged = install {
+        eprintln!(
+            "porthole-agent: no package manager on this machine claims this porthole's own \
+             binary, so it was installed from source. porthole does not offer to replace a \
+             tree it did not install; not asking again."
+        );
+        return Checked {
+            on_screen,
+            keep_checking: false,
+        };
+    }
+    let Some(verdict) = verdict else {
+        if let Install::Undetermined(reason) = &install {
+            eprintln!("porthole-agent: {reason}; nothing offered");
+        }
+        return unchanged(on_screen);
+    };
+
+    // What the check found, in the journal, whatever it found.
+    //
+    // Three of the four verdicts put nothing on screen -- a daily "porthole
+    // could not find out" would be a daily interruption reporting no news --
+    // and until this existed they left no trace anywhere else either. On a
+    // Debian or Arch machine `NoContract` is not a passing state but the
+    // permanent one, so a consenting user's agent ran a package manager every
+    // day forever, showed nothing, and logged nothing: the feature was not
+    // merely inert on two packagings out of three, it was *invisibly* inert,
+    // and the first question anyone debugging it would ask had no answer on
+    // the machine. One line is what makes that legible.
+    match &verdict {
+        // Announced below, if it is news, with a line of its own.
+        core_update::Verdict::Available { .. } => {}
+        core_update::Verdict::UpToDate => eprintln!(
+            "porthole-agent: porthole is up to date as far as this machine's package \
+             manager knows"
+        ),
+        core_update::Verdict::NoContract(reason) | core_update::Verdict::Unknown(reason) => {
+            eprintln!("porthole-agent: did not find out whether an update is available: {reason}")
+        }
+    }
+
+    // **Re-read, and merge only `announced`.**
+    //
+    // The settings read before the blocking work are stale by seconds -- this
+    // function's own doc says `dnf check-update` can spend them refreshing
+    // metadata -- and saving that copy back would carry the **consent** field
+    // with it. A `porthole update --disable` issued inside that window would
+    // be reverted to `yes`, silently, permanently, with the daily checks
+    // carrying on.
+    //
+    // Every other value in this file porthole may reasonably own. This one it
+    // may not: the whole reason consent exists as a stored answer is that a
+    // person and not a program decided it, and overwriting it with a stale
+    // copy is porthole overriding the one instruction whose entire purpose is
+    // to be the user's. So nothing read before the blocking work is ever
+    // written after it.
+    let mut settings = core_update::Settings::load(&path);
+    if !settings.consent().permits_checking() {
+        // Withdrawn while this check was in flight. Nothing is written and
+        // nothing is shown: the answer arrived after the question stopped
+        // being one porthole had been given leave to ask.
+        eprintln!(
+            "porthole-agent: update checks were turned off while this check was running, so \
+             nothing is said about what it found and nothing is written down"
+        );
+        return unchanged(on_screen);
+    }
+
+    // Once per version, not once per check -- and the record is only written
+    // when it actually moved, so an unchanged answer costs no daily write.
+    let before = settings.announced.clone();
+    let worth_saying = settings.record_announced(&verdict);
+    if settings.announced != before {
+        if let Err(e) = settings.save(&path) {
+            // Not fatal, and deliberately not silent: what it costs is that
+            // the same version may be announced again tomorrow, which is a
+            // repeated notification rather than a wrong one.
+            eprintln!(
+                "porthole-agent: could not record which update was announced ({e}); it may \
+                 be announced again"
+            );
+        }
+    }
+    if !worth_saying {
+        return unchanged(on_screen);
+    }
+
+    // Asked only now, and only because there is something to say: whether
+    // PackageKit is there decides whether the notification carries a button
+    // or a command, and nothing else in this agent needs to know.
+    let packagekit = update::is_available(system).await;
+    let Some(notice) = update::notice_for(&install, &verdict, packagekit) else {
+        return unchanged(on_screen);
+    };
+    let Install::Packaged(packaging) = install else {
+        // Unreachable: `notice_for` returns `None` for every other case.
+        // Written as a fall-through rather than an `expect` because a
+        // notification agent must not end a login session over it.
+        return unchanged(on_screen);
+    };
+
+    match notify::show(notifications, &notice).await {
+        Ok(id) => {
+            eprintln!("porthole-agent: said that a porthole update is available, as #{id}");
+            Checked {
+                on_screen: Some(UpdateOnScreen { id, packaging }),
+                keep_checking: true,
+            }
+        }
+        Err(e) => {
+            // The same failure `on_close` survives rather than reports: a
+            // session with no notification service answers every `Notify`
+            // this way.
+            eprintln!("porthole-agent: a porthole update is available but could not be shown: {e}");
+            unchanged(on_screen)
+        }
+    }
+}
+
+/// Hand the update to PackageKit, and say what came of it.
+///
+/// Spawned rather than awaited, for `on_action`'s own reason one step
+/// further: this raises **PackageKit's** polkit prompt, which can sit on a
+/// password for as long as the person takes, and then downloads and installs
+/// a package. The signal loop must keep announcing closes throughout.
+///
+/// On success the agent re-executes from the binary the install has just put
+/// on disk. That is the design's answer to what stays old after an update,
+/// and it is [`restart_from_disk`] -- the same machinery the protocol version
+/// reaches, not a second copy of it.
+fn start_the_update(
+    notifications: &NotificationsProxy<'static>,
+    system: &zbus::Connection,
+    packaging: porthole_core::update::Packaging,
+) {
+    let notifications = notifications.clone();
+    let system = system.clone();
+    tokio::spawn(async move {
+        let notice = match update::install(&system, porthole_core::update::PACKAGE).await {
+            Ok(update::Outcome::Installed) => {
+                if let Err(e) =
+                    notify::show(&notifications, &update::update_succeeded_notice()).await
+                {
+                    eprintln!("porthole-agent: porthole was updated, and saying so failed ({e})");
+                }
+                restart_from_disk("PackageKit reports porthole was updated", None);
+                // Reached only if the re-execution could not be made, which
+                // `restart_from_disk` has already said in the journal. The
+                // agent goes on announcing closes as the older binary.
+                return;
+            }
+            Ok(update::Outcome::Failed(detail)) => {
+                eprintln!("porthole-agent: the update did not go through: {detail}");
+                update::update_failed_notice(&detail, packaging)
+            }
+            Err(detail) => {
+                eprintln!("porthole-agent: could not hand the update to PackageKit: {detail}");
+                update::update_failed_notice(&detail, packaging)
+            }
+        };
+        if let Err(e) = notify::show(&notifications, &notice).await {
+            eprintln!("porthole-agent: the update did not go through, and saying so failed ({e})");
+        }
+    });
 }
 
 /// Which request a `Reopen` re-sends, and everything it carries.

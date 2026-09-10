@@ -13,6 +13,7 @@ use porthole_core::error::Error;
 use porthole_core::listening::{Binding, Service};
 use porthole_core::model::{Protocol, Target};
 use porthole_core::state::ManagedRule;
+use porthole_core::update::{Consent, Install, Verdict, PACKAGE};
 use serde_json::{json, Value};
 
 /// The Docker publish rule matching `port`/`protocol`, if any -- the lookup
@@ -765,6 +766,168 @@ pub fn json_device_changed(action: &str, name: &str, address: Option<&DeviceAddr
             "address": addr,
         },
     })
+}
+
+/// The slug `--json` publishes for each consent state. Three, because there
+/// are three: `never_asked` is not `no`, and a script that could not tell
+/// them apart could not tell "this person declined" from "nobody has asked".
+fn consent_slug(consent: Consent) -> &'static str {
+    match consent {
+        Consent::Yes => "yes",
+        Consent::No => "no",
+        Consent::NeverAsked => "never_asked",
+    }
+}
+
+/// What porthole knows about how it was installed, as one sentence.
+fn install_sentence(install: &Install) -> String {
+    match install {
+        Install::Packaged(p) => format!("porthole was installed by {}", p.as_str()),
+        Install::Unpackaged => "porthole was not installed by any package manager on this \
+             machine, so it was built and installed from source. porthole will not offer to \
+             replace a tree it did not install."
+            .to_string(),
+        Install::Undetermined(reason) => reason.clone(),
+    }
+}
+
+/// `porthole update --json`.
+///
+/// **`available` is `true`, `false` or `null`, and the third is not a
+/// nuisance to be flattened away.** `null` is every case where porthole did
+/// not get an answer: a source install, a machine with no package manager, a
+/// manager that answered in a way that answers nothing, and -- on apt and
+/// pacman -- a question their own documentation defines no exit code for.
+/// Rendering any of those as `false` would tell a script there is nothing to
+/// install on a machine that may well have something, which is the same
+/// collapse `porthole listen --json`'s own `docker_checked` field exists to
+/// avoid. `detail` is where the reason is said in words.
+pub fn json_update(consent: Consent, install: &Install, verdict: Option<&Verdict>) -> Value {
+    let (available, version, detail) = match verdict {
+        Some(Verdict::Available { version }) => (
+            Some(true),
+            version.clone(),
+            match version {
+                Some(v) => format!("{PACKAGE} {v} is available to install"),
+                None => format!(
+                    "an update to {PACKAGE} is available to install; the package manager's \
+                     own listing named no version porthole could read"
+                ),
+            },
+        ),
+        Some(Verdict::UpToDate) => (
+            Some(false),
+            None,
+            format!("{PACKAGE} is up to date as far as this machine's package manager knows"),
+        ),
+        Some(Verdict::NoContract(reason)) | Some(Verdict::Unknown(reason)) => {
+            (None, None, reason.clone())
+        }
+        None => (None, None, install_sentence(install)),
+    };
+    json!({
+        "schema": JSON_SCHEMA,
+        "update": {
+            "consent": consent_slug(consent),
+            "packaging": match install {
+                Install::Packaged(p) => Some(p.as_str()),
+                _ => None,
+            },
+            "packaged": matches!(install, Install::Packaged(_)),
+            "available": available,
+            "version": version,
+            "detail": detail,
+            // What to run by hand. Present whenever porthole knows which
+            // manager owns this install, whether or not it could answer the
+            // question -- a person told there may be an update and given
+            // nothing to type has been told half of something.
+            "command": match install {
+                Install::Packaged(p) => Some(p.manual_command()),
+                _ => None,
+            },
+        },
+    })
+}
+
+/// `porthole update`, for a person.
+pub fn print_update(consent: Consent, install: &Install, verdict: Option<&Verdict>) {
+    match verdict {
+        Some(Verdict::Available { version }) => match version {
+            Some(v) => println!("{PACKAGE} {v} is available to install."),
+            None => println!(
+                "An update to {PACKAGE} is available to install. The package manager's own \
+                 listing named no version porthole could read; the answer that there is \
+                 one comes from its exit code."
+            ),
+        },
+        Some(Verdict::UpToDate) => {
+            println!(
+                "Nothing to update: {PACKAGE} is up to date as far as this machine's \
+                      package manager knows."
+            );
+        }
+        Some(Verdict::NoContract(reason)) | Some(Verdict::Unknown(reason)) => {
+            println!("porthole did not find out whether an update is available.");
+            println!("{reason}");
+        }
+        None => println!("{}", install_sentence(install)),
+    }
+
+    if let Install::Packaged(p) = install {
+        println!();
+        println!("To update it yourself: {}", p.manual_command());
+    }
+
+    println!();
+    match consent {
+        Consent::Yes => println!(
+            "The daily check is on: porthole asks this machine's package manager once a \
+             day and says so on screen when the answer changes. `porthole update \
+             --disable` stops it."
+        ),
+        Consent::No => println!(
+            "The daily check is off. `porthole update --enable` turns it on; nothing \
+             leaves this machine either way."
+        ),
+        Consent::NeverAsked => println!(
+            "The daily check is not set up: nobody has been asked yet. The porthole \
+             window asks at first launch, and `porthole update --enable` answers it from \
+             here. Nothing leaves this machine either way -- the question goes to the \
+             package manager already installed on it."
+        ),
+    }
+}
+
+/// `porthole update --enable|--disable --json`.
+pub fn json_consent_changed(consent: Consent, dry_run: bool) -> Value {
+    json!({
+        "schema": JSON_SCHEMA,
+        "dry_run": dry_run,
+        "update": { "consent": consent_slug(consent) },
+    })
+}
+
+pub fn print_consent_changed(consent: Consent, dry_run: bool) {
+    let what = match consent {
+        Consent::Yes => "on",
+        Consent::No => "off",
+        // Unreachable from the two flags, which is why it says so rather
+        // than inventing a third sentence: `--enable` and `--disable` are
+        // the only ways here, and neither produces "never asked".
+        Consent::NeverAsked => "unchanged",
+    };
+    if dry_run {
+        println!("Would turn the daily update check {what}. Nothing was written.");
+        return;
+    }
+    match consent {
+        Consent::Yes => println!(
+            "The daily update check is on. porthole asks this machine's own package \
+             manager once a day; nothing leaves the machine."
+        ),
+        Consent::No => println!("The daily update check is off."),
+        Consent::NeverAsked => println!("The daily update check is unchanged."),
+    }
 }
 
 pub fn json_devices(rows: &[DeviceStatus]) -> Value {
