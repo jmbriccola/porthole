@@ -28,8 +28,11 @@
 //! across processes, rebuilds, profiles and libcs, and it embeds every
 //! rustdoc comment and every parameter name, so it changes when prose
 //! improves. `porthole_core::ipc::signature_digest` strips both, which is
-//! also what makes it work on a document `xmllint` refuses -- five of this
-//! interface's doc comments contain `--`.
+//! also what let it work on the document this interface served until
+//! `service.rs` turned zbus's `introspection_docs` off: `xmllint` refused it,
+//! because five of these doc comments contain `--`. That is fixed, and
+//! `the_served_introspection_is_a_document_a_parser_will_take` below is what
+//! keeps it fixed.
 //!
 //! Nothing here touches this machine's real buses, no firewall is read or
 //! written, and the object is never asked to do anything beyond answering
@@ -118,6 +121,86 @@ async fn the_served_interface_is_the_one_this_digest_names() {
          number stayed put is a client saying \"we are level\" while the signatures \
          have diverged, and committing the pair is what stops it.",
         PROTOCOL_VERSION + 1
+    );
+}
+
+/// The document the helper hands out is one a conformant XML parser accepts.
+///
+/// It was not. zbus copies each member's rustdoc into an XML comment verbatim,
+/// XML forbids `--` inside a comment, and `--` is this project's punctuation:
+/// `xmllint --noout` on the real served document exited 1 with ten "Double
+/// hyphen within comment" errors from five doc comments, and `xml.etree`
+/// stopped at the first. `busctl` and `gdbus` are lenient and never noticed,
+/// which is why this went unseen -- the tools a person reaches for were fine
+/// and every code generator was not.
+///
+/// **What is asserted is the served document, not the attribute that fixes
+/// it.** `service.rs` sets `introspection_docs = false`; a test that read that
+/// attribute back would be reading the fix rather than its effect.
+///
+/// **Not a well-formedness check in general.** No XML parser is reachable
+/// from here without a new dependency, and inventing one for a test is worse
+/// than saying what this does check. What it checks is the two facts that
+/// stand between this document and every parser that refused it: there is no
+/// comment in it, comments being the one construct free-form prose enters
+/// (everything else zbus writes comes from Rust identifiers and
+/// `Type::SIGNATURE`); and there is no `--` anywhere in it at all, so a
+/// comment that comes back by any route cannot carry the sequence that made
+/// the old document invalid.
+#[tokio::test]
+async fn the_served_introspection_is_a_document_a_parser_will_take() {
+    let state = TempDir::new().unwrap();
+    let (_conn, name) = serve("ContractXml", &state).await;
+    let xml = introspect(&name).await;
+
+    // Every assertion below is about something the document does *not*
+    // contain, and an empty string satisfies all of them. So: establish that
+    // this is the document first.
+    let opening = format!("<interface name=\"{INTERFACE}\"");
+    let block = xml
+        .split_once(&opening)
+        .unwrap_or_else(|| {
+            panic!(
+                "the introspection fetched here does not declare {INTERFACE}, so \
+                 the checks below are being made against the wrong document -- or \
+                 against no document. Got {} bytes: {xml}",
+                xml.len()
+            )
+        })
+        .1
+        .split_once("</interface>")
+        .unwrap_or_else(|| panic!("{INTERFACE}'s element is not closed: {xml}"))
+        .0;
+    // Scoped to that block and not to the whole document, which was this
+    // assertion's first mistake and was caught by breaking it: zbus serves
+    // `Introspectable`, `Peer` and `Properties` alongside, and their members
+    // are enough on their own to satisfy any floor worth setting here.
+    //
+    // A ratchet, like `declared_exit_codes`'s: the interface only ever gains
+    // members, so a count below the floor is a document that is not the one
+    // it should be rather than an interface that shrank.
+    let methods = block.matches("<method name=").count();
+    assert!(
+        methods >= 9,
+        "{INTERFACE}'s element declares {methods} methods, fewer than the nine \
+         it had when this floor was last raised. Members are only ever \
+         appended, so this is not the document it should be. Got: {xml}"
+    );
+
+    assert!(
+        !xml.contains("<!--"),
+        "the served introspection carries an XML comment again. zbus writes one \
+         per doc comment, unescaped, and this project's prose is full of `--`, \
+         which XML forbids inside a comment: that is how this document came to \
+         be one no conformant parser would read. If `introspection_docs = false` \
+         was removed from `service.rs`'s `#[zbus::interface]`, put it back; the \
+         reasoning is in the comment above it. Document:\n{xml}"
+    );
+    assert!(
+        !xml.contains("--"),
+        "the served introspection contains `--`. Inside an XML comment that is \
+         a parse error, and this document is generated, so there is no route by \
+         which the sequence should appear at all. Document:\n{xml}"
     );
 }
 

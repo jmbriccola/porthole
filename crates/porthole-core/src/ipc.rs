@@ -88,12 +88,14 @@ pub const PROTOCOL_VERSION_ABSENT: u32 = 0;
 /// pin and is the wrong one. Measured
 /// (`.superpowers/sdd/2026-09-07-docker-forward/spike-protocol-version.md`):
 /// it is deterministic to the byte across processes, rebuilds, profiles and
-/// libcs -- and it embeds every rustdoc comment and every Rust parameter
-/// name, so four words added to a doc comment change it and renaming
-/// `_seconds` to `_secs` changes it. A contract that breaks when prose
+/// libcs -- and it embedded every rustdoc comment and every Rust parameter
+/// name, so four words added to a doc comment changed it and renaming
+/// `_seconds` to `_secs` changes it still. A contract that breaks when prose
 /// improves, in a project that spends half its time improving prose, is a
-/// test that gets re-blessed unread. (It is also not well-formed XML today:
-/// five of those doc comments contain `--`.)
+/// test that gets re-blessed unread. (The prose is out of the document since
+/// `service.rs` turned zbus's `introspection_docs` off, which was a fix for
+/// the document not being well-formed XML -- five of those doc comments
+/// contained `--`. The parameter names are still in it, and they still churn.)
 pub const SIGNATURE: &str = "\
 method com.jacopobriccola.Porthole1.Close(qs) -> ((sqssssttusqq))
 method com.jacopobriccola.Porthole1.CloseAll() -> (a(sqssssttusqq)a(ssi))
@@ -266,11 +268,17 @@ fn names_an_absent_member(e: &zbus::Error) -> bool {
 /// what makes the raw XML churn on prose edits (see [`SIGNATURE`]), and
 /// nothing on the wire depends on them.
 ///
-/// Comments are removed before anything is parsed, which is also what makes
-/// this work at all on porthole's own XML: rustdoc prose containing `--`
-/// lands inside an XML comment, `xmllint` refuses the document with five
-/// "double hyphen within comment" errors, and a guard that parsed it
-/// properly would have failed before this feature started.
+/// Comments are removed before anything is parsed, and that tolerance is
+/// kept deliberately rather than left over. It is what made this work on the
+/// document porthole itself served until `service.rs` turned zbus's
+/// `introspection_docs` off: rustdoc prose containing `--` landed inside an
+/// XML comment, `xmllint` refused the document with five "double hyphen
+/// within comment" errors, and a guard that parsed it properly would have
+/// failed before this feature started. The helper's own document is
+/// well-formed now -- `the_served_introspection_is_a_document_a_parser_will_
+/// take` holds it to that -- but this function is also pointed at whatever a
+/// helper of some other vintage answers with, and that one can still be a
+/// document no parser accepts.
 ///
 /// `Err` when the document has no such interface, rather than an empty
 /// digest: a guard that compares nothing against nothing passes.
