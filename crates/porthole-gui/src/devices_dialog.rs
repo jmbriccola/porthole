@@ -13,8 +13,21 @@
 //! the title this dialog sets was rendered nowhere and nothing on screen
 //! offered to dismiss it. The bar added in [`DevicesDialog::new`] draws
 //! both. Escape is libadwaita's own and always worked from a keyboard
-//! inside the panel; `tests/devices_dialog.rs` presses the close button and
-//! checks the panel is gone, rather than checking a button is there.
+//! inside the panel.
+//!
+//! `tests/devices_dialog.rs` presses **both** and checks the panel is gone
+//! each time, rather than checking a button is there. It carries a third
+//! check that presses nothing: that the keyboard lands under the *name
+//! field*, not merely somewhere in the panel. "Somewhere in the panel" is
+//! satisfied by the header bar's own close button, so it is too weak to say
+//! anything about where typing goes -- an earlier version of that check
+//! asserted exactly that much while its comment claimed more, which is the
+//! defect this crate is most prone to.
+//!
+//! What that check does **not** do is detect the deletion of the
+//! `set_focus` call in [`DevicesDialog::new`], because on this panel that
+//! call is inert; see it for the measurement. It pins the behaviour, not
+//! the line.
 //!
 //! ## Two ways to name a device, one rule for each field
 //!
@@ -865,10 +878,25 @@ impl DevicesDialog {
             .child(&toolbar_view)
             .build();
         // Where the keyboard starts -- the name field, which is the first
-        // thing a person fills in. Named rather than left to the tab order
-        // for the reason the open dialog's own `set_focus` records: what
-        // libadwaita grabs on its own is whatever comes first in that order,
-        // and the header bar added above now comes before the form.
+        // thing a person fills in.
+        //
+        // **This call is not currently load-bearing, and an earlier version
+        // of this comment claimed it was.** It said the header bar above
+        // "now comes before the form", borrowing the open dialog's own
+        // reason. Measured in this milestone's container, with this line
+        // deleted and the crate confirmed rebuilt: the keyboard still lands
+        // on this row. The two panels differ in the one way that matters --
+        // the open dialog's bar carries a Cancel button, which GTK's tab
+        // order does reach first, and this one carries only the close
+        // button, which it skips. So there the call moves the focus and
+        // here it does not.
+        //
+        // Kept anyway, for a smaller and true reason: it makes where the
+        // keyboard starts a property of this file rather than of GTK's tab
+        // order, so adding any focusable control to the bar above cannot
+        // quietly move it. What actually guards the behaviour is
+        // `the_keyboard_starts_in_the_name_field`, which asserts the focus
+        // sits under this row and fails when it does not -- not this line.
         dialog.set_focus(Some(&name_row));
 
         let inner = Rc::new(Inner {
@@ -1067,6 +1095,17 @@ impl DevicesDialog {
 
     pub fn set_name_text(&self, text: &str) {
         self.inner.name_row.set_text(text);
+    }
+
+    /// The real name field, for a caller that needs the widget rather than
+    /// its text -- which is one caller: the check that a freshly presented
+    /// panel leaves the keyboard here rather than on the header bar this
+    /// panel now carries. What actually holds the keyboard is the `GtkText`
+    /// libadwaita builds inside this row, so that check asks whether the
+    /// focus sits *under* what this returns. The exact shape, and the exact
+    /// reason, as [`crate::open_dialog::OpenDialog::port_row`].
+    pub fn name_row(&self) -> &adw::EntryRow {
+        &self.inner.name_row
     }
 
     pub fn set_mac_text(&self, text: &str) {

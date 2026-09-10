@@ -211,16 +211,137 @@ fn the_close_button_dismisses_the_saved_devices_panel() -> Result<(), String> {
     outcome.replace(Err("activation never ran".to_string()))
 }
 
-/// And the keyboard is inside the panel the moment it opens, which is what
-/// libadwaita's own Escape shortcut needs in order to ever see the key --
-/// see `tests/open_dialog.rs`'s own Escape case for the mechanism and for
-/// the one step of a real keypress this container cannot supply.
+/// Whether `widget` is `ancestor` or sits under it.
+fn is_inside(widget: &gtk::Widget, ancestor: &gtk::Widget) -> bool {
+    let mut current = Some(widget.clone());
+    while let Some(w) = current {
+        if w == *ancestor {
+            return true;
+        }
+        current = w.parent();
+    }
+    false
+}
+
+/// Runs GTK's own bubble phase for an Escape key press delivered to
+/// `focus`: every widget from there up to the window, firing any Escape
+/// shortcut it carries and stopping at the first that reports it handled the
+/// key.
 ///
-/// Checked here as well as there because the header bar added to this panel
-/// introduces focusable widgets ahead of its form, exactly as the open
-/// dialog's does, and what libadwaita grabs on its own is whatever comes
-/// first in tab order.
-fn the_saved_devices_panel_holds_the_keyboard_when_it_opens() -> Result<(), String> {
+/// The same helper, the same mechanism and the same one gap as
+/// `tests/open_dialog.rs`'s own -- GDK4 exposes no way to construct a key
+/// event and this container has no XTEST client, so the step not covered is
+/// GDK turning a physical keypress into the event. Duplicated rather than
+/// shared because each `harness = false` target is its own binary.
+fn escape_from(focus: &gtk::Widget) -> Vec<String> {
+    use gtk::prelude::ListModelExtManual;
+    let mut fired = Vec::new();
+    let mut current = Some(focus.clone());
+    while let Some(widget) = current {
+        for controller in widget
+            .observe_controllers()
+            .iter::<gtk::glib::Object>()
+            .flatten()
+        {
+            let Ok(shortcuts) = controller.downcast::<gtk::ShortcutController>() else {
+                continue;
+            };
+            for item in shortcuts.iter::<gtk::glib::Object>().flatten() {
+                let Ok(shortcut) = item.downcast::<gtk::Shortcut>() else {
+                    continue;
+                };
+                if shortcut
+                    .trigger()
+                    .map(|t| t.to_str().to_string())
+                    .as_deref()
+                    != Some("Escape")
+                {
+                    continue;
+                }
+                let Some(action) = shortcut.action() else {
+                    continue;
+                };
+                let handled = action.activate(gtk::ShortcutActionFlags::empty(), &widget, None);
+                fired.push(format!("{}:{handled}", widget.type_().name()));
+                if handled {
+                    return fired;
+                }
+            }
+        }
+        current = widget.parent();
+    }
+    fired
+}
+
+/// The panel's second way out, which the open dialog pins and this one did
+/// not: its module doc names Escape as one of two, and only the close button
+/// was ever pressed.
+///
+/// Two things, in order. The keyboard is inside the panel -- libadwaita's
+/// Escape shortcut hangs off the sheet a presented dialog sits in and only
+/// fires for an event that reaches it, so a keyboard left outside is a panel
+/// Escape does nothing to. Then firing that chain actually dismisses.
+fn escape_dismisses_the_saved_devices_panel() -> Result<(), String> {
+    let outcome = Rc::new(RefCell::new(Err("activation never ran".to_string())));
+    let seen = outcome.clone();
+    activate(
+        "com.jacopobriccola.Porthole.Test.DevicesEscape",
+        move |app| {
+            let win = PortholeWindow::new_without_initial_load(app);
+            win.present();
+            let dialog = DevicesDialog::new();
+            dialog.present(Some(&*win));
+            settle();
+
+            let panel: gtk::Widget = dialog.dialog().clone().upcast();
+            let focus = gtk::prelude::GtkWindowExt::focus(&*win);
+            let inside = focus.as_ref().map(|f| is_inside(f, &panel));
+            let where_it_is = focus
+                .as_ref()
+                .map(|f| f.type_().name().to_string())
+                .unwrap_or_else(|| "nothing at all".to_string());
+
+            *seen.borrow_mut() = if inside != Some(true) {
+                Err(format!(
+                    "a freshly presented panel must hold the keyboard, or Escape reaches \
+                     nothing until the user clicks into it: the focus is on {where_it_is}"
+                ))
+            } else {
+                let fired = focus.as_ref().map(escape_from).unwrap_or_default();
+                settle();
+                if win.visible_dialog().is_some() {
+                    Err(format!(
+                        "Escape left the panel on screen; the shortcuts it reached were \
+                         {fired:?}"
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+        },
+    );
+    outcome.replace(Err("activation never ran".to_string()))
+}
+
+/// The keyboard lands on the name field, not on the header bar.
+///
+/// A control of the case above rather than a repeat of it, and the reason
+/// this file needs both. "Inside the panel" is what Escape needs, and it is
+/// satisfied just as well by the header bar's own close button, so it says
+/// nothing about where typing goes. The panel's first act is typing a name;
+/// this is what pins the keyboard there.
+///
+/// **What it does not do**, stated because the obvious reading is wrong:
+/// it does not fail when `dialog.set_focus(Some(&name_row))` is deleted
+/// from `devices_dialog.rs`. Measured, with the crate confirmed rebuilt --
+/// on this panel that call is inert, because the only thing its header bar
+/// puts ahead of the form is the close button and GTK's tab order skips it.
+/// Nothing can detect the removal of a line that changes no behaviour. What
+/// this check does catch is the behaviour itself moving, from whatever
+/// cause: the same deletion on the *open* dialog, whose bar does carry a
+/// focusable Cancel, moves the keyboard onto it and fails that panel's own
+/// `the_keyboard_starts_in_the_port_field`.
+fn the_keyboard_starts_in_the_name_field() -> Result<(), String> {
     let outcome = Rc::new(RefCell::new(Err("activation never ran".to_string())));
     let seen = outcome.clone();
     activate(
@@ -232,26 +353,22 @@ fn the_saved_devices_panel_holds_the_keyboard_when_it_opens() -> Result<(), Stri
             dialog.present(Some(&*win));
             settle();
 
-            let panel: gtk::Widget = dialog.dialog().clone().upcast();
             let focus = gtk::prelude::GtkWindowExt::focus(&*win);
-            let mut inside = false;
-            let mut current = focus.clone();
-            while let Some(w) = current {
-                if w == panel {
-                    inside = true;
-                    break;
-                }
-                current = w.parent();
-            }
-            *seen.borrow_mut() = if inside {
+            // The row itself is what `devices_dialog.rs` names; what takes
+            // the keyboard is the `GtkText` libadwaita builds inside it, so
+            // the question is whether the focus sits under the row.
+            let row: gtk::Widget = dialog.name_row().clone().upcast();
+            let inside = focus.as_ref().map(|f| is_inside(f, &row));
+            let where_it_is = focus
+                .map(|f| f.type_().name().to_string())
+                .unwrap_or_else(|| "nothing at all".to_string());
+
+            *seen.borrow_mut() = if inside == Some(true) {
                 Ok(())
             } else {
                 Err(format!(
-                    "a freshly presented panel must hold the keyboard, or Escape reaches \
-                     nothing until the user clicks into it: the focus is on {}",
-                    focus
-                        .map(|f| f.type_().name().to_string())
-                        .unwrap_or_else(|| "nothing at all".to_string())
+                    "a freshly opened panel must be ready to have a name typed into it, and \
+                     the keyboard is on {where_it_is}"
                 ))
             };
         },
@@ -782,8 +899,12 @@ fn main() {
             the_close_button_dismisses_the_saved_devices_panel,
         ),
         (
-            "the_saved_devices_panel_holds_the_keyboard_when_it_opens",
-            the_saved_devices_panel_holds_the_keyboard_when_it_opens,
+            "escape_dismisses_the_saved_devices_panel",
+            escape_dismisses_the_saved_devices_panel,
+        ),
+        (
+            "the_keyboard_starts_in_the_name_field",
+            the_keyboard_starts_in_the_name_field,
         ),
         (
             "saving_a_device_puts_it_in_the_book_and_then_in_the_open_dialog",
