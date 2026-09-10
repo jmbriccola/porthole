@@ -165,14 +165,27 @@ check() {
 
 	# porthole-core only, and the rest of the workspace deliberately not.
 	# porthole-core's suite passes in a container holding nothing beyond
-	# base-devel, rust and the GUI's build dependencies. porthole-cli's does
-	# not: five of its tests fail there, for two reasons. Its `doctor` tests
-	# assert on what the Helper check reports, and with no bus at all doctor
-	# reports something else; and four others redirect the state file and the
-	# device book through PORTHOLE_STATE_FILE and PORTHOLE_DEVICES_FILE, which
-	# are honoured in debug builds only -- a release binary is not to take
-	# those paths from the environment. porthole-gui's tests construct real
-	# GTK widgets and need a display.
+	# base-devel, rust and the GUI's build dependencies. porthole-gui's tests
+	# construct real GTK widgets and need a display.
+	#
+	# porthole-cli's needs two programs this container does not have:
+	# dbus-run-session, which crates/porthole-cli/tests/cli.rs asserts is on
+	# PATH rather than skipping without, and busctl, which
+	# tests/helper_e2e.rs waits with. Both come from the systemd and dbus
+	# packages; packaging/rpm/porthole.spec declares them as BuildRequires.
+	#
+	# Neither reason is --release any more, and the two reasons written here
+	# until 2026-09-10 were both stale. Its `doctor` tests pass with no
+	# reachable bus of either kind now, because cli.rs starts a private one
+	# for the test binary (measured: 4 passed, 0 failed). And the tests that
+	# redirect the state file and the device book through
+	# PORTHOLE_STATE_FILE and PORTHOLE_DEVICES_FILE -- still honoured in
+	# debug builds only, because a release binary must not take those paths
+	# from its environment -- now carry
+	# #[cfg_attr(not(debug_assertions), ignore = ...)], so a release run
+	# reports them as ignored by name. There are seven of them, not the four
+	# this comment used to claim; `forward` and the device book added three
+	# and nothing noticed. Measured: 42 passed, 0 failed, 7 ignored.
 	cargo test --release --locked -p porthole-core
 }
 

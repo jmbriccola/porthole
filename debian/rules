@@ -55,22 +55,40 @@ ifeq ($(WITH_GUI),1)
 	$(MAKE) build-gui
 endif
 
-# No test run here, and the reason is not that the suite is slow.
+# No test run here, and the reason is not that the suite is slow. Both
+# reasons written here until 2026-09-10 have stopped being true, so both are
+# replaced rather than edited.
 #
-# `porthole doctor` asks the system bus for the helper, and the one test that
-# pins its answer -- doctor_says_the_helper_is_missing_when_it_is -- wants the
-# check to report a missing helper. In a build chroot there is no system bus
-# at all, so it reports a missing *bus* instead and the test fails. Observed
-# in a debian:13 container, with and without dbus-run-session: a session bus
-# does not stand in for the system one here.
+# It is no longer the system bus. The reason used to be that
+# doctor_says_the_helper_is_missing_when_it_is wanted the Helper check to
+# report a missing helper and a chroot's missing *bus* made it report
+# something else. crates/porthole-cli/tests/cli.rs starts a private
+# dbus-run-session for the test binary and hands every porthole process it
+# launches DBUS_SYSTEM_BUS_ADDRESS pointing at it. Measured on 2026-09-10
+# with that variable pointing at /nonexistent/bus and DBUS_SESSION_BUS_ADDRESS
+# unset -- a machine with no reachable bus of either kind -- `cargo test -p
+# porthole-cli --test cli doctor`: 4 passed, 0 failed.
 #
-# `cargo test --release` fails four more, for a separate reason worth writing
-# down before someone adds --release back: PORTHOLE_STATE_FILE,
-# PORTHOLE_DEVICES_FILE and the helper's --session are all gated on
-# cfg!(debug_assertions), and the tests that drive the binary through them
-# need a debug build.
+# It is no longer --release either. PORTHOLE_STATE_FILE,
+# PORTHOLE_DEVICES_FILE and the helper's --session are still honoured only
+# where cfg!(debug_assertions) holds, deliberately: a release binary runs
+# privileged and must not take those paths from its environment. What
+# changed is that the tests depending on them now carry
+# #[cfg_attr(not(debug_assertions), ignore = ...)], so a release run reports
+# them as ignored, by name, with the reason. Seven in cli.rs, four in
+# helper_e2e.rs. Measured: `cargo test --release -p porthole-cli --test cli`
+# -> 42 passed, 0 failed, 7 ignored.
 #
-# The suite runs on a developer machine and in CI, where there is a bus.
+# What does stand in the way is a build-dependency that debian/control does
+# not declare. The requirement moved from "a system bus exists" to
+# "dbus-run-session is on PATH", which cli.rs asserts rather than skipping,
+# and busctl, which helper_e2e.rs waits with.
+# packaging/rpm/porthole.spec:84-86 declares both as BuildRequires;
+# debian/control declares neither. Declaring them is the first step to adding
+# a run here, not the whole of it: nothing has been measured in a build
+# chroot since these two reasons stopped applying.
+#
+# The suite runs on a developer machine and in CI.
 override_dh_auto_test:
 
 # PREFIX=/usr, not the Makefile's own default being taken on trust:

@@ -99,18 +99,25 @@ The test suite
 --------------
 
 debian/rules overrides dh_auto_test with nothing in it. `cargo test
---workspace --exclude porthole-gui` passes on a developer machine, and in a
-debian:13 container all of it passes except
-doctor_says_the_helper_is_missing_when_it_is: that test wants the Helper
-check to report a missing helper, and with no system bus in the chroot the
-check reports a missing bus instead. Running the suite under
-dbus-run-session, which supplies a session bus, does not change that -- the
-check porthole doctor makes without --session is against the system bus.
+--workspace --exclude porthole-gui` passes on a developer machine.
 
-Anyone re-adding the run should also drop --release from it. PORTHOLE_STATE_FILE,
-PORTHOLE_DEVICES_FILE and the helper's --session are gated on
-cfg!(debug_assertions); a release test build fails four more tests in
-crates/porthole-cli/tests/cli.rs for that reason alone.
+The two reasons this section gave until 2026-09-10 have both stopped being
+true, and debian/rules' own comment now carries the replacements. In short:
+crates/porthole-cli/tests/cli.rs gives every porthole process it starts a
+private bus of its own, so doctor_says_the_helper_is_missing_when_it_is no
+longer needs the machine to have a system bus -- measured with both bus
+variables pointing at nothing: 4 passed, 0 failed. And a release build no
+longer fails the tests that need PORTHOLE_STATE_FILE, PORTHOLE_DEVICES_FILE
+or the helper's --session, all three of which are still honoured only where
+cfg!(debug_assertions) holds: those tests carry
+#[cfg_attr(not(debug_assertions), ignore = ...)] and a release run reports
+them as ignored, by name. Measured: 42 passed, 0 failed, 7 ignored.
+
+What debian/control is missing is dbus-run-session and busctl, which the
+suite now needs on PATH and which packaging/rpm/porthole.spec declares as
+BuildRequires. Nothing has been measured in a debian:13 chroot since the two
+old reasons stopped applying, so declaring them is where re-adding the run
+would start, not where it would finish.
 
 Build profiles
 --------------

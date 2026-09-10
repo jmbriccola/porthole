@@ -55,6 +55,36 @@
 //! Every porthole process started below is killed at [`DEADLINE`] and its
 //! test fails. The two runs described above hung for more than five hundred
 //! seconds each, on a machine whose owner was somewhere else.
+//!
+//! # Seven tests that a release build must not run
+//!
+//! `PORTHOLE_STATE_FILE` and `PORTHOLE_DEVICES_FILE` are honoured only where
+//! `cfg!(debug_assertions)` holds, deliberately: a release binary runs
+//! privileged and must not take the location of its state or its address book
+//! from the environment. Seven tests below depend on being honoured, so they
+//! carry `#[cfg_attr(not(debug_assertions), ignore = ...)]` and a
+//! `cargo test --release` reports them as `ignored`, **by name**, with the
+//! reason attached. That is the arrangement `helper_e2e.rs` already had for
+//! the same shape of problem; this file did not, and a release run of it was
+//! simply red.
+//!
+//! Failing was not the worst of it, and this is why the attribute is not
+//! tidiness. Measured here on 2026-09-10, `cargo test --release -p
+//! porthole-cli --test cli`: 42 passed, 7 failed -- and among the seven,
+//! `the_picker_hides_containers_and_shows_a_name_where_the_resolver_has_one`
+//! drives `porthole devices add` to completion, so with the override ignored
+//! it **saved a device into the invoking user's own
+//! `~/.config/porthole/devices.toml`**. It survived only because that book's
+//! existing entries and the stub neighbour table happened to agree. Three
+//! more of the seven read that same real book, and two read the machine's
+//! real `/run/porthole/state.json`.
+//!
+//! What is *not* claimed: this does not stop a release run reading the real
+//! state file. Nearly every test here sets `PORTHOLE_STATE_FILE` through
+//! [`porthole`], and under `--release` all of them read
+//! `/run/porthole/state.json` -- most simply do not care what is in it, which
+//! is why they pass. What the seven ignores remove is every release
+//! assertion that depended on the override, and the only write.
 
 use std::ffi::OsString;
 use std::io::{BufRead as _, Read as _, Write as _};
@@ -866,6 +896,10 @@ fn doctor_names_all_three_backends_when_none_is_found() {
 // with each -- none of which had a test at all.
 
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "PORTHOLE_DEVICES_FILE is honoured in debug builds only, so a --release binary reads the invoking user's own address book instead of this test's"
+)]
 fn open_towards_an_unknown_device_says_so_and_lists_what_exists() {
     let dir = TempDir::new().unwrap();
     let book = dir.path().join("devices.toml");
@@ -889,6 +923,10 @@ fn open_towards_an_unknown_device_says_so_and_lists_what_exists() {
 }
 
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "PORTHOLE_DEVICES_FILE is honoured in debug builds only, so a --release binary reads the invoking user's own address book instead of this test's"
+)]
 fn open_towards_a_saved_device_that_is_absent_exits_device_unreachable() {
     // Resolution shells out to `ip -4 neigh show`. This used to `return` on
     // a machine without `ip` -- without even printing why, and libtest
@@ -965,6 +1003,10 @@ fn a_bad_duration_is_refused_before_a_device_is_resolved() {
 }
 
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "PORTHOLE_DEVICES_FILE is honoured in debug builds only, so a --release binary reads the invoking user's own address book instead of this test's"
+)]
 fn a_hand_edited_book_with_an_unusable_name_fails_naming_it() {
     let dir = TempDir::new().unwrap();
     let book = dir.path().join("devices.toml");
@@ -980,6 +1022,10 @@ fn a_hand_edited_book_with_an_unusable_name_fails_naming_it() {
 }
 
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "PORTHOLE_DEVICES_FILE is honoured in debug builds only, so a --release binary reads the invoking user's own address book instead of this test's"
+)]
 fn devices_rm_honours_json_and_reports_what_it_forgot() {
     let dir = TempDir::new().unwrap();
     let book = dir.path().join("devices.toml");
@@ -1209,6 +1255,10 @@ fn porthole_with_a_firewall(args: &[&str], state: &Path, bin: &Path) -> Output {
 /// stub `getent` answers for one address and not the other, so both halves
 /// of "show a name where one can be found" are exercised in one run.
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "PORTHOLE_DEVICES_FILE is honoured in debug builds only, and this test saves a device: a --release binary writes to the invoking user's own address book"
+)]
 fn the_picker_hides_containers_and_shows_a_name_where_the_resolver_has_one() {
     let dir = TempDir::new().unwrap();
     let bin = dir.path().join("bin");
@@ -1330,6 +1380,10 @@ fn path_ahead_of(bin: &Path) -> OsString {
 }
 
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "PORTHOLE_STATE_FILE is honoured in debug builds only, so a --release binary reads /run/porthole/state.json instead of this test's"
+)]
 fn a_forwards_row_says_both_ports_and_where_it_goes() {
     // The defect this exists against: a forward rendered as an open tells a
     // user the port permits traffic when it redirects it, and says nothing
@@ -1371,6 +1425,10 @@ fn a_forwards_row_says_both_ports_and_where_it_goes() {
 }
 
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "PORTHOLE_STATE_FILE is honoured in debug builds only, so a --release binary reads /run/porthole/state.json instead of this test's"
+)]
 fn list_json_carries_a_forward_and_says_nothing_for_an_open() {
     let dir = TempDir::new().unwrap();
     let path = state_path(&dir);
