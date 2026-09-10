@@ -380,7 +380,7 @@ uniform:
 |---|---|---|
 | dnf | **100** updates available, **0** none | `dnf5-check-upgrade(8)`, verbatim |
 | apt | none for this question | `apt-get(8)` and `apt(8)` DIAGNOSTICS document only "zero on normal operation, decimal 100 on error" |
-| pacman | none | `pacman(8)` has no EXIT STATUS and no DIAGNOSTICS section at all |
+| pacman | none | `pacman(8)` (v7.1.0) has no EXIT STATUS and no DIAGNOSTICS section at all — see the note below on how that page was read |
 
 So on a Fedora-packaged install porthole answers the question, and on a
 Debian- or Arch-packaged one it reports that it will not: `porthole update`
@@ -390,6 +390,22 @@ would be reporting an answer apt never gave, on a machine that may well have
 an update waiting. (`checkupdates(8)` from pacman-contrib *does* document an
 exit code — 2 for "no updates available" — but it answers whether *anything*
 on the system has an update, not whether porthole does.)
+
+The dnf and apt pages above can be read as they stand. **The pacman one
+cannot**, and the difference is worth writing down rather than glossing:
+`archlinux:latest` ships no man pages at all — its `/etc/pacman.conf` carries
+`NoExtract = usr/share/man/* usr/share/info/*` — so `pacman(8)` is simply not
+on disk there, though `pacman -Ql pacman` lists it. Removing those lines and
+reinstalling the package that owns the page is what makes the reading
+reproducible:
+
+```bash
+podman run --rm docker.io/library/archlinux:latest sh -c '
+  sed -i "/^NoExtract/d" /etc/pacman.conf
+  pacman -Syy --noconfirm >/dev/null
+  pacman -S --noconfirm --overwrite "*" pacman >/dev/null
+  zcat /usr/share/man/man8/pacman.8.gz | grep "^\.SH"'
+```
 
 **It never touches a source install.** The first thing the check does is ask
 each package manager whether it owns porthole's own binary. If one answers and

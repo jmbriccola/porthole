@@ -45,9 +45,32 @@
 //!   meaning "an update is available", for any apt subcommand. Asking and
 //!   reading `0` would be reading "no error", not "nothing to update", and
 //!   reporting it as the latter is a claim the tool never made.
-//! - **pacman**. `pacman(8)`, read in an `archlinux:latest` container, has no
-//!   EXIT STATUS and no DIAGNOSTICS section at all -- the whole page mentions
-//!   an exit exactly once, in `-V, --version` ("Display version and exit").
+//! - **pacman**. `pacman(8)` -- pacman v7.1.0, libalpm v16.0.1 -- has no EXIT
+//!   STATUS and no DIAGNOSTICS section at all: its section headers run NAME,
+//!   SYNOPSIS, DESCRIPTION, OPERATIONS, OPTIONS, the five per-operation option
+//!   sections, HANDLING CONFIG FILES, EXAMPLES, CONFIGURATION, SEE ALSO, BUGS,
+//!   AUTHORS, and the whole page mentions an exit exactly once, in
+//!   `-V, --version` ("Display version and exit").
+//!
+//!   **How that page was read**, because `archlinux:latest` cannot simply be
+//!   asked: that image ships **no man pages at all** -- its `/etc/pacman.conf`
+//!   carries `NoExtract = usr/share/man/* usr/share/info/*`, so
+//!   `/usr/share/man/man8/pacman.8.gz` is not there, even though `pacman -Ql
+//!   pacman` lists it. Removing those lines and reinstalling the package that
+//!   owns it is what puts the page on disk, and this is the whole recipe:
+//!
+//!   ```text
+//!   podman run --rm docker.io/library/archlinux:latest sh -c '
+//!     sed -i "/^NoExtract/d" /etc/pacman.conf
+//!     pacman -Syy --noconfirm >/dev/null
+//!     pacman -S --noconfirm --overwrite "*" pacman >/dev/null
+//!     zcat /usr/share/man/man8/pacman.8.gz | grep "^\.SH"'
+//!   ```
+//!
+//!   The apt and dpkg-query citations above need no such step and reproduce
+//!   as written; this one does, and saying so is the difference between a
+//!   citation the next person can check and one that stops them looking.
+//!
 //!   `checkupdates(8)` from pacman-contrib *does* document one (0 normal, 1
 //!   unknown failure, **2 no updates available**), but it answers a different
 //!   question: whether *anything* on the system has an update. Reporting that
@@ -400,9 +423,24 @@ impl Settings {
     pub fn record_announced(&mut self, verdict: &Verdict) -> bool {
         match verdict {
             Verdict::Available { version } => {
-                let key = version
-                    .clone()
-                    .unwrap_or_else(|| UNVERSIONED_KEY.to_string());
+                let key = match version {
+                    Some(version) => version.clone(),
+                    // An update this build could not put a name to, on top of
+                    // one already announced, is not new news -- and treating
+                    // it as new is a **repeat**, not merely a redundancy. A
+                    // listing whose readability alternates (reworded,
+                    // localised or colourised one day and not the next) would
+                    // flip the key between the version and the constant below
+                    // and notify at every single check, which is exactly what
+                    // "once per version" exists to prevent. So the record
+                    // stands and nothing is said a second time.
+                    //
+                    // It stands only until there is nothing to announce:
+                    // `UpToDate` clears it, so the next update announces
+                    // itself whether or not its version can be read.
+                    None if self.announced.is_some() => return false,
+                    None => UNVERSIONED_KEY.to_string(),
+                };
                 if self.announced.as_deref() == Some(key.as_str()) {
                     return false;
                 }
@@ -845,6 +883,47 @@ mod tests {
             .announced
             .as_deref()
             .is_some_and(|k| !k.starts_with(char::is_numeric)));
+    }
+
+    #[test]
+    fn a_listing_whose_readability_alternates_does_not_notify_at_every_check() {
+        // The repeat "once per version" would otherwise let through, and the
+        // one the prose used not to mention: a listing that can be read one
+        // day and not the next -- reworded, localised, colourised -- flips the
+        // key between the version and the constant, so every check counts as
+        // different news and notifies again.
+        let mut settings = Settings::default();
+        let named = Verdict::Available {
+            version: Some("0.2.0".to_string()),
+        };
+        let unnamed = Verdict::Available { version: None };
+
+        assert!(
+            settings.record_announced(&named),
+            "the first sighting is news"
+        );
+        for round in 0..5 {
+            assert!(
+                !settings.record_announced(&unnamed),
+                "round {round}: an update that could not be named is not a second update"
+            );
+            assert!(
+                !settings.record_announced(&named),
+                "round {round}: nor is the same one, named again"
+            );
+        }
+        assert_eq!(
+            settings.announced.as_deref(),
+            Some("0.2.0"),
+            "and the record keeps the version it could read, rather than decaying to the \
+             key for one it could not"
+        );
+
+        // It stands only until there is nothing left to announce: installing
+        // the update clears the record, so the next one is news whether or
+        // not its version can be read.
+        assert!(!settings.record_announced(&Verdict::UpToDate));
+        assert!(settings.record_announced(&unnamed));
     }
 
     #[test]
