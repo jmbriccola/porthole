@@ -1584,7 +1584,7 @@ mod tests {
 
     #[test]
     fn a_method_error_is_errored_not_unreachable() {
-        // I2: the helper answered here -- a typed error, not silence.
+        // The helper answered here -- a typed error, not silence.
         let e = method_error(
             "com.jacopobriccola.Porthole.NotAuthorized",
             Some("not authorized: com.jacopobriccola.Porthole.List"),
@@ -1604,7 +1604,7 @@ mod tests {
 
     #[test]
     fn a_state_failure_classifies_the_same_way_as_a_denial_not_as_unreachable() {
-        // I4: `HelperError::State` (a `StateStore` read/write failure) is
+        // `HelperError::State` (a `StateStore` read/write failure) is
         // just as much a `MethodError` as `HelperError::NotAuthorized` is,
         // and `classify_failure` does not -- cannot, from the wire alone --
         // tell them apart. Pinning this is what makes `Errored`'s own doc

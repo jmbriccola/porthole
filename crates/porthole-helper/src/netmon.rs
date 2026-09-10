@@ -705,8 +705,9 @@ mod tests {
 
     #[test]
     fn check_network_leaves_a_rule_broader_than_the_lost_subnet_alone() {
-        // The same C1 case as `porthole_core::engine`'s own test, exercised
-        // through this module's own entry point.
+        // The same case as `porthole_core::engine`'s own
+        // `close_rules_outside_leaves_a_rule_broader_than_the_lost_subnet_alone`,
+        // exercised through this module's own entry point.
         let dir = TempDir::new().unwrap();
         let store = StateStore::open(dir.path().join("state.json")).unwrap();
         let backend = FakeBackend::new();
@@ -765,7 +766,7 @@ mod tests {
 
     #[test]
     fn check_network_leaves_rules_alone_when_resolution_fails_for_a_reason_other_than_no_network() {
-        // I1: a spawn failure, a non-zero exit, or a malformed `ip` body are
+        // A spawn failure, a non-zero exit, or a malformed `ip` body are
         // not "no network" -- they are "porthole could not tell this time".
         // Only `Error::NoNetwork` may close anything.
         let dir = TempDir::new().unwrap();

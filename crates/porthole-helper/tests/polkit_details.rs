@@ -1,4 +1,4 @@
-//! I5: the polkit prompt must let a human tell an expected request from an
+//! The polkit prompt must let a human tell an expected request from an
 //! unexpected one -- naming the port, the protocol, and the resolved target,
 //! not just a static sentence any request could have produced.
 //!

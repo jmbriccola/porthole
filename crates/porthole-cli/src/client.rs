@@ -962,7 +962,7 @@ mod tests {
 
     #[test]
     fn close_all_failures_keep_their_structured_kind_over_the_bus() {
-        // I3: close_all's per-rule failures used to be `.to_string()`'d away
+        // close_all's per-rule failures used to be `.to_string()`'d away
         // into `Error::Unexpected`, so `close --all --json` reported
         // `"kind":"unexpected"` for a failure that would have been
         // `"command_failed"` locally. `wire_error_to_local` is what

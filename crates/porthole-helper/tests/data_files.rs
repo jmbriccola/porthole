@@ -237,7 +237,8 @@ fn the_unit_preserves_state_across_restarts_and_crashes() {
 fn the_activation_files_systemd_service_names_a_real_unit_file() {
     // A typo here would let D-Bus activation and the systemd unit silently
     // stop agreeing on which unit owns the process -- the same class of
-    // drift C3 hit with the CLI path, just one file over.
+    // drift `the_cli_path_the_helper_resolves_is_documented` below guards
+    // against, just one file over.
     let service = data("com.jacopobriccola.Porthole.service");
     let unit_file = service
         .lines()
@@ -256,7 +257,7 @@ fn the_cli_path_the_helper_resolves_is_documented() {
     // Coupling code to documentation is an unusual thing for a test to do,
     // but this exact drift -- the expiry timer pointed at a path the install
     // docs never named at all, while the README installed somewhere else --
-    // is what C3 was. Importing CLI_CANDIDATES (in
+    // has happened here once already. Importing CLI_CANDIDATES (in
     // crates/porthole-core/src/cli_path.rs) rather than repeating its two
     // literals here means a change to one automatically reopens the exact bug
     // this test exists to catch, instead of quietly checking stale literals

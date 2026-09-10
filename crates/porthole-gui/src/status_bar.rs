@@ -51,10 +51,10 @@
 //! capitalised, authored for this surface, and -- deliberately -- it does
 //! not itself claim reachability. The reachability claim -- and the rest of
 //! `detail`'s own explanation, unedited -- still reaches the user, verbatim,
-//! on [`StatusBar::line`] right underneath: item 5's own principle (the
-//! helper's text must reach the user, not a GUI paraphrase resting on an
-//! invariant held elsewhere) survives; only which widget carries which half
-//! of it changed.
+//! on [`StatusBar::line`] right underneath: the principle that the helper's
+//! text must reach the user, not a GUI paraphrase resting on an invariant
+//! held elsewhere, survives; only which widget carries which half of it
+//! changed.
 //!
 //! `!status.firewall_available` is not, on its own, "no firewall is
 //! installed" -- `docs/json-schema.md` documents it as folding that together
@@ -430,11 +430,12 @@ mod tests {
 
     #[test]
     fn the_no_firewall_title_does_not_itself_claim_reachability() {
-        // Item 6 (round 3): the banner's own short title must not
-        // independently assert "already reachable" -- that would rest the
-        // claim on a GUI-authored sentence again, the exact thing item 5
-        // fixed once already. The claim belongs to `status.detail`,
-        // verbatim, on `line` -- see `the_no_firewall_banner_shows_a_short_
+        // The banner's own short title must not independently assert
+        // "already reachable" -- that would rest the claim on a
+        // GUI-authored sentence again, which is the exact thing moving the
+        // helper's own text onto `line` fixed once already. The claim
+        // belongs to `status.detail`, verbatim, on `line` -- see
+        // `the_no_firewall_banner_shows_a_short_
         // title_with_the_full_detail_on_the_line` in `tests/status_bar.rs`
         // for the real widgets carrying that split.
         assert!(
@@ -496,7 +497,7 @@ mod tests {
 
     #[test]
     fn an_errored_reply_is_worded_apart_from_both_other_cases() {
-        // I2: a helper that answered with a typed error is a third fact,
+        // A helper that answered with a typed error is a third fact,
         // not a rewording of "could not reach" or "no firewall". Pins all
         // three titles apart the same way the test above pins the first two.
         let errored = errored_title("not authorized: com.jacopobriccola.Porthole.List");
@@ -598,7 +599,7 @@ mod tests {
 
     #[test]
     fn the_errored_title_does_not_assert_a_refusal() {
-        // I4: a `StateStore` failure inside the helper reaches this exact
+        // A `StateStore` failure inside the helper reaches this exact
         // rendering too (see `window.rs`'s own `classify_failure`), and it
         // is not a decision anyone made to decline anything -- pinning
         // that the wording never claims otherwise, regardless of what the

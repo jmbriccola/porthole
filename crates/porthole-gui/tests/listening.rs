@@ -246,7 +246,7 @@ fn a_port_already_open_is_not_offered_again() -> Result<(), String> {
     Ok(())
 }
 
-/// I6: a helper round trip that fails must withdraw an "already open" claim
+/// A helper round trip that fails must withdraw an "already open" claim
 /// it can no longer confirm, not leave it standing on whatever
 /// `set_open_ports` last said -- `set_open_ports_unknown` is the method a
 /// caller reaches for that.
@@ -322,8 +322,8 @@ fn a_helper_failure_withdraws_a_stale_already_open_claim() -> Result<(), String>
 /// `LoopbackOnly` rows on the same port -- a genuine `127.0.0.1` +
 /// `::1` dual-stack pair -- correctly render the *same* text. There is no
 /// button to click twice here either way, so unlike the network-facing
-/// case this is not the readability problem the milestone's final wave
-/// tracks; this test only pins that the fixed wording really is fixed.
+/// case this is not the readability problem tracked against that surface;
+/// this test only pins that the fixed wording really is fixed.
 fn loopback_only_rows_share_the_same_reassurance_regardless_of_address() -> Result<(), String> {
     let result = Rc::new(RefCell::new(None));
     let seen = result.clone();
@@ -441,7 +441,7 @@ fn nothing_listening_is_a_calm_note_not_an_error() -> Result<(), String> {
     Ok(())
 }
 
-/// I5: before `set_services` has ever been called, this section must not
+/// Before `set_services` has ever been called, this section must not
 /// be sitting on the calm "Nothing else is listening" claim -- a fresh
 /// `ListeningSection` has not scanned anything yet to earn that.
 fn the_initial_state_before_any_scan_is_neither_calm_nor_populated() -> Result<(), String> {
@@ -479,7 +479,7 @@ fn the_initial_state_before_any_scan_is_neither_calm_nor_populated() -> Result<(
     Ok(())
 }
 
-/// I4: a `/proc` scan that fails outright must not leave the calm
+/// A `/proc` scan that fails outright must not leave the calm
 /// "Nothing else is listening" page up -- a stderr line is not a UI, and
 /// from the user's side "porthole could not check" and "porthole checked
 /// and found nothing" are exactly the collapse this project keeps finding.
@@ -601,7 +601,7 @@ fn a_scan_failure_survives_a_later_set_open_ports() -> Result<(), String> {
     Ok(())
 }
 
-/// The other half of the same hole (I5, the loading state): with no scan
+/// The other half of the same hole (the loading state): with no scan
 /// having run at all yet, a `set_open_ports` arriving first (the helper
 /// answering before `/proc` has been read) must not manufacture the calm
 /// page either -- the loading state exists precisely to keep this section

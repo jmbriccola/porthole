@@ -137,8 +137,8 @@ fn no_firewall_at_all_is_prominent_not_a_footnote() -> Result<(), String> {
     Ok(())
 }
 
-/// Round 3's own fix: an earlier version of this case put
-/// `WireStatus::detail` -- three sentences, written for a CLI's own
+/// An earlier version of this case put `WireStatus::detail` -- three
+/// sentences, written for a CLI's own
 /// per-command error ("**this port** is already reachable… Setting up a
 /// firewall is outside what porthole does") -- directly into the banner's
 /// one-line `title`. This checks the real widgets carry the corrected
@@ -283,7 +283,7 @@ fn a_firewall_porthole_could_not_read_is_not_confused_with_a_confirmed_stop() ->
     Ok(())
 }
 
-/// I2: a helper that answered with a typed error is prominent too, but
+/// A helper that answered with a typed error is prominent too, but
 /// must not be worded as if the helper could not be reached at all -- the
 /// helper answered here.
 fn an_errored_reply_is_prominent_but_not_worded_as_unreachable() -> Result<(), String> {
@@ -312,7 +312,7 @@ fn an_errored_reply_is_prominent_but_not_worded_as_unreachable() -> Result<(), S
         ));
     }
     if text.to_lowercase().contains("refus") || text.to_lowercase().contains("declin") {
-        // I4: this same code path renders a `StateStore` failure inside
+        // This same code path renders a `StateStore` failure inside
         // the helper too, which is not a decision anyone made -- see
         // `status_bar.rs`'s own module doc.
         return Err(format!(
@@ -327,7 +327,7 @@ fn an_errored_reply_is_prominent_but_not_worded_as_unreachable() -> Result<(), S
     Ok(())
 }
 
-/// I7: once the banner takes over, the ordinary line's own real, on-screen
+/// Once the banner takes over, the ordinary line's own real, on-screen
 /// text must not still read a stale confirmed claim from an earlier,
 /// successful refresh -- `text()` alone cannot catch this (it prefers the
 /// revealed banner over the line), so this reads the line widget directly.
@@ -362,7 +362,7 @@ fn the_ordinary_line_is_cleared_once_the_banner_takes_over() -> Result<(), Strin
     Ok(())
 }
 
-/// The re-reviewer's own residual on item 9's original fix: the no-firewall
+/// A residual left by the no-firewall fix: the no-firewall
 /// detail sits on the same `gtk::Label` `StatusBar::new` gives `dim-label`/
 /// `caption` unconditionally, so the explanation of a prominent warning
 /// banner rendered small and grey at the opposite end of the window from the

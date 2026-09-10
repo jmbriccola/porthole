@@ -714,9 +714,9 @@ mod tests {
 
     #[test]
     fn detect_does_not_report_no_firewall_when_firewalld_state_spawn_fails() {
-        // Item 2 of the eighth wave, on the one backend the seventh
-        // instance's fix did not touch: `firewall-cmd --version` succeeding
-        // already proves firewalld is installed; a resource-level failure
+        // On the one backend the earlier ufw and nftables permission-denied
+        // fix did not cover: `firewall-cmd --version` succeeding already
+        // proves firewalld is installed; a resource-level failure
         // to even run `--state` afterwards used to propagate with `?` out
         // of `Firewalld::health`, and `detect` propagates any `health()`
         // error the same way -- so this reported "no firewall found" on a

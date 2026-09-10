@@ -219,7 +219,7 @@ fn each_rule_shows_port_protocol_target_and_a_close_button() -> Result<(), Strin
     Ok(())
 }
 
-/// Item 7: the most exposed state porthole can produce -- a rule open to
+/// The most exposed state porthole can produce -- a rule open to
 /// anyone -- must be visually distinguishable from an ordinary
 /// subnet-scoped one, not just by the subtitle's own text (which already
 /// differed) but by shape: a warning icon, mirroring `open_dialog.rs`'s
@@ -662,7 +662,7 @@ fn an_unreachable_helper_does_not_render_as_the_calm_empty_state() -> Result<(),
     Ok(())
 }
 
-/// I5: before any of `set_rules`/`set_unreachable`/`set_errored` has ever
+/// Before any of `set_rules`/`set_unreachable`/`set_errored` has ever
 /// been called, this section must not be sitting on the calm "No ports
 /// open" claim -- a fresh `OpenNowSection` has not earned the right to
 /// state that, and a zbus proxy carries no default per-call timeout to
@@ -701,10 +701,10 @@ fn the_initial_state_before_any_answer_is_neither_calm_nor_populated() -> Result
     Ok(())
 }
 
-/// I2: a helper that answered with a typed error is a different fact from
+/// A helper that answered with a typed error is a different fact from
 /// one that could not be reached at all, and must not share its wording --
 /// the same distinction `status_bar.rs`'s own pinned test checks, proven
-/// here on the real widget this section actually shows. I4: it also must
+/// here on the real widget this section actually shows. It also must
 /// not claim a refusal the error may not be -- `set_errored` renders the
 /// identical error-page state for a `StateStore` failure inside the
 /// helper (not a decision anyone made) as it does for a polkit denial.
@@ -750,7 +750,7 @@ fn an_errored_reply_reads_differently_from_an_unreachable_helper() -> Result<(),
     Ok(())
 }
 
-/// I1: a close already in flight when a refresh failure lands must not be
+/// A close already in flight when a refresh failure lands must not be
 /// able to repaint the calm empty state over the error page once it
 /// resolves. `set_unreachable` clears the section's own rule list because
 /// that list is unconfirmed once the helper cannot be reached -- but a

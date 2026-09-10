@@ -1158,7 +1158,7 @@ mod tests {
 
     #[test]
     fn the_close_line_names_both_uids_when_they_differ() {
-        // I1: `close`, `close_by_id` and `close_all` must all log who *asked*
+        // `close`, `close_by_id` and `close_all` must all log who *asked*
         // for the close, separately from who *opened* the rule — a test
         // where the two happen to be the same value would pass even if the
         // closer's uid were never wired in at all.
@@ -1169,10 +1169,10 @@ mod tests {
 
     #[test]
     fn a_timer_triggered_close_carries_the_expired_marker() {
-        // Milestone 1 added `, expired` so a close the timer fired reads
-        // differently in the journal from one a person asked for. I2 wires
-        // `from_timer` back across the bus so this survives the move to the
-        // helper.
+        // The `, expired` marker exists so a close the timer fired reads
+        // differently in the journal from one a person asked for, and
+        // `from_timer` is wired back across the bus so this survives the
+        // move to the helper.
         let line = format_close_log(&rule(1000), 1000, CloseReason::Expired);
         assert!(line.ends_with(", expired"), "got: {line}");
     }

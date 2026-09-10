@@ -1050,14 +1050,14 @@ pub(crate) mod tests {
 
     #[test]
     fn a_state_spawn_failure_after_a_successful_version_is_still_available_not_an_error() {
-        // Item 2 of the eighth wave: `--version` succeeding already proves
-        // firewalld is installed; a resource-level failure to even run
-        // `--state` afterwards (EAGAIN, ENOMEM, EMFILE, the binary swapped
+        // `--version` succeeding already proves firewalld is installed; a
+        // resource-level failure to even run `--state` afterwards (EAGAIN,
+        // ENOMEM, EMFILE, the binary swapped
         // mid-upgrade) is a different fact from "not installed" and must
         // degrade the same way ufw's and nftables' own permission-denied
         // reads do, not propagate with `?` -- which used to turn this into
         // `detect()` reporting no firewall found at all on a machine running
-        // firewalld, the one backend the wave before this one did not touch.
+        // firewalld, the one backend that earlier fix did not cover.
         struct VersionOkThenSpawnFails;
         impl CommandRunner for VersionOkThenSpawnFails {
             fn run(&self, cmd: &Command) -> Result<Output> {

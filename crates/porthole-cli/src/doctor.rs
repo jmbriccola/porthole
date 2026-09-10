@@ -888,11 +888,10 @@ mod tests {
         // `nft --version` succeeds but `nft -j list chains` returns garbage --
         // a version whose JSON shape porthole has never seen, say. This test
         // used to assert that `health()` propagated the parse failure as an
-        // `Err`; it no longer does (a fix in a later wave than the one that
-        // wrote that assumption: an installed `nft` porthole cannot parse is
-        // still an installed `nft`, not "no firewall found", and `detect`
-        // propagates any `health()` error with `?` before `firewall_check`
-        // is ever reached in production -- see
+        // `Err`; it no longer does (a later fix changed that: an installed
+        // `nft` porthole cannot parse is still an installed `nft`, not "no
+        // firewall found", and `detect` propagates any `health()` error with
+        // `?` before `firewall_check` is ever reached in production -- see
         // `detect_does_not_report_no_firewall_when_nftables_output_is_unparseable`
         // in `backend/mod.rs` for the production-path proof this test,
         // constructing `Nftables` directly, cannot give). `firewall_check`
@@ -934,12 +933,12 @@ mod tests {
 
     #[test]
     fn nftables_active_unknown_does_not_claim_reachability_either_way() {
-        // Follow-up to C1: `active: false` on nftables now has two different
-        // causes -- a confirmed-empty input hook (`not_active_remedy`'s "the
-        // port is already reachable"), and a permission-denied read that
-        // tells porthole nothing at all. That sentence is true of the first
-        // and false, in the dangerous direction, of the second. Assert on
-        // the property -- no claim about reachability in either direction --
+        // `active: false` on nftables has two different causes -- a
+        // confirmed-empty input hook (`not_active_remedy`'s "the port is
+        // already reachable"), and a permission-denied read that tells
+        // porthole nothing at all. That sentence is true of the first and
+        // false, in the dangerous direction, of the second. Assert on the
+        // property -- no claim about reachability in either direction --
         // rather than the literal sentence, so a future rewording of either
         // remedy cannot quietly reintroduce it.
         let runner = RecordingRunner::with_responses(vec![

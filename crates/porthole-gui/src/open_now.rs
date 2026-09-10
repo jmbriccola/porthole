@@ -447,7 +447,7 @@ fn subtitle_for(rule: &WireRule) -> String {
     }
 }
 
-// Item 7's own marking (built in `apply`, below) uses `open_dialog.rs`'s
+// The anywhere-scoped marking (built in `apply`, below) uses `open_dialog.rs`'s
 // own `anyone_note()` for its tooltip, called directly rather than kept as
 // a second, separate copy of the sentence -- an earlier version of this
 // module did exactly that, as a private constant worded slightly
@@ -570,7 +570,7 @@ fn apply(inner: &Rc<Inner>, rules: &[WireRule], listed_at: u64) {
             .subtitle(subtitle_for(rule))
             .build();
 
-        // Item 7: the most exposed state porthole can produce, marked the
+        // The most exposed state porthole can produce, marked the
         // same way the other two surfaces already mark the identical
         // (`open_dialog.rs`) or a lesser (`listening_section.rs`'s
         // `BeyondReach`) concern -- an icon, not colour alone, and no
@@ -1008,7 +1008,7 @@ impl OpenNowSection {
             .map(|r| r.close_busy.clone())
     }
 
-    /// Item 7: whether row `index` carries the "open to anyone" marking,
+    /// Whether row `index` carries the "open to anyone" marking,
     /// checked against the live widget tree -- the icon's own `parent()`
     /// -- rather than only whether `significant_icon` is `Some`. `Some`
     /// alone would only prove an icon was constructed; a future edit that
