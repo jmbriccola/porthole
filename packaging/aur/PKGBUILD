@@ -61,12 +61,12 @@ depends=(
 	'systemd'
 )
 
-# The tag v1.0.0 is not published yet, so there is no upstream tarball to
-# checksum and this is 'SKIP'. Before submitting to the AUR: push the tag,
-# then run `updpkgsums` here and regenerate .SRCINFO with
-# `makepkg --printsrcinfo > .SRCINFO`.
+# The checksum is of the archive GitHub serves for the tag named below, not
+# of anything built here. After a version bump the tag must exist before it
+# can be computed: push the tag, then `updpkgsums` here and regenerate
+# .SRCINFO with `makepkg --printsrcinfo > .SRCINFO`.
 source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('8efa3ab3673fba191b150466edf49f38cea1668aa3929a5572fc5baee46d504d')
 
 # Two packages out of one source tree. porthole-gui is the only part that
 # links GTK4 and libadwaita, and a headless machine -- a server, a container
