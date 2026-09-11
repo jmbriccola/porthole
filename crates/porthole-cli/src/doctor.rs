@@ -267,24 +267,26 @@ fn not_active_remedy(id: BackendId) -> &'static str {
 /// Deliberately silent on which way the answer would actually go: naming a
 /// direction here would just be `not_active_remedy`'s mistake with the
 /// wording softened, not fixed. Also deliberately silent on asserting *why*
-/// porthole could not confirm it: a permission-denied read is the common
-/// reason for ufw and nftables, but `active_unknown` sets for any failure to
-/// confirm, not only that one -- a broken install or a stray traceback also
-/// exits non-zero, and porthole has not established which this is. Naming
-/// "needs privilege" unconditionally was a narrower claim than the condition
-/// that sets the flag actually supports; name it as the common cause worth
-/// ruling out first, not the established one.
+/// porthole could not confirm it: a read refused for want of privilege is
+/// the common reason for all three backends, but `active_unknown` sets for
+/// any failure to confirm, not only that one -- a broken install or a stray
+/// traceback also exits non-zero, and porthole has not established which
+/// this is. Naming "needs privilege" unconditionally was a narrower claim
+/// than the condition that sets the flag actually supports; name it as the
+/// common cause worth ruling out first, not the established one.
 fn activity_unconfirmed_remedy(id: BackendId) -> &'static str {
     match id {
-        // Reachable, if rarely: firewalld's own reads (`firewall-cmd
-        // --version`, `--state`) never need more privilege than any user
-        // has, but a resource-level failure to even run `--state` (EAGAIN,
-        // ENOMEM, the binary swapped mid-upgrade) still sets `active_unknown`
-        // -- see `Firewalld::health`'s own `Err(e)` arm on that call.
+        // The common cause is the same as for the other two: firewalld refuses
+        // an unprivileged `--state` on some machines (exit 253, measured on
+        // ubuntu:24.04 with firewalld running), and doctor runs unprivileged.
+        // Any other exit but 252, or a failure to run `--state` at all, sets
+        // it too -- see `Firewalld::health`.
         BackendId::Firewalld => {
-            "porthole could not confirm whether firewalld is enforcing anything just now. \
-             This should never need more privilege than any user has, so try `porthole \
-             doctor` again, or check `firewall-cmd --state` by hand for the actual reason."
+            "porthole could not confirm whether firewalld is enforcing anything here -- \
+             one way or the other. The common reason is that firewalld refuses to answer \
+             a process without root, which it does on some machines; run `porthole doctor` \
+             as root to rule that out, or check `sudo firewall-cmd --state` yourself for \
+             the actual reason."
         }
         BackendId::Ufw => {
             "porthole could not confirm whether ufw is enforcing anything here -- one way \
@@ -705,7 +707,9 @@ pub fn json(checks: &[Check]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use porthole_core::backend::{nftables::Nftables, ufw::Ufw, FirewallBackend};
+    use porthole_core::backend::{
+        firewalld::Firewalld, nftables::Nftables, ufw::Ufw, FirewallBackend,
+    };
     use porthole_core::command::{Output, RecordingRunner};
     use porthole_core::docker::Published;
     use porthole_core::model::Protocol;
@@ -998,6 +1002,41 @@ mod tests {
         assert!(
             check.remedy.contains("root") || check.remedy.contains("privilege"),
             "must say the actual reason -- needs privilege -- got: {}",
+            check.remedy
+        );
+    }
+
+    #[test]
+    fn firewalld_refusing_an_unprivileged_read_is_not_reported_as_stopped() {
+        // Same follow-up, firewalld's shape. Measured on ubuntu:24.04 with
+        // firewalld active: an unprivileged `doctor` said "installed but not
+        // running, so no rule it holds is being enforced" and told the user to
+        // start a daemon that was already running. Root, same machine: "is
+        // running".
+        let refused = || Output {
+            status: 253,
+            stdout: String::new(),
+            stderr: "Authorization failed.".to_string(),
+        };
+        let runner = RecordingRunner::with_responses(vec![refused(), refused()]);
+        let backend = Firewalld::new(&runner);
+        let check = firewall_check(&backend, &runner);
+        assert!(
+            !check.ok,
+            "porthole genuinely does not know here -- must not read as ok"
+        );
+        let text = format!("{} {}", check.detail, check.remedy).to_lowercase();
+        assert!(
+            !text.contains("not running")
+                && !text.contains("start it")
+                && !text.contains("reachable"),
+            "must not claim firewalld is stopped, or anything about reachability: {} / {}",
+            check.detail,
+            check.remedy
+        );
+        assert!(
+            check.remedy.contains("root") || check.remedy.contains("privilege"),
+            "must name the cause worth ruling out first -- got: {}",
             check.remedy
         );
     }

@@ -111,9 +111,11 @@ pub struct BackendHealth {
     /// `true` when `active` is `false` only because porthole could not
     /// confirm activity, never because it confirmed an absence of it.
     ///
-    /// The most common cause is a permission-denied `ufw status` or `nft -j
-    /// list chains` -- both need root to read at all, and `porthole status`/
-    /// `doctor` run without it -- but it is not the *only* one: an `nft -j
+    /// The most common cause is a read refused for want of privilege: `ufw
+    /// status` and `nft -j list chains` need root to read at all, firewalld
+    /// refuses an unprivileged `firewall-cmd --state` on some machines (exit
+    /// 253, its own NOT_AUTHORIZED), and `porthole status`/`doctor` run
+    /// without root. But it is not the *only* one: an `nft -j
     /// list chains` that returns something porthole cannot parse sets it
     /// too, since an installed `nft` porthole cannot make sense of is still
     /// installed, not absent, and porthole did not confirm anything either
@@ -747,7 +749,13 @@ mod tests {
         // machine chose.
         let runner = RecordingRunner::with_responses(vec![
             Output::stdout("2.4.4"),
-            Output::failure("not running"),
+            // 252, firewalld's own NOT_RUNNING: what a stopped firewalld
+            // actually answers, and the only exit `health()` reads as stopped.
+            Output {
+                status: 252,
+                stdout: "not running".into(),
+                stderr: String::new(),
+            },
         ]);
         let backend = detect(&runner).unwrap();
         assert_eq!(backend.id(), BackendId::Firewalld);

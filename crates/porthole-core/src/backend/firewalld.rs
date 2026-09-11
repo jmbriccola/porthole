@@ -26,6 +26,15 @@ use crate::forward::ForwardTo;
 use crate::model::{OpenRequest, Protocol, Target};
 use crate::net;
 
+/// `firewall-cmd`'s exit for "firewalld is not running" -- `NOT_RUNNING` in
+/// firewalld's own `firewall/errors.py`, the same value in 2.1.1 (Ubuntu
+/// 24.04) and 2.4.4 (Fedora 44). The one exit of `--state` that confirms the
+/// daemon is stopped.
+const NOT_RUNNING: i32 = 252;
+
+/// `NOT_AUTHORIZED`, same file: firewalld refused to answer the caller.
+const NOT_AUTHORIZED: i32 = 253;
+
 pub struct Firewalld<'a> {
     runner: &'a dyn CommandRunner,
 }
@@ -343,48 +352,70 @@ impl FirewallBackend for Firewalld<'_> {
                 })
             }
             // Anything else is not proof the binary is absent -- only
-            // `CommandSpawn` is, and that already returned above.
-            // `RealRunner` can only ever fail this specific call with
-            // `CommandSpawn`, so this arm is unreachable through it, but
-            // `CommandRunner` is a trait: a hypothetical different failure
-            // (a non-zero exit, or some other runner error) means only that
-            // this one read did not answer, not that firewalld is not
-            // installed. Fall through with no version known and let the
-            // next read -- `--state`, a call this backend already has to
-            // make -- decide `available`/`active` on its own evidence,
-            // rather than inventing a third outcome for a call `RealRunner`
-            // cannot actually produce.
+            // `CommandSpawn` is, and that already returned above. A non-zero
+            // exit is real and common: firewall-cmd connects to the daemon
+            // before it gets to `--version`, so where firewalld refuses an
+            // unprivileged caller it refuses `--version` too (exit 253,
+            // measured). Any other runner error cannot come from
+            // `RealRunner`, but `CommandRunner` is a trait. Either way this
+            // one read did not answer, which says nothing about whether
+            // firewalld is installed: fall through with no version known and
+            // let `--state` decide `available`/`active` on its own evidence.
             Ok(_) | Err(_) => None,
         };
 
-        // `firewall-cmd --state` exits non-zero when the daemon is stopped,
-        // so a non-zero exit is the answer, not an error -- but a failure to
-        // even run the command (a resource-level `CommandSpawn`: EAGAIN,
-        // ENOMEM, EMFILE, or the binary swapped mid-upgrade between this
-        // call and the one above) is a different fact, and is not proof
-        // firewalld is stopped either. Unlike ufw's `status` or nft's `-j
-        // list chains`, this call itself never needs more privilege than any
-        // user has -- firewalld's info actions are `yes` in its own policy
-        // for everyone -- so there is no permission-denied case to degrade
-        // here, but there is still a "could not confirm" one, and it must
-        // degrade the same way theirs do rather than propagate: an installed
-        // firewalld this process could not currently ask is not the same
-        // fact as "no firewall found" once this reaches `detect`.
+        // Only one answer from `firewall-cmd --state` confirms that firewalld
+        // is stopped: exit 252, its own NOT_RUNNING. Every other non-zero exit
+        // is a read that did not answer, and degrades to "could not confirm"
+        // rather than being taken for the daemon's reply. The common one is
+        // 253, NOT_AUTHORIZED. Measured on ubuntu:24.04 under systemd, with
+        // firewalld active and holding its default zone and polkit running: a
+        // non-root `--state` exits 253, root's exits 0 -- and reading that 253
+        // as "stopped" had `doctor` tell an ordinary user that nothing was
+        // being enforced, and `open --dry-run` refuse on the same premise. A
+        // failure to run the command at all (a resource-level `CommandSpawn`:
+        // EAGAIN, ENOMEM, EMFILE, or the binary swapped mid-upgrade between
+        // this call and the one above) degrades the same way. None of these
+        // propagates: an installed firewalld this process could not currently
+        // ask is not the same fact as "no firewall found" once this reaches
+        // `detect`.
         let state_cmd = Command::read("firewall-cmd", ["--state"]);
         let (active, active_unknown, detail) = match self.runner.run(&state_cmd) {
+            Ok(state) if state.success() && state.stdout.trim() == "running" => {
+                let detail = match &version {
+                    Some(v) => format!("firewalld {v} is running"),
+                    None => "firewalld is running".to_string(),
+                };
+                (true, false, detail)
+            }
+            Ok(state) if state.status == NOT_RUNNING => (
+                false,
+                false,
+                "firewalld is installed but not running, so no rule it holds is being \
+                 enforced"
+                    .to_string(),
+            ),
             Ok(state) => {
-                let active = state.success() && state.stdout.trim() == "running";
-                let detail = if active {
-                    match &version {
-                        Some(v) => format!("firewalld {v} is running"),
-                        None => "firewalld is running".to_string(),
-                    }
+                let said = if state.status == NOT_AUTHORIZED {
+                    "NOT_AUTHORIZED: firewalld refused to answer this process".to_string()
                 } else {
-                    "firewalld is installed but not running, so no rule it holds is being \
-                     enforced"
+                    [state.stderr.trim(), state.stdout.trim()]
+                        .into_iter()
+                        .find(|s| !s.is_empty())
+                        .and_then(|s| s.lines().next())
+                        .unwrap_or("no output")
                         .to_string()
                 };
-                (active, false, detail)
+                (
+                    false,
+                    true,
+                    format!(
+                        "firewalld is installed, but `firewall-cmd --state` exited {} ({said}) \
+                         -- that is not the same as firewalld being stopped, it may already be \
+                         running and enforcing rules porthole could not confirm just now",
+                        state.status
+                    ),
+                )
             }
             Err(e) => (
                 false,
@@ -1042,10 +1073,81 @@ pub(crate) mod tests {
         assert!(health.available);
         assert!(!health.active);
         assert!(
+            !health.active_unknown,
+            "252 is firewalld's own NOT_RUNNING: a definite answer, not an unknown"
+        );
+        assert!(
             health.detail.contains("not running"),
             "got: {}",
             health.detail
         );
+    }
+
+    /// What a real firewalld answers an unprivileged caller where it refuses
+    /// one. Measured on ubuntu:24.04 under systemd, firewalld active and
+    /// holding its default zone: each read tried -- `--version`, `--state`,
+    /// `--list-rich-rules` -- exits 253, and `--state` prints nothing on
+    /// stdout. Root, same machine, same moment: 0.
+    fn refused() -> Output {
+        Output {
+            status: 253,
+            stdout: String::new(),
+            stderr: "Authorization failed.\n    Make sure polkit agent is running or run \
+                     the application as superuser."
+                .into(),
+        }
+    }
+
+    #[test]
+    fn a_refused_state_read_is_unknown_not_stopped() {
+        // Any non-zero `--state` used to be read as the daemon's answer, so
+        // `doctor` told an ordinary user that no rule firewalld held was being
+        // enforced -- on a machine where firewalld was running and enforcing
+        // them -- and `open --dry-run` refused on the same false premise.
+        let runner = RecordingRunner::with_responses(vec![refused(), refused()]);
+        let health = Firewalld::new(&runner).health().unwrap();
+        assert!(health.available, "a refusal proves firewalld is there");
+        assert!(!health.active, "and proves nothing about whether it runs");
+        assert!(
+            health.active_unknown,
+            "this is the unknown case: {}",
+            health.detail
+        );
+        assert!(
+            !health.detail.contains("not running") && !health.detail.contains("no rule"),
+            "must not state what a refusal cannot support: {}",
+            health.detail
+        );
+        assert!(
+            health.detail.contains("253"),
+            "must name what firewall-cmd actually answered: {}",
+            health.detail
+        );
+    }
+
+    #[test]
+    fn only_not_running_counts_as_stopped() {
+        // 252 is the one exit firewalld defines as "not running". Anything
+        // else from `--state` -- its RUNNING_BUT_FAILED (251) and UNKNOWN_ERROR
+        // (254), or a Python traceback's 1 -- is a read that did not answer.
+        for status in [1, 251, 254] {
+            let runner = RecordingRunner::with_responses(vec![
+                Output::stdout("2.4.4"),
+                Output {
+                    status,
+                    stdout: String::new(),
+                    stderr: "something went wrong".into(),
+                },
+            ]);
+            let health = Firewalld::new(&runner).health().unwrap();
+            assert!(!health.active, "exit {status}");
+            assert!(health.active_unknown, "exit {status}: {}", health.detail);
+            assert!(
+                health.detail.contains(&status.to_string()),
+                "exit {status}: {}",
+                health.detail
+            );
+        }
     }
 
     #[test]

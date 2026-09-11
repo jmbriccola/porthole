@@ -251,9 +251,12 @@ Global flags:
   prompts go to stderr and stdout carries only the device it saved. See
   [docs/json-schema.md](docs/json-schema.md).
 - `--dry-run` — print the commands porthole would run, and change nothing.
-  Needs no privileges for `open` and `close`. `forward --dry-run` is the
-  exception: it reads Docker's own rules itself, which needs root, and exits
-  10 without it.
+  `open` and `close` need no privileges of their own. `open --dry-run` does
+  read whether the firewall is enforcing rules, though, and where firewalld
+  refuses that read to an unprivileged process (measured on Ubuntu 24.04) it
+  exits 3, saying porthole could not confirm it; run it as root there.
+  `forward --dry-run` needs root everywhere: it reads Docker's own rules
+  itself, and exits 10 without it.
 
 Defaults: `--proto tcp`, `--for 1h`, `--to subnet`.
 

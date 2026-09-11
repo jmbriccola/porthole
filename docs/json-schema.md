@@ -135,16 +135,21 @@ definite answer, whichever way it came out. `firewall_active_unknown: true`
 means it could not **confirm** activity, one way or the other — not
 specifically "permission denied," though that is the most common reason:
 ufw's and nftables' own reads both need more privilege than `porthole
-status` runs with, so a permission-denied read sets it. So does an `nft -j
+status` runs with, and firewalld refuses an unprivileged `firewall-cmd
+--state` on some machines, so a refused read sets it. So does an `nft -j
 list chains` that returns something porthole cannot parse — an installed
 `nft` porthole cannot make sense of is still installed, not absent, and
 porthole did not confirm anything either way about it. Neither cause has a
 field of its own here; `porthole doctor` (plain or `--json`) names the
 actual reason in its `Firewall` check's `detail` when that matters. Treat
 `firewall_active_unknown` as "could not confirm," not as a synonym for one
-specific cause. It is always `false` for firewalld (its reads never need
-more privilege than any user has, and it has no unparseable-output case) and
-always `false` when `firewall_available` is itself `false` (there is
+specific cause. For firewalld it is `true` whenever `firewall-cmd --state`
+answers anything but `running`, or exit `252` (firewalld's own "not
+running") — including the `253` (NOT_AUTHORIZED) it answers an unprivileged
+caller where it refuses one, measured on Ubuntu 24.04 with firewalld running.
+In porthole 1.0.0 this document said it was always `false` for firewalld,
+and on such a machine porthole reported a running firewalld as stopped. It
+is always `false` when `firewall_available` is itself `false` (there is
 nothing to have failed to confirm). A script that only reads
 `firewall_active` behaves exactly as it always has; one that reads
 `firewall_active_unknown` too can avoid treating "porthole could not tell"
