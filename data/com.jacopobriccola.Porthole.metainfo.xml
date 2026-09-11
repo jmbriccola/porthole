@@ -52,6 +52,15 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.0" date="2026-09-11">
+      <description>
+        <p>First release. Opens a single port towards the local network, or
+        forwards one to a container, for a bounded time, and closes it again
+        by itself. Command line, GTK4 window and desktop notifications;
+        firewalld, ufw or nftables underneath. Packaging for RPM, deb and
+        Arch is in the source tree, and no distribution ships it yet.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-09-06">
       <description>
         <p>Opening and closing a port from the GUI or the CLI, backed by

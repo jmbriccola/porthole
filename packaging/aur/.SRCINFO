@@ -1,5 +1,5 @@
 pkgbase = porthole
-	pkgver = 0.1.0
+	pkgver = 1.0.0
 	pkgrel = 1
 	url = https://github.com/jmbriccola/porthole
 	arch = x86_64
@@ -15,7 +15,7 @@ pkgbase = porthole
 	depends = iproute2
 	depends = polkit
 	depends = systemd
-	source = porthole-0.1.0.tar.gz::https://github.com/jmbriccola/porthole/archive/refs/tags/v0.1.0.tar.gz
+	source = porthole-1.0.0.tar.gz::https://github.com/jmbriccola/porthole/archive/refs/tags/v1.0.0.tar.gz
 	sha256sums = SKIP
 
 pkgname = porthole
@@ -28,7 +28,7 @@ pkgname = porthole
 
 pkgname = porthole-gui
 	pkgdesc = GTK4/libadwaita front end for porthole
-	depends = porthole=0.1.0-1
+	depends = porthole=1.0.0-1
 	depends = gcc-libs
 	depends = glib2
 	depends = glibc
