@@ -13,6 +13,23 @@ close it again, and knowing which firewall the machine you are on actually uses.
 porthole does one thing: it opens a single port towards the network you are on
 right now, for a bounded amount of time, and closes it again.
 
+It exists for people who have never had to touch a firewall. Anyone at home
+with `firewall-cmd`, `ufw` or `nft` already does this in one line, and gains
+little from porthole beyond the close it does by itself. Someone new to Linux
+who wants their phone to reach the site they are building, or a friend's
+laptop to reach the game they are hosting, should not have to learn a
+firewall's syntax, or find out which firewall their distribution even uses,
+to do it once.
+
+For them porthole is [a window](#the-gui). It lists what is listening on the
+machine and opens one of those ports towards the local network in two clicks,
+counts down what is open, and closes it again, so a port someone forgets about
+still closes. Installing it takes a terminal or a package manager, once. After
+that, opening a port asks for an administrator's password: once per session
+towards your own network, every time towards everyone.
+
+From a terminal, the same thing looks like this:
+
 ```console
 $ porthole open 5173 --for 30m
 Opened 5173/tcp towards 10.10.10.0/24 · closes 30m 0s
