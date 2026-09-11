@@ -1,0 +1,16 @@
+# Project Config of home:jmbriccola:porthole on build.opensuse.org -- what is
+# pasted into the project's "Project Config" tab, kept here so the repository
+# says what the build service is doing and why.
+#
+# The spec builds from the vendored crate tree (its Source1) only under
+# `--with vendor`. OBS builders have no network, so on OBS it is always on.
+# The Debian packages need nothing here: debian/rules goes offline by itself
+# when the source package carries vendor/.
+#
+# Not in this file, because it lives in the repository definitions rather
+# than in the project config: Debian_13 builds against Debian:13/standard *and*
+# Debian:13/backports. Debian 13 ships rustc 1.85, this workspace needs 1.87,
+# and trixie-backports carries a newer one.
+Macros:
+%_with_vendor 1
+:Macros

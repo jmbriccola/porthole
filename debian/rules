@@ -27,6 +27,17 @@ export CARGO_HOME = $(CURDIR)/debian/cargo-home
 # moves it all out of the shipped binaries either way.
 export CARGO_PROFILE_RELEASE_DEBUG = 1
 
+# Offline, from a vendored crate tree, when the source package carries one.
+# The OBS build (packaging/obs/) ships the crates as a second orig tarball,
+# porthole_<version>.orig-vendor.tar.xz, which dpkg-source unpacks into
+# vendor/, and OBS builders have no network: cargo must not try crates.io
+# there. Without vendor/ -- CI, a dpkg-buildpackage run by hand -- nothing
+# below changes and cargo fetches as it always has.
+VENDORED := $(wildcard $(CURDIR)/vendor)
+ifneq (,$(VENDORED))
+export CARGO_NET_OFFLINE = true
+endif
+
 # Native builds only. porthole-gui links GTK4 through gtk4-sys, and nothing
 # here sets up a cross toolchain or a cross pkg-config; a cross build would
 # need both.
@@ -40,7 +51,16 @@ endif
 
 # A Makefile at the top of the tree makes dh pick its makefile build system,
 # whose dh_auto_configure would run ./configure if one existed. There is none.
+# The one piece of configuring this build does need is pointing cargo at
+# vendor/ when the source carries it. That goes into CARGO_HOME rather than a
+# .cargo/ in the tree, so the unpacked source stays as it was shipped and
+# override_dh_auto_clean removes it with the rest of CARGO_HOME.
 override_dh_auto_configure:
+ifneq (,$(VENDORED))
+	mkdir -p $(CARGO_HOME)
+	printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "%s"\n' \
+	  "$(CURDIR)/vendor" > $(CARGO_HOME)/config.toml
+endif
 
 # The Makefile's own targets rather than the `cargo build --release --locked`
 # they expand to: the same one place the install layout lives, so a change to
@@ -117,6 +137,16 @@ endif
 override_dh_auto_clean:
 	rm -rf $(CURDIR)/debian/cargo-home
 	rm -rf target/generated target/install-check
+
+# dh_clean deletes *.orig files anywhere in the tree, as leftovers of patch.
+# Every crate under vendor/ ships a Cargo.toml.orig -- the manifest as it was
+# published -- and lists it in its .cargo-checksum.json, so deleting them made
+# every vendored build fail cargo's checksum check before compiling anything.
+# Measured in the Debian 13 build image: plain dh_clean took the vendored tree
+# from 163 of them to 0, dh_clean -Xvendor/ left all 163. Nothing under
+# vendor/ is ever a build leftover, and without vendor/ this excludes nothing.
+override_dh_clean:
+	dh_clean -Xvendor/
 
 # porthole-helper.service is Type=dbus with no [Install] section, reached
 # through /usr/share/dbus-1/system-services/com.jacopobriccola.Porthole.service.

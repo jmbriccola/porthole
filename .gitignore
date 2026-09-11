@@ -1,6 +1,10 @@
 /target
 **/*.rs.bk
 
+# Packaging output: .copr/Makefile's SRPM tree, and the upload set
+# packaging/obs/make-sources.sh writes by default.
+/build/
+
 # Working files, not part of the published project.
 /docs/notes/
 /.notes/

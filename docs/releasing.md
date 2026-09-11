@@ -138,11 +138,28 @@ After the tag exists at the remote:
   repository holding just `PKGBUILD`, `.SRCINFO` and `porthole.install`. It is
   not this repository, and nothing here pushes to it.
 
-## 4. What is deliberately not in this procedure
+## 4. The build service
+
+The Fedora, Debian and Ubuntu packages are built on build.opensuse.org, in
+`home:jmbriccola:porthole`, from files this repository prepares and a person
+uploads. After the step above:
+
+    packaging/obs/make-sources.sh <version>
+
+writes the upload set to `build/obs/<version>/`: the spec, the tag's tarball,
+the crates vendored from its own `Cargo.lock`, and a Debian source package
+built from both. It checks the tarball against the checksum
+`packaging/aur/PKGBUILD` now carries, which is why it comes after the step
+above. [packaging/obs/README.md](../packaging/obs/README.md) says how the
+project is set up, and why Debian 13's repository paths are in the order they
+are.
+
+## 5. What is deliberately not in this procedure
 
 - **No version-bumping script.** Six files in four syntaxes, three of them
   histories that need a sentence written by a person. A script would need the
   sentence anyway, and the guard in step 1 already makes a forgotten file a
   red test rather than a shipped mistake.
-- **No published packages.** Nothing in this repository uploads to COPR, to
-  Debian or to the AUR, and no check here reaches a network archive.
+- **No published packages.** Nothing in this repository uploads to OBS, to
+  COPR, to Debian or to the AUR. `make-sources.sh` downloads the tag's tarball
+  and the crates it needs, writes seven files, and stops there.
