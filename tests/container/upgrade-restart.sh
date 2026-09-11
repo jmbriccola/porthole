@@ -174,9 +174,12 @@ export DEB_BUILD_PROFILES=pkg.porthole.nogui
 # 1. The package this tree builds.
 dpkg-buildpackage -b -us -uc
 mv ../*.deb /out/a/
-lintian --no-tag-display-limit /out/a/porthole_*.deb > /out/lintian.txt 2>&1 \
-  && echo "lintian: clean" >> /out/lintian.txt \
-  || echo "lintian: reported something (exit $?)" >> /out/lintian.txt
+# Printed, not filed. $WORK is removed when this script exits, so a result
+# written there and nowhere else is a check whose output nobody ever reads.
+echo "--- lintian, on the package this tree builds ---"
+lintian_rc=0
+lintian --no-tag-display-limit /out/a/porthole_*.deb || lintian_rc=$?
+echo "lintian exit: $lintian_rc"
 
 # 2. The same source under a newer package version. Only debian/changelog
 #    moves: the .deb version comes from there, and nothing about the
