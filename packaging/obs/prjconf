@@ -18,7 +18,13 @@
 # provides it. apt picks the real package without asking; OBS refuses to pick
 # and calls the build unresolvable, which is what the first upload got
 # (2026-09-11). Naming the one apt would pick keeps OBS and apt in step.
-Prefer: libjpeg-dev
+#
+# Fedora 43 and 44 have two packages for /usr/sbin/iptables, which the
+# spec's %check needs: iptables-legacy and iptables-nft. OBS refused to pick
+# there too, on the second upload. Asked for /usr/sbin/iptables, dnf itself
+# installs iptables-legacy on both, measured the same day; OBS is told to do
+# the same, so its build root matches the one `dnf builddep` produces.
+Prefer: libjpeg-dev iptables-legacy
 
 Macros:
 %_with_vendor 1
