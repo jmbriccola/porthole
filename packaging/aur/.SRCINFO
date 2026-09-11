@@ -16,7 +16,7 @@ pkgbase = porthole
 	depends = polkit
 	depends = systemd
 	source = porthole-1.0.1.tar.gz::https://github.com/jmbriccola/porthole/archive/refs/tags/v1.0.1.tar.gz
-	sha256sums = SKIP
+	sha256sums = f87905c584dabddc03d18d051517428d14bd28064a2e8eef2adcf5daf854d67e
 
 pkgname = porthole
 	pkgdesc = Open a port to your local network, temporarily and on purpose.

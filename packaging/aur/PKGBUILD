@@ -66,7 +66,7 @@ depends=(
 # can be computed: push the tag, then `updpkgsums` here and regenerate
 # .SRCINFO with `makepkg --printsrcinfo > .SRCINFO`.
 source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('f87905c584dabddc03d18d051517428d14bd28064a2e8eef2adcf5daf854d67e')
 
 # Two packages out of one source tree. porthole-gui is the only part that
 # links GTK4 and libadwaita, and a headless machine -- a server, a container
