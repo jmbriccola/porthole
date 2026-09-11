@@ -1741,7 +1741,6 @@ mod tests {
         // repeat would make "older" mean nothing. And no two rows may
         // describe the same interface: a version raised over an unchanged
         // contract would tell two matched binaries they are mismatched.
-        assert!(!CONTRACTS.is_empty(), "there is at least one contract");
         for (i, contract) in CONTRACTS.iter().enumerate() {
             assert_eq!(
                 contract.version,
@@ -1765,7 +1764,10 @@ mod tests {
             }
         }
         assert_eq!(
-            CONTRACTS.last().expect("non-empty").version,
+            CONTRACTS
+                .last()
+                .expect("there is at least one contract")
+                .version,
             PROTOCOL_VERSION,
             "this build speaks the newest contract there is; a row above the version \
              this build was compiled with is a contract nothing implements"
