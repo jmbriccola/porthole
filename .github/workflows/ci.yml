@@ -96,15 +96,33 @@ jobs:
       # a skip of that shape counts as a pass.
       #
       # What is left genuinely reading this machine is `porthole doctor`,
-      # whose whole subject is the machine it runs on, and the two tests in
+      # whose whole subject is the machine it runs on. Asserted here so a
+      # changed runner image fails at this step rather than as a test result.
+      #
+      # A claim that used to stand here named "the two tests in
       # crates/porthole-helper/tests/service.rs that need *a* backend to
-      # exist. Asserted here so a changed runner image fails at this step
-      # rather than as a test result:
+      # exist". There are none. All eight tests in that file refuse before an
+      # `Engine` is ever built -- on an invalid argument, on an unusable state
+      # path, on a missing rule, or inside `iptables` -- and not one of them
+      # asks a firewall anything.
+      #
+      # The daemon is asserted through systemd and not through `firewall-cmd`,
+      # which is not a matter of taste. Measured on ubuntu:24.04 under
+      # systemd, with firewalld active and holding `public (default, active)`:
+      # a non-root `firewall-cmd --version` *or* `--state` exits 253 --
+      # firewalld's own NOT_AUTHORIZED -- printing "Authorization failed. Make
+      # sure polkit agent is running", while the same calls as root exit 0.
+      # Both spellings are refused, so the two lines that used to stand here
+      # died on the first of them, printed nothing at all, and this job never
+      # once reached its own test step. `sudo` would have turned the step
+      # green while asserting a condition the suite never sees, because the
+      # suite runs unprivileged. `systemctl is-active` needs no polkit and
+      # answers what this step is actually asking. Negative control: with
+      # firewalld stopped, the step exits 3.
       - name: The conditions the suite reads out of this machine
         run: |
           set -euo pipefail
-          firewall-cmd --version
-          firewall-cmd --state
+          systemctl is-active --quiet firewalld
           ip -j route show default
           busctl --system --no-pager list > /dev/null
           # signals.rs starts one on the shipped bus policy; dbus-broker
@@ -204,13 +222,13 @@ jobs:
             dbus firewalld nftables iptables iproute2
           sudo systemctl enable --now firewalld
       # The same conditions the stable test job asserts, and for the same
-      # reasons; that job's comment says what each one carries and what no
-      # longer depends on it.
+      # reasons; that job's comment says what each one carries, what no longer
+      # depends on it, and why the daemon is asserted through systemd rather
+      # than through a `firewall-cmd` a non-root caller is refused.
       - name: The conditions the suite reads out of this machine
         run: |
           set -euo pipefail
-          firewall-cmd --version
-          firewall-cmd --state
+          systemctl is-active --quiet firewalld
           ip -j route show default
           busctl --system --no-pager list > /dev/null
           dbus-daemon --version > /dev/null
@@ -314,7 +332,13 @@ jobs:
         run: |
           set -euo pipefail
           useradd --create-home builder
-          install -d -o builder -g builder /home/builder/rpmbuild/SOURCES
+          # The parent too, not only SOURCES: `install -d -o builder` applies
+          # the ownership to the leaf it names and leaves any intermediate it
+          # creates as root. rpmbuild then runs as builder and cannot create
+          # BUILD inside a root-owned 0755 directory -- measured, the whole
+          # job failed there before reading the spec.
+          install -d -o builder -g builder \
+            /home/builder/rpmbuild /home/builder/rpmbuild/SOURCES
       - name: Source tarball
         run: |
           set -euo pipefail
@@ -454,6 +478,25 @@ jobs:
           install -d -o builder -g builder /home/builder/build
           install -m 0644 -o builder -g builder \
             packaging/aur/PKGBUILD /home/builder/build/PKGBUILD
+          # sha256sums in the published PKGBUILD is of the tarball GitHub
+          # serves for the tag. This job does not download that: it feeds
+          # makepkg a `git archive` of the commit under test, which is a
+          # different file by construction -- different mtimes, different
+          # gzip output -- so validating it against that sum would fail on
+          # every commit. The copy makepkg reads here is forced to SKIP; the
+          # published one keeps the real sum, and is what an AUR user gets.
+          # The download half of source= is deliberately not exercised here:
+          # a commit that has no tag yet has nothing to download.
+          sed -i "s/^sha256sums=.*/sha256sums=('SKIP')/" \
+            /home/builder/build/PKGBUILD
+          grep -q "^sha256sums=('SKIP')$" /home/builder/build/PKGBUILD
+          # package_porthole() declares install=porthole.install, and makepkg
+          # refuses to start without it. Copying only the PKGBUILD meant this
+          # job never built anything -- including never running the scriptlet
+          # that restarts the helper on upgrade, which this job exists to
+          # cover.
+          install -m 0644 -o builder -g builder \
+            packaging/aur/porthole.install /home/builder/build/porthole.install
           git archive --prefix="porthole-${pkgver}/" \
             -o "/home/builder/build/porthole-${pkgver}.tar.gz" HEAD
           chown builder:builder "/home/builder/build/porthole-${pkgver}.tar.gz"
