@@ -131,10 +131,25 @@ package:
     DEB_BUILD_PROFILES=pkg.porthole.nogui dpkg-buildpackage -b -us -uc
 
 That drops the porthole-gui package entirely. It is the same line the source
-tree's Makefile draws with WITH_GUI=0. Run in a debian:13 container with the
-pin stanza above and no libgtk-4-dev installed: two files out,
-porthole_0.1.0-1_amd64.deb and porthole-dbgsym_0.1.0-1_amd64.deb, lintian
-clean.
+tree's Makefile draws with WITH_GUI=0. Run on 2026-09-11 in the debian:13
+container tests/container/Containerfile.deb-upgrade builds -- rustc and cargo
+from trixie-backports, no libgtk-4-dev installed: two files out,
+porthole_1.0.0-1_amd64.deb and porthole-dbgsym_1.0.0-1_amd64.deb.
+
+lintian raises one tag on that pair, and it is left standing rather than
+overridden:
+
+    W: porthole: command-with-path-in-maintainer-script /usr/bin/porthole
+       (in test syntax) [prerm:44]
+
+which is the `[ -x /usr/bin/porthole ]` guard in debian/porthole.prerm. The
+absolute path is the point there: the prerm has to find *this package's own*
+binary, at the location this package installed it, while it is still on disk,
+and a maintainer script running as root is not a place to let $PATH decide
+which `porthole` gets executed. lintian's own exit status is 0 -- it is a
+warning, not an error -- so the tag is recorded here rather than silenced in
+debian/porthole.lintian-overrides, where a reader would have to go looking for
+it to find out it had been raised at all.
 
 The file list
 -------------
