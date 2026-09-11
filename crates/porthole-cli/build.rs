@@ -61,7 +61,7 @@ fn assets_dir() -> PathBuf {
 /// child as `porthole-devices-list(1)`; a page that points at pages nobody
 /// installed is a broken reference in every package at once. `version` on
 /// each page, or the child pages carry an empty footer where the top-level
-/// one carries "porthole 0.1.0".
+/// one carries "porthole 1.0.0".
 fn render_tree(cmd: &Command, name: &str, version: &'static str, dir: &Path) -> io::Result<()> {
     // `disable_help_subcommand` per page, not once at the root: clap does not
     // propagate it, so without it here every page with subcommands renders a

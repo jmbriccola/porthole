@@ -1,3 +1,10 @@
+porthole (1.0.0-1) unstable; urgency=medium
+
+  * First release. The packaging is unchanged from 0.1.0-1, which was never
+    published; this is the version the first tag carries.
+
+ -- Jacopo Maria Briccola <jmbriccola@gmail.com>  Fri, 11 Sep 2026 08:00:00 +0200
+
 porthole (0.1.0-1) unstable; urgency=medium
 
   * Initial Debian packaging. Two binary packages: porthole (the command-line

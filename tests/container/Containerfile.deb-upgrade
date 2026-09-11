@@ -1,0 +1,63 @@
+# The image the deb upgrade measurement runs in: build the package here, and
+# install it here under systemd as PID 1.
+#
+# One image for both halves on purpose. The build needs a toolchain and
+# debhelper; the measurement needs a machine where `porthole-helper.service`
+# can really be D-Bus activated, which means systemd as PID 1, a system bus
+# and the package's own runtime dependencies resolvable. Two images would be
+# two descriptions of "a Debian 13 machine" free to drift from each other, and
+# the thing being measured is a maintainer script running on a real one.
+#
+# `nftables` is installed ahead of the package so the `firewalld | ufw |
+# nftables` alternation in debian/control is already satisfied: apt would
+# otherwise pull firewalld, which drags in a Python stack this measurement has
+# no use for.
+FROM docker.io/library/debian:13
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# rustc/cargo >= 1.87 is porthole's MSRV and trixie ships 1.85, so the
+# toolchain comes from trixie-backports -- the route debian/README.source
+# records and .github/workflows/ci.yml's deb job takes.
+RUN cat > /etc/apt/sources.list.d/backports.sources <<'SOURCES' \
+ && apt-get update -qq
+Types: deb
+URIs: http://deb.debian.org/debian
+Suites: trixie-backports
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+SOURCES
+
+RUN apt-get install -y -qq --no-install-recommends \
+      build-essential \
+      debhelper \
+      dpkg-dev \
+      lintian \
+      ca-certificates \
+      systemd \
+      systemd-sysv \
+      dbus \
+      polkitd \
+      nftables \
+      iproute2 \
+      procps \
+      pkgconf \
+ && apt-get install -y -qq --no-install-recommends -t trixie-backports rustc cargo \
+ && rm -rf /var/lib/apt/lists/*
+
+# Last, and on its own, because it is the whole point of this file.
+#
+# docker.io/library/debian ships /usr/sbin/policy-rc.d returning 101, which
+# invoke-rc.d and deb-systemd-invoke both honour: with it in place every
+# service action a maintainer script takes does nothing and says nothing, so
+# an upgrade measurement taken in this image would report "the helper was not
+# restarted" no matter what debian/rules asks for, and a measurement that the
+# scriptlet works would be indistinguishable from one that it does not. A real
+# Debian machine has no such file.
+#
+# Removed in its own layer, after the installs above rather than before them:
+# with it gone, every service-carrying package installed in a build container
+# with no systemd running would try to start its units during the build.
+RUN rm -f /usr/sbin/policy-rc.d
+
+CMD ["/sbin/init"]

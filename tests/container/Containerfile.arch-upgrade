@@ -1,0 +1,39 @@
+# The image the AUR upgrade measurement runs in: build the package here with
+# makepkg, and install it here under systemd as PID 1.
+#
+# One image for both halves, for the reason tests/container/Containerfile.deb-upgrade
+# gives: what is being measured is a scriptlet running on a real machine of
+# this distribution, and two images would be two descriptions of one.
+#
+# gtk4 and libadwaita are here because packaging/aur/PKGBUILD declares them in
+# makedepends and builds porthole-gui as part of the split package; makepkg
+# refuses to start without them. nftables satisfies the backend the base
+# package leaves to optdepends, so the installed machine has one.
+#
+# `-Syu`, not a bare `-Sy` plus package names: installing against a stale
+# local package database is an unsupported partial upgrade on Arch, and
+# tests/container/Containerfile.arch records it breaking a build here for real.
+FROM docker.io/library/archlinux:latest
+
+RUN pacman -Syu --noconfirm --needed \
+      base-devel \
+      rust \
+      gtk4 \
+      libadwaita \
+      systemd \
+      dbus-broker-units \
+      polkit \
+      nftables \
+      iproute2 \
+      procps-ng \
+ && pacman -Scc --noconfirm
+
+# makepkg refuses to run as root. base-devel carries the sudo makepkg reaches
+# pacman with; this measurement pre-installs the dependencies instead, so the
+# rule exists here only to let `makepkg --syncdeps` work if it is ever asked
+# for.
+RUN useradd --create-home builder \
+ && printf 'builder ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/builder \
+ && chmod 0440 /etc/sudoers.d/builder
+
+CMD ["/sbin/init"]
