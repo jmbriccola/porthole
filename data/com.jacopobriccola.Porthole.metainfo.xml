@@ -52,6 +52,14 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.1" date="2026-09-11">
+      <description>
+        <p>Where firewalld refuses to answer an unprivileged process,
+        Porthole no longer reports it as stopped: it says it could not
+        confirm whether the firewall is enforcing rules, and suggests
+        checking as root.</p>
+      </description>
+    </release>
     <release version="1.0.0" date="2026-09-11">
       <description>
         <p>First release. Opens a single port towards the local network, or

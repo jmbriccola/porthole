@@ -1,3 +1,13 @@
+porthole (1.0.1-1) unstable; urgency=medium
+
+  * New upstream release. Where firewalld refuses an unprivileged caller,
+    firewall-cmd --state exits 253, and porthole read that as firewalld not
+    running: doctor told the user no rule was being enforced, and open
+    --dry-run refused on that premise. Only exit 252 now means stopped; any
+    other failure is reported as unconfirmed.
+
+ -- Jacopo Maria Briccola <jmbriccola@gmail.com>  Fri, 11 Sep 2026 14:20:03 +0200
+
 porthole (1.0.0-1) unstable; urgency=medium
 
   * First release. The packaging is unchanged from 0.1.0-1, which was never

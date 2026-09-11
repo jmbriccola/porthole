@@ -1,5 +1,5 @@
 pkgbase = porthole
-	pkgver = 1.0.0
+	pkgver = 1.0.1
 	pkgrel = 1
 	url = https://github.com/jmbriccola/porthole
 	arch = x86_64
@@ -15,8 +15,8 @@ pkgbase = porthole
 	depends = iproute2
 	depends = polkit
 	depends = systemd
-	source = porthole-1.0.0.tar.gz::https://github.com/jmbriccola/porthole/archive/refs/tags/v1.0.0.tar.gz
-	sha256sums = 8efa3ab3673fba191b150466edf49f38cea1668aa3929a5572fc5baee46d504d
+	source = porthole-1.0.1.tar.gz::https://github.com/jmbriccola/porthole/archive/refs/tags/v1.0.1.tar.gz
+	sha256sums = SKIP
 
 pkgname = porthole
 	pkgdesc = Open a port to your local network, temporarily and on purpose.
@@ -28,7 +28,7 @@ pkgname = porthole
 
 pkgname = porthole-gui
 	pkgdesc = GTK4/libadwaita front end for porthole
-	depends = porthole=1.0.0-1
+	depends = porthole=1.0.1-1
 	depends = gcc-libs
 	depends = glib2
 	depends = glibc

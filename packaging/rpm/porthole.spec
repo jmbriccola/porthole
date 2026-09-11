@@ -22,7 +22,7 @@
 %bcond_with    vendor
 
 Name:           porthole
-Version:        1.0.0
+Version:        1.0.1
 Release:        1%{?dist}
 Summary:        Open a port to your local network, temporarily and on purpose
 
@@ -440,6 +440,13 @@ systemctl reload dbus.service >/dev/null 2>&1 || :
 %endif
 
 %changelog
+* Fri Sep 11 2026 Jacopo Maria Briccola <jmbriccola@gmail.com> - 1.0.1-1
+- Where firewalld refuses an unprivileged caller, firewall-cmd --state
+  exits 253, and porthole read that as firewalld not running: doctor told
+  the user no rule was being enforced, and open --dry-run refused on that
+  premise. Only exit 252 now means stopped; any other failure is reported
+  as unconfirmed.
+
 * Fri Sep 11 2026 Jacopo Maria Briccola <jmbriccola@gmail.com> - 1.0.0-1
 - First release.
 - The 0.1.0 below was never published anywhere; this is the version the
