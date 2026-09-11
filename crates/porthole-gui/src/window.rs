@@ -3,11 +3,10 @@
 //! `PortholeWindow` wraps a real `adw::ApplicationWindow` rather than
 //! subclassing one: nothing here needs a custom GObject property or signal,
 //! only a widget tree and three stable extension points -- the `content`
-//! box that Tasks 3-6 append their sections into, one per task; the narrow-
-//! width `AdwBreakpoint` the spec requires (`INITIAL_PROMPT.md` §5:
-//! "finestra ridimensionabile fino a larghezze strette (`AdwBreakpoint`)");
-//! and the `AdwToastOverlay` any section can show a toast through, first
-//! used by Task 3's close button.
+//! box each section appends itself into; the narrow-width `AdwBreakpoint`
+//! that keeps the window usable when it is resized small, which this
+//! project requires of it; and the `AdwToastOverlay` any section can show
+//! a toast through, first used by the close button on an open rule.
 //!
 //! `Deref` to the real window is what makes `.present()`, `.is_realized()`,
 //! `.current_breakpoint()` and every other `gtk::Window`/`gtk::Widget`/

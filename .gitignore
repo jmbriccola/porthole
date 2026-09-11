@@ -2,8 +2,9 @@
 **/*.rs.bk
 
 # Working files, not part of the published project.
-/docs/superpowers/
-/INITIAL_PROMPT.md
+/docs/notes/
+/.notes/
+/REQUIREMENTS.md
 
 # dpkg-buildpackage's working files. `dh` builds each binary package inside
 # debian/<package>/ and leaves its bookkeeping beside it; debian/cargo-home is
