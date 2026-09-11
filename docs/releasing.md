@@ -60,6 +60,19 @@ which is that module's own version and not porthole's.
 
 Run from a clean tree. Every one of these is a gate, not a formality.
 
+**Run the container-based ones one at a time.** They bind-mount this working
+tree into containers with SELinux `:Z`, which relabels the mounted files with
+a category private to that one container. Two containers holding overlapping
+`:Z` mounts of this tree therefore relabel each other's files, and a binary
+that was executable a moment ago fails with `Permission denied` and exit 126.
+Measured here on 2026-09-11: the RPM build below mounts the whole repository,
+`tests/container/run.sh` mounts the musl binaries under `target/`, and running
+the two together failed
+`a_subnet_the_machine_left_is_announced_along_with_the_rules_it_closed` on a
+tree where nothing was wrong. Neither check was at fault and neither is flaky.
+A failure of that shape means they overlapped, and the answer is to re-run the
+suite on its own rather than to look for the bug in porthole.
+
     cargo fmt --all --check
     cargo clippy --workspace --exclude porthole-gui --all-targets -- -D warnings
     cargo test --workspace --exclude porthole-gui
