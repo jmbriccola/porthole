@@ -101,6 +101,8 @@ readonly WORK
 # needs the SYS_ADMIN among them: without it polkit fails 217/USER and a
 # measurement taken there runs with no authorizer at all. The same set
 # crates/porthole-cli/tests/container.rs passes for its systemd images.
+# shellcheck disable=SC2054 # the commas inside --cap-add= are podman's own
+# syntax for one option's value, not array element separators.
 readonly SYSTEMD_ARGS=(
     --systemd=always
     --cap-add=NET_ADMIN,NET_RAW,SYS_ADMIN,SYS_PTRACE,MKNOD,AUDIT_WRITE,SYS_CHROOT,SETFCAP,DAC_OVERRIDE
@@ -115,6 +117,16 @@ FAILURES=0
 
 note() { printf '\n=== %s ===\n' "$*"; }
 
+# Build, or reuse from podman's cache, one of the two images this script
+# needs. The script that needs an image is the script that builds it -- the
+# same shape crates/porthole-cli/tests/container.rs uses -- so that running
+# this on a machine that has never built them is not a precondition somebody
+# has to have been told about.
+ensure_image() {
+    local tag="$1" containerfile="$2"
+    podman build -q -t "$tag" -f "tests/container/$containerfile" tests/container >/dev/null
+}
+
 record() { # label before after expectation verdict
     RESULTS+=("$(printf '%-34s before=%-8s after=%-8s %-28s %s' "$1" "$2" "$3" "$4" "$5")")
     [ "$5" = ok ] || FAILURES=$((FAILURES + 1))
@@ -126,8 +138,7 @@ start_systemd_container() {
     podman rm -f "$name" >/dev/null 2>&1 || true
     podman run -d --name "$name" "${SYSTEMD_ARGS[@]}" \
         -v "$WORK/out:/out:ro,Z" "$image" /sbin/init >/dev/null
-    local i
-    for i in $(seq 1 120); do
+    for _ in $(seq 1 120); do
         case "$(podman exec "$name" systemctl is-system-running 2>&1 || true)" in
             running | degraded | maintenance) return 0 ;;
         esac
@@ -206,11 +217,20 @@ mv ../*.deb /out/nc/
     ls -1 "$WORK/out/deb"/{a,b,nc}/porthole_*.deb
     # What the maintainer scripts actually became, read out of the built
     # packages rather than inferred from the flags that generated them.
-    for d in a b nc; do
-        echo "--- $d postinst: lines mentioning porthole-helper ---"
-        dpkg-deb --info "$WORK/out/deb/$d"/porthole_*.deb postinst 2>/dev/null |
-            grep -n 'porthole-helper\|try-restart\|deb-systemd-invoke' || echo "(none)"
-    done
+    #
+    # Read *inside the image*. This ran on the host once and printed "(none)"
+    # for all three packages, because the host develops porthole on Fedora and
+    # has no dpkg-deb: a check reporting nothing rather than failing, which is
+    # the exact shape this script exists to catch elsewhere.
+    podman run --rm -v "$WORK/out/deb:/d:ro,Z" "$DEBIAN_IMAGE" bash -c '
+for x in a b nc; do
+  echo "--- $x postinst ---"
+  dpkg-deb -I /d/$x/porthole_*.deb postinst \
+    | grep -nE "try-restart|deb-systemd-invoke" || echo "(no service action in postinst)"
+  echo "--- $x preinst ---"
+  dpkg-deb -I /d/$x/porthole_*.deb preinst 2>/dev/null \
+    | grep -nE "stop|try-restart" || echo "(no preinst, or no service action in it)"
+done'
 }
 
 measure_debian() {
@@ -306,11 +326,15 @@ mv ./*.pkg.tar.zst /out/nc/
 '
     echo "arch packages built:"
     ls -1 "$WORK/out/arch"/{a,b,nc}/porthole-[0-9]*.pkg.tar.zst
-    for d in a b nc; do
-        echo "--- $d .INSTALL: the functions it defines ---"
-        bsdtar -xOf "$WORK/out/arch/$d"/porthole-[0-9]*.pkg.tar.zst .INSTALL 2>/dev/null |
-            grep -E '^[a-z_]+\(\) \{' || echo "(no .INSTALL, or it defines nothing)"
-    done
+    # Inside the image, for the reason build_debian gives about dpkg-deb: a
+    # Fedora host has no bsdtar either, and this printed "(no .INSTALL)" for
+    # all three packages when it ran there.
+    podman run --rm -v "$WORK/out/arch:/d:ro,Z" "$ARCH_IMAGE" bash -c '
+for x in a b nc; do
+  echo "--- $x .INSTALL: the functions it defines ---"
+  bsdtar -xOf /d/$x/porthole-[0-9]*.pkg.tar.zst .INSTALL \
+    | grep -E "^[a-z_]+\(\) \{" || echo "(no .INSTALL, or it defines nothing)"
+done'
 }
 
 measure_arch() {
