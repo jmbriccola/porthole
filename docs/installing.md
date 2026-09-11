@@ -17,13 +17,14 @@ exits 10 (`docker_unreadable`) for an ordinary user whether or not the helper
 is installed. Saying it could not check is the intended answer — the
 alternative is a dry run that reports a forward it never verified.
 
-porthole is in no distribution's repositories yet, and there is no release to
-download. What the repository does carry is the packaging for three formats,
-each building from this source tree and each installing through the `Makefile`
-below rather than listing files of its own: a Debian package under `debian/`,
-an Arch `PKGBUILD` under `packaging/aur/`, and an RPM spec under
-`packaging/rpm/`. Until one of them is published — and on any distribution
-none of them covers — the `Makefile` installs every piece into a `DESTDIR`:
+Fedora 43 and 44, Debian 13 and Ubuntu 26.04 have packages: the README's
+[Install](../README.md#install) section says which repository to add. None of
+this is in a distribution's own archive. The source tree carries the packaging
+for three formats, each building from it and each installing through the
+`Makefile` below rather than listing files of its own: a Debian package under
+`debian/`, an Arch `PKGBUILD` under `packaging/aur/`, and an RPM spec under
+`packaging/rpm/`. On a distribution none of the packages covers, or to build
+porthole yourself, the `Makefile` installs every piece into a `DESTDIR`:
 
 ```bash
 make                                  # the CLI, the helper and the agent,
@@ -459,12 +460,15 @@ person who updates from a terminal without going through porthole at all. A
 **window** that is open cannot restart itself while somebody is using it; it
 says so rather than going on talking to a helper it was not built for.
 
-One thing this does not do, and it is the reason the notifier is useful on
-fewer machines than it might be: **the shipped packages carry no repository of
-their own.** A `.rpm` downloaded by hand installs a porthole that no
-repository offers an update for, so the check will honestly find nothing.
-Adding a repository definition to the packages is what would change that, and
-it is not part of this.
+What decides whether there is anything to find is where porthole came from.
+**Installed from the repository the README's [Install](../README.md#install)
+section adds, the package manager knows where a newer porthole is**: on Fedora
+the check answers definitely, and on Debian and Ubuntu apt gives it no such
+answer, as above, though `apt upgrade` installs a newer porthole from that
+repository like any other package. The packages themselves carry no
+repository definition of their own. A `.rpm` or `.deb` installed from a file
+by hand is a porthole no repository offers an update for, and the check will
+honestly find nothing.
 
 ## The GUI: making it appear in the app grid
 

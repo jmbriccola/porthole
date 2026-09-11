@@ -45,9 +45,10 @@ Closed 5173/tcp towards 10.10.10.0/24
 Opening and closing no longer need root: a privileged helper does the work — a
 system D-Bus service authorised by polkit, rather than the CLI holding
 privilege itself. Installing it does need root, **once**: a helper binary, a
-polkit policy, a D-Bus configuration and a systemd unit. See
-[docs/installing.md](docs/installing.md) for where each one goes; until a
-distribution packages porthole, you place them by hand.
+polkit policy, a D-Bus configuration and a systemd unit. The packages under
+[Install](#install) put all of it in place; building porthole yourself, you
+place them by hand, and [docs/installing.md](docs/installing.md) says where
+each one goes.
 
 `porthole list` and `porthole status` need none of that installed at all —
 they never touch the bus. `--dry-run` changes nothing, and for `open` and
@@ -141,7 +142,43 @@ grid or a software centre once installed.
 
 ## Install
 
-Distribution packages are not published yet. To build from source you need Rust
+### From a package
+
+Fedora 43 and 44, Debian 13 and Ubuntu 26.04 have packages, built on the
+openSUSE Build Service and published in one repository per distribution. Add
+the repository once and porthole updates with the rest of the system. All four
+are signed with the same key, fingerprint
+`1EC2 D55A D761 70A4 412D  351F 47E5 6159 4291 B0CD`.
+
+Fedora 43 and 44 (on a minimal install, `sudo dnf install dnf5-plugins`
+first, for `config-manager`):
+
+```bash
+sudo dnf config-manager addrepo --from-repofile=https://download.opensuse.org/repositories/home:/jmbriccola:/porthole/Fedora_$(rpm -E %fedora)/home:jmbriccola:porthole.repo
+sudo dnf install porthole porthole-gui
+```
+
+Debian 13 — for Ubuntu 26.04, write `xUbuntu_26.04` where both URLs say
+`Debian_13`:
+
+```bash
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://download.opensuse.org/repositories/home:/jmbriccola:/porthole/Debian_13/Release.key \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/porthole.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/porthole.gpg] https://download.opensuse.org/repositories/home:/jmbriccola:/porthole/Debian_13/ /' \
+  | sudo tee /etc/apt/sources.list.d/porthole.list
+sudo apt update
+sudo apt install porthole porthole-gui
+```
+
+`porthole-gui` is the window; leave it out on a machine with no desktop. These
+commands, exactly as written, were run in a clean container of each of the
+four distributions on 2026-09-11, and `porthole --version` answered 1.0.1 in
+every one.
+
+### From source
+
+To build from source you need Rust
 1.87 or newer — the privileged helper depends on `zbus`, and every `zbus 5.19`
 component declares `rust-version = "1.87"`. **Debian 13 ships rustc 1.85**, so
 packaging porthole for it means bringing a newer toolchain along, not just
