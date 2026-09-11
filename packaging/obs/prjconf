@@ -11,6 +11,15 @@
 # than in the project config: Debian_13 builds against Debian:13/standard *and*
 # Debian:13/backports. Debian 13 ships rustc 1.85, this workspace needs 1.87,
 # and trixie-backports carries a newer one.
+#
+# Debian 13 has two packages that answer to libjpeg-dev, which OBS reported
+# as needed by libgdk-pixbuf-2.0-dev and libtiff-dev: libjpeg-dev itself,
+# which depends on libjpeg62-turbo-dev, and libjpeg62-turbo-dev, which
+# provides it. apt picks the real package without asking; OBS refuses to pick
+# and calls the build unresolvable, which is what the first upload got
+# (2026-09-11). Naming the one apt would pick keeps OBS and apt in step.
+Prefer: libjpeg-dev
+
 Macros:
 %_with_vendor 1
 :Macros

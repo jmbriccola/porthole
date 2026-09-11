@@ -106,7 +106,7 @@ endif
 # not declare. The requirement moved from "a system bus exists" to
 # "dbus-run-session is on PATH", which cli.rs asserts rather than skipping,
 # and busctl, which helper_e2e.rs waits with.
-# packaging/rpm/porthole.spec:84-86 declares both as BuildRequires;
+# packaging/rpm/porthole.spec:91-92 declares both as BuildRequires;
 # debian/control declares neither. Declaring them is the first step to adding
 # a run here, not the whole of it: nothing has been measured in a build
 # chroot since these two reasons stopped applying.

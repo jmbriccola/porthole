@@ -81,9 +81,15 @@ BuildRequires:  libappstream-glib
 #                     rather than as a missing file
 #
 # Nothing here is run privileged and nothing here writes a rule.
-BuildRequires:  /usr/bin/dbus-run-session
-BuildRequires:  /usr/bin/dbus-daemon
-BuildRequires:  /usr/bin/busctl
+#
+# The first three are named by package rather than by path because the build
+# service could not resolve the paths: the first upload to OBS came back
+# "nothing provides /usr/bin/dbus-run-session, nothing provides
+# /usr/bin/dbus-daemon, nothing provides /usr/bin/busctl" on Fedora 43 and 44
+# alike (2026-09-11). `dnf repoquery --whatprovides` on Fedora 44 answers
+# dbus-daemon for the first two and systemd for busctl.
+BuildRequires:  dbus-daemon
+BuildRequires:  systemd
 BuildRequires:  nftables
 BuildRequires:  /usr/sbin/iptables
 %if %{with gui}
