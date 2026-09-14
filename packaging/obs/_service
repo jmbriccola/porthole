@@ -1,0 +1,30 @@
+<!-- What the OBS package home:jmbriccola:porthole/porthole holds instead of
+     its sources: the two services that fetch them.
+
+     A release tagged on GitHub carries one attachment, obs-sources.tar, with
+     the seven files packaging/obs/make-sources.sh produces. download_url
+     takes the newest release's copy of it, and extract_file unpacks all
+     seven beside it. OBS then builds the spec for the Fedora repositories
+     and the .dsc for the Debian ones, exactly as it does from files uploaded
+     by hand.
+
+     The release is made by .github/workflows/ci.yml, only for a tag and only
+     once every job of that run is green. The same job then asks OBS to run
+     these services, with a token that can do nothing else and nothing to any
+     other package.
+
+     filename is set because the service otherwise stores the file under the
+     name the server reports: fetching a tag tarball by hand here left a
+     v1.0.1.tar.gz. The files parameter is a glob, which extract_file hands to
+     tar, so nothing in this file names a version and no release has to edit
+     it. -->
+<services>
+  <service name="download_url">
+    <param name="url">https://github.com/jmbriccola/porthole/releases/latest/download/obs-sources.tar</param>
+    <param name="filename">obs-sources.tar</param>
+  </service>
+  <service name="extract_file">
+    <param name="archive">obs-sources.tar</param>
+    <param name="files">*</param>
+  </service>
+</services>

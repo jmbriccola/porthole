@@ -4,8 +4,10 @@ porthole's version is written by hand in **ten places across six files**, and
 three packagings build from them. This is the order to move them in and the
 checks that have to pass before a tag exists.
 
-Nothing here is automated, and nothing here pushes: the last two steps are the
-maintainer's own.
+Steps 1 to 3 are a person's: the version, the checks, and the tag. Step 4 is
+not, since this workflow publishes to the build service on a tag of its own
+accord. Nothing here pushes a commit or a tag, and the AUR submission stays
+the maintainer's own.
 
 ## 1. The version, in the ten places that carry it
 
@@ -140,19 +142,21 @@ After the tag exists at the remote:
 
 ## 4. The build service
 
-The Fedora, Debian and Ubuntu packages are built on build.opensuse.org, in
-`home:jmbriccola:porthole`, from files this repository prepares and a person
-uploads. After the step above:
+Pushing the tag is what publishes the Fedora, Debian and Ubuntu packages.
+This workflow runs for the tag like it does for a branch, and its last job --
+`obs`, gated on every other job of that same run -- prepares the seven files,
+attaches them to the tag's GitHub release as `obs-sources.tar`, and asks
+build.opensuse.org to fetch them. The one credential this needs is a token
+that can do nothing but that, and nothing to any other package.
+
+So nothing here is a step for a person, unless something failed:
 
     packaging/obs/make-sources.sh <version>
 
-writes the upload set to `build/obs/<version>/`: the spec, the tag's tarball,
-the crates vendored from its own `Cargo.lock`, and a Debian source package
-built from both. It checks the tarball against the checksum
-`packaging/aur/PKGBUILD` now carries, which is why it comes after the step
-above. [packaging/obs/README.md](../packaging/obs/README.md) says how the
-project is set up, and why Debian 13's repository paths are in the order they
-are.
+writes the same seven files to `build/obs/<version>/` for uploading by hand.
+[packaging/obs/README.md](../packaging/obs/README.md) says how the project is
+set up, what the seven files are, and why Debian 13's repository paths are in
+the order they are.
 
 ## 5. What is deliberately not in this procedure
 
@@ -160,6 +164,9 @@ are.
   histories that need a sentence written by a person. A script would need the
   sentence anyway, and the guard in step 1 already makes a forgotten file a
   red test rather than a shipped mistake.
-- **No published packages.** Nothing in this repository uploads to OBS, to
-  COPR, to Debian or to the AUR. `make-sources.sh` downloads the tag's tarball
-  and the crates it needs, writes seven files, and stops there.
+- **Nothing uploads to COPR, to Debian or to the AUR.** The build service is
+  the one exception, and only through the workflow: on a tag it attaches the
+  seven files to that tag's GitHub release and asks OBS to fetch them, with a
+  token that can ask for nothing else. `make-sources.sh` on its own downloads
+  the tag's tarball and the crates it needs, writes the seven files, and
+  stops there.

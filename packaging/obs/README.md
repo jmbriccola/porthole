@@ -30,14 +30,29 @@ tab. It turns on the spec's `--with vendor`. The Debian packages need nothing
 there: `debian/rules` goes offline by itself when the source carries
 `vendor/`.
 
-## A release
+## A release, once this is set up
 
-Once the tag exists at GitHub, and after `packaging/aur/PKGBUILD` has its
-checksum (step 3 of [docs/releasing.md](../../docs/releasing.md)):
+Tagging is all of it. `.github/workflows/ci.yml` runs for a tag as it does
+for a branch, and its last job -- `obs`, which lists every other job in its
+`needs` and refuses to run for anything but a tag -- does three things:
 
-    packaging/obs/make-sources.sh <version>
+1. runs `packaging/obs/make-sources.sh <version>`, which writes the seven
+   files to `build/obs/<version>/` and packs them into `obs-sources.tar`;
+2. creates the GitHub release for the tag with that one attachment;
+3. asks OBS to run the services of this package, with a token whose only
+   permission is exactly that.
 
-writes seven files to `build/obs/<version>/`:
+OBS then reads [`_service`](_service): `download_url` takes
+`releases/latest/download/obs-sources.tar`, `extract_file` unpacks the seven
+files beside it, and every repository rebuilds. Nothing in `_service` names a
+version, so no release edits it.
+
+The checksum in `packaging/aur/PKGBUILD` cannot be cross-checked at that
+moment -- the sum of the tarball GitHub serves for a tag is pinned in a
+commit *after* the tag -- so `make-sources.sh` says so and goes on. Run it
+again later, after that commit, and it checks.
+
+**What the seven files are:**
 
 | File                               | Used by                                   |
 | ---------------------------------- | ----------------------------------------- |
@@ -51,12 +66,30 @@ writes seven files to `build/obs/<version>/`:
 
 The crates are vendored once, from the tag's own `Cargo.lock`, and the same
 tarball goes to both packagings under the two names they each expect. The
-script checks the upstream tarball against the checksum in the PKGBUILD, so
-all three packagings are provably built from one file. It refuses an output
-directory that is not empty rather than clearing it.
+script refuses an output directory that is not empty rather than clearing it,
+and the same tag always produces the same bytes.
 
-Upload the seven files to the package, and delete the previous version's
-tarballs and `.dsc` from it. OBS rebuilds every repository on its own.
+**By hand**, when the automatic path is not wanted or not yet set up: run
+`packaging/obs/make-sources.sh <version>` and upload the seven files to the
+package, replacing the previous version's. That is how 1.0.1 was published.
+
+## Setting it up once
+
+1. **A token on OBS**, bound to this package and allowed one operation:
+
+       osc token --create --operation runservice home:jmbriccola:porthole porthole
+
+   or the same thing from the web interface, under the account's Tokens.
+   Anyone holding it can ask OBS to re-read the files this project publishes,
+   and nothing else: it cannot upload, change or release anything.
+
+2. **The token in GitHub**, as the repository secret `OBS_RUNSERVICE_TOKEN`.
+   Without it the release is still made and the job says so instead of
+   failing; OBS then has to be asked by hand.
+
+3. **`_service` in the package**, in place of the seven uploaded files.
+   Delete those first: with both present, OBS would keep building the ones
+   that no longer move.
 
 ## How this was checked
 

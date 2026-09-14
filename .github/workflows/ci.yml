@@ -6,6 +6,12 @@ name: CI
 on:
   push:
     branches: ["**"]
+    # Tags too, and not for the sake of running the same checks twice: the
+    # job at the bottom hands the build service a release, and it is allowed
+    # to do that only as `needs` of every job in this file. That is what
+    # "only when CI is green" means here -- it is the workflow's own graph,
+    # not a second workflow reading the first one's result.
+    tags: ["v*"]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -520,3 +526,73 @@ jobs:
           test "${#gui[@]}" -eq 1
           bsdtar -tf "${base[0]}"
           bsdtar -tf "${gui[0]}"
+
+  # Everything above ran for this tag. This job is what the build service
+  # sees: the release it reads its sources from, and the one request that
+  # tells it to look.
+  #
+  # It cannot run before the other nine, and it cannot run for a branch.
+  # packaging/obs/README.md says what the seven files are and how the
+  # _service on OBS picks them up.
+  obs:
+    name: OBS (tag only)
+    needs: [fmt, clippy, test, msrv, gui, container-tests, rpm, deb, aur]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    # The only job in this workflow that writes anything. The file-level
+    # permission above stays read-only, so this one line is the whole of it.
+    permissions:
+      contents: write
+    steps:
+      # fetch-depth: 0 for the tag object itself: make-sources.sh dates the
+      # vendored tarball by the tag's own commit, so the same release always
+      # produces the same bytes.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: The seven files OBS builds from
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          echo "tag ${GITHUB_REF_NAME}, version ${version}"
+          packaging/obs/make-sources.sh "${version}"
+          ls -l "build/obs/${version}"
+      # The _service on OBS downloads
+      # releases/latest/download/obs-sources.tar, so the attachment's name is
+      # fixed and the release is what makes a version reachable. --clobber on
+      # the second call so re-running this job replaces the attachment rather
+      # than failing on it.
+      - name: Attach obs-sources.tar to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          tar="build/obs/${version}/obs-sources.tar"
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "${tar}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" "${tar}" \
+              --title "porthole ${version}" \
+              --notes "Packages for Fedora, Debian and Ubuntu are built from obs-sources.tar; see the README for the repository to add."
+          fi
+      # A token that can do one thing to one package: run its source
+      # services. It carries no permission to change what those services
+      # fetch, which is why this is the credential that lives on GitHub.
+      # Missing token is not a failure: the release above is already made,
+      # and OBS can be asked by hand.
+      - name: Ask OBS to fetch them
+        env:
+          OBS_TOKEN: ${{ secrets.OBS_RUNSERVICE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OBS_TOKEN}" ]; then
+            echo "OBS_RUNSERVICE_TOKEN is not set: the release is made, nothing was asked of OBS"
+            exit 0
+          fi
+          code=$(curl -sS -o /tmp/obs-answer -w '%{http_code}' -X POST \
+            -H "Authorization: Token ${OBS_TOKEN}" \
+            https://api.opensuse.org/trigger/runservice)
+          echo "HTTP ${code}"
+          cat /tmp/obs-answer
+          test "${code}" = 200

@@ -48,15 +48,20 @@ echo "== upstream tarball for v$version"
 curl -fsSL "$url" -o "$out/porthole-$version.tar.gz"
 sum=$(sha256sum "$out/porthole-$version.tar.gz" | cut -d' ' -f1)
 pinned_version=$(sed -n 's/^pkgver=//p' "$repo/packaging/aur/PKGBUILD")
-if [ "$pinned_version" = "$version" ]; then
-    pinned=$(sed -n "s/^sha256sums=('\([0-9a-f]\{64\}\)')$/\1/p" "$repo/packaging/aur/PKGBUILD")
-    if [ "$sum" != "$pinned" ]; then
-        echo "sha256 $sum does not match the $pinned in packaging/aur/PKGBUILD" >&2
-        exit 1
-    fi
-    echo "   sha256 matches packaging/aur/PKGBUILD"
-else
+pinned=$(sed -n "s/^sha256sums=('\([0-9a-f]\{64\}\)')$/\1/p" "$repo/packaging/aur/PKGBUILD")
+if [ "$pinned_version" != "$version" ]; then
     echo "   packaging/aur/PKGBUILD is for $pinned_version, not $version: not cross-checked" >&2
+elif [ -z "$pinned" ]; then
+    # The tag's own PKGBUILD still carries sha256sums=('SKIP'): the checksum
+    # of the tarball GitHub serves for a tag cannot be inside that tarball,
+    # so it is pinned in a commit after the tag. Running right after the tag,
+    # which is what the release workflow does, is that moment.
+    echo "   packaging/aur/PKGBUILD carries SKIP: nothing to cross-check yet" >&2
+elif [ "$sum" != "$pinned" ]; then
+    echo "sha256 $sum does not match the $pinned in packaging/aur/PKGBUILD" >&2
+    exit 1
+else
+    echo "   sha256 matches packaging/aur/PKGBUILD"
 fi
 cp "$out/porthole-$version.tar.gz" "$out/porthole_$version.orig.tar.gz"
 
@@ -80,18 +85,40 @@ mv "$work/vendor" "$src/vendor"
 rm -rf "$src/debian"
 cp -a "$repo/debian" "$src/debian"
 cp "$out/porthole_$version.orig.tar.gz" "$out/porthole_$version.orig-vendor.tar.xz" "$work/"
-podman run --rm --security-opt label=disable -v "$work:/w" -w /w debian:13 bash -c '
-    set -euo pipefail
-    apt-get -o Acquire::http::Timeout=20 -o Acquire::Retries=2 update -qq >/dev/null
-    apt-get install -y -qq --no-install-recommends dpkg-dev >/dev/null
-    upstream=$(dpkg-parsechangelog -l "porthole-$0/debian/changelog" -S Version | sed "s/-[^-]*$//")
-    if [ "$upstream" != "$0" ]; then
-        echo "debian/changelog is for $upstream, not $0" >&2
-        exit 1
-    fi
-    dpkg-source -b "porthole-$0"
-' "$version"
+if command -v dpkg-source >/dev/null && command -v dpkg-parsechangelog >/dev/null; then
+    echo "   dpkg-source: this machine's own"
+    ( cd "$work"
+      upstream=$(dpkg-parsechangelog -l "porthole-$version/debian/changelog" -S Version | sed "s/-[^-]*$//")
+      if [ "$upstream" != "$version" ]; then
+          echo "debian/changelog is for $upstream, not $version" >&2
+          exit 1
+      fi
+      dpkg-source -b "porthole-$version" )
+else
+    echo "   dpkg-source: in a debian:13 container"
+    podman run --rm --security-opt label=disable -v "$work:/w" -w /w debian:13 bash -c '
+        set -euo pipefail
+        apt-get -o Acquire::http::Timeout=20 -o Acquire::Retries=2 update -qq >/dev/null
+        apt-get install -y -qq --no-install-recommends dpkg-dev >/dev/null
+        upstream=$(dpkg-parsechangelog -l "porthole-$0/debian/changelog" -S Version | sed "s/-[^-]*$//")
+        if [ "$upstream" != "$0" ]; then
+            echo "debian/changelog is for $upstream, not $0" >&2
+            exit 1
+        fi
+        dpkg-source -b "porthole-$0"
+    ' "$version"
+fi
 cp "$work"/porthole_"$version"-*.debian.tar.xz "$work"/porthole_"$version"-*.dsc "$out/"
+
+echo "== obs-sources.tar, the release's one attachment"
+# The same seven files in one file, so the _service on OBS can name a single
+# attachment that never changes with the version. Reproducible like the
+# vendor tarball above: one release in, the same bytes out.
+( cd "$out" && tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
+    -cf obs-sources.tar porthole.spec "porthole-$version.tar.gz" \
+    "porthole-$version-vendor.tar.xz" "porthole_$version.orig.tar.gz" \
+    "porthole_$version.orig-vendor.tar.xz" porthole_"$version"-*.debian.tar.xz \
+    porthole_"$version"-*.dsc )
 
 echo "== $out"
 ls -l "$out"
