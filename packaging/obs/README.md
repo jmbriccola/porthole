@@ -105,6 +105,18 @@ On 2026-09-11, for 1.0.1, before the first upload:
   `debian/rules` beside the fix: `dh_clean` deletes `*.orig`, and every
   vendored crate carries a `Cargo.toml.orig` its checksums name.
 
-What that does not cover is OBS itself: its resolver choosing the backports
-rustc, and its own build environment. The first build on OBS is where that
-gets checked.
+On 2026-09-14, for the automatic path, on OBS itself:
+
+- A package `porthole-test` in the same project, publishing disabled, holding
+  nothing but `_service`. Its first run failed with `404`, because the release
+  did not exist yet; its second with `service error: No matching archive
+  found`, which is how the prefix in the archive's name was found. With the
+  glob, the services succeeded and the expanded sources showed the downloaded
+  tar and the seven extracted files at the sizes they have here.
+- All six builds of that package succeeded from those sources: Debian 13,
+  Ubuntu 26.04, and Fedora 43 and 44 on x86_64 and aarch64. Debian was the
+  one in doubt, since its `.dsc` names tarballs that arrive under prefixed
+  names.
+
+What none of this covers is the release job itself: it can only run for a
+tag, so the first tag after this is where it gets checked.
